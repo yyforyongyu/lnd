@@ -238,6 +238,11 @@ fmt-check: fmt
 	@$(call print, "Checking fmt results.")
 	if test -n "$$(git status --porcelain)"; then echo "code not formatted correctly, please run `make fmt` again!"; git status; git diff; exit 1; fi
 
+gomod-check:
+	@$(call print, "Checking go mod files.")
+	go work sync
+	if test -n "$$(git status --porcelain '*.mod')"; then echo "modules are not updated, please run 'make gomod-check' and commit the changes!"; git status; fi;
+
 lint: docker-tools
 	@$(call print, "Linting source.")
 	$(DOCKER_TOOLS) golangci-lint run -v $(LINT_WORKERS)
