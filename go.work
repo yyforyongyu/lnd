@@ -1,0 +1,14 @@
+go 1.20
+
+use (
+	.
+	./cert
+	./clock
+	./healthcheck
+	./kvdb
+	./queue
+	./ticker
+	./tlv
+	./tools
+	./tor
+)
