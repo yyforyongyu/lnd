@@ -938,7 +938,8 @@ func (h *htlcTimeoutResolver) waitForMempoolOrBlockSpend(op wire.OutPoint,
 	pkScript []byte) (*chainntnfs.SpendDetail, error) {
 
 	log.Infof("%T(%v): waiting for spent of HTLC output %v to be found "+
-		"in mempool or block", h, h.htlcResolution.ClaimOutpoint, op)
+		"in mempool or block after height=%d", h,
+		h.htlcResolution.ClaimOutpoint, op, h.broadcastHeight)
 
 	// Subscribe for block spent(confirmed).
 	blockSpent, err := h.Notifier.RegisterSpendNtfn(
