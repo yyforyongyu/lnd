@@ -181,3 +181,40 @@ func (b *BlockbeatDispatcher) notifyQueues() {
 		}
 	}
 }
+
+// SetInitialBeat sets the current beat during the startup.
+//
+// NOTE: Must be called before `Start`.
+func (b *BlockbeatDispatcher) SetInitialBeat() error {
+	// We need to register for block epochs and retry sweeping every block.
+	// We should get a notification with the current best block immediately
+	// if we don't provide any epoch. We'll wait for that in the collector.
+	blockEpochs, err := b.notifier.RegisterBlockEpochNtfn(nil)
+	if err != nil {
+		return fmt.Errorf("register block epoch ntfn: %w", err)
+	}
+
+	// We registered for the block epochs with a nil request. The notifier
+	// should send us the current best block immediately. So we need to
+	// wait for it here because we need to know the current best height.
+	select {
+	case bestBlock := <-blockEpochs.Epochs:
+		clog.Infof("Received initial block %v at height %d",
+			bestBlock.Hash, bestBlock.Height)
+
+		// Update the current blockbeat.
+		b.beat = NewBeat(*bestBlock)
+
+	case <-b.quit:
+		clog.Debug("Sweeper shutting down")
+	}
+
+	// Set the initial height for the consumer.
+	for _, queue := range b.consumerQueues {
+		for _, c := range queue {
+			c.SetCurrentBeat(b.beat)
+		}
+	}
+
+	return nil
+}
