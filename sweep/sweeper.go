@@ -827,6 +827,7 @@ func (s *UtxoSweeper) sweep(set InputSet) error {
 		DeliveryAddress: sweepAddr,
 		MaxFeeRate:      s.cfg.MaxFeeRate.FeePerKWeight(),
 		StartingFeeRate: set.StartingFeeRate(),
+		Immediate:       set.Immediate(),
 		// TODO(yy): pass the strategy here.
 	}
 
@@ -1539,6 +1540,8 @@ func (s *UtxoSweeper) updateSweeperInputs() InputsMap {
 // sweepPendingInputs is called when the ticker fires. It will create clusters
 // and attempt to create and publish the sweeping transactions.
 func (s *UtxoSweeper) sweepPendingInputs(inputs InputsMap) {
+	log.Debugf("Sweeping %v inputs", len(inputs))
+
 	// Cluster all of our inputs based on the specific Aggregator.
 	sets := s.cfg.Aggregator.ClusterInputs(inputs)
 
