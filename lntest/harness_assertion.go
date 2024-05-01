@@ -2537,7 +2537,7 @@ func (h *HarnessTest) AssertClosingTxInMempool(cp *lnrpc.ChannelPoint,
 
 	// Get the closing tx from the mempool.
 	op := h.OutPointFromChannelPoint(cp)
-	closeTx := h.Miner.AssertOutpointInMempool(op)
+	closeTx := h.AssertOutpointInMempool(op)
 
 	return closeTx
 }
@@ -2551,7 +2551,7 @@ func (h *HarnessTest) MineClosingTx(cp *lnrpc.ChannelPoint) *wire.MsgTx {
 
 	// Get the closing tx from the mempool.
 	op := h.OutPointFromChannelPoint(cp)
-	closeTx := h.Miner.AssertOutpointInMempool(op)
+	closeTx := h.AssertOutpointInMempool(op)
 
 	// Mine a block to confirm the closing transaction and potential anchor
 	// sweep.
