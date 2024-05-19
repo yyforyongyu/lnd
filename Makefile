@@ -6,13 +6,14 @@ TOOLS_DIR := tools
 PREFIX ?= /usr/local
 
 BTCD_PKG := github.com/btcsuite/btcd
+UTREEXOD_PKG := github.com/utreexo/utreexod
 GOACC_PKG := github.com/ory/go-acc
 GOIMPORTS_PKG := github.com/rinchsan/gosimports/cmd/gosimports
 
 GO_BIN := ${GOPATH}/bin
 BTCD_BIN := $(GO_BIN)/btcd
 GOIMPORTS_BIN := $(GO_BIN)/gosimports
-GOMOBILE_BIN := $(GO_BIN)/gomobile
+GDirOMOBILE_BIN := $(GO_BIN)/gomobile
 GOACC_BIN := $(GO_BIN)/go-acc
 
 MOBILE_BUILD_DIR :=${GOPATH}/src/$(MOBILE_PKG)/build
@@ -93,6 +94,10 @@ $(BTCD_BIN):
 	@$(call print, "Installing btcd.")
 	cd $(TOOLS_DIR); go install -trimpath $(BTCD_PKG)
 
+$(UTREEXOD_BIN):
+	@$(call print, "Installing utreexod.")
+	cd $(TOOLS_DIR); go install -trimpath $(UTREEXOD_PKG)
+
 $(GOIMPORTS_BIN):
 	@$(call print, "Installing goimports.")
 	cd $(TOOLS_DIR); go install -trimpath $(GOIMPORTS_PKG)
@@ -115,6 +120,11 @@ build-itest:
 
 	@$(call print, "Building itest binary for ${backend} backend.")
 	CGO_ENABLED=0 $(GOTEST) -v ./itest -tags="$(DEV_TAGS) $(RPC_TAGS) integration $(backend)" -c -o itest/itest.test$(EXEC_SUFFIX)
+
+#? build-itest-x: Build integration test binaries, place them in itest directory
+build-utreexod:
+	@$(call print, "Building itest utreexod")
+	CGO_ENABLED=0 $(GOBUILD) -tags="integration" -o itest/utreexod-itest$(EXEC_SUFFIX) $(DEV_LDFLAGS) $(UTREEXOD_PKG)
 
 #? build-itest-race: Build integration test binaries in race detector mode, place them in itest directory
 build-itest-race:
@@ -207,6 +217,9 @@ itest-only: db-instance
 
 #? itest: Build and run integration tests
 itest: build-itest itest-only
+
+#? itestx: Build and run integration tests for utreexod
+itestx: build-itest build-utreexod itest-only
 
 #? itest-race: Build and run integration tests in race detector mode
 itest-race: build-itest-race itest-only
