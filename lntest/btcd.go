@@ -1,5 +1,5 @@
-//go:build !bitcoind && !neutrino
-// +build !bitcoind,!neutrino
+//go:build !bitcoind && !neutrino && !utreexod
+// +build !bitcoind,!neutrino,!utreexod
 
 package lntest
 

@@ -41,6 +41,11 @@ var (
 	btcdExecutable = flag.String(
 		"btcdexec", "", "full path to btcd binary",
 	)
+
+	// utreexodExecutable is the full path to the btcd binary.
+	utreexodExecutable = flag.String(
+		"utreexodexec", "", "full path to utreexod binary",
+	)
 )
 
 type DatabaseBackend int
@@ -356,6 +361,16 @@ func CopyFile(dest, src string) error {
 func GetBtcdBinary() string {
 	if btcdExecutable != nil {
 		return *btcdExecutable
+	}
+
+	return ""
+}
+
+// GetUtreexodBinary returns the full path to the binary of the custom built
+// utreexod executable or an empty string if none is set.
+func GetUtreexodBinary() string {
+	if utreexodExecutable != nil {
+		return *utreexodExecutable
 	}
 
 	return ""
