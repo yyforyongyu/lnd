@@ -234,6 +234,7 @@ const (
 	bitcoindBackendName = "bitcoind"
 	btcdBackendName     = "btcd"
 	neutrinoBackendName = "neutrino"
+	utreexodBackendName = "utreexod"
 )
 
 var (
@@ -356,6 +357,7 @@ type Config struct {
 	BtcdMode     *lncfg.Btcd     `group:"btcd" namespace:"btcd"`
 	BitcoindMode *lncfg.Bitcoind `group:"bitcoind" namespace:"bitcoind"`
 	NeutrinoMode *lncfg.Neutrino `group:"neutrino" namespace:"neutrino"`
+	UtreexodMdoe *lncfg.Utreexod `group:"utreexod" namespace:"utreexod"`
 
 	BlockCacheSize uint64 `long:"blockcachesize" description:"The maximum capacity of the block cache"`
 
@@ -578,6 +580,12 @@ func DefaultConfig() Config {
 			UserAgentName:    neutrino.UserAgentName,
 			UserAgentVersion: neutrino.UserAgentVersion,
 		},
+		UtreexodMdoe: &lncfg.Utreexod{
+			Dir:     defaultBtcdDir,
+			RPCHost: defaultRPCHost,
+			RPCCert: defaultBtcdRPCCertFile,
+		},
+
 		BlockCacheSize:     defaultBlockCacheSize,
 		MaxPendingChannels: lncfg.DefaultMaxPendingChannels,
 		NoSeedBackup:       defaultNoSeedBackup,
@@ -1252,6 +1260,15 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 			return nil, mkErr("unable to load RPC "+
 				"credentials for btcd: %v", err)
 		}
+	case utreexodBackendName:
+		err := parseRPCParams(
+			cfg.Bitcoin, cfg.UtreexodMdoe, cfg.ActiveNetParams,
+		)
+		if err != nil {
+			return nil, mkErr("unable to load RPC "+
+				"credentials for utreexod: %v", err)
+		}
+
 	case bitcoindBackendName:
 		if cfg.Bitcoin.SimNet {
 			return nil, mkErr("bitcoind does not " +

@@ -172,6 +172,15 @@ func (n *NoChainSource) GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader,
 	}, nil
 }
 
+// GetBlockHeader returns the block header for the given block hash, or an error
+// if the client has been shut down or the hash doesn't exist or is unknown.
+func (n *NoChainSource) GetBlockHeaderVerbose(
+	blockHash *chainhash.Hash) (*btcjson.GetBlockHeaderVerboseResult,
+	error) {
+
+	return nil, errNotImplemented
+}
+
 func (n *NoChainSource) IsCurrent() bool {
 	return true
 }

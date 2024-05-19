@@ -22,6 +22,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs/bitcoindnotify"
 	"github.com/lightningnetwork/lnd/chainntnfs/btcdnotify"
 	"github.com/lightningnetwork/lnd/chainntnfs/neutrinonotify"
+	"github.com/lightningnetwork/lnd/chainntnfs/utreexodnotify"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/input"
@@ -33,6 +34,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/chainview"
 	"github.com/lightningnetwork/lnd/walletunlocker"
+	utreexorpc "github.com/utreexo/utreexod/rpcclient"
 )
 
 // Config houses necessary fields that a chainControl instance needs to
@@ -54,6 +56,9 @@ type Config struct {
 
 	// BtcdMode defines settings for connecting to a btcd node.
 	BtcdMode *lncfg.Btcd
+
+	// UtreexodMode defines settings for connecting to a utreexod node.
+	UtreexodMode *lncfg.Utreexod
 
 	// HeightHintDB is a pointer to the database that stores the height
 	// hints.
@@ -668,6 +673,150 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 				return nil, nil, err
 			}
 		}
+
+	case "utreexod":
+		// Otherwise, we'll be speaking directly via RPC to a node.
+		//
+		// So first we'll load utreexod's TLS cert for the RPC
+		// connection. If a raw cert was specified in the config, then
+		// we'll set that directly. Otherwise, we attempt to read the
+		// cert from the path specified in the config.
+		var (
+			rpcCert      []byte
+			utreexodMode = cfg.UtreexodMode
+		)
+		if utreexodMode.RawRPCCert != "" {
+			rpcCert, err = hex.DecodeString(utreexodMode.RawRPCCert)
+			if err != nil {
+				return nil, nil, err
+			}
+		} else {
+			certFile, err := os.Open(utreexodMode.RPCCert)
+			if err != nil {
+				return nil, nil, err
+			}
+			rpcCert, err = io.ReadAll(certFile)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := certFile.Close(); err != nil {
+				return nil, nil, err
+			}
+		}
+
+		// If the specified host for the utreexod RPC server already
+		// has a port specified, then we use that directly. Otherwise,
+		// we assume the default port according to the selected chain
+		// parameters.
+		var utreexodHost string
+		if strings.Contains(utreexodMode.RPCHost, ":") {
+			utreexodHost = utreexodMode.RPCHost
+		} else {
+			utreexodHost = fmt.Sprintf("%v:%v", utreexodMode.RPCHost,
+				cfg.ActiveNetParams.RPCPort)
+		}
+
+		utreexodUser := utreexodMode.RPCUser
+		utreexodPass := utreexodMode.RPCPass
+		connCfg := &utreexorpc.ConnConfig{
+			Host:                 utreexodHost,
+			Endpoint:             "ws",
+			User:                 utreexodUser,
+			Pass:                 utreexodPass,
+			Certificates:         rpcCert,
+			DisableTLS:           false,
+			DisableConnectOnNew:  true,
+			DisableAutoReconnect: false,
+		}
+
+		chainNotifier, err := utreexodnotify.New(
+			connCfg, cfg.ActiveNetParams.Params, hintCache,
+			hintCache, cfg.BlockCache,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		cc.ChainNotifier = chainNotifier
+		cc.MempoolNotifier = chainNotifier
+
+		utreexoCfg := &chain.UtreexodRPCClientConfig{
+			ReconnectAttempts:    20,
+			Conn:                 connCfg,
+			Chain:                cfg.ActiveNetParams.Params,
+			NotificationHandlers: nil,
+		}
+
+		// Finally, we'll create an instance of the default chain view
+		// to be used within the routing layer.
+		cc.ChainView, err = chainview.NewUtreexodFilteredChainView(
+			utreexoCfg, cfg.BlockCache,
+		)
+		if err != nil {
+			log.Errorf("unable to create chain view: %v", err)
+			return nil, nil, err
+		}
+
+		// Create a special websockets rpc client for btcd which will be
+		// used by the wallet for notifications, calls, etc.
+		chainRPC, err := chain.NewUtreexodRPCClientWithConfig(
+			utreexoCfg,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// restConfCopy := *connCfg
+		// restConfCopy.Endpoint = ""
+		// restConfCopy.HTTPPostMode = true
+		// chainConn, err := rpcclient.New(&restConfCopy, nil)
+		// if err != nil {
+		// 	return nil, nil, err
+		// }
+		// if !backendSupportsTaproot(chainConn) {
+		// 	return nil, nil, fmt.Errorf("node backend does not " +
+		// 		"support taproot")
+		// }
+
+		cc.ChainSource = chainRPC
+
+		// // Use a query for our best block as a health check.
+		// cc.HealthCheck = func() error {
+		// 	_, _, err := cc.ChainSource.GetBestBlock()
+		// 	if err != nil {
+		// 		return err
+		// 	}
+
+		// 	// On local test networks we usually don't have multiple
+		// 	// chain backend peers, so we can skip
+		// 	// the checkOutboundPeers test.
+		// 	if cfg.Bitcoin.SimNet || cfg.Bitcoin.RegTest {
+		// 		return nil
+		// 	}
+
+		// 	// Make sure the btcd chain backend maintains a
+		// 	// healthy connection to the network by checking the
+		// 	// number of outbound peers.
+		// 	return checkOutboundPeers(chainRPC.Client)
+		// }
+
+		// // If we're not in simnet or regtest mode, then we'll attempt
+		// // to use a proper fee estimator for testnet.
+		// if !cfg.Bitcoin.SimNet && !cfg.Bitcoin.RegTest {
+		// 	log.Info("Initializing utreexod backed fee estimator")
+
+		// 	// Finally, we'll re-initialize the fee estimator, as
+		// 	// if we're using btcd as a backend, then we can use
+		// 	// live fee estimates, rather than a statically coded
+		// 	// value.
+		// 	fallBackFeeRate := chainfee.SatPerKVByte(25 * 1000)
+		// 	cc.FeeEstimator, err = chainfee.NewBtcdEstimator(
+		// 		*rpcConfig, fallBackFeeRate.FeePerKWeight(),
+		// 	)
+		// 	if err != nil {
+		// 		return nil, nil, err
+		// 	}
+		// }
 
 	case "nochainbackend":
 		backend := &NoChainBackend{}
