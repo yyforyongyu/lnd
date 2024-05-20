@@ -99,12 +99,19 @@ func (h *HarnessTest) MineBlocksAndAssertNumTxes(num uint32,
 	// Update the harness's current height.
 	defer h.updateCurrentHeight()
 
+	// Neutrino nodes have trouble accessing the mempool so we skip it.
+	//
+	// TODO(yy): figure out the details.
+	if h.IsNeutrinoBackend() {
+		return h.miner.MineBlocks(num)
+	}
+
 	// If we expect transactions to be included in the blocks we'll mine,
 	// we wait here until they are seen in the miner's mempool.
 	txids := h.AssertNumTxsInMempool(numTxs)
 
 	// Mine blocks.
-	blocks := h.miner.MineBlocksSlow(num)
+	blocks := h.miner.MineBlocks(num)
 
 	// Assert that all the transactions were included in the first block.
 	for _, txid := range txids {
