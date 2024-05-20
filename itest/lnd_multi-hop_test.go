@@ -2223,7 +2223,11 @@ func createThreeHopNetwork(ht *lntest.HarnessTest,
 		ht.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, carol)
 
 		// Mine 1 block to get the above coins confirmed.
-		ht.MineBlocks(1)
+		if ht.IsNeutrinoBackend() {
+			ht.MineBlocks(1)
+		} else {
+			ht.MineBlocksAndAssertNumTxes(1, 3)
+		}
 	}
 
 	// We'll start the test by creating a channel between Alice and Bob,
@@ -2704,7 +2708,7 @@ func runExtraPreimageFromLocalCommit(ht *lntest.HarnessTest,
 		ht.AssertOutpointInMempool(htlcOutpoint)
 
 		// Mine a block to confirm Carol's direct spend tx.
-		ht.MineBlocks(1)
+		ht.MineBlocksAndAssertNumTxes(1, 1)
 	}
 
 	// Finally, check that the Alice's payment is marked as succeeded as

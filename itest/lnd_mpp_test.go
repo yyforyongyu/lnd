@@ -208,7 +208,13 @@ func newMppTestScenario(ht *lntest.HarnessTest) *mppTestScenario {
 		ht.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, carol)
 		ht.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, dave)
 		ht.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, eve)
-		ht.MineBlocks(1)
+
+		// Mine 1 block to get the above coins confirmed.
+		if ht.IsNeutrinoBackend() {
+			ht.MineBlocks(1)
+		} else {
+			ht.MineBlocksAndAssertNumTxes(1, 3)
+		}
 	}
 
 	mts := &mppTestScenario{
@@ -318,7 +324,7 @@ func (m *mppTestScenario) closeChannels() {
 	m.ht.CloseChannelAssertPending(m.eve, m.channelPoints[5], false)
 
 	// Now mine a block to include all the closing transactions.
-	m.ht.MineBlocks(1)
+	m.ht.MineBlocksAndAssertNumTxes(1, 6)
 
 	// Assert that the channels are closed.
 	for _, hn := range m.nodes {
