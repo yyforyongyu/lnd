@@ -1540,7 +1540,7 @@ func (s *UtxoSweeper) updateSweeperInputs() InputsMap {
 		// skip this input and wait for the locktime to be reached.
 		mature, locktime := input.isMature(uint32(s.currentHeight))
 		if !mature {
-			log.Infof("Skipping input %v due to locktime=%v not "+
+			log.Debugf("Skipping input %v due to locktime=%v not "+
 				"reached, current height is %v", op, locktime,
 				s.currentHeight)
 
