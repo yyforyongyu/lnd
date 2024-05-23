@@ -74,40 +74,41 @@ func testMultiHopPayments(ht *lntest.HarnessTest) {
 	const aliceFeeRatePPM = 100000
 	updateChannelPolicy(
 		ht, alice, chanPointAlice, aliceBaseFeeSat*1000,
-		aliceFeeRatePPM, 0, 0, false,
+		aliceFeeRatePPM, nil,
 		chainreg.DefaultBitcoinTimeLockDelta, maxHtlc, carol,
 	)
 
 	// Define a negative inbound fee for Alice, to verify that this is
 	// backwards compatible with an older sender ignoring the discount.
-	const (
-		aliceInboundBaseFeeMsat = -2000
-		aliceInboundFeeRate     = -50000 // 5%
-	)
+	aliceInboundFee := &lnrpc.InboundFee{
+		BaseFeeMsat: -2000,
+		FeeRatePpm:  -50000, // 5%
+	}
 
 	// We update the channel twice. The first time we set the inbound fee,
 	// the second time we don't. This is done to test whether the switch is
 	// still aware of the inbound fees.
 	updateChannelPolicy(
-		ht, alice, chanPointDave, 0, 0,
-		aliceInboundBaseFeeMsat, aliceInboundFeeRate, true,
-		chainreg.DefaultBitcoinTimeLockDelta, maxHtlc,
-		dave,
+		ht, alice, chanPointDave, 0, 0, aliceInboundFee,
+		chainreg.DefaultBitcoinTimeLockDelta, maxHtlc, dave,
 	)
 
 	updateChannelPolicy(
-		ht, alice, chanPointDave, 0, 0,
-		aliceInboundBaseFeeMsat, aliceInboundFeeRate, false,
-		chainreg.DefaultBitcoinTimeLockDelta, maxHtlc,
-		dave,
+		ht, alice, chanPointDave, 0, 0, nil,
+		chainreg.DefaultBitcoinTimeLockDelta, maxHtlc, dave,
 	)
 
 	const daveBaseFeeSat = 5
 	const daveFeeRatePPM = 150000
+
+	daveInboundFee := &lnrpc.InboundFee{
+		BaseFeeMsat: 0,
+		FeeRatePpm:  0,
+	}
 	updateChannelPolicy(
 		ht, dave, chanPointDave, daveBaseFeeSat*1000, daveFeeRatePPM,
-		0, 0, true,
-		chainreg.DefaultBitcoinTimeLockDelta, maxHtlc, carol,
+		daveInboundFee, chainreg.DefaultBitcoinTimeLockDelta,
+		maxHtlc, carol,
 	)
 
 	// Using Carol as the source, pay to the 5 invoices from Bob created
@@ -247,25 +248,20 @@ func testMultiHopPayments(ht *lntest.HarnessTest) {
 // NOTE: only used in current test.
 func updateChannelPolicy(ht *lntest.HarnessTest, hn *node.HarnessNode,
 	chanPoint *lnrpc.ChannelPoint, baseFee int64, feeRate int64,
-	inboundBaseFee, inboundFeeRate int32, updateInboundFee bool,
-	timeLockDelta uint32, maxHtlc uint64, listenerNode *node.HarnessNode) {
+	inboundFee *lnrpc.InboundFee, timeLockDelta uint32, maxHtlc uint64,
+	listenerNode *node.HarnessNode) {
 
 	expectedPolicy := &lnrpc.RoutingPolicy{
-		FeeBaseMsat:             baseFee,
-		FeeRateMilliMsat:        feeRate,
-		TimeLockDelta:           timeLockDelta,
-		MinHtlc:                 1000, // default value
-		MaxHtlcMsat:             maxHtlc,
-		InboundFeeBaseMsat:      inboundBaseFee,
-		InboundFeeRateMilliMsat: inboundFeeRate,
+		FeeBaseMsat:      baseFee,
+		FeeRateMilliMsat: feeRate,
+		TimeLockDelta:    timeLockDelta,
+		MinHtlc:          1000, // default value
+		MaxHtlcMsat:      maxHtlc,
 	}
 
-	var inboundFee *lnrpc.InboundFee
-	if updateInboundFee {
-		inboundFee = &lnrpc.InboundFee{
-			BaseFeeMsat: inboundBaseFee,
-			FeeRatePpm:  inboundFeeRate,
-		}
+	if inboundFee != nil {
+		expectedPolicy.InboundFeeBaseMsat = inboundFee.BaseFeeMsat
+		expectedPolicy.InboundFeeRateMilliMsat = inboundFee.FeeRatePpm
 	}
 
 	updateFeeReq := &lnrpc.PolicyUpdateRequest{
