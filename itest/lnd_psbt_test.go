@@ -3,6 +3,7 @@ package itest
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"testing"
 	"time"
 
@@ -649,16 +650,51 @@ func runPsbtChanFundingSingleStep(ht *lntest.HarnessTest, carol,
 
 // testSignPsbt tests that the SignPsbt RPC works correctly.
 func testSignPsbt(ht *lntest.HarnessTest) {
-	runSignPsbtSegWitV0P2WKH(ht, ht.Alice)
-	runSignPsbtSegWitV0NP2WKH(ht, ht.Alice)
-	runSignPsbtSegWitV1KeySpendBip86(ht, ht.Alice)
-	runSignPsbtSegWitV1KeySpendRootHash(ht, ht.Alice)
-	runSignPsbtSegWitV1ScriptSpend(ht, ht.Alice)
+	psbtTestRunners := []struct {
+		name   string
+		runner func(*lntest.HarnessTest, *node.HarnessNode)
+	}{
+		{
+			name:   "sign psbt segwit v0 P2WPKH",
+			runner: runSignPsbtSegWitV0P2WKH,
+		},
+		{
+			name:   "sign psbt segwit v0 P2WSH",
+			runner: runSignPsbtSegWitV0NP2WKH,
+		},
+		{
+			name:   "sign psbt segwit v1 key spend bip86",
+			runner: runSignPsbtSegWitV1KeySpendBip86,
+		},
+		{
+			name:   "sign psbt segwit v1 key spend root hash",
+			runner: runSignPsbtSegWitV1KeySpendRootHash,
+		},
+		{
+			name:   "sign psbt segwit v1 script spend",
+			runner: runSignPsbtSegWitV1ScriptSpend,
+		},
+		{
+			// The above tests all make sure we can sign for keys
+			// that aren't in the wallet. But we also want to make
+			// sure we can fund and then sign PSBTs from our
+			// wallet.
+			name:   "fund and sign psbt",
+			runner: runFundAndSignPsbt,
+		},
+	}
 
-	// The above tests all make sure we can sign for keys that aren't in
-	// the wallet. But we also want to make sure we can fund and then sign
-	// PSBTs from our wallet.
-	runFundAndSignPsbt(ht, ht.Alice)
+	for _, tc := range psbtTestRunners {
+		succeed := ht.Run(tc.name, func(t *testing.T) {
+			st := ht.Subtest(t)
+			tc.runner(st, st.Alice)
+		})
+
+		// Abort the test if failed.
+		if !succeed {
+			return
+		}
+	}
 }
 
 // runSignPsbtSegWitV0P2WKH tests that the SignPsbt RPC works correctly for a
@@ -1010,29 +1046,42 @@ func runFundAndSignPsbt(ht *lntest.HarnessTest, alice *node.HarnessNode) {
 
 	for _, addrType := range spendAddrTypes {
 		for _, changeType := range changeAddrTypes {
-			ht.Logf("testing with address type %s and "+
-				"change address type %s", addrType, changeType)
+			name := fmt.Sprintf("address type %s-change address "+
+				"type %s", addrType, changeType)
 
-			// First, spend all the coins in the wallet to an
-			// address of the given type so that UTXO will be picked
-			// when funding a PSBT.
-			sendAllCoinsToAddrType(ht, alice, addrType)
+			succeed := ht.Run(name, func(t *testing.T) {
+				st := ht.Subtest(t)
 
-			// Let's fund a PSBT now where we want to send a few
-			// sats to our main address.
-			assertPsbtFundSignSpend(
-				ht, alice, fundOutputs, changeType, false,
-			)
+				// First, spend all the coins in the wallet to
+				// an address of the given type so that UTXO
+				// will be picked when funding a PSBT.
+				sendAllCoinsToAddrType(st, alice, addrType)
 
-			// Send all coins back to a single address once again.
-			sendAllCoinsToAddrType(ht, alice, addrType)
+				// Let's fund a PSBT now where we want to send
+				// a few sats to our main address.
+				assertPsbtFundSignSpend(
+					st, alice, fundOutputs, changeType,
+					false,
+				)
 
-			// And now make sure the alternate way of signing a
-			// PSBT, which is calling FinalizePsbt directly, also
-			// works for this address type.
-			assertPsbtFundSignSpend(
-				ht, alice, fundOutputs, changeType, true,
-			)
+				// Send all coins back to a single address once
+				// again.
+				sendAllCoinsToAddrType(st, alice, addrType)
+
+				// And now make sure the alternate way of
+				// signing a PSBT, which is calling
+				// FinalizePsbt directly, also works for this
+				// address type.
+				assertPsbtFundSignSpend(
+					st, alice, fundOutputs, changeType,
+					true,
+				)
+			})
+
+			// Abort the test if failed.
+			if !succeed {
+				return
+			}
 		}
 	}
 }
