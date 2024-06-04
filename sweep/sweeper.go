@@ -445,49 +445,12 @@ func (s *UtxoSweeper) Start() error {
 	// not change from here on.
 	s.relayFeeRate = s.cfg.FeeEstimator.RelayFeePerKW()
 
-	// We need to register for block epochs and retry sweeping every block.
-	// We should get a notification with the current best block immediately
-	// if we don't provide any epoch. We'll wait for that in the collector.
-	blockEpochs, err := s.cfg.Notifier.RegisterBlockEpochNtfn(nil)
-	if err != nil {
-		return fmt.Errorf("register block epoch ntfn: %w", err)
-	}
+	// Set the current height.
+	s.currentHeight = s.CurrentBeat().Height()
 
 	// Start sweeper main loop.
 	s.wg.Add(1)
-	go func() {
-		defer blockEpochs.Cancel()
-		defer s.wg.Done()
-
-		s.collector(blockEpochs.Epochs)
-
-		// The collector exited and won't longer handle incoming
-		// requests. This can happen on shutdown, when the block
-		// notifier shuts down before the sweeper and its clients. In
-		// order to not deadlock the clients waiting for their requests
-		// being handled, we handle them here and immediately return an
-		// error. When the sweeper finally is shut down we can exit as
-		// the clients will be notified.
-		for {
-			select {
-			case inp := <-s.newInputs:
-				inp.resultChan <- Result{
-					Err: ErrSweeperShuttingDown,
-				}
-
-			case req := <-s.pendingSweepsReqs:
-				req.errChan <- ErrSweeperShuttingDown
-
-			case req := <-s.updateReqs:
-				req.responseChan <- &updateResp{
-					err: ErrSweeperShuttingDown,
-				}
-
-			case <-s.quit:
-				return
-			}
-		}
-	}()
+	go s.collector()
 
 	return nil
 }
@@ -650,17 +613,8 @@ func (s *UtxoSweeper) removeConflictSweepDescendants(
 
 // collector is the sweeper main loop. It processes new inputs, spend
 // notifications and counts down to publication of the sweep tx.
-func (s *UtxoSweeper) collector(blockEpochs <-chan *chainntnfs.BlockEpoch) {
-	// We registered for the block epochs with a nil request. The notifier
-	// should send us the current best block immediately. So we need to wait
-	// for it here because we need to know the current best height.
-	select {
-	case bestBlock := <-blockEpochs:
-		s.currentHeight = bestBlock.Height
-
-	case <-s.quit:
-		return
-	}
+func (s *UtxoSweeper) collector() {
+	defer s.wg.Done()
 
 	for {
 		// Clean inputs, which will remove inputs that are swept,
@@ -724,7 +678,7 @@ func (s *UtxoSweeper) collector(blockEpochs <-chan *chainntnfs.BlockEpoch) {
 
 		// A new block comes in, update the bestHeight, perform a check
 		// over all pending inputs and publish sweeping txns if needed.
-		case epoch, ok := <-blockEpochs:
+		case beat, ok := <-s.BlockbeatChan:
 			if !ok {
 				// We should stop the sweeper before stopping
 				// the chain service. Otherwise it indicates an
@@ -735,13 +689,13 @@ func (s *UtxoSweeper) collector(blockEpochs <-chan *chainntnfs.BlockEpoch) {
 			}
 
 			// Update the sweeper to the best height.
-			s.currentHeight = epoch.Height
+			s.currentHeight = beat.Height()
 
 			// Update the inputs with the latest height.
 			inputs := s.updateSweeperInputs()
 
 			log.Debugf("Received new block: height=%v, attempt "+
-				"sweeping %d inputs:\n%s", epoch.Height,
+				"sweeping %d inputs:\n%s", s.currentHeight,
 				len(inputs), newLogClosure(func() string {
 					inps := make(
 						[]input.Input, 0, len(inputs),
@@ -755,6 +709,9 @@ func (s *UtxoSweeper) collector(blockEpochs <-chan *chainntnfs.BlockEpoch) {
 
 			// Attempt to sweep any pending inputs.
 			s.sweepPendingInputs(inputs)
+
+			// Notify we've processed the block.
+			beat.NotifyBlockProcessed(nil, s.quit)
 
 		case <-s.quit:
 			return
