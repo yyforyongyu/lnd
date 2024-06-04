@@ -691,13 +691,8 @@ func (t *TxPublisher) Start() error {
 	log.Info("TxPublisher starting...")
 	defer log.Debugf("TxPublisher started")
 
-	blockEvent, err := t.cfg.Notifier.RegisterBlockEpochNtfn(nil)
-	if err != nil {
-		return fmt.Errorf("register block epoch ntfn: %w", err)
-	}
-
 	t.wg.Add(1)
-	go t.monitor(blockEvent)
+	go t.monitor()
 
 	return nil
 }
@@ -717,13 +712,12 @@ func (t *TxPublisher) Stop() {
 // to be bumped. If so, it will attempt to bump the fee of the tx.
 //
 // NOTE: Must be run as a goroutine.
-func (t *TxPublisher) monitor(blockEvent *chainntnfs.BlockEpochEvent) {
-	defer blockEvent.Cancel()
+func (t *TxPublisher) monitor() {
 	defer t.wg.Done()
 
 	for {
 		select {
-		case epoch, ok := <-blockEvent.Epochs:
+		case beat, ok := <-t.BlockbeatChan:
 			if !ok {
 				// We should stop the publisher before stopping
 				// the chain service. Otherwise it indicates an
@@ -734,6 +728,7 @@ func (t *TxPublisher) monitor(blockEvent *chainntnfs.BlockEpochEvent) {
 				return
 			}
 
+			epoch := beat.Epoch
 			log.Debugf("TxPublisher received new block: %v",
 				epoch.Height)
 
@@ -743,6 +738,9 @@ func (t *TxPublisher) monitor(blockEvent *chainntnfs.BlockEpochEvent) {
 			// Check all monitored txns to see if any of them needs
 			// to be bumped.
 			t.processRecords()
+
+			// Notify we've processed the block.
+			fn.SendOrQuit(beat.Err, nil, t.quit)
 
 		case <-t.quit:
 			log.Debug("Fee bumper stopped, exit monitor")
