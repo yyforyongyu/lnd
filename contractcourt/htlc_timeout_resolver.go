@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn"
@@ -81,7 +82,11 @@ func newTimeoutResolver(res lnwallet.OutgoingHtlcResolution,
 		htlc:                htlc,
 	}
 
+	// Mount the block consumer.
+	h.BlockConsumer = chainio.NewBlockConsumer(h.quit, h.Name())
+
 	h.initReport()
+	h.initLogger(h.Name())
 
 	return h
 }
@@ -477,13 +482,9 @@ func (h *htlcTimeoutResolver) Resolve() (ContractResolver, error) {
 	return h.handleCommitSpend(commitSpend)
 }
 
-// sweepSecondLevelTx sends a second level timeout transaction to the sweeper.
-// This transaction uses the SINLGE|ANYONECANPAY flag.
-func (h *htlcTimeoutResolver) sweepSecondLevelTx() error {
-	log.Infof("%T(%x): offering second-layer timeout tx to sweeper: %v",
-		h, h.htlc.RHash[:],
-		spew.Sdump(h.htlcResolution.SignedTimeoutTx))
-
+// createSweepRequestStageOne creates a sweep request to sweep the HTLC output
+// using the second level timeout tx.
+func (h *htlcTimeoutResolver) createSweepRequestStageOne() sweepRequest {
 	var inp input.Input
 	if h.isTaproot() {
 		inp = lnutils.Ptr(input.MakeHtlcSecondLevelTimeoutTaprootInput(
@@ -511,37 +512,36 @@ func (h *htlcTimeoutResolver) sweepSecondLevelTx() error {
 		btcutil.Amount(inp.SignDesc().Output.Value), 2, 0,
 	)
 
-	// For an outgoing HTLC, it must be swept before the RefundTimeout of
-	// its incoming HTLC is reached.
-	//
-	// TODO(yy): we may end up mixing inputs with different time locks.
-	// Suppose we have two outgoing HTLCs,
-	// - HTLC1: nLocktime is 800000, CLTV delta is 80.
-	// - HTLC2: nLocktime is 800001, CLTV delta is 79.
-	// This means they would both have an incoming HTLC that expires at
-	// 800080, hence they share the same deadline but different locktimes.
-	// However, with current design, when we are at block 800000, HTLC1 is
-	// offered to the sweeper. When block 800001 is reached, HTLC1's
-	// sweeping process is already started, while HTLC2 is being offered to
-	// the sweeper, so they won't be mixed. This can become an issue tho,
-	// if we decide to sweep per X blocks. Or the contractcourt sees the
-	// block first while the sweeper is only aware of the last block. To
-	// properly fix it, we need `blockbeat` to make sure subsystems are in
-	// sync.
-	log.Infof("%T(%x): offering second-level HTLC timeout tx to sweeper "+
-		"with deadline=%v, budget=%v", h, h.htlc.RHash[:],
-		h.incomingHTLCExpiryHeight, budget)
-
-	_, err := h.Sweeper.SweepInput(
-		inp,
-		sweep.Params{
+	// With our input constructed, we'll create the sweep request.
+	return sweepRequest{
+		inp: inp,
+		params: sweep.Params{
 			Budget:         budget,
 			DeadlineHeight: h.incomingHTLCExpiryHeight,
 		},
-	)
-	if err != nil {
-		return err
 	}
+}
+
+// sweepSecondLevelTx sends a second level timeout transaction to the sweeper.
+// This transaction uses the SINLGE|ANYONECANPAY flag.
+func (h *htlcTimeoutResolver) sweepSecondLevelTx() error {
+	log.Debugf("%T(%x): offering second-layer timeout tx to sweeper: %v",
+		h, h.htlc.RHash[:],
+		spew.Sdump(h.htlcResolution.SignedTimeoutTx))
+
+	// Create a sweep request.
+	req := h.createSweepRequestStageOne()
+
+	// For an outgoing HTLC, it must be swept before the RefundTimeout of
+	// its incoming HTLC is reached.
+	log.Infof("%s(%x): offering second-level HTLC timeout tx to sweeper "+
+		"with deadline=%v, budget=%v", h.Name(), h.htlc.RHash[:],
+		h.incomingHTLCExpiryHeight, req.params.Budget)
+
+	// Handle the blockbeat and get the sweep result channel.
+	//
+	// TODO(yy): make use of the resultChan like other resolvers.
+	_, err := h.processBlockbeat(req)
 
 	// TODO(yy): checkpoint here?
 	return err
@@ -668,6 +668,46 @@ func (h *htlcTimeoutResolver) checkPointSecondLevelTx() error {
 	return nil
 }
 
+// createSweepRequestStageTwo creates a sweep request to sweep the output of
+// the second level timeout tx.
+func (h *htlcTimeoutResolver) createSweepRequestStageTwo(
+	op wire.OutPoint, spendHeight uint32) sweepRequest {
+
+	var csvWitnessType input.StandardWitnessType
+	if h.isTaproot() {
+		csvWitnessType = input.TaprootHtlcOfferedTimeoutSecondLevel
+	} else {
+		csvWitnessType = input.HtlcOfferedTimeoutSecondLevel
+	}
+
+	// Let the sweeper sweep the second-level output now that the CSV/CLTV
+	// locks have expired.
+	inp := h.makeSweepInput(
+		&op, csvWitnessType, input.LeaseHtlcOfferedTimeoutSecondLevel,
+		&h.htlcResolution.SweepSignDesc, h.htlcResolution.CsvDelay,
+		spendHeight, h.htlc.RHash,
+	)
+
+	// Calculate the budget for this sweep.
+	budget := calculateBudget(
+		btcutil.Amount(inp.SignDesc().Output.Value),
+		h.Budget.NoDeadlineHTLCRatio,
+		h.Budget.NoDeadlineHTLC,
+	)
+
+	return sweepRequest{
+		inp: inp,
+		params: sweep.Params{
+			Budget: budget,
+
+			// For second level success tx, there's no rush
+			// to get it confirmed, so we use a nil
+			// deadline.
+			DeadlineHeight: fn.None[int32](),
+		},
+	}
+}
+
 // handleCommitSpend handles the spend of the HTLC output on the commitment
 // transaction. If this was our local commitment, the spend will be he
 // confirmed second-level timeout transaction, and we'll sweep that into our
@@ -727,45 +767,19 @@ func (h *htlcTimeoutResolver) handleCommitSpend(
 			Index: commitSpend.SpenderInputIndex,
 		}
 
-		var csvWitnessType input.StandardWitnessType
-		if h.isTaproot() {
-			//nolint:lll
-			csvWitnessType = input.TaprootHtlcOfferedTimeoutSecondLevel
-		} else {
-			csvWitnessType = input.HtlcOfferedTimeoutSecondLevel
-		}
-
-		// Let the sweeper sweep the second-level output now that the
-		// CSV/CLTV locks have expired.
-		inp := h.makeSweepInput(
-			op, csvWitnessType,
-			input.LeaseHtlcOfferedTimeoutSecondLevel,
-			&h.htlcResolution.SweepSignDesc,
-			h.htlcResolution.CsvDelay,
-			uint32(commitSpend.SpendingHeight), h.htlc.RHash,
-		)
-		// Calculate the budget for this sweep.
-		budget := calculateBudget(
-			btcutil.Amount(inp.SignDesc().Output.Value),
-			h.Budget.NoDeadlineHTLCRatio,
-			h.Budget.NoDeadlineHTLC,
+		// Create a sweep request.
+		req := h.createSweepRequestStageTwo(
+			*op, uint32(commitSpend.SpendingHeight),
 		)
 
 		log.Infof("%T(%x): offering second-level timeout tx output to "+
 			"sweeper with no deadline and budget=%v at height=%v",
-			h, h.htlc.RHash[:], budget, waitHeight)
+			h, h.htlc.RHash[:], req.params.Budget, waitHeight)
 
-		_, err := h.Sweeper.SweepInput(
-			inp,
-			sweep.Params{
-				Budget: budget,
-
-				// For second level success tx, there's no rush
-				// to get it confirmed, so we use a nil
-				// deadline.
-				DeadlineHeight: fn.None[int32](),
-			},
-		)
+		// Handle the blockbeat and get the sweep result channel.
+		//
+		// TODO(yy): make use of the resultChan like other resolvers.
+		_, err := h.processBlockbeat(req)
 		if err != nil {
 			return nil, err
 		}
