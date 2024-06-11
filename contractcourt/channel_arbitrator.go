@@ -15,6 +15,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/fn"
@@ -321,6 +322,8 @@ func (h HtlcSetKey) String() string {
 // broadcasting to ensure that we avoid any possibility of race conditions, and
 // sweep the output(s) without contest.
 type ChannelArbitrator struct {
+	chainio.BlockConsumer
+
 	started int32 // To be used atomically.
 	stopped int32 // To be used atomically.
 
@@ -398,7 +401,7 @@ func NewChannelArbitrator(cfg ChannelArbitratorConfig,
 		unmerged[RemotePendingHtlcSet] = htlcSets[RemotePendingHtlcSet]
 	}
 
-	return &ChannelArbitrator{
+	c := &ChannelArbitrator{
 		log:              log,
 		blocks:           make(chan int32, arbitratorBlockBufferSize),
 		signalUpdates:    make(chan *signalUpdateMsg),
@@ -409,7 +412,15 @@ func NewChannelArbitrator(cfg ChannelArbitratorConfig,
 		cfg:              cfg,
 		quit:             make(chan struct{}),
 	}
+
+	// Mount the block consumer.
+	c.BlockConsumer = chainio.NewBlockConsumer(c.quit, c.Name())
+
+	return c
 }
+
+// Compile-time check for the chainio.Consumer interface.
+var _ chainio.Consumer = (*ChannelArbitrator)(nil)
 
 // chanArbStartState contains the information from disk that we need to start
 // up a channel arbitrator.
@@ -3138,6 +3149,13 @@ func (c *ChannelArbitrator) channelAttendant(bestHeight int32) {
 			return
 		}
 	}
+}
+
+// Name returns a human-readable string for this subsystem.
+//
+// NOTE: Part of chainio.Consumer interface.
+func (c *ChannelArbitrator) Name() string {
+	return fmt.Sprintf("ChannelArbitrator(%v)", c.cfg.ChanPoint)
 }
 
 // checkLegacyBreach returns StateFullyResolved if the channel was closed with
