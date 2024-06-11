@@ -9,6 +9,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
@@ -72,6 +73,8 @@ func newAnchorResolver(anchorSignDescriptor input.SignDescriptor,
 		currentReport:        report,
 	}
 
+	// Mount the block consumer and init logger.
+	r.BlockConsumer = chainio.NewBlockConsumer(r.quit, r.Name())
 	r.initLogger(r.Name())
 
 	return r
@@ -91,8 +94,8 @@ func (c *anchorResolver) ResolverKey() []byte {
 	return nil
 }
 
-// Resolve offers the anchor output to the sweeper and waits for it to be swept.
-func (c *anchorResolver) Resolve() (ContractResolver, error) {
+// createSweepRequest creates a sweep request for the anchor output.
+func (c *anchorResolver) createSweepRequest() sweepRequest {
 	// Attempt to update the sweep parameters to the post-confirmation
 	// situation. We don't want to force sweep anymore, because the anchor
 	// lost its special purpose to get the commitment confirmed. It is just
@@ -119,9 +122,10 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 		c.broadcastHeight, nil,
 	)
 
-	resultChan, err := c.Sweeper.SweepInput(
-		&anchorInput,
-		sweep.Params{
+	// With our input constructed, we'll create the sweep request.
+	return sweepRequest{
+		inp: &anchorInput,
+		params: sweep.Params{
 			// For normal anchor sweeping, the budget is 330 sats.
 			Budget: btcutil.Amount(
 				anchorInput.SignDesc().Output.Value,
@@ -131,8 +135,24 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 			// deadline here.
 			DeadlineHeight: fn.None[int32](),
 		},
-	)
+	}
+}
+
+// Resolve offers the anchor output to the sweeper and waits for it to be swept.
+func (c *anchorResolver) Resolve() (ContractResolver, error) {
+	// If we're already resolved, then we can exit early.
+	if c.resolved {
+		c.log.Warn("Resolver already resolved")
+		return nil, nil
+	}
+
+	// Create a sweep request.
+	req := c.createSweepRequest()
+
+	// Handle the blockbeat and get the sweep result channel.
+	resultChan, err := c.processBlockbeat(req)
 	if err != nil {
+		c.log.Errorf("Unable to sweep input: %v", err)
 		return nil, err
 	}
 

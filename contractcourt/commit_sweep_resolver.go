@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn"
@@ -77,7 +78,10 @@ func newCommitSweepResolver(res lnwallet.CommitOutputResolution,
 		chanPoint:           chanPoint,
 	}
 
+	// Mount the block consumer and init logger.
+	r.BlockConsumer = chainio.NewBlockConsumer(r.quit, r.Name())
 	r.initLogger(r.Name())
+
 	r.initReport()
 
 	return r
@@ -155,46 +159,13 @@ func (c *commitSweepResolver) getCommitTxConfHeight() (uint32, error) {
 	}
 }
 
-// Resolve instructs the contract resolver to resolve the output on-chain. Once
-// the output has been *fully* resolved, the function should return immediately
-// with a nil ContractResolver value for the first return value.  In the case
-// that the contract requires further resolution, then another resolve is
-// returned.
-//
-// NOTE: This function MUST be run as a goroutine.
-func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
-	// If we're already resolved, then we can exit early.
-	if c.resolved {
-		return nil, nil
-	}
-
-	confHeight, err := c.getCommitTxConfHeight()
-	if err != nil {
-		return nil, err
-	}
-
-	// Wait up until the CSV expires, unless we also have a CLTV that
-	// expires after.
-	unlockHeight := confHeight + c.commitResolution.MaturityDelay
-	if c.hasCLTV() {
-		unlockHeight = uint32(math.Max(
-			float64(unlockHeight), float64(c.leaseExpiry),
-		))
-	}
-
-	c.log.Debugf("commit conf_height=%v, unlock_height=%v",
-		confHeight, unlockHeight)
-
-	// Update report now that we learned the confirmation height.
-	c.reportLock.Lock()
-	c.currentReport.MaturityHeight = unlockHeight
-	c.reportLock.Unlock()
-
+// createSweepRequest creates a sweep request for the commitment output.
+func (c *commitSweepResolver) createSweepRequest() sweepRequest {
 	var (
 		isLocalCommitTx bool
-
-		signDesc = c.commitResolution.SelfOutputSignDesc
+		signDesc        = c.commitResolution.SelfOutputSignDesc
 	)
+
 	switch {
 	// For taproot channels, we'll know if this is the local commit based
 	// on the witness script. For local channels, the witness script has an
@@ -263,8 +234,6 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 		witnessType = input.CommitmentNoDelay
 	}
 
-	c.log.Infof("Sweeping with witness type: %v", witnessType)
-
 	// We'll craft an input with all the information required for the
 	// sweeper to create a fully valid sweeping transaction to recover
 	// these coins.
@@ -292,21 +261,65 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 		btcutil.Amount(inp.SignDesc().Output.Value),
 		c.Budget.ToLocalRatio, c.Budget.ToLocal,
 	)
-	c.log.Infof("Sweeping commit output using budget=%v", budget)
+	c.log.Infof("Sweeping commit output %v using budget=%v", witnessType,
+		budget)
 
-	// With our input constructed, we'll now offer it to the sweeper.
-	resultChan, err := c.Sweeper.SweepInput(
-		inp, sweep.Params{
+	// With our input constructed, we'll create the sweep request.
+	return sweepRequest{
+		inp: inp,
+		params: sweep.Params{
 			Budget: budget,
 
 			// Specify a nil deadline here as there's no time
 			// pressure.
 			DeadlineHeight: fn.None[int32](),
 		},
-	)
-	if err != nil {
-		c.log.Errorf("unable to sweep input: %v", err)
+	}
+}
 
+// Resolve instructs the contract resolver to resolve the output on-chain. Once
+// the output has been *fully* resolved, the function should return immediately
+// with a nil ContractResolver value for the first return value.  In the case
+// that the contract requires further resolution, then another resolve is
+// returned.
+//
+// NOTE: This function MUST be run as a goroutine.
+func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
+	// If we're already resolved, then we can exit early.
+	if c.resolved {
+		c.log.Warn("Resolver already resolved")
+		return nil, nil
+	}
+
+	confHeight, err := c.getCommitTxConfHeight()
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait up until the CSV expires, unless we also have a CLTV that
+	// expires after.
+	unlockHeight := confHeight + c.commitResolution.MaturityDelay
+	if c.hasCLTV() {
+		unlockHeight = uint32(math.Max(
+			float64(unlockHeight), float64(c.leaseExpiry),
+		))
+	}
+
+	c.log.Debugf("commit conf_height=%v, unlock_height=%v",
+		confHeight, unlockHeight)
+
+	// Update report now that we learned the confirmation height.
+	c.reportLock.Lock()
+	c.currentReport.MaturityHeight = unlockHeight
+	c.reportLock.Unlock()
+
+	// Create a sweep request.
+	req := c.createSweepRequest()
+
+	// Handle the blockbeat and get the sweep result channel.
+	resultChan, err := c.processBlockbeat(req)
+	if err != nil {
+		c.log.Errorf("Unable to sweep input: %v", err)
 		return nil, err
 	}
 
