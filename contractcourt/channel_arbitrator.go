@@ -1583,13 +1583,18 @@ func (c *ChannelArbitrator) findCommitmentDeadlineAndValue(heightHint uint32,
 // launchResolvers updates the activeResolvers list and starts the resolvers.
 func (c *ChannelArbitrator) launchResolvers(resolvers []ContractResolver) {
 	c.activeResolversLock.Lock()
-	defer c.activeResolversLock.Unlock()
-
 	c.activeResolvers = resolvers
+	c.activeResolversLock.Unlock()
 
 	for _, contract := range resolvers {
 		c.wg.Add(1)
 		go c.resolveContract(contract)
+	}
+
+	// Notify the resolvers about the current block immediately.
+	if err := c.notifyResolvers(c.Beat); err != nil {
+		log.Errorf("ChannelArbitrator(%v): unable to notify "+
+			"resolvers of block: %v", c.cfg.ChanPoint, err)
 	}
 }
 
@@ -2605,14 +2610,14 @@ func (c *ChannelArbitrator) replaceResolver(oldResolver,
 func (c *ChannelArbitrator) resolveContract(currentContract ContractResolver) {
 	defer c.wg.Done()
 
-	log.Debugf("ChannelArbitrator(%v): attempting to resolve %T",
-		c.cfg.ChanPoint, currentContract)
+	log.Debugf("ChannelArbitrator(%v): attempting to resolve %s",
+		c.cfg.ChanPoint, currentContract.Name())
 
 	// Until the contract is fully resolved, we'll continue to iteratively
 	// resolve the contract one step at a time.
 	for !currentContract.IsResolved() {
-		log.Debugf("ChannelArbitrator(%v): contract %T not yet resolved",
-			c.cfg.ChanPoint, currentContract)
+		log.Debugf("ChannelArbitrator(%v): %s not yet resolved",
+			c.cfg.ChanPoint, currentContract.Name())
 
 		select {
 
@@ -2630,8 +2635,8 @@ func (c *ChannelArbitrator) resolveContract(currentContract ContractResolver) {
 				}
 
 				log.Errorf("ChannelArbitrator(%v): unable to "+
-					"progress %T: %v",
-					c.cfg.ChanPoint, currentContract, err)
+					"progress %s: %v", c.cfg.ChanPoint,
+					currentContract.Name(), err)
 				return
 			}
 
@@ -2643,9 +2648,9 @@ func (c *ChannelArbitrator) resolveContract(currentContract ContractResolver) {
 			// place of the old one.
 			case nextContract != nil:
 				log.Debugf("ChannelArbitrator(%v): swapping "+
-					"out contract %T for %T ",
-					c.cfg.ChanPoint, currentContract,
-					nextContract)
+					"out contract %s for %s ",
+					c.cfg.ChanPoint, currentContract.Name(),
+					nextContract.Name())
 
 				// Swap contract in log.
 				err := c.log.SwapContract(
@@ -2676,13 +2681,13 @@ func (c *ChannelArbitrator) resolveContract(currentContract ContractResolver) {
 			// we'll mark it as such within the database.
 			case currentContract.IsResolved():
 				log.Debugf("ChannelArbitrator(%v): marking "+
-					"contract %T fully resolved",
-					c.cfg.ChanPoint, currentContract)
+					"contract %s fully resolved",
+					c.cfg.ChanPoint, currentContract.Name())
 
 				err := c.log.ResolveContract(currentContract)
 				if err != nil {
-					log.Errorf("unable to resolve contract: %v",
-						err)
+					log.Errorf("unable to resolve "+
+						"contract: %v", err)
 				}
 
 				// Now that the contract has been resolved,
@@ -3152,7 +3157,43 @@ func (c *ChannelArbitrator) handleBlockbeat(beat chainio.Blockbeat) error {
 		}
 	}
 
+	// Notify resolvers about this blockbeat.
+	if err := c.notifyResolvers(beat); err != nil {
+		return fmt.Errorf("unable to notify resolvers: %w", err)
+	}
+
 	return nil
+}
+
+// Report returns htlc reports for the active resolvers.
+func (c *ChannelArbitrator) notifyResolvers(beat chainio.Blockbeat) error {
+	// Read the active resolvers in a lock.
+	c.activeResolversLock.RLock()
+
+	// Make a copy of the active resolvers.
+	resolvers := make([]chainio.Consumer, 0, len(c.activeResolvers))
+	for _, resolver := range c.activeResolvers {
+		// TODO(yy): remove resolved contracts from activeResolvers.
+		if resolver.IsResolved() {
+			log.Debugf("ChannelArbitrator(%v): skipped sending "+
+				"block %v to resolved contract %s",
+				c.cfg.ChanPoint, beat.Epoch.Height,
+				resolver.Name())
+
+			continue
+		}
+
+		log.Debugf("ChannelArbitrator(%v): sending block %v to "+
+			"resolver %s", c.cfg.ChanPoint, beat.Epoch.Height,
+			resolver.Name())
+
+		resolvers = append(resolvers, resolver)
+	}
+
+	c.activeResolversLock.RUnlock()
+
+	// Iterate all the copied channels and send the blockbeat to them.
+	return chainio.NotifyConcurrent(resolvers, beat)
 }
 
 // Name returns a human-readable string for this subsystem.
