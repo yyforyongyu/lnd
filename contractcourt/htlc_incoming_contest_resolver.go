@@ -9,6 +9,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/fn"
@@ -48,10 +49,17 @@ func newIncomingContestResolver(
 		res, broadcastHeight, htlc, resCfg,
 	)
 
-	return &htlcIncomingContestResolver{
+	h := &htlcIncomingContestResolver{
 		htlcExpiry:          htlc.RefundTimeout,
 		htlcSuccessResolver: success,
 	}
+
+	// Mount the block consumer.
+	h.BlockConsumer = chainio.NewBlockConsumer(h.quit, h.Name())
+
+	h.log.Debugf("Created incoming htlc contest resolver: %v", h.Name())
+
+	return h
 }
 
 // Name returns the name of the resolver type.
@@ -101,6 +109,7 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 	// If we're already full resolved, then we don't have anything further
 	// to do.
 	if h.resolved {
+		h.log.Warn("Resolver already resolved")
 		return nil, nil
 	}
 
@@ -131,21 +140,19 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		return nil, h.PutResolverReport(nil, resReport)
 	}
 
-	// Register for block epochs. After registration, the current height
-	// will be sent on the channel immediately.
-	blockEpochs, err := h.Notifier.RegisterBlockEpochNtfn(nil)
-	if err != nil {
-		return nil, err
-	}
-	defer blockEpochs.Cancel()
-
 	var currentHeight int32
 	select {
-	case newBlock, ok := <-blockEpochs.Epochs:
+	case beat, ok := <-h.BlockbeatChan:
 		if !ok {
 			return nil, errResolverShuttingDown
 		}
-		currentHeight = newBlock.Height
+
+		// Notify the block is processed immediately as the following
+		// operations don't impact other subsystems.
+		fn.SendOrQuit(beat.Err, nil, h.quit)
+
+		currentHeight = beat.Epoch.Height
+
 	case <-h.quit:
 		return nil, errResolverShuttingDown
 	}
@@ -408,15 +415,19 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 			htlcResolution := hodlItem.(invoices.HtlcResolution)
 			return processHtlcResolution(htlcResolution)
 
-		case newBlock, ok := <-blockEpochs.Epochs:
+		case beat, ok := <-h.BlockbeatChan:
 			if !ok {
 				return nil, errResolverShuttingDown
 			}
 
+			// Notify the block is processed immediately as the
+			// following operations don't impact other subsystems.
+			fn.SendOrQuit(beat.Err, nil, h.quit)
+
 			// If this new height expires the HTLC, then this means
 			// we never found out the preimage, so we can mark
 			// resolved and exit.
-			newHeight := uint32(newBlock.Height)
+			newHeight := uint32(beat.Epoch.Height)
 			if newHeight >= h.htlcExpiry {
 				log.Infof("%T(%v): HTLC has timed out "+
 					"(expiry=%v, height=%v), abandoning", h,
