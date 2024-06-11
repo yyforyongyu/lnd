@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -71,9 +72,16 @@ func newAnchorResolver(anchorSignDescriptor input.SignDescriptor,
 		currentReport:        report,
 	}
 
-	r.initLogger(r)
+	r.initLogger(r.Name())
 
 	return r
+}
+
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (c *anchorResolver) Name() string {
+	return fmt.Sprintf("anchorResolver(%v)", c.anchor)
 }
 
 // ResolverKey returns an identifier which should be globally unique for this

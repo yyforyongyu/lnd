@@ -9,6 +9,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog"
 	"github.com/lightningnetwork/lnd/build"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn"
 )
@@ -31,6 +32,8 @@ const (
 // partially resolve the contract, then persist, and set up for an additional
 // resolution.
 type ContractResolver interface {
+	chainio.Consumer
+
 	// ResolverKey returns an identifier which should be globally unique
 	// for this particular resolver within the chain the original contract
 	// resides within.
@@ -105,6 +108,8 @@ type ResolverConfig struct {
 // given ContractResolver implementation. It contains all the common items that
 // a resolver requires to carry out its duties.
 type contractResolverKit struct {
+	chainio.BlockConsumer
+
 	ResolverConfig
 
 	log btclog.Logger
@@ -121,8 +126,8 @@ func newContractResolverKit(cfg ResolverConfig) *contractResolverKit {
 }
 
 // initLogger initializes the resolver-specific logger.
-func (r *contractResolverKit) initLogger(resolver ContractResolver) {
-	logPrefix := fmt.Sprintf("%T(%v):", resolver, r.ChanPoint)
+func (r *contractResolverKit) initLogger(name string) {
+	logPrefix := fmt.Sprintf("%v(%v):", name, r.ChanPoint)
 	r.log = build.NewPrefixLog(logPrefix, log)
 }
 

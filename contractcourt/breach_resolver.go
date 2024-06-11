@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 
 	"github.com/lightningnetwork/lnd/channeldb"
@@ -32,9 +33,16 @@ func newBreachResolver(resCfg ResolverConfig) *breachResolver {
 		replyChan:           make(chan struct{}),
 	}
 
-	r.initLogger(r)
+	r.initLogger(r.Name())
 
 	return r
+}
+
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (b *breachResolver) Name() string {
+	return fmt.Sprintf("breachResolver(%v)", b.ChanPoint)
 }
 
 // ResolverKey returns the unique identifier for this resolver.
@@ -114,7 +122,7 @@ func newBreachResolverFromReader(r io.Reader, resCfg ResolverConfig) (
 		return nil, err
 	}
 
-	b.initLogger(b)
+	b.initLogger(b.Name())
 
 	return b, nil
 }

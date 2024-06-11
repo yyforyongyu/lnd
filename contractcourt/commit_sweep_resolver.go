@@ -77,10 +77,18 @@ func newCommitSweepResolver(res lnwallet.CommitOutputResolution,
 		chanPoint:           chanPoint,
 	}
 
-	r.initLogger(r)
+	r.initLogger(r.Name())
 	r.initReport()
 
 	return r
+}
+
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (c *commitSweepResolver) Name() string {
+	return fmt.Sprintf("commitSweepResolver(%v)",
+		c.commitResolution.SelfOutPoint)
 }
 
 // ResolverKey returns an identifier which should be globally unique for this
@@ -454,7 +462,7 @@ func newCommitSweepResolverFromReader(r io.Reader, resCfg ResolverConfig) (
 	// removed this, but keep in mind that this data may still be present in
 	// the database.
 
-	c.initLogger(c)
+	c.initLogger(c.Name())
 	c.initReport()
 
 	return c, nil

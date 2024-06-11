@@ -54,6 +54,13 @@ func newIncomingContestResolver(
 	}
 }
 
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (h *htlcIncomingContestResolver) Name() string {
+	return fmt.Sprintf("htlcIncomingContestResolver(%v)", h.outpoint())
+}
+
 func (h *htlcIncomingContestResolver) processFinalHtlcFail() error {
 	// Mark the htlc as final failed.
 	err := h.ChainArbitratorConfig.PutFinalHtlcOutcome(

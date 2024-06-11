@@ -86,6 +86,13 @@ func newTimeoutResolver(res lnwallet.OutgoingHtlcResolution,
 	return h
 }
 
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (h *htlcTimeoutResolver) Name() string {
+	return fmt.Sprintf("htlcTimeoutResolver(%v)", h.outpoint())
+}
+
 // isTaproot returns true if the htlc output is a taproot output.
 func (h *htlcTimeoutResolver) isTaproot() bool {
 	return txscript.IsPayToTaproot(
@@ -93,23 +100,24 @@ func (h *htlcTimeoutResolver) isTaproot() bool {
 	)
 }
 
+func (h *htlcTimeoutResolver) outpoint() wire.OutPoint {
+	// The primary key for this resolver will be the outpoint of the HTLC
+	// on the commitment transaction itself. If this is our commitment,
+	// then the output can be found within the signed timeout tx,
+	// otherwise, it's just the ClaimOutpoint.
+	if h.htlcResolution.SignedTimeoutTx != nil {
+		return h.htlcResolution.SignedTimeoutTx.TxIn[0].PreviousOutPoint
+	}
+
+	return h.htlcResolution.ClaimOutpoint
+}
+
 // ResolverKey returns an identifier which should be globally unique for this
 // particular resolver within the chain the original contract resides within.
 //
 // NOTE: Part of the ContractResolver interface.
 func (h *htlcTimeoutResolver) ResolverKey() []byte {
-	// The primary key for this resolver will be the outpoint of the HTLC
-	// on the commitment transaction itself. If this is our commitment,
-	// then the output can be found within the signed timeout tx,
-	// otherwise, it's just the ClaimOutpoint.
-	var op wire.OutPoint
-	if h.htlcResolution.SignedTimeoutTx != nil {
-		op = h.htlcResolution.SignedTimeoutTx.TxIn[0].PreviousOutPoint
-	} else {
-		op = h.htlcResolution.ClaimOutpoint
-	}
-
-	key := newResolverID(op)
+	key := newResolverID(h.outpoint())
 	return key[:]
 }
 

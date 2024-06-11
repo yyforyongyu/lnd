@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"sync"
 
@@ -85,23 +86,31 @@ func newSuccessResolver(res lnwallet.IncomingHtlcResolution,
 	return h
 }
 
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (h *htlcSuccessResolver) Name() string {
+	return fmt.Sprintf("htlcSuccessResolver(%v)", h.outpoint())
+}
+
+func (h *htlcSuccessResolver) outpoint() wire.OutPoint {
+	// The primary key for this resolver will be the outpoint of the HTLC
+	// on the commitment transaction itself. If this is our commitment,
+	// then the output can be found within the signed success tx,
+	// otherwise, it's just the ClaimOutpoint.
+	if h.htlcResolution.SignedSuccessTx != nil {
+		return h.htlcResolution.SignedSuccessTx.TxIn[0].PreviousOutPoint
+	}
+
+	return h.htlcResolution.ClaimOutpoint
+}
+
 // ResolverKey returns an identifier which should be globally unique for this
 // particular resolver within the chain the original contract resides within.
 //
 // NOTE: Part of the ContractResolver interface.
 func (h *htlcSuccessResolver) ResolverKey() []byte {
-	// The primary key for this resolver will be the outpoint of the HTLC
-	// on the commitment transaction itself. If this is our commitment,
-	// then the output can be found within the signed success tx,
-	// otherwise, it's just the ClaimOutpoint.
-	var op wire.OutPoint
-	if h.htlcResolution.SignedSuccessTx != nil {
-		op = h.htlcResolution.SignedSuccessTx.TxIn[0].PreviousOutPoint
-	} else {
-		op = h.htlcResolution.ClaimOutpoint
-	}
-
-	key := newResolverID(op)
+	key := newResolverID(h.outpoint())
 	return key[:]
 }
 

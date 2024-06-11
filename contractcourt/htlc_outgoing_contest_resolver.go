@@ -36,6 +36,13 @@ func newOutgoingContestResolver(res lnwallet.OutgoingHtlcResolution,
 	}
 }
 
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (h *htlcOutgoingContestResolver) Name() string {
+	return fmt.Sprintf("htlcOutgoingContestResolver(%v)", h.outpoint())
+}
+
 // Resolve commences the resolution of this contract. As this contract hasn't
 // yet timed out, we'll wait for one of two things to happen
 //
