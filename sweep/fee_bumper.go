@@ -13,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
@@ -277,6 +278,8 @@ type TxPublisherConfig struct {
 // until the tx is confirmed or the fee rate reaches the maximum fee rate
 // specified by the caller.
 type TxPublisher struct {
+	chainio.BlockConsumer
+
 	wg sync.WaitGroup
 
 	// cfg specifies the configuration of the TxPublisher.
@@ -304,14 +307,22 @@ type TxPublisher struct {
 // Compile-time constraint to ensure TxPublisher implements Bumper.
 var _ Bumper = (*TxPublisher)(nil)
 
+// Compile-time check for the chainio.Consumer interface.
+var _ chainio.Consumer = (*TxPublisher)(nil)
+
 // NewTxPublisher creates a new TxPublisher.
 func NewTxPublisher(cfg TxPublisherConfig) *TxPublisher {
-	return &TxPublisher{
+	tp := &TxPublisher{
 		cfg:             &cfg,
 		records:         lnutils.SyncMap[uint64, *monitorRecord]{},
 		subscriberChans: lnutils.SyncMap[uint64, chan *BumpResult]{},
 		quit:            make(chan struct{}),
 	}
+
+	// Mount the block consumer.
+	tp.BlockConsumer = chainio.NewBlockConsumer(tp.quit, tp.Name())
+
+	return tp
 }
 
 // isNeutrinoBackend checks if the wallet backend is neutrino.
@@ -344,6 +355,11 @@ func (t *TxPublisher) Broadcast(req *BumpRequest) <-chan *BumpResult {
 	t.subscriberChans.Store(requestID, subscriber)
 
 	return subscriber
+}
+
+// NOTE: part of the `chainio.Consumer` interface.
+func (t *TxPublisher) Name() string {
+	return "TxPublisher"
 }
 
 // initialBroadcast initializes a fee function, creates an RBF-compliant tx and
@@ -677,13 +693,8 @@ func (t *TxPublisher) Start() error {
 	log.Info("TxPublisher starting...")
 	defer log.Debugf("TxPublisher started")
 
-	blockEvent, err := t.cfg.Notifier.RegisterBlockEpochNtfn(nil)
-	if err != nil {
-		return fmt.Errorf("register block epoch ntfn: %w", err)
-	}
-
 	t.wg.Add(1)
-	go t.monitor(blockEvent)
+	go t.monitor()
 
 	return nil
 }
@@ -703,13 +714,12 @@ func (t *TxPublisher) Stop() {
 // to be bumped. If so, it will attempt to bump the fee of the tx.
 //
 // NOTE: Must be run as a goroutine.
-func (t *TxPublisher) monitor(blockEvent *chainntnfs.BlockEpochEvent) {
-	defer blockEvent.Cancel()
+func (t *TxPublisher) monitor() {
 	defer t.wg.Done()
 
 	for {
 		select {
-		case epoch, ok := <-blockEvent.Epochs:
+		case beat, ok := <-t.BlockbeatChan:
 			if !ok {
 				// We should stop the publisher before stopping
 				// the chain service. Otherwise it indicates an
@@ -720,6 +730,7 @@ func (t *TxPublisher) monitor(blockEvent *chainntnfs.BlockEpochEvent) {
 				return
 			}
 
+			epoch := beat.Epoch
 			log.Debugf("TxPublisher received new block: %v",
 				epoch.Height)
 
@@ -729,6 +740,9 @@ func (t *TxPublisher) monitor(blockEvent *chainntnfs.BlockEpochEvent) {
 			// Check all monitored txns to see if any of them needs
 			// to be bumped.
 			t.processRecords()
+
+			// Notify we've processed the block.
+			fn.SendOrQuit(beat.Err, nil, t.quit)
 
 		case <-t.quit:
 			log.Debug("Fee bumper stopped, exit monitor")

@@ -9,8 +9,11 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog"
 	"github.com/lightningnetwork/lnd/build"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/sweep"
 )
 
 var (
@@ -31,6 +34,8 @@ const (
 // partially resolve the contract, then persist, and set up for an additional
 // resolution.
 type ContractResolver interface {
+	chainio.Consumer
+
 	// ResolverKey returns an identifier which should be globally unique
 	// for this particular resolver within the chain the original contract
 	// resides within.
@@ -43,7 +48,7 @@ type ContractResolver interface {
 	// resolution, then another resolve is returned.
 	//
 	// NOTE: This function MUST be run as a goroutine.
-	Resolve(immediate bool) (ContractResolver, error)
+	Resolve() (ContractResolver, error)
 
 	// SupplementState allows the user of a ContractResolver to supplement
 	// it with state required for the proper resolution of a contract.
@@ -105,6 +110,8 @@ type ResolverConfig struct {
 // given ContractResolver implementation. It contains all the common items that
 // a resolver requires to carry out its duties.
 type contractResolverKit struct {
+	chainio.BlockConsumer
+
 	ResolverConfig
 
 	log btclog.Logger
@@ -121,8 +128,8 @@ func newContractResolverKit(cfg ResolverConfig) *contractResolverKit {
 }
 
 // initLogger initializes the resolver-specific logger.
-func (r *contractResolverKit) initLogger(resolver ContractResolver) {
-	logPrefix := fmt.Sprintf("%T(%v):", resolver, r.ChanPoint)
+func (r *contractResolverKit) initLogger(name string) {
+	logPrefix := fmt.Sprintf("%v(%v):", name, r.ChanPoint)
 	r.log = build.NewPrefixLog(logPrefix, log)
 }
 
@@ -131,3 +138,71 @@ var (
 	// progressing because it received the quit signal.
 	errResolverShuttingDown = errors.New("resolver shutting down")
 )
+
+// sweepRequest holds the params used when calling `SweepInput`.
+type sweepRequest struct {
+	// inp is the input to be swept.
+	inp input.Input
+
+	// params specifies the parameters for the sweep.
+	params sweep.Params
+}
+
+// processBlockbeat reads a blockbeat from the blockbeat chan and processes it
+// by sending a sweep request to the sweeper using the specified input and
+// params.
+func (r *contractResolverKit) processBlockbeat(
+	req sweepRequest) (chan sweep.Result, error) {
+
+	var (
+		resultChan chan sweep.Result
+		err        error
+	)
+
+	// Read a blockbeat from the block consumer.
+	select {
+	case beat := <-r.BlockbeatChan:
+		r.log.Tracef("Processing block=%v", beat.Epoch.Height)
+
+		// With our input constructed, we'll now offer it to
+		// the sweeper.
+		resultChan, err = r.Sweeper.SweepInput(req.inp, req.params)
+
+		// Notify we've processed the block.
+		sent := fn.SendOrQuit(beat.Err, nil, r.quit)
+
+		r.log.Tracef("Processed block=%v, sent=%v", beat.Epoch.Height,
+			sent)
+
+	case <-r.quit:
+		return nil, errResolverShuttingDown
+	}
+
+	// Consume future blockbeats - we don't need them anymore once the
+	// sweep request has been made, but we need to consume them to unblock
+	// the block consumption on the ChannelArbitrator.
+	go func() {
+		for {
+			// Read a blockbeat from the block consumer.
+			select {
+			case beat, ok := <-r.BlockbeatChan:
+				if !ok {
+					r.log.Debug("Blockbeat chan closed")
+
+					return
+				}
+
+				// Notify we've processed the block.
+				sent := fn.SendOrQuit(beat.Err, nil, r.quit)
+
+				r.log.Tracef("Processed block=%v, sent=%v",
+					beat.Epoch.Height, sent)
+
+			case <-r.quit:
+				return
+			}
+		}
+	}()
+
+	return resultChan, err
+}

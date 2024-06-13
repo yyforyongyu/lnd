@@ -2,8 +2,10 @@ package contractcourt
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/channeldb"
 )
 
@@ -32,9 +34,18 @@ func newBreachResolver(resCfg ResolverConfig) *breachResolver {
 		replyChan:           make(chan struct{}),
 	}
 
-	r.initLogger(r)
+	// Mount the block consumer and init logger.
+	r.BlockConsumer = chainio.NewBlockConsumer(r.quit, r.Name())
+	r.initLogger(r.Name())
 
 	return r
+}
+
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (b *breachResolver) Name() string {
+	return fmt.Sprintf("breachResolver(%v)", b.ChanPoint)
 }
 
 // ResolverKey returns the unique identifier for this resolver.
@@ -47,7 +58,21 @@ func (b *breachResolver) ResolverKey() []byte {
 // been broadcast.
 //
 // TODO(yy): let sweeper handle the breach inputs.
-func (b *breachResolver) Resolve(_ bool) (ContractResolver, error) {
+func (b *breachResolver) Resolve() (ContractResolver, error) {
+	// Do a non-blocking reading on the blockbeat chan as breach inputs
+	// are not handled by the sweeper now.
+	//
+	// TODO(yy): handle the blockbeat once breach inputs are sent to the
+	// sweeper.
+	go func() {
+		select {
+		case beat := <-b.BlockbeatChan:
+			b.log.Debugf("[%s] received block=%v", b.Name(),
+				beat.Epoch.Height)
+		case <-b.quit:
+		}
+	}()
+
 	if !b.subscribed {
 		complete, err := b.SubscribeBreachComplete(
 			&b.ChanPoint, b.replyChan,
@@ -114,7 +139,7 @@ func newBreachResolverFromReader(r io.Reader, resCfg ResolverConfig) (
 		return nil, err
 	}
 
-	b.initLogger(b)
+	b.initLogger(b.Name())
 
 	return b, nil
 }

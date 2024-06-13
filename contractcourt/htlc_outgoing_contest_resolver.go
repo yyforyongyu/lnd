@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -31,9 +32,23 @@ func newOutgoingContestResolver(res lnwallet.OutgoingHtlcResolution,
 		res, broadcastHeight, htlc, resCfg,
 	)
 
-	return &htlcOutgoingContestResolver{
+	h := &htlcOutgoingContestResolver{
 		htlcTimeoutResolver: timeout,
 	}
+
+	// Mount the block consumer.
+	h.BlockConsumer = chainio.NewBlockConsumer(h.quit, h.Name())
+
+	h.log.Debugf("Created outgoing htlc contest resolver: %v", h.Name())
+
+	return h
+}
+
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (h *htlcOutgoingContestResolver) Name() string {
+	return fmt.Sprintf("htlcOutgoingContestResolver(%v)", h.outpoint())
 }
 
 // Resolve commences the resolution of this contract. As this contract hasn't
@@ -49,9 +64,7 @@ func newOutgoingContestResolver(res lnwallet.OutgoingHtlcResolution,
 // When either of these two things happens, we'll create a new resolver which
 // is able to handle the final resolution of the contract. We're only the pivot
 // point.
-func (h *htlcOutgoingContestResolver) Resolve(
-	_ bool) (ContractResolver, error) {
-
+func (h *htlcOutgoingContestResolver) Resolve() (ContractResolver, error) {
 	// If we're already full resolved, then we don't have anything further
 	// to do.
 	if h.resolved {
@@ -99,21 +112,19 @@ func (h *htlcOutgoingContestResolver) Resolve(
 	// If we reach this point, then we can't fully act yet, so we'll await
 	// either of our signals triggering: the HTLC expires, or we learn of
 	// the preimage.
-	blockEpochs, err := h.Notifier.RegisterBlockEpochNtfn(nil)
-	if err != nil {
-		return nil, err
-	}
-	defer blockEpochs.Cancel()
-
 	for {
 		select {
 
 		// A new block has arrived, we'll check to see if this leads to
 		// HTLC expiration.
-		case newBlock, ok := <-blockEpochs.Epochs:
+		case beat, ok := <-h.BlockbeatChan:
 			if !ok {
 				return nil, errResolverShuttingDown
 			}
+
+			// Notify the block is processed immediately as the
+			// following operations don't impact other subsystems.
+			fn.SendOrQuit(beat.Err, nil, h.quit)
 
 			// If the current height is >= expiry, then a timeout
 			// path spend will be valid to be included in the next
@@ -125,7 +136,7 @@ func (h *htlcOutgoingContestResolver) Resolve(
 			// check doesn't pass, error `transaction is not
 			// finalized` will be returned and the broadcast will
 			// fail.
-			newHeight := uint32(newBlock.Height)
+			newHeight := uint32(beat.Epoch.Height)
 			if newHeight >= h.htlcResolution.Expiry {
 				log.Infof("%T(%v): HTLC has expired "+
 					"(height=%v, expiry=%v), transforming "+

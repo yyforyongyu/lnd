@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn"
@@ -77,10 +78,21 @@ func newCommitSweepResolver(res lnwallet.CommitOutputResolution,
 		chanPoint:           chanPoint,
 	}
 
-	r.initLogger(r)
+	// Mount the block consumer and init logger.
+	r.BlockConsumer = chainio.NewBlockConsumer(r.quit, r.Name())
+	r.initLogger(r.Name())
+
 	r.initReport()
 
 	return r
+}
+
+// Name returns the name of the resolver type.
+//
+// NOTE: Part of the chainio.Consumer interface.
+func (c *commitSweepResolver) Name() string {
+	return fmt.Sprintf("commitSweepResolver(%v)",
+		c.commitResolution.SelfOutPoint)
 }
 
 // ResolverKey returns an identifier which should be globally unique for this
@@ -88,36 +100,6 @@ func newCommitSweepResolver(res lnwallet.CommitOutputResolution,
 func (c *commitSweepResolver) ResolverKey() []byte {
 	key := newResolverID(c.commitResolution.SelfOutPoint)
 	return key[:]
-}
-
-// waitForHeight registers for block notifications and waits for the provided
-// block height to be reached.
-func waitForHeight(waitHeight uint32, notifier chainntnfs.ChainNotifier,
-	quit <-chan struct{}) error {
-
-	// Register for block epochs. After registration, the current height
-	// will be sent on the channel immediately.
-	blockEpochs, err := notifier.RegisterBlockEpochNtfn(nil)
-	if err != nil {
-		return err
-	}
-	defer blockEpochs.Cancel()
-
-	for {
-		select {
-		case newBlock, ok := <-blockEpochs.Epochs:
-			if !ok {
-				return errResolverShuttingDown
-			}
-			height := newBlock.Height
-			if height >= int32(waitHeight) {
-				return nil
-			}
-
-		case <-quit:
-			return errResolverShuttingDown
-		}
-	}
 }
 
 // waitForSpend waits for the given outpoint to be spent, and returns the
@@ -177,81 +159,13 @@ func (c *commitSweepResolver) getCommitTxConfHeight() (uint32, error) {
 	}
 }
 
-// Resolve instructs the contract resolver to resolve the output on-chain. Once
-// the output has been *fully* resolved, the function should return immediately
-// with a nil ContractResolver value for the first return value.  In the case
-// that the contract requires further resolution, then another resolve is
-// returned.
-//
-// NOTE: This function MUST be run as a goroutine.
-//
-//nolint:funlen
-func (c *commitSweepResolver) Resolve(_ bool) (ContractResolver, error) {
-	// If we're already resolved, then we can exit early.
-	if c.resolved {
-		return nil, nil
-	}
-
-	confHeight, err := c.getCommitTxConfHeight()
-	if err != nil {
-		return nil, err
-	}
-
-	// Wait up until the CSV expires, unless we also have a CLTV that
-	// expires after.
-	unlockHeight := confHeight + c.commitResolution.MaturityDelay
-	if c.hasCLTV() {
-		unlockHeight = uint32(math.Max(
-			float64(unlockHeight), float64(c.leaseExpiry),
-		))
-	}
-
-	c.log.Debugf("commit conf_height=%v, unlock_height=%v",
-		confHeight, unlockHeight)
-
-	// Update report now that we learned the confirmation height.
-	c.reportLock.Lock()
-	c.currentReport.MaturityHeight = unlockHeight
-	c.reportLock.Unlock()
-
-	// If there is a csv/cltv lock, we'll wait for that.
-	if c.commitResolution.MaturityDelay > 0 || c.hasCLTV() {
-		// Determine what height we should wait until for the locks to
-		// expire.
-		var waitHeight uint32
-		switch {
-		// If we have both a csv and cltv lock, we'll need to look at
-		// both and see which expires later.
-		case c.commitResolution.MaturityDelay > 0 && c.hasCLTV():
-			c.log.Debugf("waiting for CSV and CLTV lock to expire "+
-				"at height %v", unlockHeight)
-			// If the CSV expires after the CLTV, or there is no
-			// CLTV, then we can broadcast a sweep a block before.
-			// Otherwise, we need to broadcast at our expected
-			// unlock height.
-			waitHeight = uint32(math.Max(
-				float64(unlockHeight-1), float64(c.leaseExpiry),
-			))
-
-		// If we only have a csv lock, wait for the height before the
-		// lock expires as the spend path should be unlocked by then.
-		case c.commitResolution.MaturityDelay > 0:
-			c.log.Debugf("waiting for CSV lock to expire at "+
-				"height %v", unlockHeight)
-			waitHeight = unlockHeight - 1
-		}
-
-		err := waitForHeight(waitHeight, c.Notifier, c.quit)
-		if err != nil {
-			return nil, err
-		}
-	}
-
+// createSweepRequest creates a sweep request for the commitment output.
+func (c *commitSweepResolver) createSweepRequest() sweepRequest {
 	var (
 		isLocalCommitTx bool
-
-		signDesc = c.commitResolution.SelfOutputSignDesc
+		signDesc        = c.commitResolution.SelfOutputSignDesc
 	)
+
 	switch {
 	// For taproot channels, we'll know if this is the local commit based
 	// on the witness script. For local channels, the witness script has an
@@ -320,8 +234,6 @@ func (c *commitSweepResolver) Resolve(_ bool) (ContractResolver, error) {
 		witnessType = input.CommitmentNoDelay
 	}
 
-	c.log.Infof("Sweeping with witness type: %v", witnessType)
-
 	// We'll craft an input with all the information required for the
 	// sweeper to create a fully valid sweeping transaction to recover
 	// these coins.
@@ -349,21 +261,65 @@ func (c *commitSweepResolver) Resolve(_ bool) (ContractResolver, error) {
 		btcutil.Amount(inp.SignDesc().Output.Value),
 		c.Budget.ToLocalRatio, c.Budget.ToLocal,
 	)
-	c.log.Infof("Sweeping commit output using budget=%v", budget)
+	c.log.Infof("Sweeping commit output %v using budget=%v", witnessType,
+		budget)
 
-	// With our input constructed, we'll now offer it to the sweeper.
-	resultChan, err := c.Sweeper.SweepInput(
-		inp, sweep.Params{
+	// With our input constructed, we'll create the sweep request.
+	return sweepRequest{
+		inp: inp,
+		params: sweep.Params{
 			Budget: budget,
 
 			// Specify a nil deadline here as there's no time
 			// pressure.
 			DeadlineHeight: fn.None[int32](),
 		},
-	)
-	if err != nil {
-		c.log.Errorf("unable to sweep input: %v", err)
+	}
+}
 
+// Resolve instructs the contract resolver to resolve the output on-chain. Once
+// the output has been *fully* resolved, the function should return immediately
+// with a nil ContractResolver value for the first return value.  In the case
+// that the contract requires further resolution, then another resolve is
+// returned.
+//
+// NOTE: This function MUST be run as a goroutine.
+func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
+	// If we're already resolved, then we can exit early.
+	if c.resolved {
+		c.log.Warn("Resolver already resolved")
+		return nil, nil
+	}
+
+	confHeight, err := c.getCommitTxConfHeight()
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait up until the CSV expires, unless we also have a CLTV that
+	// expires after.
+	unlockHeight := confHeight + c.commitResolution.MaturityDelay
+	if c.hasCLTV() {
+		unlockHeight = uint32(math.Max(
+			float64(unlockHeight), float64(c.leaseExpiry),
+		))
+	}
+
+	c.log.Debugf("commit conf_height=%v, unlock_height=%v",
+		confHeight, unlockHeight)
+
+	// Update report now that we learned the confirmation height.
+	c.reportLock.Lock()
+	c.currentReport.MaturityHeight = unlockHeight
+	c.reportLock.Unlock()
+
+	// Create a sweep request.
+	req := c.createSweepRequest()
+
+	// Handle the blockbeat and get the sweep result channel.
+	resultChan, err := c.processBlockbeat(req)
+	if err != nil {
+		c.log.Errorf("Unable to sweep input: %v", err)
 		return nil, err
 	}
 
@@ -519,7 +475,7 @@ func newCommitSweepResolverFromReader(r io.Reader, resCfg ResolverConfig) (
 	// removed this, but keep in mind that this data may still be present in
 	// the database.
 
-	c.initLogger(c)
+	c.initLogger(c.Name())
 	c.initReport()
 
 	return c, nil
