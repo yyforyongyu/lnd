@@ -605,6 +605,7 @@ func (c *ChainArbitrator) Start() error {
 				auxLeafStore:        c.cfg.AuxLeafStore,
 				auxResolver:         c.cfg.AuxResolver,
 			},
+			c.CurrentBeat(),
 		)
 		if err != nil {
 			return err
@@ -1188,6 +1189,7 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 			auxLeafStore:        c.cfg.AuxLeafStore,
 			auxResolver:         c.cfg.AuxResolver,
 		},
+		c.CurrentBeat(),
 	)
 	if err != nil {
 		return err
