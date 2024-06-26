@@ -25,7 +25,14 @@ type Beat struct {
 	epoch chainntnfs.BlockEpoch
 
 	// errChan is a buffered chan that receives an error returned from
-	// processing this block.
+	// processing this block. This serves as the communication channel
+	// between the BlockbeatDispatcher and the Consumer. The flow is,
+	// - BlockbeatDispatcher sends a `Beat` to the Consumer and waits an
+	//   error to be read from `Beat.errChan` or time out.
+	// - Consumer receives this blockbeat in `ProcessBlock`.
+	// - Consumer processes the block and calls `NotifyBlockProcessed`.
+	// - BlockbeatDispatcher unblocks the current dispatch by reading the
+	//   error from `Beat.errChan`.
 	errChan chan error
 
 	// log is the customized logger for the blockbeat which prints the
