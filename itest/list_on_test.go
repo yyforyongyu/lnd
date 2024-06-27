@@ -630,4 +630,8 @@ var allTestCases = []*lntest.TestCase{
 		Name:     "coop close with external delivery",
 		TestFunc: testCoopCloseWithExternalDelivery,
 	},
+	{
+		Name:     "intercept and refill channel",
+		TestFunc: testInterceptAndRefillChannel,
+	},
 }
