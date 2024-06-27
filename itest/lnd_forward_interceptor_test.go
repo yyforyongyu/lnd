@@ -497,3 +497,146 @@ func (c *interceptorTestScenario) buildRoute(amtMsat int64,
 
 	return routeResp.Route
 }
+
+func testInterceptAndRefillChannel(ht *lntest.HarnessTest) {
+	// refillAmt is the amount Carol sends to Bob to refill the edge
+	// Bob->Carol.
+	// refillAmt := btcutil.Amount(10_000)
+
+	// paymentAmt is the amount Alice sends to Carol.
+	paymentAmt := btcutil.Amount(100_000)
+
+	// chanAmt is the initial channel size for all channels.
+	chanAmt := btcutil.Amount(1000_000)
+
+	// We now set up the force close scenario. We will create a network
+	// from Alice -> Bob -> Carol, where Alice will send a payment to Carol
+	// via Bob, Carol goes offline. We expect Bob to sweep his anchor and
+	// outgoing HTLC.
+	//
+	// Prepare params.
+	cfg := []string{"--protocol.anchors"}
+	openChannelParams := lntest.OpenChannelParams{
+		Amt: chanAmt,
+	}
+
+	// Create a three hop network: Alice -> Bob -> Carol.
+	chanPoints, nodes := createSimpleNetwork(ht, cfg, 3, openChannelParams)
+
+	// Get the nodes.
+	alice, bob, carol := nodes[0], nodes[1], nodes[2]
+
+	// We now send a payment of 900k from Bob to Carol, which will move
+	// the channel balance of Bob->Carol below the paymentAmt 100k.
+	//
+	// Carol adds the invoice.
+	invoice := carol.RPC.AddInvoice(&lnrpc.Invoice{
+		Value: int64(chanAmt - paymentAmt),
+	})
+
+	// Bob makes the payment.
+	payReq := &routerrpc.SendPaymentRequest{
+		PaymentRequest: invoice.PaymentRequest,
+		TimeoutSeconds: 60,
+		FeeLimitMsat:   noFeeLimitMsat,
+	}
+	ht.SendPaymentAssertSettled(bob, payReq)
+
+	// Assert that Bob is in the desired state.
+	//
+	// Bob sends a payment of 100k to Carol and fails.
+	invoice = carol.RPC.AddInvoice(&lnrpc.Invoice{
+		Value: int64(paymentAmt),
+	})
+	payReq = &routerrpc.SendPaymentRequest{
+		PaymentRequest: invoice.PaymentRequest,
+		TimeoutSeconds: 60,
+		FeeLimitMsat:   noFeeLimitMsat,
+	}
+	ht.SendPaymentAssertFail(
+		bob, payReq,
+		lnrpc.PaymentFailureReason_FAILURE_REASON_INSUFFICIENT_BALANCE,
+	)
+
+	// Bob now connects the interceptor.
+	interceptor, cancelInterceptor := bob.RPC.HtlcInterceptor()
+	defer cancelInterceptor()
+
+	// We now send a payment from Alice to Carol, which will be routed
+	// through Bob. We expect Bob to intercept this HTLC and pause till a
+	// payment from Carol is received to refill his channel with Carol.
+	invoice = carol.RPC.AddInvoice(&lnrpc.Invoice{
+		Value: int64(paymentAmt),
+	})
+
+	// Prepare the route.
+	rpcHops := make([][]byte, 0, 2)
+
+	// Parse the pubkeys.
+	for _, n := range nodes[1:] {
+		pubkey, err := route.NewVertexFromStr(n.PubKeyStr)
+		require.NoErrorf(ht, err, "error parsing %v", err)
+		rpcHops = append(rpcHops, pubkey[:])
+	}
+
+	// Alice builds the route.
+	req := &routerrpc.BuildRouteRequest{
+		AmtMsat:        int64(paymentAmt) * 1000,
+		FinalCltvDelta: chainreg.DefaultBitcoinTimeLockDelta,
+		HopPubkeys:     rpcHops,
+		PaymentAddr:    invoice.PaymentAddr,
+	}
+	routeResp := alice.RPC.BuildRoute(req)
+
+	// Alice sends the payment in a goroutine.
+	result := make(chan *lnrpc.HTLCAttempt, 1)
+
+	go func() {
+		sendReq := &routerrpc.SendToRouteRequest{
+			PaymentHash: invoice.RHash,
+			Route:       routeResp.Route,
+		}
+		result <- alice.RPC.SendToRouteV2(sendReq)
+	}()
+
+	// Bob should intercept the payment and pause.
+	packet := ht.ReceiveHtlcInterceptor(interceptor)
+
+	// Alice should expect one in flight payment since Bob is holding the
+	// htlc.
+	//
+	// Get the preimage first.
+	inv := carol.RPC.LookupInvoice(invoice.RHash)
+	var preimage lntypes.Preimage
+	copy(preimage[:], inv.RPreimage)
+
+	// Asser the payment is in flight.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_IN_FLIGHT)
+
+	// Carol now sends a payment of 200k to Bob to refill the channel.
+	//
+	// NOTE: This is where the atmoic swap (ecash<->HTLC) would happen.
+	refillInvoice := bob.RPC.AddInvoice(&lnrpc.Invoice{
+		Value: int64(paymentAmt) * 2,
+	})
+	payReq = &routerrpc.SendPaymentRequest{
+		PaymentRequest: refillInvoice.PaymentRequest,
+		TimeoutSeconds: 60,
+		FeeLimitMsat:   noFeeLimitMsat,
+	}
+	ht.SendPaymentAssertSettled(carol, payReq)
+
+	// Bob now settle the htlc.
+	err := interceptor.Send(&routerrpc.ForwardHtlcInterceptResponse{
+		IncomingCircuitKey: packet.IncomingCircuitKey,
+		Action:             routerrpc.ResolveHoldForwardAction_SETTLE,
+	})
+	require.NoError(ht, err, "failed to send request")
+
+	// Alice should now see the payment succeed.
+	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_SUCCEEDED)
+
+	// Finally, close channels.
+	ht.CloseChannel(alice, chanPoints[0])
+	ht.CloseChannel(bob, chanPoints[1])
+}
