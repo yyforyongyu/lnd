@@ -94,7 +94,7 @@ func newChanRestoreScenario(ht *lntest.HarnessTest, ct lnrpc.CommitmentType,
 	ht.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, dave)
 
 	// Mine a block to confirm the funds.
-	ht.MineBlocks(1)
+	ht.MineBlocksAndAssertNumTxes(1, 2)
 
 	// For the anchor output case we need two UTXOs for Carol so she can
 	// sweep both the local and remote anchor.
@@ -624,8 +624,8 @@ func runChanRestoreScenarioCommitTypes(ht *lntest.HarnessTest,
 
 	var fundingShim *lnrpc.FundingShim
 	if ct == lnrpc.CommitmentType_SCRIPT_ENFORCED_LEASE {
-		_, minerHeight := ht.Miner.GetBestBlock()
-		thawHeight := uint32(minerHeight + thawHeightDelta)
+		minerHeight := ht.CurrentHeight()
+		thawHeight := minerHeight + thawHeightDelta
 
 		fundingShim, _ = deriveFundingShim(
 			ht, dave, carol, crs.params.Amt, thawHeight, true, ct,
@@ -783,7 +783,7 @@ func runChanRestoreScenarioForceClose(ht *lntest.HarnessTest, zeroConf bool) {
 	)
 
 	// We now wait until both Dave's closing tx.
-	ht.Miner.AssertNumTxsInMempool(1)
+	ht.AssertNumTxsInMempool(1)
 
 	// Now that we're able to make our restored now, we'll shutdown the old
 	// Dave node as we'll be storing it shortly below.
@@ -1272,7 +1272,7 @@ func testDataLossProtection(ht *lntest.HarnessTest) {
 	ht.MineBlocks(1)
 
 	// Dave should sweep his funds.
-	ht.Miner.AssertNumTxsInMempool(1)
+	ht.AssertNumTxsInMempool(1)
 
 	// Mine a block to confirm the sweep, and make sure Dave got his
 	// balance back.
@@ -1428,7 +1428,7 @@ func assertTimeLockSwept(ht *lntest.HarnessTest, carol, dave *node.HarnessNode,
 
 	// Mine a block to trigger the sweeps.
 	ht.MineBlocks(1)
-	ht.Miner.AssertNumTxsInMempool(expectedTxes)
+	ht.AssertNumTxsInMempool(expectedTxes)
 
 	// Carol should consider the channel pending force close (since she is
 	// waiting for her sweep to confirm).
@@ -1462,9 +1462,9 @@ func assertTimeLockSwept(ht *lntest.HarnessTest, carol, dave *node.HarnessNode,
 
 	// Mine a block to trigger the sweeps.
 	ht.MineEmptyBlocks(1)
-	daveSweep := ht.Miner.AssertNumTxsInMempool(1)[0]
+	daveSweep := ht.AssertNumTxsInMempool(1)[0]
 	block := ht.MineBlocksAndAssertNumTxes(1, 1)[0]
-	ht.Miner.AssertTxInBlock(block, daveSweep)
+	ht.AssertTxInBlock(block, daveSweep)
 
 	// Now the channel should be fully closed also from Dave's POV.
 	ht.AssertNumPendingForceClose(dave, 0)
@@ -1510,7 +1510,7 @@ func assertDLPExecuted(ht *lntest.HarnessTest,
 
 	// Upon reconnection, the nodes should detect that Dave is out of sync.
 	// Carol should force close the channel using her latest commitment.
-	ht.Miner.AssertNumTxsInMempool(1)
+	ht.AssertNumTxsInMempool(1)
 
 	// Channel should be in the state "waiting close" for Carol since she
 	// broadcasted the force close tx.
