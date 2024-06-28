@@ -503,7 +503,7 @@ func (c *ChainArbitrator) ResolveContract(chanPoint wire.OutPoint) error {
 
 		if err := chainArb.Stop(); err != nil {
 			log.Warnf("unable to stop ChannelArbitrator(%v): %v",
-				chanPoint, err)
+				chainArb.cfg.ShortChanID, err)
 		}
 	}
 	if chainWatcher != nil {
@@ -961,7 +961,7 @@ func (c *ChainArbitrator) Stop() error {
 	}
 	for chanPoint, arbitrator := range activeChannels {
 		log.Tracef("Attempting to stop ChannelArbitrator(%v)",
-			chanPoint)
+			arbitrator.cfg.ShortChanID)
 
 		if err := arbitrator.Stop(); err != nil {
 			log.Errorf("unable to stop arbitrator for "+
@@ -1136,7 +1136,7 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 	chanPoint := newChan.FundingOutpoint
 
 	log.Infof("Creating new ChannelArbitrator for ChannelPoint(%v)",
-		chanPoint)
+		newChan.ShortChannelID)
 
 	// If we're already watching this channel, then we'll ignore this
 	// request.

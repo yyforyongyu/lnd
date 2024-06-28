@@ -134,7 +134,7 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 	payload, nextHopOnionBlob, err := h.decodePayload()
 	if err != nil {
 		log.Debugf("ChannelArbitrator(%v): cannot decode payload of "+
-			"htlc %v", h.ChanPoint, h.HtlcPoint())
+			"htlc %v", h.ShortChanID, h.HtlcPoint())
 
 		// If we've locked in an htlc with an invalid payload on our
 		// commitment tx, we don't need to resolve it. The other party
