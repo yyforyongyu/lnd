@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 
 	"github.com/lightningnetwork/lnd/channeldb"
@@ -32,7 +33,7 @@ func newBreachResolver(resCfg ResolverConfig) *breachResolver {
 		replyChan:           make(chan struct{}),
 	}
 
-	r.initLogger(r)
+	r.initLogger(fmt.Sprintf("%T(%v)", r, r.ChanPoint))
 
 	return r
 }
@@ -82,6 +83,7 @@ func (b *breachResolver) Resolve() (ContractResolver, error) {
 
 // Stop signals the breachResolver to stop.
 func (b *breachResolver) Stop() {
+	b.log.Debugf("stopping...")
 	close(b.quit)
 }
 
@@ -114,7 +116,7 @@ func newBreachResolverFromReader(r io.Reader, resCfg ResolverConfig) (
 		return nil, err
 	}
 
-	b.initLogger(b)
+	b.initLogger(fmt.Sprintf("%T(%v)", b, b.ChanPoint))
 
 	return b, nil
 }
@@ -122,3 +124,16 @@ func newBreachResolverFromReader(r io.Reader, resCfg ResolverConfig) (
 // A compile time assertion to ensure breachResolver meets the ContractResolver
 // interface.
 var _ ContractResolver = (*breachResolver)(nil)
+
+// TODO(yy): implement it once the outputs are offered to the sweeper.
+func (b *breachResolver) Launch() error {
+	if b.launched {
+		b.log.Tracef("already launched")
+		return nil
+	}
+
+	b.log.Debugf("launching resolver...")
+	b.launched = true
+
+	return nil
+}

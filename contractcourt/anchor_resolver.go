@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -71,7 +72,7 @@ func newAnchorResolver(anchorSignDescriptor input.SignDescriptor,
 		currentReport:        report,
 	}
 
-	r.initLogger(r)
+	r.initLogger(fmt.Sprintf("%T(%v)", r, r.anchor))
 
 	return r
 }
@@ -83,49 +84,12 @@ func (c *anchorResolver) ResolverKey() []byte {
 	return nil
 }
 
-// Resolve offers the anchor output to the sweeper and waits for it to be swept.
+// Resolve waits for the output to be swept.
 func (c *anchorResolver) Resolve() (ContractResolver, error) {
-	// Attempt to update the sweep parameters to the post-confirmation
-	// situation. We don't want to force sweep anymore, because the anchor
-	// lost its special purpose to get the commitment confirmed. It is just
-	// an output that we want to sweep only if it is economical to do so.
-	//
-	// An exclusive group is not necessary anymore, because we know that
-	// this is the only anchor that can be swept.
-	//
-	// We also clear the parent tx information for cpfp, because the
-	// commitment tx is confirmed.
-	//
-	// After a restart or when the remote force closes, the sweeper is not
-	// yet aware of the anchor. In that case, it will be added as new input
-	// to the sweeper.
-	witnessType := input.CommitmentAnchor
-
-	// For taproot channels, we need to use the proper witness type.
-	if c.chanType.IsTaproot() {
-		witnessType = input.TaprootAnchorSweepSpend
-	}
-
-	anchorInput := input.MakeBaseInput(
-		&c.anchor, witnessType, &c.anchorSignDescriptor,
-		c.broadcastHeight, nil,
-	)
-
-	resultChan, err := c.Sweeper.SweepInput(
-		&anchorInput,
-		sweep.Params{
-			// For normal anchor sweeping, the budget is 330 sats.
-			Budget: btcutil.Amount(
-				anchorInput.SignDesc().Output.Value,
-			),
-
-			// There's no rush to sweep the anchor, so we use a nil
-			// deadline here.
-			DeadlineHeight: fn.None[int32](),
-		},
-	)
-	if err != nil {
-		return nil, err
+	// If we're already resolved, then we can exit early.
+	if c.resolved {
+		c.log.Errorf("already resolved")
+		return nil, nil
 	}
 
 	var (
@@ -134,7 +98,7 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 	)
 
 	select {
-	case sweepRes := <-resultChan:
+	case sweepRes := <-c.sweepResultChan:
 		switch sweepRes.Err {
 		// Anchor was swept successfully.
 		case nil:
@@ -180,6 +144,7 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 //
 // NOTE: Part of the ContractResolver interface.
 func (c *anchorResolver) Stop() {
+	c.log.Debugf("stopping...")
 	close(c.quit)
 }
 
@@ -215,3 +180,68 @@ func (c *anchorResolver) Encode(w io.Writer) error {
 // A compile time assertion to ensure anchorResolver meets the
 // ContractResolver interface.
 var _ ContractResolver = (*anchorResolver)(nil)
+
+// Launch offers the anchor output to the sweeper.
+func (c *anchorResolver) Launch() error {
+	if c.launched {
+		c.log.Tracef("already launched")
+		return nil
+	}
+
+	c.log.Debugf("launching resolver...")
+	c.launched = true
+
+	// If we're already resolved, then we can exit early.
+	if c.resolved {
+		c.log.Errorf("already resolved")
+		return nil
+	}
+
+	// Attempt to update the sweep parameters to the post-confirmation
+	// situation. We don't want to force sweep anymore, because the anchor
+	// lost its special purpose to get the commitment confirmed. It is just
+	// an output that we want to sweep only if it is economical to do so.
+	//
+	// An exclusive group is not necessary anymore, because we know that
+	// this is the only anchor that can be swept.
+	//
+	// We also clear the parent tx information for cpfp, because the
+	// commitment tx is confirmed.
+	//
+	// After a restart or when the remote force closes, the sweeper is not
+	// yet aware of the anchor. In that case, it will be added as new input
+	// to the sweeper.
+	witnessType := input.CommitmentAnchor
+
+	// For taproot channels, we need to use the proper witness type.
+	if c.chanType.IsTaproot() {
+		witnessType = input.TaprootAnchorSweepSpend
+	}
+
+	anchorInput := input.MakeBaseInput(
+		&c.anchor, witnessType, &c.anchorSignDescriptor,
+		c.broadcastHeight, nil,
+	)
+
+	resultChan, err := c.Sweeper.SweepInput(
+		&anchorInput,
+		sweep.Params{
+			// For normal anchor sweeping, the budget is 330 sats.
+			Budget: btcutil.Amount(
+				anchorInput.SignDesc().Output.Value,
+			),
+
+			// There's no rush to sweep the anchor, so we use a nil
+			// deadline here.
+			DeadlineHeight: fn.None[int32](),
+		},
+	)
+
+	if err != nil {
+		return err
+	}
+
+	c.sweepResultChan = resultChan
+
+	return nil
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
@@ -960,6 +961,7 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 			},
 		},
 	}
+	closeTxid := closeTx.TxHash()
 
 	htlcOp := wire.OutPoint{
 		Hash:  closeTx.TxHash(),
@@ -1089,6 +1091,14 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	// beat := chainio.NewBlockbeatFromHeight(10)
 	// chanArb.BlockbeatChan <- beat
 
+	// Notify resolver that the HTLC output of the commitment has been
+	// spent.
+	oldNotifier.SpendChan <- &chainntnfs.SpendDetail{
+		SpendingTx:    closeTx,
+		SpentOutPoint: &wire.OutPoint{},
+		SpenderTxHash: &closeTxid,
+	}
+
 	// htlcOutgoingContestResolver is now transforming into a
 	// htlcTimeoutResolver and should send the contract off for incubation.
 	select {
@@ -1097,9 +1107,13 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 		t.Fatalf("no response received")
 	}
 
-	// Notify resolver that the HTLC output of the commitment has been
+	// Notify resolver that the HTLC output of the timeout tx has been
 	// spent.
-	oldNotifier.SpendChan <- &chainntnfs.SpendDetail{SpendingTx: closeTx}
+	oldNotifier.SpendChan <- &chainntnfs.SpendDetail{
+		SpendingTx:    closeTx,
+		SpentOutPoint: &wire.OutPoint{},
+		SpenderTxHash: &closeTxid,
+	}
 
 	// Finally, we should also receive a resolution message instructing the
 	// switch to cancel back the HTLC.
@@ -1125,9 +1139,6 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 		t.Fatalf("channel resolved prematurely")
 	default:
 	}
-
-	// Notify resolver that the second level transaction is spent.
-	oldNotifier.SpendChan <- &chainntnfs.SpendDetail{SpendingTx: closeTx}
 
 	// At this point channel should be marked as resolved.
 	chanArbCtxNew.AssertStateTransitions(StateFullyResolved)
@@ -2998,7 +3009,8 @@ func assertResolverReport(t *testing.T, reports chan *channeldb.ResolverReport,
 	select {
 	case report := <-reports:
 		if !reflect.DeepEqual(report, expected) {
-			t.Fatalf("expected: %v, got: %v", expected, report)
+			t.Fatalf("expected: %v, got: %v", spew.Sdump(expected),
+				spew.Sdump(report))
 		}
 
 	case <-time.After(defaultTimeout):

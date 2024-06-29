@@ -503,7 +503,7 @@ func (c *ChainArbitrator) ResolveContract(chanPoint wire.OutPoint) error {
 
 		if err := chainArb.Stop(); err != nil {
 			log.Warnf("unable to stop ChannelArbitrator(%v): %v",
-				chanPoint, err)
+				chainArb.cfg.ShortChanID, err)
 		}
 	}
 	if chainWatcher != nil {
@@ -806,16 +806,28 @@ func (c *ChainArbitrator) handleBlockbeat(beat chainio.Blockbeat) {
 
 	// Create a slice to record active channel arbitrator.
 	channels := make([]chainio.Consumer, 0, len(c.activeChannels))
+	watchers := make([]chainio.Consumer, 0, len(c.activeWatchers))
 
 	// Copy the active channels to the slice.
 	for _, channel := range c.activeChannels {
 		channels = append(channels, channel)
 	}
 
+	for _, watcher := range c.activeWatchers {
+		watchers = append(watchers, watcher)
+	}
+
 	c.Unlock()
 
+	// Iterate all the copied watchers and send the blockbeat to them.
+	err := beat.DispatchConcurrent(watchers)
+	if err != nil {
+		// Shutdown lnd if there's an error processing the block.
+		log.Criticalf("Notify blockbeat failed: %v", err)
+	}
+
 	// Iterate all the copied channels and send the blockbeat to them.
-	err := beat.DispatchConcurrent(channels)
+	err = beat.DispatchConcurrent(channels)
 	if err != nil {
 		// Shutdown lnd if there's an error processing the block.
 		log.Criticalf("Notify blockbeat failed: %v", err)
@@ -949,7 +961,7 @@ func (c *ChainArbitrator) Stop() error {
 	}
 	for chanPoint, arbitrator := range activeChannels {
 		log.Tracef("Attempting to stop ChannelArbitrator(%v)",
-			chanPoint)
+			arbitrator.cfg.ShortChanID)
 
 		if err := arbitrator.Stop(); err != nil {
 			log.Errorf("unable to stop arbitrator for "+
@@ -1124,7 +1136,7 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 	chanPoint := newChan.FundingOutpoint
 
 	log.Infof("Creating new ChannelArbitrator for ChannelPoint(%v)",
-		chanPoint)
+		newChan.ShortChannelID)
 
 	// If we're already watching this channel, then we'll ignore this
 	// request.

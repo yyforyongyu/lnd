@@ -15,6 +15,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn"
@@ -198,6 +199,8 @@ type chainWatcherConfig struct {
 // that the channel has been closed, and also give them the materials necessary
 // to sweep the funds of the channel on chain eventually.
 type chainWatcher struct {
+	chainio.BeatConsumer
+
 	started int32 // To be used atomically.
 	stopped int32 // To be used atomically.
 
@@ -251,12 +254,27 @@ func newChainWatcher(cfg chainWatcherConfig) (*chainWatcher, error) {
 		)
 	}
 
-	return &chainWatcher{
+	c := &chainWatcher{
 		cfg:                 cfg,
 		stateHintObfuscator: stateHint,
 		quit:                make(chan struct{}),
 		clientSubscriptions: make(map[uint64]*ChainEventSubscription),
-	}, nil
+	}
+
+	// Mount the block consumer.
+	c.BeatConsumer = chainio.NewBeatConsumer(c.quit, c.Name())
+
+	return c, nil
+}
+
+// Compile-time check for the chainio.Consumer interface.
+var _ chainio.Consumer = (*chainWatcher)(nil)
+
+// Name returns the name of the watcher.
+//
+// NOTE: part of the `chainio.Consumer` interface.
+func (c *chainWatcher) Name() string {
+	return fmt.Sprintf("ChainWatcher(%v)", c.cfg.chanState.FundingOutpoint)
 }
 
 // Start starts all goroutines that the chainWatcher needs to perform its
@@ -588,16 +606,21 @@ func newChainSet(chanState *channeldb.OpenChannel) (*chainSet, error) {
 func (c *chainWatcher) closeObserver(spendNtfn *chainntnfs.SpendEvent) {
 	defer c.wg.Done()
 
+	fundingOutpoint := c.cfg.chanState.FundingOutpoint
+	pkScript, err := txscript.ParsePkScript(c.fundingPkScript)
+	if err != nil {
+		log.Errorf("Unable to parse pkScript: %v", err)
+	}
+
 	log.Infof("Close observer for ChannelPoint(%v) active",
 		c.cfg.chanState.FundingOutpoint)
 
 	// If this is a taproot channel, before we proceed, we want to ensure
 	// that the expected funding output has confirmed on chain.
 	if c.cfg.chanState.ChanType.IsTaproot() {
-		fundingPoint := c.cfg.chanState.FundingOutpoint
-
 		confNtfn, err := c.cfg.notifier.RegisterConfirmationsNtfn(
-			&fundingPoint.Hash, c.fundingPkScript, 1, c.heightHint,
+			&fundingOutpoint.Hash, c.fundingPkScript, 1,
+			c.heightHint,
 		)
 		if err != nil {
 			log.Warnf("unable to register for conf: %v", err)
@@ -618,131 +641,73 @@ func (c *chainWatcher) closeObserver(spendNtfn *chainntnfs.SpendEvent) {
 		}
 	}
 
-	select {
-	// We've detected a spend of the channel onchain! Depending on the type
-	// of spend, we'll act accordingly, so we'll examine the spending
-	// transaction to determine what we should do.
+	// During startup, we will quickly check whether there's already a
+	// commit spend. If so, we will handle it here.
 	//
-	// TODO(Roasbeef): need to be able to ensure this only triggers
-	// on confirmation, to ensure if multiple txns are broadcast, we
-	// act on the one that's timestamped
-	case commitSpend, ok := <-spendNtfn.Spend:
-		// If the channel was closed, then this means that the notifier
-		// exited, so we will as well.
-		if !ok {
-			return
-		}
+	// TODO(yy): remove this step once `blockbeat` is able to handle
+	// rescanning.
+	handled := c.handleRestart(spendNtfn)
 
-		// Otherwise, the remote party might have broadcast a prior
-		// revoked state...!!!
-		commitTxBroadcast := commitSpend.SpendingTx
+	for {
+		select {
+		// A new block is received, we will check whether this block
+		// contains a spending tx that we are interested in.
+		case beat := <-c.BlockbeatChan:
+			log.Tracef("Received blockbeat %v", beat.Height())
 
-		// First, we'll construct the chainset which includes all the
-		// data we need to dispatch an event to our subscribers about
-		// this possible channel close event.
-		chainSet, err := newChainSet(c.cfg.chanState)
-		if err != nil {
-			log.Errorf("unable to create commit set: %v", err)
-			return
-		}
+			// If the commit spend is already handled, we can skip
+			// processing it.
+			if handled {
+				log.Debugf("Commit spend already handled "+
+					"prior to or at height %v",
+					beat.Height())
 
-		// Decode the state hint encoded within the commitment
-		// transaction to determine if this is a revoked state or not.
-		obfuscator := c.stateHintObfuscator
-		broadcastStateNum := c.cfg.extractStateNumHint(
-			commitTxBroadcast, obfuscator,
-		)
+				beat.NotifyBlockProcessed(nil, c.quit)
 
-		// We'll go on to check whether it could be our own commitment
-		// that was published and know is confirmed.
-		ok, err = c.handleKnownLocalState(
-			commitSpend, broadcastStateNum, chainSet,
-		)
-		if err != nil {
-			log.Errorf("Unable to handle known local state: %v",
-				err)
-			return
-		}
-
-		if ok {
-			return
-		}
-
-		// Now that we know it is neither a non-cooperative closure nor
-		// a local close with the latest state, we check if it is the
-		// remote that closed with any prior or current state.
-		ok, err = c.handleKnownRemoteState(
-			commitSpend, broadcastStateNum, chainSet,
-		)
-		if err != nil {
-			log.Errorf("Unable to handle known remote state: %v",
-				err)
-			return
-		}
-
-		if ok {
-			return
-		}
-
-		// Next, we'll check to see if this is a cooperative channel
-		// closure or not. This is characterized by having an input
-		// sequence number that's finalized. This won't happen with
-		// regular commitment transactions due to the state hint
-		// encoding scheme.
-		if commitTxBroadcast.TxIn[0].Sequence == wire.MaxTxInSequenceNum {
-			// TODO(roasbeef): rare but possible, need itest case
-			// for
-			err := c.dispatchCooperativeClose(commitSpend)
-			if err != nil {
-				log.Errorf("unable to handle co op close: %v", err)
+				continue
 			}
+
+			// Otherwise process the block.
+			c.handleBlockbeat(beat, fundingOutpoint, pkScript)
+
+		// The chainWatcher has been signalled to exit, so we'll do so
+		// now.
+		case <-c.quit:
 			return
 		}
+	}
+}
 
-		log.Warnf("Unknown commitment broadcast for "+
-			"ChannelPoint(%v) ", c.cfg.chanState.FundingOutpoint)
+// handleBlockbeat takes a blockbeat and queries for a spending tx for the
+// funding output. If the spending tx is found, it will be handled based on the
+// closure type.
+func (c *chainWatcher) handleBlockbeat(beat chainio.Blockbeat,
+	fundingOutpoint wire.OutPoint, pkScript txscript.PkScript) {
 
-		// We'll try to recover as best as possible from losing state.
-		// We first check if this was a local unknown state. This could
-		// happen if we force close, then lose state or attempt
-		// recovery before the commitment confirms.
-		ok, err = c.handleUnknownLocalState(
-			commitSpend, broadcastStateNum, chainSet,
-		)
-		if err != nil {
-			log.Errorf("Unable to handle known local state: %v",
-				err)
-			return
-		}
+	// Notify the chain arbitrator has processed the block.
+	defer beat.NotifyBlockProcessed(nil, c.quit)
 
-		if ok {
-			return
-		}
+	// Check if the block contains a spending tx for the funding output.
+	spend, err := beat.HasOutpointSpentByScript(fundingOutpoint, pkScript)
+	if err != nil {
+		log.Errorf("Query spend failed for %v", fundingOutpoint, err)
 
-		// Since it was neither a known remote state, nor a local state
-		// that was published, it most likely mean we lost state and
-		// the remote node closed. In this case we must start the DLP
-		// protocol in hope of getting our money back.
-		ok, err = c.handleUnknownRemoteState(
-			commitSpend, broadcastStateNum, chainSet,
-		)
-		if err != nil {
-			log.Errorf("Unable to handle unknown remote state: %v",
-				err)
-			return
-		}
-
-		if ok {
-			return
-		}
-
-		log.Warnf("Unable to handle spending tx %v of channel point %v",
-			commitTxBroadcast.TxHash(), c.cfg.chanState.FundingOutpoint)
 		return
+	}
 
-	// The chainWatcher has been signalled to exit, so we'll do so now.
-	case <-c.quit:
+	if spend == nil {
+		log.Tracef("No spend found for ChannelPoint(%v) in block %v",
+			c.cfg.chanState.FundingOutpoint, beat.Height())
+
 		return
+	}
+
+	log.Debugf("Found spend details for funding output: %v",
+		spend.SpenderTxHash)
+
+	err = c.handleCommitSpend(spend)
+	if err != nil {
+		log.Errorf("Failed to handle commit spend: %v", err)
 	}
 }
 
@@ -1357,5 +1322,136 @@ func (c *chainWatcher) waitForCommitmentPoint() *btcec.PublicKey {
 		case <-c.quit:
 			return nil
 		}
+	}
+}
+
+// handleCommitSpend takes a spending tx of the funding output and handles the
+// channel close based on the closure type.
+func (c *chainWatcher) handleCommitSpend(
+	commitSpend *chainntnfs.SpendDetail) error {
+
+	commitTxBroadcast := commitSpend.SpendingTx
+
+	// First, we'll construct the chainset which includes all the data we
+	// need to dispatch an event to our subscribers about this possible
+	// channel close event.
+	chainSet, err := newChainSet(c.cfg.chanState)
+	if err != nil {
+		return fmt.Errorf("create commit set: %w", err)
+	}
+
+	// Decode the state hint encoded within the commitment transaction to
+	// determine if this is a revoked state or not.
+	obfuscator := c.stateHintObfuscator
+	broadcastStateNum := c.cfg.extractStateNumHint(
+		commitTxBroadcast, obfuscator,
+	)
+
+	// We'll go on to check whether it could be our own commitment that was
+	// published and know is confirmed.
+	ok, err := c.handleKnownLocalState(
+		commitSpend, broadcastStateNum, chainSet,
+	)
+	if err != nil {
+		return fmt.Errorf("handle known local state: %w", err)
+	}
+	if ok {
+		return nil
+	}
+
+	// Now that we know it is neither a non-cooperative closure nor a local
+	// close with the latest state, we check if it is the remote that
+	// closed with any prior or current state.
+	ok, err = c.handleKnownRemoteState(
+		commitSpend, broadcastStateNum, chainSet,
+	)
+	if err != nil {
+		return fmt.Errorf("handle known remote state: %w", err)
+	}
+	if ok {
+		return nil
+	}
+
+	// Next, we'll check to see if this is a cooperative channel closure or
+	// not. This is characterized by having an input sequence number that's
+	// finalized. This won't happen with regular commitment transactions
+	// due to the state hint encoding scheme.
+	if commitTxBroadcast.TxIn[0].Sequence == wire.MaxTxInSequenceNum {
+		// TODO(roasbeef): rare but possible, need itest case for
+		err := c.dispatchCooperativeClose(commitSpend)
+		if err != nil {
+			return fmt.Errorf("handle coop close: %w", err)
+		}
+
+		return nil
+	}
+
+	log.Warnf("Unknown commitment broadcast for ChannelPoint(%v) ",
+		c.cfg.chanState.FundingOutpoint)
+
+	// We'll try to recover as best as possible from losing state.  We
+	// first check if this was a local unknown state. This could happen if
+	// we force close, then lose state or attempt recovery before the
+	// commitment confirms.
+	ok, err = c.handleUnknownLocalState(
+		commitSpend, broadcastStateNum, chainSet,
+	)
+	if err != nil {
+		return fmt.Errorf("handle known local state: %w", err)
+	}
+	if ok {
+		return nil
+	}
+
+	// Since it was neither a known remote state, nor a local state that
+	// was published, it most likely mean we lost state and the remote node
+	// closed. In this case we must start the DLP protocol in hope of
+	// getting our money back.
+	ok, err = c.handleUnknownRemoteState(
+		commitSpend, broadcastStateNum, chainSet,
+	)
+	if err != nil {
+		return fmt.Errorf("handle unknown remote state: %w", err)
+	}
+	if ok {
+		return nil
+	}
+
+	log.Errorf("Unable to handle spending tx %v of channel point %v",
+		commitTxBroadcast.TxHash(), c.cfg.chanState.FundingOutpoint)
+
+	return nil
+}
+
+// handleRestart performs a non-blocking read on the spendNtfn channel to check
+// whether there's a commit spend already. Returns a bool to indicate whether
+// the spend was found and handled.
+func (c *chainWatcher) handleRestart(spendNtfn *chainntnfs.SpendEvent) bool {
+	defer spendNtfn.Cancel()
+
+	select {
+	// We've detected a spend of the channel onchain! Depending on the type
+	// of spend, we'll act accordingly, so we'll examine the spending
+	// transaction to determine what we should do.
+	//
+	// TODO(Roasbeef): need to be able to ensure this only triggers
+	// on confirmation, to ensure if multiple txns are broadcast, we
+	// act on the one that's timestamped
+	case commitSpend, ok := <-spendNtfn.Spend:
+		// If the channel was closed, then this means that the notifier
+		// exited, so we will as well.
+		if !ok {
+			return false
+		}
+
+		err := c.handleCommitSpend(commitSpend)
+		if err != nil {
+			log.Errorf("Failed to handle commit spend: %v", err)
+		}
+
+		return true
+
+	default:
+		return false
 	}
 }
