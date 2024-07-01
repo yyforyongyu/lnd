@@ -811,11 +811,8 @@ func (c *ChannelArbitrator) relaunchResolvers(commitSet *CommitSet,
 
 // Report returns htlc reports for the active resolvers.
 func (c *ChannelArbitrator) Report() []*ContractReport {
-	c.activeResolversLock.RLock()
-	defer c.activeResolversLock.RUnlock()
-
 	var reports []*ContractReport
-	for _, resolver := range c.activeResolvers {
+	for _, resolver := range c.resolvers() {
 		r, ok := resolver.(reportingContractResolver)
 		if !ok {
 			continue
@@ -1569,6 +1566,7 @@ func (c *ChannelArbitrator) findCommitmentDeadlineAndValue(heightHint uint32,
 // resolveContracts updates the activeResolvers list and starts to resolve each
 // contract concurrently, and launches them.
 func (c *ChannelArbitrator) resolveContracts(resolvers []ContractResolver) {
+	// Update the active contract resolvers.
 	c.activeResolversLock.Lock()
 	c.activeResolvers = resolvers
 	c.activeResolversLock.Unlock()
@@ -1576,7 +1574,7 @@ func (c *ChannelArbitrator) resolveContracts(resolvers []ContractResolver) {
 	// Launch all resolvers.
 	c.launchResolvers()
 
-	for _, contract := range resolvers {
+	for _, contract := range c.resolvers() {
 		c.wg.Add(1)
 		go c.resolveContract(contract)
 	}
@@ -1584,9 +1582,7 @@ func (c *ChannelArbitrator) resolveContracts(resolvers []ContractResolver) {
 
 // launchResolvers launches all the active resolvers concurrently.
 func (c *ChannelArbitrator) launchResolvers() {
-	c.activeResolversLock.Lock()
-	resolvers := c.activeResolvers
-	c.activeResolversLock.Unlock()
+	resolvers := c.resolvers()
 
 	// errChans is a map of channels that will be used to receive errors
 	// returned from launching the resolvers.
@@ -3454,4 +3450,15 @@ func (c *ChannelArbitrator) abandonForwards(htlcs fn.Set[uint64]) error {
 	}
 
 	return nil
+}
+
+// resolvers returns a copy of the active resolvers.
+func (c *ChannelArbitrator) resolvers() []ContractResolver {
+	c.activeResolversLock.Lock()
+	defer c.activeResolversLock.Unlock()
+
+	resolvers := make([]ContractResolver, 0, len(c.activeResolvers))
+	resolvers = append(resolvers, c.activeResolvers...)
+
+	return resolvers
 }
