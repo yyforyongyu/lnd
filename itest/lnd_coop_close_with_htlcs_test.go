@@ -117,10 +117,10 @@ func coopCloseWithHTLCs(ht *lntest.HarnessTest) {
 	)
 
 	// Wait for the close tx to be in the Mempool.
-	ht.Miner.AssertTxInMempool(&closeTxid)
+	ht.AssertTxInMempool(&closeTxid)
 
 	// Wait for it to get mined and finish tearing down.
-	ht.AssertStreamChannelCoopClosed(alice, chanPoint, false, closeClient)
+	ht.AssertStreamChannelCoopClosed(alice, chanPoint, closeClient)
 }
 
 // coopCloseWithHTLCsWithRestart also tests the coop close flow when an HTLC

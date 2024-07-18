@@ -1010,7 +1010,7 @@ func testErrorHandlingOnChainFailure(ht *lntest.HarnessTest) {
 	ht.MineBlocks(node.DefaultCSV - 1)
 	ht.AssertNumPendingSweeps(ht.Bob, 1)
 	ht.MineEmptyBlocks(1)
-	ht.Miner.MineBlocksAndAssertNumTxes(1, 1)
+	ht.MineBlocksAndAssertNumTxes(1, 1)
 
 	// Restart bob so that we can test that he's able to recover everything
 	// he needs to claim a blinded HTLC.
@@ -1021,18 +1021,21 @@ func testErrorHandlingOnChainFailure(ht *lntest.HarnessTest) {
 	// value.
 	info := ht.Bob.RPC.GetInfo()
 	target := carolHTLC.IncomingExpiry - info.BlockHeight
-	ht.MineBlocks(target)
+	ht.MineBlocks(int(target))
 
 	// Wait for Bob's timeout transaction in the mempool, since we've
 	// suspended Carol we don't need to account for her commitment output
 	// claim.
-	ht.Miner.MineBlocksAndAssertNumTxes(1, 1)
 	ht.AssertNumPendingSweeps(ht.Bob, 0)
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+
+	// Clean up the rest of our force close: mine blocks so that Bob's CSV
+	// expires plus one block to trigger his sweep and then mine it.
+	ht.MineBlocks(node.DefaultCSV - 1)
+	ht.AssertNumPendingSweeps(ht.Bob, 1)
+	ht.MineBlocksAndAssertNumTxes(1, 1)
 
 	// Assert that the HTLC has cleared.
-	ht.WaitForBlockchainSync(ht.Bob)
-	ht.WaitForBlockchainSync(ht.Alice)
-
 	ht.AssertHTLCNotActive(ht.Bob, testCase.channels[0], hash[:])
 	ht.AssertHTLCNotActive(ht.Alice, testCase.channels[0], hash[:])
 
@@ -1045,11 +1048,6 @@ func testErrorHandlingOnChainFailure(ht *lntest.HarnessTest) {
 		ht, htlcs[0].Failure.Code,
 		lnrpc.Failure_INVALID_ONION_BLINDING,
 	)
-
-	// Clean up the rest of our force close: mine blocks so that Bob's CSV
-	// expires plus one block to trigger his sweep and then mine it.
-	ht.MineBlocks(node.DefaultCSV + 1)
-	ht.Miner.MineBlocksAndAssertNumTxes(1, 1)
 
 	// Bring carol back up so that we can close out the rest of our
 	// channels cooperatively. She requires an interceptor to start up

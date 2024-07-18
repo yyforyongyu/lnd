@@ -23,6 +23,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
+	"github.com/lightningnetwork/lnd/lntest/miner"
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/rpc"
 	"github.com/lightningnetwork/lnd/lntest/wait"
@@ -54,7 +55,8 @@ func (h *HarnessTest) WaitForBlockchainSync(hn *node.HarnessNode) {
 		return fmt.Errorf("%s is not synced to chain", hn.Name())
 	}, DefaultTimeout)
 
-	require.NoError(h, err, "timeout waiting for blockchain sync")
+	require.NoError(h, err, "%s: timeout waiting for blockchain sync",
+		hn.Name())
 }
 
 // WaitForBlockchainSyncTo waits until the node is synced to bestBlock.
@@ -632,8 +634,7 @@ func (h *HarnessTest) AssertNumPendingForceClose(hn *node.HarnessNode,
 // - assert the node has zero waiting close channels.
 // - assert the node has seen the channel close update.
 func (h *HarnessTest) AssertStreamChannelCoopClosed(hn *node.HarnessNode,
-	cp *lnrpc.ChannelPoint, anchors bool,
-	stream rpc.CloseChanClient) *chainhash.Hash {
+	cp *lnrpc.ChannelPoint, stream rpc.CloseChanClient) *chainhash.Hash {
 
 	// Assert the channel is waiting close.
 	resp := h.AssertChannelWaitingClose(hn, cp)
@@ -646,16 +647,12 @@ func (h *HarnessTest) AssertStreamChannelCoopClosed(hn *node.HarnessNode,
 	// We'll now, generate a single block, wait for the final close status
 	// update, then ensure that the closing transaction was included in the
 	// block. If there are anchors, we also expect an anchor sweep.
-	expectedTxes := 1
-	if anchors {
-		expectedTxes = 2
-	}
-	block := h.MineBlocksAndAssertNumTxes(1, expectedTxes)[0]
+	block := h.MineBlocksAndAssertNumTxes(1, 1)[0]
 
 	// Consume one close event and assert the closing txid can be found in
 	// the block.
 	closingTxid := h.WaitForChannelCloseEvent(stream)
-	h.Miner.AssertTxInBlock(block, closingTxid)
+	h.AssertTxInBlock(block, closingTxid)
 
 	// We should see zero waiting close channels now.
 	h.AssertNumWaitingClose(hn, 0)
@@ -699,7 +696,7 @@ func (h *HarnessTest) AssertStreamChannelForceClosed(hn *node.HarnessNode,
 	// Consume one close event and assert the closing txid can be found in
 	// the block.
 	closingTxid := h.WaitForChannelCloseEvent(stream)
-	h.Miner.AssertTxInBlock(block, closingTxid)
+	h.AssertTxInBlock(block, closingTxid)
 
 	// We should see zero waiting close channels and 1 pending force close
 	// channels now.
@@ -784,8 +781,13 @@ func (h *HarnessTest) AssertNumUTXOsWithConf(hn *node.HarnessNode,
 			return nil
 		}
 
+		desc := "has UTXOs:\n"
+		for _, utxo := range resp.Utxos {
+			desc += fmt.Sprintf("%v\n", utxo)
+		}
+
 		return errNumNotMatched(hn.Name(), "num of UTXOs",
-			expectedUtxos, total-old, total, old)
+			expectedUtxos, total-old, total, old, desc)
 	}, DefaultTimeout)
 	require.NoError(h, err, "timeout waiting for UTXOs")
 
@@ -937,7 +939,7 @@ func (h *HarnessTest) RandomPreimage() lntypes.Preimage {
 
 // DecodeAddress decodes a given address and asserts there's no error.
 func (h *HarnessTest) DecodeAddress(addr string) btcutil.Address {
-	resp, err := btcutil.DecodeAddress(addr, harnessNetParams)
+	resp, err := btcutil.DecodeAddress(addr, miner.HarnessNetParams)
 	require.NoError(h, err, "DecodeAddress failed")
 
 	return resp
@@ -2015,6 +2017,7 @@ func (h *HarnessTest) CreateBurnAddr(addrType lnrpc.AddressType) ([]byte,
 	require.NoError(h, err)
 
 	randomKeyBytes := randomPrivKey.PubKey().SerializeCompressed()
+	harnessNetParams := miner.HarnessNetParams
 
 	var addr btcutil.Address
 	switch addrType {
@@ -2562,11 +2565,11 @@ func (h *HarnessTest) AssertClosingTxInMempool(cp *lnrpc.ChannelPoint,
 	}
 
 	// Wait for the expected txes to be found in the mempool.
-	h.Miner.AssertNumTxsInMempool(expectedTxes)
+	h.AssertNumTxsInMempool(expectedTxes)
 
 	// Get the closing tx from the mempool.
 	op := h.OutPointFromChannelPoint(cp)
-	closeTx := h.Miner.AssertOutpointInMempool(op)
+	closeTx := h.AssertOutpointInMempool(op)
 
 	return closeTx
 }
@@ -2576,11 +2579,11 @@ func (h *HarnessTest) AssertClosingTxInMempool(cp *lnrpc.ChannelPoint,
 // will assert the anchor sweep tx is also in the mempool.
 func (h *HarnessTest) MineClosingTx(cp *lnrpc.ChannelPoint) *wire.MsgTx {
 	// Wait for the expected txes to be found in the mempool.
-	h.Miner.AssertNumTxsInMempool(1)
+	h.AssertNumTxsInMempool(1)
 
 	// Get the closing tx from the mempool.
 	op := h.OutPointFromChannelPoint(cp)
-	closeTx := h.Miner.AssertOutpointInMempool(op)
+	closeTx := h.AssertOutpointInMempool(op)
 
 	// Mine a block to confirm the closing transaction and potential anchor
 	// sweep.
@@ -2663,4 +2666,37 @@ func (h *HarnessTest) FindSweepingTxns(txns []*wire.MsgTx,
 	require.Len(h, sweepTxns, expectedNumSweeps, "unexpected num of sweeps")
 
 	return sweepTxns
+}
+
+// AssertForceCloseAndAnchorTxnsInMempool asserts that the force close and
+// anchor sweep txns are found in the mempool and returns the force close tx
+// and the anchor sweep tx.
+func (h *HarnessTest) AssertForceCloseAndAnchorTxnsInMempool() (*wire.MsgTx,
+	*wire.MsgTx) {
+
+	// Assert there are two txns in the mempool.
+	txns := h.GetNumTxsFromMempool(2)
+
+	// Assume the first is the force close tx.
+	forceCloseTx, anchorSweepTx := txns[0], txns[1]
+
+	// Get the txid.
+	closeTxid := forceCloseTx.TxHash()
+
+	// We now check whether there is an anchor input used in the assumed
+	// anchorSweepTx by checking every input's previous outpoint against
+	// the assumed closingTxid. If we fail to find one, it means the first
+	// item from the above txns is the anchor sweeping tx.
+	for _, inp := range anchorSweepTx.TxIn {
+		if inp.PreviousOutPoint.Hash == closeTxid {
+			// Found a match, this is indeed the anchor sweeping tx
+			// so we return it here.
+			return forceCloseTx, anchorSweepTx
+		}
+	}
+
+	// The assumed order is incorrect so we swap and return.
+	forceCloseTx, anchorSweepTx = anchorSweepTx, forceCloseTx
+
+	return forceCloseTx, anchorSweepTx
 }
