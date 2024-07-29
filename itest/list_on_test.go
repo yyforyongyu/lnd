@@ -50,6 +50,10 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testSendAllCoins,
 	},
 	{
+		Name:     "send selected coins",
+		TestFunc: testSendSelectedCoins,
+	},
+	{
 		Name:     "disconnecting target peer",
 		TestFunc: testDisconnectingTargetPeer,
 	},
