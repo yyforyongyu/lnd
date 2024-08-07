@@ -1385,7 +1385,7 @@ func (c *ChannelArbitrator) sweepAnchors(anchors *lnwallet.AnchorResolutions,
 		_, err = c.cfg.Sweeper.SweepInput(
 			&anchorInput,
 			sweep.Params{
-				Exclusive:      &exclusive,
+				Exclusive:      fn.Some(exclusive),
 				Budget:         budget,
 				DeadlineHeight: deadlineHeight,
 			},

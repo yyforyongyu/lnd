@@ -46,7 +46,7 @@ var (
 type Params struct {
 	// Exclusive is an identifier that, if set, prevents other inputs with
 	// the same identifier from being batched together.
-	Exclusive *uint64
+	Exclusive fn.Option[uint64]
 
 	// DeadlineHeight specifies an absolute block height that this input
 	// should be confirmed by. This value is used by the fee bumper to
@@ -75,9 +75,9 @@ func (p Params) String() string {
 	})
 
 	exclusiveGroup := "none"
-	if p.Exclusive != nil {
-		exclusiveGroup = fmt.Sprintf("%d", *p.Exclusive)
-	}
+	p.Exclusive.WhenSome(func(e uint64) {
+		exclusiveGroup = fmt.Sprintf("%d", e)
+	})
 
 	return fmt.Sprintf("startingFeeRate=%v, immediate=%v, "+
 		"exclusive_group=%v, budget=%v, deadline=%v", p.StartingFeeRate,
@@ -723,12 +723,17 @@ func (s *UtxoSweeper) removeExclusiveGroup(group uint64) {
 		outpoint := outpoint
 
 		// Skip inputs that aren't exclusive.
-		if input.params.Exclusive == nil {
+		if input.params.Exclusive.IsNone() {
 			continue
 		}
 
 		// Skip inputs from other exclusive groups.
-		if *input.params.Exclusive != group {
+		var sameGroup bool
+		input.params.Exclusive.WhenSome(func(g uint64) {
+			sameGroup = g == group
+		})
+
+		if !sameGroup {
 			continue
 		}
 
@@ -1313,13 +1318,12 @@ func (s *UtxoSweeper) handleExistingInput(input *sweepInputMessage,
 	// inputs were used as CPFP, so we need to make sure we update the
 	// sweep parameters but also remove all inputs with the same exclusive
 	// group because the are outdated too.
-	var prevExclGroup *uint64
-	if oldInput.params.Exclusive != nil &&
-		input.params.Exclusive == nil {
-
-		prevExclGroup = new(uint64)
-		*prevExclGroup = *oldInput.params.Exclusive
-	}
+	var previousGroup fn.Option[uint64]
+	oldInput.params.Exclusive.WhenSome(func(oldGroup uint64) {
+		if input.params.Exclusive.IsNone() {
+			previousGroup = oldInput.params.Exclusive
+		}
+	})
 
 	// Update input details and sweep parameters. The re-offered input
 	// details may contain a change to the unconfirmed parent tx info.
@@ -1334,9 +1338,9 @@ func (s *UtxoSweeper) handleExistingInput(input *sweepInputMessage,
 	// Add additional result channel to signal spend of this input.
 	oldInput.listeners = append(oldInput.listeners, input.resultChan)
 
-	if prevExclGroup != nil {
-		s.removeExclusiveGroup(*prevExclGroup)
-	}
+	previousGroup.WhenSome(func(g uint64) {
+		s.removeExclusiveGroup(g)
+	})
 }
 
 // handleInputSpent takes a spend event of our input and updates the sweeper's
@@ -1431,9 +1435,9 @@ func (s *UtxoSweeper) markInputsSwept(tx *wire.MsgTx, isOurTx bool) {
 		})
 
 		// Remove all other inputs in this exclusive group.
-		if input.params.Exclusive != nil {
-			s.removeExclusiveGroup(*input.params.Exclusive)
-		}
+		input.params.Exclusive.WhenSome(func(group uint64) {
+			s.removeExclusiveGroup(group)
+		})
 	}
 }
 
@@ -1445,9 +1449,9 @@ func (s *UtxoSweeper) markInputFailed(pi *SweeperInput, err error) {
 	pi.state = Failed
 
 	// Remove all other inputs in this exclusive group.
-	if pi.params.Exclusive != nil {
-		s.removeExclusiveGroup(*pi.params.Exclusive)
-	}
+	pi.params.Exclusive.WhenSome(func(group uint64) {
+		s.removeExclusiveGroup(group)
+	})
 
 	s.signalResult(pi, Result{Err: err})
 }

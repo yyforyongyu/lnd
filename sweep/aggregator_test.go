@@ -449,12 +449,12 @@ func TestBudgetInputSetClusterInputs(t *testing.T) {
 
 	// Add the exclusive input to the inputs map. We expect this input to
 	// be in its own input set although it has deadline1.
-	exclusive := uint64(123)
+	exclusive := fn.Some(uint64(123))
 	inputs[opExclusive] = &SweeperInput{
 		Input: inpExclusive,
 		params: Params{
 			Budget:    budgetHigh,
-			Exclusive: &exclusive,
+			Exclusive: exclusive,
 		},
 		DeadlineHeight: deadline1,
 	}
