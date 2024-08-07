@@ -141,6 +141,9 @@ func (c *anchorResolver) Resolve(_ bool) (ContractResolver, error) {
 			// large deadline here to prevent it from being grouped
 			// with other inputs.
 			DeadlineHeight: fn.Some(anchorSweepDeadline),
+
+			// TODO(yy): pass the short channel ID here.
+			Exclusive: fn.Some(uint64(0)),
 		},
 	)
 	if err != nil {
