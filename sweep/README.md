@@ -82,8 +82,7 @@ flowchart LR
 deadline together. Inputs with the same deadline express the same time
 sensitivity, so it makes sense to sweep them in the same transaction. Once
 grouped, inputs in each batch are sorted based on their budgets. The only
-exception is inputs with the `ExclusiveGroup` flag set, which will be swept
-alone.
+exception is inputs with the `Exclusive` flag set, which will be swept alone.
 
 Once the batching is finished, an `InputSet` is returned, which is an interface
 used to decide whether a wallet UTXO is needed or not when creating the

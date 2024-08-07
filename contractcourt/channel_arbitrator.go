@@ -1303,7 +1303,7 @@ func (c *ChannelArbitrator) sweepAnchors(anchors *lnwallet.AnchorResolutions,
 
 	// Use the chan id as the exclusive group. This prevents any of the
 	// anchors from being batched together.
-	exclusiveGroup := c.cfg.ShortChanID.ToUint64()
+	exclusive := c.cfg.ShortChanID.ToUint64()
 
 	// sweepWithDeadline is a helper closure that takes an anchor
 	// resolution and sweeps it with its corresponding deadline.
@@ -1385,7 +1385,7 @@ func (c *ChannelArbitrator) sweepAnchors(anchors *lnwallet.AnchorResolutions,
 		_, err = c.cfg.Sweeper.SweepInput(
 			&anchorInput,
 			sweep.Params{
-				ExclusiveGroup: &exclusiveGroup,
+				Exclusive:      &exclusive,
 				Budget:         budget,
 				DeadlineHeight: deadlineHeight,
 			},

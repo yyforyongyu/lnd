@@ -44,9 +44,9 @@ var (
 
 // Params contains the parameters that control the sweeping process.
 type Params struct {
-	// ExclusiveGroup is an identifier that, if set, prevents other inputs
-	// with the same identifier from being batched together.
-	ExclusiveGroup *uint64
+	// Exclusive is an identifier that, if set, prevents other inputs with
+	// the same identifier from being batched together.
+	Exclusive *uint64
 
 	// DeadlineHeight specifies an absolute block height that this input
 	// should be confirmed by. This value is used by the fee bumper to
@@ -75,8 +75,8 @@ func (p Params) String() string {
 	})
 
 	exclusiveGroup := "none"
-	if p.ExclusiveGroup != nil {
-		exclusiveGroup = fmt.Sprintf("%d", *p.ExclusiveGroup)
+	if p.Exclusive != nil {
+		exclusiveGroup = fmt.Sprintf("%d", *p.Exclusive)
 	}
 
 	return fmt.Sprintf("startingFeeRate=%v, immediate=%v, "+
@@ -537,7 +537,7 @@ func (s *UtxoSweeper) SweepInput(inp input.Input,
 // remote-dangling, remote). Using neutrino all of those transactions will be
 // accepted (the commitment tx will be different in all of those cases) and have
 // to be removed as soon as one of them confirmes (they do have the same
-// ExclusiveGroup). For neutrino backends the corresponding BIP 157 serving full
+// Exclusive). For neutrino backends the corresponding BIP 157 serving full
 // nodes do not signal invalid transactions anymore.
 func (s *UtxoSweeper) removeConflictSweepDescendants(
 	outpoints map[wire.OutPoint]struct{}) error {
@@ -723,12 +723,12 @@ func (s *UtxoSweeper) removeExclusiveGroup(group uint64) {
 		outpoint := outpoint
 
 		// Skip inputs that aren't exclusive.
-		if input.params.ExclusiveGroup == nil {
+		if input.params.Exclusive == nil {
 			continue
 		}
 
 		// Skip inputs from other exclusive groups.
-		if *input.params.ExclusiveGroup != group {
+		if *input.params.Exclusive != group {
 			continue
 		}
 
@@ -1129,7 +1129,7 @@ func (s *UtxoSweeper) handleUpdateReq(req *updateReq) (
 		Immediate:       req.params.Immediate,
 		Budget:          req.params.Budget,
 		DeadlineHeight:  req.params.DeadlineHeight,
-		ExclusiveGroup:  sweeperInput.params.ExclusiveGroup,
+		Exclusive:       sweeperInput.params.Exclusive,
 	}
 
 	log.Debugf("Updating parameters for %v(state=%v) from (%v) to (%v)",
@@ -1314,11 +1314,11 @@ func (s *UtxoSweeper) handleExistingInput(input *sweepInputMessage,
 	// sweep parameters but also remove all inputs with the same exclusive
 	// group because the are outdated too.
 	var prevExclGroup *uint64
-	if oldInput.params.ExclusiveGroup != nil &&
-		input.params.ExclusiveGroup == nil {
+	if oldInput.params.Exclusive != nil &&
+		input.params.Exclusive == nil {
 
 		prevExclGroup = new(uint64)
-		*prevExclGroup = *oldInput.params.ExclusiveGroup
+		*prevExclGroup = *oldInput.params.Exclusive
 	}
 
 	// Update input details and sweep parameters. The re-offered input
@@ -1431,8 +1431,8 @@ func (s *UtxoSweeper) markInputsSwept(tx *wire.MsgTx, isOurTx bool) {
 		})
 
 		// Remove all other inputs in this exclusive group.
-		if input.params.ExclusiveGroup != nil {
-			s.removeExclusiveGroup(*input.params.ExclusiveGroup)
+		if input.params.Exclusive != nil {
+			s.removeExclusiveGroup(*input.params.Exclusive)
 		}
 	}
 }
@@ -1445,8 +1445,8 @@ func (s *UtxoSweeper) markInputFailed(pi *SweeperInput, err error) {
 	pi.state = Failed
 
 	// Remove all other inputs in this exclusive group.
-	if pi.params.ExclusiveGroup != nil {
-		s.removeExclusiveGroup(*pi.params.ExclusiveGroup)
+	if pi.params.Exclusive != nil {
+		s.removeExclusiveGroup(*pi.params.Exclusive)
 	}
 
 	s.signalResult(pi, Result{Err: err})
