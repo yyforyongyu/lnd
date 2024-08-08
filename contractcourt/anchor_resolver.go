@@ -122,6 +122,11 @@ func (c *anchorResolver) Resolve(_ bool) (ContractResolver, error) {
 			// There's no rush to sweep the anchor, so we use a nil
 			// deadline here.
 			DeadlineHeight: fn.None[int32](),
+
+			// For non-CPFP anchor sweeping, we also set the
+			// exclusive group so it won't be grouped with other
+			// inputs.
+			ExclusiveGroup: fn.Some(c.ShortChanID.ToUint64()),
 		},
 	)
 	if err != nil {
