@@ -46,7 +46,7 @@ var (
 type Params struct {
 	// ExclusiveGroup is an identifier that, if set, prevents other inputs
 	// with the same identifier from being batched together.
-	ExclusiveGroup *uint64
+	ExclusiveGroup fn.Option[uint64]
 
 	// DeadlineHeight specifies an absolute block height that this input
 	// should be confirmed by. This value is used by the fee bumper to
@@ -75,9 +75,9 @@ func (p Params) String() string {
 	})
 
 	exclusiveGroup := "none"
-	if p.ExclusiveGroup != nil {
-		exclusiveGroup = fmt.Sprintf("%d", *p.ExclusiveGroup)
-	}
+	p.ExclusiveGroup.WhenSome(func(g uint64) {
+		exclusiveGroup = fmt.Sprintf("%d", g)
+	})
 
 	return fmt.Sprintf("startingFeeRate=%v, immediate=%v, "+
 		"exclusive_group=%v, budget=%v, deadline=%v", p.StartingFeeRate,
@@ -722,13 +722,18 @@ func (s *UtxoSweeper) removeExclusiveGroup(group uint64) {
 	for outpoint, input := range s.inputs {
 		outpoint := outpoint
 
-		// Skip inputs that aren't exclusive.
-		if input.params.ExclusiveGroup == nil {
-			continue
-		}
+		var isSameGroup bool
 
-		// Skip inputs from other exclusive groups.
-		if *input.params.ExclusiveGroup != group {
+		// If the input has an exclusive group, we check if it is the
+		// same as the above group.
+		input.params.ExclusiveGroup.WhenSome(func(g uint64) {
+			isSameGroup = g == group
+		})
+
+		// Skip the input if the group is not the same. This means
+		// either the input doesn't have an exclusive group set, or the
+		// group ID is different.
+		if !isSameGroup {
 			continue
 		}
 
@@ -1313,12 +1318,11 @@ func (s *UtxoSweeper) handleExistingInput(input *sweepInputMessage,
 	// inputs were used as CPFP, so we need to make sure we update the
 	// sweep parameters but also remove all inputs with the same exclusive
 	// group because the are outdated too.
-	var prevExclGroup *uint64
-	if oldInput.params.ExclusiveGroup != nil &&
-		input.params.ExclusiveGroup == nil {
-
-		prevExclGroup = new(uint64)
-		*prevExclGroup = *oldInput.params.ExclusiveGroup
+	var prevExclGroup fn.Option[uint64]
+	if oldInput.params.ExclusiveGroup.IsSome() {
+		if input.params.ExclusiveGroup.IsNone() {
+			prevExclGroup = oldInput.params.ExclusiveGroup
+		}
 	}
 
 	// Update input details and sweep parameters. The re-offered input
@@ -1334,9 +1338,9 @@ func (s *UtxoSweeper) handleExistingInput(input *sweepInputMessage,
 	// Add additional result channel to signal spend of this input.
 	oldInput.listeners = append(oldInput.listeners, input.resultChan)
 
-	if prevExclGroup != nil {
-		s.removeExclusiveGroup(*prevExclGroup)
-	}
+	prevExclGroup.WhenSome(func(group uint64) {
+		s.removeExclusiveGroup(group)
+	})
 }
 
 // handleInputSpent takes a spend event of our input and updates the sweeper's
@@ -1431,9 +1435,9 @@ func (s *UtxoSweeper) markInputsSwept(tx *wire.MsgTx, isOurTx bool) {
 		})
 
 		// Remove all other inputs in this exclusive group.
-		if input.params.ExclusiveGroup != nil {
-			s.removeExclusiveGroup(*input.params.ExclusiveGroup)
-		}
+		input.params.ExclusiveGroup.WhenSome(func(g uint64) {
+			s.removeExclusiveGroup(g)
+		})
 	}
 }
 
@@ -1445,9 +1449,9 @@ func (s *UtxoSweeper) markInputFailed(pi *SweeperInput, err error) {
 	pi.state = Failed
 
 	// Remove all other inputs in this exclusive group.
-	if pi.params.ExclusiveGroup != nil {
-		s.removeExclusiveGroup(*pi.params.ExclusiveGroup)
-	}
+	pi.params.ExclusiveGroup.WhenSome(func(g uint64) {
+		s.removeExclusiveGroup(g)
+	})
 
 	s.signalResult(pi, Result{Err: err})
 }
@@ -1509,6 +1513,17 @@ func (s *UtxoSweeper) updateSweeperInputs() InputsMap {
 			log.Infof("Skipping input %v due to CSV expiry=%v not "+
 				"reached, current height is %v", op, locktime,
 				s.currentHeight)
+
+			continue
+		}
+
+		// If the input has a deadline that's two weeks away, we won't
+		// attempt to create a sweeping tx and fee bump it now.
+		deadline := input.params.DeadlineHeight.UnwrapOr(0)
+		if deadline > s.currentHeight+DefaultDeadlineDelta*2 {
+			log.Infof("Skipping input %v since its deadline=%v is "+
+				"far in the future, current height is %v", op,
+				deadline, s.currentHeight)
 
 			continue
 		}

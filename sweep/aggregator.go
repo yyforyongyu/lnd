@@ -78,7 +78,7 @@ func (b *BudgetAggregator) ClusterInputs(inputs InputsMap) []InputSet {
 		height := input.DeadlineHeight
 
 		// Put exclusive inputs in their own set.
-		if input.params.ExclusiveGroup != nil {
+		if input.params.ExclusiveGroup.IsSome() {
 			log.Tracef("Input %v is exclusive", input.OutPoint())
 			exclusiveInputs[input.OutPoint()] = clusterGroup{
 				height: []SweeperInput{*input},
