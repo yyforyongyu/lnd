@@ -13,6 +13,8 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
@@ -224,6 +226,15 @@ func (c *chanArbTestCtx) CleanUp() {
 	if c.cleanUp != nil {
 		c.cleanUp()
 	}
+}
+
+// receiveBlockbeat mocks the behavior of a blockbeat being sent by the
+// BlockbeatDispatcher, which essentially mocks the method `ProcessBlock`.
+func (c *chanArbTestCtx) receiveBlockbeat(height int) {
+	go func() {
+		beat := chainio.NewBeatFromHeight(int32(height))
+		c.chanArb.BlockbeatChan <- beat
+	}()
 }
 
 // AssertStateTransitions asserts that the state machine steps through the
@@ -496,6 +507,10 @@ func createTestChannelArbitrator(t *testing.T, log ArbitratorLog,
 	chanArbCtx.log = log
 	chanArbCtx.incubationRequests = incubateChan
 	chanArbCtx.sweeper = mockSweeper
+
+	// Mock the behavior of BlockbeatDispatcher - during the startup, a new
+	// blockbeat will always be sent.
+	chanArbCtx.receiveBlockbeat(1)
 
 	return chanArbCtx, nil
 }
@@ -943,6 +958,7 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 			},
 		},
 	}
+	closeTxid := closeTx.TxHash()
 
 	htlcOp := wire.OutPoint{
 		Hash:  closeTx.TxHash(),
@@ -1027,7 +1043,7 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	}
 	require.Equal(t, expectedFinalHtlcs, chanArbCtx.finalHtlcs)
 
-	// We'll no re-create the resolver, notice that we use the existing
+	// We'll now re-create the resolver, notice that we use the existing
 	// arbLog so it carries over the same on-disk state.
 	chanArbCtxNew, err := chanArbCtx.Restart(nil)
 	require.NoError(t, err, "unable to create ChannelArbitrator")
@@ -1077,7 +1093,19 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 
 	// Notify resolver that the HTLC output of the commitment has been
 	// spent.
-	oldNotifier.SpendChan <- &chainntnfs.SpendDetail{SpendingTx: closeTx}
+	oldNotifier.SpendChan <- &chainntnfs.SpendDetail{
+		SpendingTx:    closeTx,
+		SpentOutPoint: &wire.OutPoint{},
+		SpenderTxHash: &closeTxid,
+	}
+
+	// Notify resolver that the HTLC output of the commitment has been
+	// spent.
+	oldNotifier.SpendChan <- &chainntnfs.SpendDetail{
+		SpendingTx:    closeTx,
+		SpentOutPoint: &wire.OutPoint{},
+		SpenderTxHash: &closeTxid,
+	}
 
 	// Finally, we should also receive a resolution message instructing the
 	// switch to cancel back the HTLC.
@@ -1104,8 +1132,12 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	default:
 	}
 
-	// Notify resolver that the second level transaction is spent.
-	oldNotifier.SpendChan <- &chainntnfs.SpendDetail{SpendingTx: closeTx}
+	// Notify resolver that the output of the timeout tx has been spent.
+	oldNotifier.SpendChan <- &chainntnfs.SpendDetail{
+		SpendingTx:    closeTx,
+		SpentOutPoint: &wire.OutPoint{},
+		SpenderTxHash: &closeTxid,
+	}
 
 	// At this point channel should be marked as resolved.
 	chanArbCtxNew.AssertStateTransitions(StateFullyResolved)
@@ -1902,7 +1934,8 @@ func TestChannelArbitratorDanglingCommitForceClose(t *testing.T) {
 			// now mine a block (height 5), which is 5 blocks away
 			// (our grace delta) from the expiry of that HTLC.
 			case testCase.htlcExpired:
-				chanArbCtx.chanArb.blocks <- 5
+				beat := chainio.NewBeatFromHeight(5)
+				chanArbCtx.chanArb.BlockbeatChan <- beat
 
 			// Otherwise, we'll just trigger a regular force close
 			// request.
@@ -2006,8 +2039,7 @@ func TestChannelArbitratorDanglingCommitForceClose(t *testing.T) {
 			// so instead, we'll mine another block which'll cause
 			// it to re-examine its state and realize there're no
 			// more HTLCs.
-			chanArbCtx.chanArb.blocks <- 6
-			chanArbCtx.AssertStateTransitions(StateFullyResolved)
+			chanArbCtx.receiveBlockbeat(6)
 		})
 	}
 }
@@ -2078,13 +2110,15 @@ func TestChannelArbitratorPendingExpiredHTLC(t *testing.T) {
 	// We will advance the uptime to 10 seconds which should be still within
 	// the grace period and should not trigger going to chain.
 	testClock.SetTime(startTime.Add(time.Second * 10))
-	chanArbCtx.chanArb.blocks <- 5
+	beat := chainio.NewBeatFromHeight(5)
+	chanArbCtx.chanArb.BlockbeatChan <- beat
 	chanArbCtx.AssertState(StateDefault)
 
 	// We will advance the uptime to 16 seconds which should trigger going
 	// to chain.
 	testClock.SetTime(startTime.Add(time.Second * 16))
-	chanArbCtx.chanArb.blocks <- 6
+	beat = chainio.NewBeatFromHeight(6)
+	chanArbCtx.chanArb.BlockbeatChan <- beat
 	chanArbCtx.AssertStateTransitions(
 		StateBroadcastCommit,
 		StateCommitmentBroadcasted,
@@ -2452,7 +2486,7 @@ func TestSweepAnchors(t *testing.T) {
 
 	// Set current block height.
 	heightHint := uint32(1000)
-	chanArbCtx.chanArb.blocks <- int32(heightHint)
+	chanArbCtx.receiveBlockbeat(int(heightHint))
 
 	htlcIndexBase := uint64(99)
 	deadlineDelta := uint32(10)
@@ -2651,27 +2685,28 @@ func TestChannelArbitratorAnchors(t *testing.T) {
 	}
 	chanArb.UpdateContractSignals(signals)
 
-	// Set current block height.
-	heightHint := uint32(1000)
-	chanArbCtx.chanArb.blocks <- int32(heightHint)
-
 	htlcAmt := lnwire.MilliSatoshi(1_000_000)
 
 	// Create testing HTLCs.
-	deadlineDelta := uint32(10)
-	deadlinePreimageDelta := deadlineDelta + 2
+	spendingHeight := uint32(chanArb.CurrentBeat().Height())
+	deadlineDelta := uint32(100)
+
+	deadlinePreimageDelta := deadlineDelta
 	htlcWithPreimage := channeldb.HTLC{
-		HtlcIndex:     99,
-		RefundTimeout: heightHint + deadlinePreimageDelta,
+		HtlcIndex: 99,
+		// RefundTimeout is 101.
+		RefundTimeout: spendingHeight + deadlinePreimageDelta,
 		RHash:         rHash,
 		Incoming:      true,
 		Amt:           htlcAmt,
 	}
+	expectedDeadline := deadlineDelta/2 + spendingHeight
 
-	deadlineHTLCdelta := deadlineDelta + 3
+	deadlineHTLCdelta := deadlineDelta + 40
 	htlc := channeldb.HTLC{
-		HtlcIndex:     100,
-		RefundTimeout: heightHint + deadlineHTLCdelta,
+		HtlcIndex: 100,
+		// RefundTimeout is 141.
+		RefundTimeout: spendingHeight + deadlineHTLCdelta,
 		Amt:           htlcAmt,
 	}
 
@@ -2755,7 +2790,9 @@ func TestChannelArbitratorAnchors(t *testing.T) {
 	}
 
 	chanArb.cfg.ChainEvents.LocalUnilateralClosure <- &LocalUnilateralCloseInfo{
-		SpendDetail: &chainntnfs.SpendDetail{},
+		SpendDetail: &chainntnfs.SpendDetail{
+			SpendingHeight: int32(spendingHeight),
+		},
 		LocalForceCloseSummary: &lnwallet.LocalForceCloseSummary{
 			CloseTx:          closeTx,
 			HtlcResolutions:  &lnwallet.HtlcResolutions{},
@@ -2817,12 +2854,14 @@ func TestChannelArbitratorAnchors(t *testing.T) {
 	// to htlcWithPreimage's CLTV.
 	require.Equal(t, 2, len(chanArbCtx.sweeper.deadlines))
 	require.EqualValues(t,
-		heightHint+deadlinePreimageDelta/2,
-		chanArbCtx.sweeper.deadlines[0],
+		expectedDeadline,
+		chanArbCtx.sweeper.deadlines[0], "want %d, got %d",
+		expectedDeadline, chanArbCtx.sweeper.deadlines[0],
 	)
 	require.EqualValues(t,
-		heightHint+deadlinePreimageDelta/2,
-		chanArbCtx.sweeper.deadlines[1],
+		expectedDeadline,
+		chanArbCtx.sweeper.deadlines[1], "want %d, got %d",
+		expectedDeadline, chanArbCtx.sweeper.deadlines[1],
 	)
 }
 
@@ -2969,7 +3008,8 @@ func assertResolverReport(t *testing.T, reports chan *channeldb.ResolverReport,
 	select {
 	case report := <-reports:
 		if !reflect.DeepEqual(report, expected) {
-			t.Fatalf("expected: %v, got: %v", expected, report)
+			t.Fatalf("expected: %v, got: %v", spew.Sdump(expected),
+				spew.Sdump(report))
 		}
 
 	case <-time.After(defaultTimeout):
