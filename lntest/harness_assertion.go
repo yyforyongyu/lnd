@@ -964,6 +964,11 @@ func (h *HarnessTest) AssertChannelBalanceResp(hn *node.HarnessNode,
 	expected *lnrpc.ChannelBalanceResponse) {
 
 	resp := hn.RPC.ChannelBalance()
+
+	// Ignore custom channel data of both expected and actual responses.
+	expected.CustomChannelData = nil
+	resp.CustomChannelData = nil
+
 	require.True(h, proto.Equal(expected, resp), "balance is incorrect "+
 		"got: %v, want: %v", resp, expected)
 }
@@ -1600,13 +1605,16 @@ func (h *HarnessTest) findPayment(hn *node.HarnessNode,
 	return nil
 }
 
+// PaymentCheck is a function that checks a payment for a specific condition.
+type PaymentCheck func(*lnrpc.Payment) error
+
 // AssertPaymentStatus asserts that the given node list a payment with the
 // given preimage has the expected status. It also checks that the payment has
 // the expected preimage, which is empty when it's not settled and matches the
 // given preimage when it's succeeded.
 func (h *HarnessTest) AssertPaymentStatus(hn *node.HarnessNode,
-	preimage lntypes.Preimage,
-	status lnrpc.Payment_PaymentStatus) *lnrpc.Payment {
+	preimage lntypes.Preimage, status lnrpc.Payment_PaymentStatus,
+	checks ...PaymentCheck) *lnrpc.Payment {
 
 	var target *lnrpc.Payment
 	payHash := preimage.Hash()
@@ -1636,7 +1644,30 @@ func (h *HarnessTest) AssertPaymentStatus(hn *node.HarnessNode,
 			target.PaymentPreimage, "expected zero preimage")
 	}
 
+	// Perform any additional checks on the payment.
+	for _, check := range checks {
+		require.NoError(h, check(target))
+	}
+
 	return target
+}
+
+// AssertPaymentFailureReason asserts that the given node lists a payment with
+// the given preimage which has the expected failure reason.
+func (h *HarnessTest) AssertPaymentFailureReason(hn *node.HarnessNode,
+	preimage lntypes.Preimage, reason lnrpc.PaymentFailureReason) {
+
+	payHash := preimage.Hash()
+	err := wait.NoError(func() error {
+		p := h.findPayment(hn, payHash.String())
+		if reason == p.FailureReason {
+			return nil
+		}
+
+		return fmt.Errorf("payment: %v failure reason not match, "+
+			"want %s got %s", payHash, reason, p.Status)
+	}, DefaultTimeout)
+	require.NoError(h, err, "timeout checking payment failure reason")
 }
 
 // AssertActiveNodesSynced asserts all active nodes have synced to the chain.
@@ -2218,12 +2249,12 @@ func (h *HarnessTest) AssertFeeReport(hn *node.HarnessNode,
 //
 // TODO(yy): needs refactor to reduce its complexity.
 func (h *HarnessTest) AssertHtlcEvents(client rpc.HtlcEventsClient,
-	fwdCount, fwdFailCount, settleCount int,
+	fwdCount, fwdFailCount, settleCount, linkFailCount int,
 	userType routerrpc.HtlcEvent_EventType) []*routerrpc.HtlcEvent {
 
-	var forwards, forwardFails, settles int
+	var forwards, forwardFails, settles, linkFails int
 
-	numEvents := fwdCount + fwdFailCount + settleCount
+	numEvents := fwdCount + fwdFailCount + settleCount + linkFailCount
 	events := make([]*routerrpc.HtlcEvent, 0)
 
 	// It's either the userType or the unknown type.
@@ -2256,6 +2287,9 @@ func (h *HarnessTest) AssertHtlcEvents(client rpc.HtlcEventsClient,
 				settles++
 			}
 
+		case *routerrpc.HtlcEvent_LinkFailEvent:
+			linkFails++
+
 		default:
 			require.Fail(h, "assert event fail",
 				"unexpected event: %T", event.Event)
@@ -2266,6 +2300,7 @@ func (h *HarnessTest) AssertHtlcEvents(client rpc.HtlcEventsClient,
 	require.Equal(h, fwdFailCount, forwardFails,
 		"num of forward fails mismatch")
 	require.Equal(h, settleCount, settles, "num of settles mismatch")
+	require.Equal(h, linkFailCount, linkFails, "num of link fails mismatch")
 
 	return events
 }

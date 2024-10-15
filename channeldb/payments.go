@@ -104,7 +104,7 @@ var (
 )
 
 var (
-	// ErrNoSequenceNumber is returned if we lookup a payment which does
+	// ErrNoSequenceNumber is returned if we look up a payment which does
 	// not have a sequence number.
 	ErrNoSequenceNumber = errors.New("sequence number not found")
 
@@ -147,18 +147,20 @@ const (
 	// balance to complete the payment.
 	FailureReasonInsufficientBalance FailureReason = 4
 
-	// TODO(halseth): cancel state.
+	// FailureReasonCanceled indicates that the payment was canceled by the
+	// user.
+	FailureReasonCanceled FailureReason = 5
 
 	// TODO(joostjager): Add failure reasons for:
 	// LocalLiquidityInsufficient, RemoteCapacityInsufficient.
 )
 
-// Error returns a human readable error string for the FailureReason.
+// Error returns a human-readable error string for the FailureReason.
 func (r FailureReason) Error() string {
 	return r.String()
 }
 
-// String returns a human readable FailureReason.
+// String returns a human-readable FailureReason.
 func (r FailureReason) String() string {
 	switch r {
 	case FailureReasonTimeout:
@@ -171,6 +173,8 @@ func (r FailureReason) String() string {
 		return "incorrect_payment_details"
 	case FailureReasonInsufficientBalance:
 		return "insufficient_balance"
+	case FailureReasonCanceled:
+		return "canceled"
 	}
 
 	return "unknown"
@@ -191,6 +195,11 @@ type PaymentCreationInfo struct {
 
 	// PaymentRequest is the full payment request, if any.
 	PaymentRequest []byte
+
+	// FirstHopCustomRecords are the TLV records that are to be sent to the
+	// first hop of this payment. These records will be transmitted via the
+	// wire message only and therefore do not affect the onion payload size.
+	FirstHopCustomRecords lnwire.CustomRecords
 }
 
 // htlcBucketKey creates a composite key from prefix and id where the result is
@@ -1006,10 +1015,21 @@ func serializePaymentCreationInfo(w io.Writer, c *PaymentCreationInfo) error {
 		return err
 	}
 
+	// Any remaining bytes are TLV encoded records. Currently, these are
+	// only the custom records provided by the user to be sent to the first
+	// hop. But this can easily be extended with further records by merging
+	// the records into a single TLV stream.
+	err := c.FirstHopCustomRecords.SerializeTo(w)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func deserializePaymentCreationInfo(r io.Reader) (*PaymentCreationInfo, error) {
+func deserializePaymentCreationInfo(r io.Reader) (*PaymentCreationInfo,
+	error) {
+
 	var scratch [8]byte
 
 	c := &PaymentCreationInfo{}
@@ -1042,6 +1062,15 @@ func deserializePaymentCreationInfo(r io.Reader) (*PaymentCreationInfo, error) {
 	}
 	c.PaymentRequest = payReq
 
+	// Any remaining bytes are TLV encoded records. Currently, these are
+	// only the custom records provided by the user to be sent to the first
+	// hop. But this can easily be extended with further records by merging
+	// the records into a single TLV stream.
+	c.FirstHopCustomRecords, err = lnwire.ParseCustomRecordsFrom(r)
+	if err != nil {
+		return nil, err
+	}
+
 	return c, nil
 }
 
@@ -1064,6 +1093,25 @@ func serializeHTLCAttemptInfo(w io.Writer, a *HTLCAttemptInfo) error {
 	}
 
 	if _, err := w.Write(a.Hash[:]); err != nil {
+		return err
+	}
+
+	// Merge the fixed/known records together with the custom records to
+	// serialize them as a single blob. We can't do this in SerializeRoute
+	// because we're in the middle of the byte stream there. We can only do
+	// TLV serialization at the end of the stream, since EOF is allowed for
+	// a stream if no more data is expected.
+	producers := []tlv.RecordProducer{
+		&a.Route.FirstHopAmount,
+	}
+	tlvData, err := lnwire.MergeAndEncode(
+		producers, nil, a.Route.FirstHopWireCustomRecords,
+	)
+	if err != nil {
+		return err
+	}
+
+	if _, err := w.Write(tlvData); err != nil {
 		return err
 	}
 
@@ -1103,6 +1151,22 @@ func deserializeHTLCAttemptInfo(r io.Reader) (*HTLCAttemptInfo, error) {
 	}
 
 	a.Hash = &hash
+
+	// Read any remaining data (if any) and parse it into the known records
+	// and custom records.
+	extraData, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+
+	customRecords, _, _, err := lnwire.ParseAndExtractCustomRecords(
+		extraData, &a.Route.FirstHopAmount,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	a.Route.FirstHopWireCustomRecords = customRecords
 
 	return a, nil
 }
@@ -1369,6 +1433,8 @@ func SerializeRoute(w io.Writer, r route.Route) error {
 		}
 	}
 
+	// Any new/extra TLV data is encoded in serializeHTLCAttemptInfo!
+
 	return nil
 }
 
@@ -1401,6 +1467,8 @@ func DeserializeRoute(r io.Reader) (route.Route, error) {
 		hops = append(hops, hop)
 	}
 	rt.Hops = hops
+
+	// Any new/extra TLV data is decoded in deserializeHTLCAttemptInfo!
 
 	return rt, nil
 }

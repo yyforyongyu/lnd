@@ -268,9 +268,12 @@ func TestChannelLinkRevThenSig(t *testing.T) {
 
 	// Restart Bob as well by calling NewLightningChannel.
 	bobSigner := harness.bobChannel.Signer
+	signerMock := lnwallet.NewDefaultAuxSignerMock(t)
 	bobPool := lnwallet.NewSigPool(runtime.NumCPU(), bobSigner)
 	bobChannel, err := lnwallet.NewLightningChannel(
 		bobSigner, harness.bobChannel.State(), bobPool,
+		lnwallet.WithLeafStore(&lnwallet.MockAuxLeafStore{}),
+		lnwallet.WithAuxSigner(signerMock),
 	)
 	require.NoError(t, err)
 	err = bobPool.Start()
@@ -403,9 +406,12 @@ func TestChannelLinkSigThenRev(t *testing.T) {
 
 	// Restart Bob as well by calling NewLightningChannel.
 	bobSigner := harness.bobChannel.Signer
+	signerMock := lnwallet.NewDefaultAuxSignerMock(t)
 	bobPool := lnwallet.NewSigPool(runtime.NumCPU(), bobSigner)
 	bobChannel, err := lnwallet.NewLightningChannel(
 		bobSigner, harness.bobChannel.State(), bobPool,
+		lnwallet.WithLeafStore(&lnwallet.MockAuxLeafStore{}),
+		lnwallet.WithAuxSigner(signerMock),
 	)
 	require.NoError(t, err)
 	err = bobPool.Start()
@@ -444,7 +450,7 @@ func TestChannelLinkSingleHopPayment(t *testing.T) {
 	t.Parallel()
 
 	// Setup a alice-bob network.
-	alice, bob, err := createTwoClusterChannels(
+	alice, bob, err := createMirroredChannel(
 		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
 	)
 	require.NoError(t, err, "unable to create channel")
@@ -2072,6 +2078,8 @@ func (m *mockPeer) QuitSignal() <-chan struct{} {
 	return m.quit
 }
 
+func (m *mockPeer) Disconnect(err error) {}
+
 var _ lnpeer.Peer = (*mockPeer)(nil)
 
 func (m *mockPeer) SendMessage(sync bool, msgs ...lnwire.Message) error {
@@ -2333,7 +2341,7 @@ func handleStateUpdate(link *channelLink,
 	if !ok {
 		return fmt.Errorf("expected RevokeAndAck got %T", msg)
 	}
-	_, _, _, _, err = remoteChannel.ReceiveRevocation(revoke)
+	_, _, err = remoteChannel.ReceiveRevocation(revoke)
 	if err != nil {
 		return fmt.Errorf("unable to receive "+
 			"revocation: %v", err)
@@ -2387,7 +2395,7 @@ func updateState(batchTick chan time.Time, link *channelLink,
 		return fmt.Errorf("expected RevokeAndAck got %T",
 			msg)
 	}
-	_, _, _, _, err = remoteChannel.ReceiveRevocation(revoke)
+	_, _, err = remoteChannel.ReceiveRevocation(revoke)
 	if err != nil {
 		return fmt.Errorf("unable to receive "+
 			"revocation: %v", err)
@@ -3641,7 +3649,7 @@ func TestChannelLinkTrimCircuitsRemoteCommit(t *testing.T) {
 	rev, _, _, err := harness.bobChannel.RevokeCurrentCommitment()
 	require.NoError(t, err, "unable to revoke current commitment")
 
-	_, _, _, _, err = alice.channel.ReceiveRevocation(rev)
+	_, _, err = alice.channel.ReceiveRevocation(rev)
 	require.NoError(t, err, "unable to receive revocation")
 
 	// Restart Alice's link, which simulates a disconnection with the remote
@@ -4471,9 +4479,19 @@ func TestChannelLinkUpdateCommitFee(t *testing.T) {
 
 	// Triggering the link to update the fee of the channel with a fee rate
 	// that exceeds its maximum fee allocation should result in a fee rate
-	// corresponding to the maximum fee allocation.
+	// corresponding to the maximum fee allocation. Increase the dust
+	// threshold so that we don't trigger that logic.
+	highFeeExposure := lnwire.NewMSatFromSatoshis(
+		2 * btcutil.SatoshiPerBitcoin,
+	)
 	const maxFeeRate chainfee.SatPerKWeight = 207180182
+	n.aliceChannelLink.cfg.MaxFeeExposure = highFeeExposure
+	n.firstBobChannelLink.cfg.MaxFeeExposure = highFeeExposure
 	triggerFeeUpdate(maxFeeRate+1, minRelayFee, maxFeeRate, true)
+
+	// Decrease the max fee exposure back to normal.
+	n.aliceChannelLink.cfg.MaxFeeExposure = DefaultMaxFeeExposure
+	n.firstBobChannelLink.cfg.MaxFeeExposure = DefaultMaxFeeExposure
 
 	// Triggering the link to update the fee of the channel with a fee rate
 	// that is below the current min relay fee rate should result in a fee
@@ -4869,7 +4887,8 @@ func (h *persistentLinkHarness) restartLink(
 		FetchLastChannelUpdate: mockGetChanUpdateMessage,
 		PreimageCache:          pCache,
 		OnChannelFailure: func(lnwire.ChannelID,
-			lnwire.ShortChannelID, LinkFailureError) { // nolint:whitespace
+			lnwire.ShortChannelID, LinkFailureError) {
+
 		},
 		UpdateContractSignals: func(*contractcourt.ContractSignals) error {
 			return nil
@@ -5824,7 +5843,7 @@ func TestChannelLinkFail(t *testing.T) {
 				c.cfg.Peer.(*mockPeer).disconnected = true
 			},
 			func(*testing.T, *Switch, *channelLink,
-				*lnwallet.LightningChannel) { //nolint:whitespace,lll
+				*lnwallet.LightningChannel) {
 
 				// Should fail at startup.
 			},
@@ -5844,7 +5863,7 @@ func TestChannelLinkFail(t *testing.T) {
 				c.channel.State().Packager = pkg
 			},
 			func(*testing.T, *Switch, *channelLink,
-				*lnwallet.LightningChannel) { //nolint:whitespace,lll
+				*lnwallet.LightningChannel) {
 
 				// Should fail at startup.
 			},
@@ -6153,13 +6172,13 @@ func TestForwardingAsymmetricTimeLockPolicies(t *testing.T) {
 // forwarding policy.
 func TestCheckHtlcForward(t *testing.T) {
 	fetchLastChannelUpdate := func(lnwire.ShortChannelID) (
-		*lnwire.ChannelUpdate, error) {
+		*lnwire.ChannelUpdate1, error) {
 
-		return &lnwire.ChannelUpdate{}, nil
+		return &lnwire.ChannelUpdate1{}, nil
 	}
 
 	failAliasUpdate := func(sid lnwire.ShortChannelID,
-		incoming bool) *lnwire.ChannelUpdate {
+		incoming bool) *lnwire.ChannelUpdate1 {
 
 		return nil
 	}
@@ -6308,7 +6327,7 @@ func TestChannelLinkCanceledInvoice(t *testing.T) {
 	t.Parallel()
 
 	// Setup a alice-bob network.
-	alice, bob, err := createTwoClusterChannels(
+	alice, bob, err := createMirroredChannel(
 		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
 	)
 	require.NoError(t, err, "unable to create channel")
@@ -6364,7 +6383,7 @@ type hodlInvoiceTestCtx struct {
 
 func newHodlInvoiceTestCtx(t *testing.T) (*hodlInvoiceTestCtx, error) {
 	// Setup a alice-bob network.
-	alice, bob, err := createTwoClusterChannels(
+	alice, bob, err := createMirroredChannel(
 		t, btcutil.SatoshiPerBitcoin*3, btcutil.SatoshiPerBitcoin*5,
 	)
 	require.NoError(t, err, "unable to create channel")

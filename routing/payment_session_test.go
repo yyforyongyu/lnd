@@ -147,7 +147,7 @@ func TestUpdateAdditionalEdge(t *testing.T) {
 	)
 
 	// Create the channel update message and sign.
-	msg := &lnwire.ChannelUpdate{
+	msg := &lnwire.ChannelUpdate1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(testChannelID),
 		Timestamp:      uint32(time.Now().Unix()),
 		BaseFee:        newFeeBaseMSat,
@@ -235,6 +235,9 @@ func TestRequestRoute(t *testing.T) {
 
 	route, err := session.RequestRoute(
 		payment.Amount, payment.FeeLimit, 0, height,
+		lnwire.CustomRecords{
+			lnwire.MinCustomRecordsTlvType + 123: []byte{1, 2, 3},
+		},
 	)
 	if err != nil {
 		t.Fatal(err)

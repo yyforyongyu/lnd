@@ -22,6 +22,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	basewallet "github.com/btcsuite/btcwallet/wallet"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lncfg"
@@ -120,12 +121,13 @@ func (r *RPCKeyRing) NewAddress(addrType lnwallet.AddressType, change bool,
 // NOTE: This is a part of the WalletController interface.
 //
 // NOTE: This method only signs with BIP49/84 keys.
-func (r *RPCKeyRing) SendOutputs(outputs []*wire.TxOut,
-	feeRate chainfee.SatPerKWeight, minConfs int32, label string,
+func (r *RPCKeyRing) SendOutputs(inputs fn.Set[wire.OutPoint],
+	outputs []*wire.TxOut, feeRate chainfee.SatPerKWeight,
+	minConfs int32, label string,
 	strategy basewallet.CoinSelectionStrategy) (*wire.MsgTx, error) {
 
 	tx, err := r.WalletController.SendOutputs(
-		outputs, feeRate, minConfs, label, strategy,
+		inputs, outputs, feeRate, minConfs, label, strategy,
 	)
 	if err != nil && err != basewallet.ErrTxUnsigned {
 		return nil, err
@@ -152,7 +154,7 @@ func (r *RPCKeyRing) SendOutputs(outputs []*wire.TxOut,
 		// watch-only wallet if it can map this outpoint into a coin we
 		// own. If not, then we can't continue because our wallet state
 		// is out of sync.
-		info, err := r.WalletController.FetchInputInfo(
+		info, err := r.WalletController.FetchOutpointInfo(
 			&txIn.PreviousOutPoint,
 		)
 		if err != nil {
@@ -287,7 +289,7 @@ func (r *RPCKeyRing) FinalizePsbt(packet *psbt.Packet, _ string) error {
 		// We can only sign this input if it's ours, so we try to map it
 		// to a coin we own. If we can't, then we'll continue as it
 		// isn't our input.
-		utxo, err := r.FetchInputInfo(&txIn.PreviousOutPoint)
+		utxo, err := r.FetchOutpointInfo(&txIn.PreviousOutPoint)
 		if err != nil {
 			continue
 		}
@@ -904,7 +906,7 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 		}
 
 		txIn := tx.TxIn[idx]
-		info, err := r.WalletController.FetchInputInfo(
+		info, err := r.WalletController.FetchOutpointInfo(
 			&txIn.PreviousOutPoint,
 		)
 		if err != nil {
@@ -1013,19 +1015,32 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 		signDesc.KeyDesc.PubKey = fullDesc.PubKey
 	}
 
+	var derivation *psbt.Bip32Derivation
+
 	// Make sure we actually know about the input. We either have been
 	// watching the UTXO on-chain or we have been given all the required
 	// info in the sign descriptor.
-	info, err := r.WalletController.FetchInputInfo(&txIn.PreviousOutPoint)
+	info, err := r.WalletController.FetchOutpointInfo(
+		&txIn.PreviousOutPoint,
+	)
+
+	// If the wallet is aware of this outpoint, we go ahead and fetch the
+	// derivation info.
+	if err == nil {
+		derivation, err = r.WalletController.FetchDerivationInfo(
+			info.PkScript,
+		)
+	}
+
 	switch {
-	// No error, we do have the full UTXO and derivation info available.
+	// No error, we do have the full UTXO info available.
 	case err == nil:
 		in.WitnessUtxo = &wire.TxOut{
 			Value:    int64(info.Value),
 			PkScript: info.PkScript,
 		}
 		in.NonWitnessUtxo = info.PrevTx
-		in.Bip32Derivation = []*psbt.Bip32Derivation{info.Derivation}
+		in.Bip32Derivation = []*psbt.Bip32Derivation{derivation}
 
 	// The wallet doesn't know about this UTXO, so it's probably a TX that
 	// we haven't published yet (e.g. a channel funding TX). So we need to

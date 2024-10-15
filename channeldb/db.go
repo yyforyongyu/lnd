@@ -26,6 +26,8 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb/migration29"
 	"github.com/lightningnetwork/lnd/channeldb/migration30"
 	"github.com/lightningnetwork/lnd/channeldb/migration31"
+	"github.com/lightningnetwork/lnd/channeldb/migration32"
+	"github.com/lightningnetwork/lnd/channeldb/migration33"
 	"github.com/lightningnetwork/lnd/channeldb/migration_01_to_11"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/invoices"
@@ -285,6 +287,14 @@ var (
 			// first optional migration.
 			number:    31,
 			migration: migration31.DeleteLastPublishedTxTLB,
+		},
+		{
+			number:    32,
+			migration: migration32.MigrateMCRouteSerialisation,
+		},
+		{
+			number:    33,
+			migration: migration33.MigrateMCStoreNameSpacedResults,
 		},
 	}
 

@@ -489,6 +489,15 @@ func (i *Invoice) IsAMP() bool {
 	)
 }
 
+// IsBlinded returns true if the invoice contains blinded paths.
+func (i *Invoice) IsBlinded() bool {
+	if i.Terms.Features == nil {
+		return false
+	}
+
+	return i.Terms.Features.IsSet(lnwire.Bolt11BlindedPathsRequired)
+}
+
 // HtlcState defines the states an htlc paying to an invoice can be in.
 type HtlcState uint8
 
@@ -538,6 +547,11 @@ type InvoiceHTLC struct {
 	// the htlc.
 	CustomRecords record.CustomSet
 
+	// WireCustomRecords contains the custom key/value pairs that were only
+	// included in p2p wire message of the HTLC and not in the onion
+	// payload.
+	WireCustomRecords lnwire.CustomRecords
+
 	// AMP encapsulates additional data relevant to AMP HTLCs. This includes
 	// the AMP onion record, in addition to the HTLC's payment hash and
 	// preimage since these are unique to each AMP HTLC, and not the invoice
@@ -557,6 +571,7 @@ func (h *InvoiceHTLC) Copy() *InvoiceHTLC {
 		result.CustomRecords[k] = v
 	}
 
+	result.WireCustomRecords = h.WireCustomRecords.Copy()
 	result.AMP = h.AMP.Copy()
 
 	return &result

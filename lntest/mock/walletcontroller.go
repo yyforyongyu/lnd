@@ -16,6 +16,7 @@ import (
 	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
@@ -33,14 +34,18 @@ type WalletController struct {
 	Utxos                 []*lnwallet.Utxo
 }
 
+// A compile time check to ensure this mocked WalletController implements the
+// WalletController.
+var _ lnwallet.WalletController = (*WalletController)(nil)
+
 // BackEnd returns "mock" to signify a mock wallet controller.
 func (w *WalletController) BackEnd() string {
 	return "mock"
 }
 
-// FetchInputInfo will be called to get info about the inputs to the funding
+// FetchOutpointInfo will be called to get info about the inputs to the funding
 // transaction.
-func (w *WalletController) FetchInputInfo(
+func (w *WalletController) FetchOutpointInfo(
 	prevOut *wire.OutPoint) (*lnwallet.Utxo, error) {
 
 	utxo := &lnwallet.Utxo{
@@ -73,9 +78,8 @@ func (w *WalletController) ConfirmedBalance(int32, string) (btcutil.Amount,
 func (w *WalletController) NewAddress(lnwallet.AddressType, bool,
 	string) (btcutil.Address, error) {
 
-	addr, _ := btcutil.NewAddressPubKey(
-		w.RootKey.PubKey().SerializeCompressed(), &chaincfg.MainNetParams,
-	)
+	pkh := btcutil.Hash160(w.RootKey.PubKey().SerializeCompressed())
+	addr, _ := btcutil.NewAddressPubKeyHash(pkh, &chaincfg.MainNetParams)
 	return addr, nil
 }
 
@@ -140,15 +144,15 @@ func (w *WalletController) ImportTaprootScript(waddrmgr.KeyScope,
 }
 
 // SendOutputs currently returns dummy values.
-func (w *WalletController) SendOutputs([]*wire.TxOut,
-	chainfee.SatPerKWeight, int32, string,
-	base.CoinSelectionStrategy) (*wire.MsgTx, error) {
+func (w *WalletController) SendOutputs(fn.Set[wire.OutPoint], []*wire.TxOut,
+	chainfee.SatPerKWeight, int32, string, base.CoinSelectionStrategy) (
+	*wire.MsgTx, error) {
 
 	return nil, nil
 }
 
 // CreateSimpleTx currently returns dummy values.
-func (w *WalletController) CreateSimpleTx([]*wire.TxOut,
+func (w *WalletController) CreateSimpleTx(fn.Set[wire.OutPoint], []*wire.TxOut,
 	chainfee.SatPerKWeight, int32, base.CoinSelectionStrategy,
 	bool) (*txauthor.AuthoredTx, error) {
 
@@ -190,9 +194,9 @@ func (w *WalletController) ListTransactionDetails(int32, int32,
 
 // LeaseOutput returns the current time and a nil error.
 func (w *WalletController) LeaseOutput(wtxmgr.LockID, wire.OutPoint,
-	time.Duration) (time.Time, []byte, btcutil.Amount, error) {
+	time.Duration) (time.Time, error) {
 
-	return time.Now(), nil, 0, nil
+	return time.Now(), nil
 }
 
 // ReleaseOutput currently does nothing.
@@ -286,4 +290,12 @@ func (w *WalletController) RemoveDescendants(*wire.MsgTx) error {
 
 func (w *WalletController) CheckMempoolAcceptance(tx *wire.MsgTx) error {
 	return nil
+}
+
+// FetchDerivationInfo queries for the wallet's knowledge of the passed
+// pkScript and constructs the derivation info and returns it.
+func (w *WalletController) FetchDerivationInfo(
+	pkScript []byte) (*psbt.Bip32Derivation, error) {
+
+	return nil, nil
 }

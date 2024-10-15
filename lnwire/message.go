@@ -23,6 +23,7 @@ type MessageType uint16
 // Lightning protocol.
 const (
 	MsgWarning                 MessageType = 1
+	MsgStfu                                = 2
 	MsgInit                                = 16
 	MsgError                               = 17
 	MsgPing                                = 18
@@ -51,11 +52,14 @@ const (
 	MsgNodeAnnouncement                    = 257
 	MsgChannelUpdate                       = 258
 	MsgAnnounceSignatures                  = 259
+	MsgAnnounceSignatures2                 = 260
 	MsgQueryShortChanIDs                   = 261
 	MsgReplyShortChanIDsEnd                = 262
 	MsgQueryChannelRange                   = 263
 	MsgReplyChannelRange                   = 264
 	MsgGossipTimestampRange                = 265
+	MsgChannelAnnouncement2                = 267
+	MsgChannelUpdate2                      = 271
 	MsgKickoffSig                          = 777
 )
 
@@ -84,6 +88,8 @@ func (t MessageType) String() string {
 	switch t {
 	case MsgWarning:
 		return "Warning"
+	case MsgStfu:
+		return "Stfu"
 	case MsgInit:
 		return "Init"
 	case MsgOpenChannel:
@@ -152,6 +158,12 @@ func (t MessageType) String() string {
 		return "ClosingComplete"
 	case MsgClosingSig:
 		return "ClosingSig"
+	case MsgAnnounceSignatures2:
+		return "MsgAnnounceSignatures2"
+	case MsgChannelAnnouncement2:
+		return "ChannelAnnouncement2"
+	case MsgChannelUpdate2:
+		return "ChannelUpdate2"
 	default:
 		return "<unknown>"
 	}
@@ -211,6 +223,8 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 	switch msgType {
 	case MsgWarning:
 		msg = &Warning{}
+	case MsgStfu:
+		msg = &Stfu{}
 	case MsgInit:
 		msg = &Init{}
 	case MsgOpenChannel:
@@ -254,15 +268,15 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 	case MsgError:
 		msg = &Error{}
 	case MsgChannelAnnouncement:
-		msg = &ChannelAnnouncement{}
+		msg = &ChannelAnnouncement1{}
 	case MsgChannelUpdate:
-		msg = &ChannelUpdate{}
+		msg = &ChannelUpdate1{}
 	case MsgNodeAnnouncement:
 		msg = &NodeAnnouncement{}
 	case MsgPing:
 		msg = &Ping{}
 	case MsgAnnounceSignatures:
-		msg = &AnnounceSignatures{}
+		msg = &AnnounceSignatures1{}
 	case MsgPong:
 		msg = &Pong{}
 	case MsgQueryShortChanIDs:
@@ -279,6 +293,12 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 		msg = &ClosingComplete{}
 	case MsgClosingSig:
 		msg = &ClosingSig{}
+	case MsgAnnounceSignatures2:
+		msg = &AnnounceSignatures2{}
+	case MsgChannelAnnouncement2:
+		msg = &ChannelAnnouncement2{}
+	case MsgChannelUpdate2:
+		msg = &ChannelUpdate2{}
 	default:
 		// If the message is not within our custom range and has not
 		// specifically been overridden, return an unknown message.

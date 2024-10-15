@@ -17,7 +17,11 @@ import (
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/chainntnfs"
+	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/tlv"
+	"github.com/stretchr/testify/mock"
 )
 
 var (
@@ -35,14 +39,18 @@ type mockWalletController struct {
 	Utxos                 []*Utxo
 }
 
+// A compile time check to ensure that mockWalletController implements the
+// WalletController.
+var _ WalletController = (*mockWalletController)(nil)
+
 // BackEnd returns "mock" to signify a mock wallet controller.
 func (w *mockWalletController) BackEnd() string {
 	return "mock"
 }
 
-// FetchInputInfo will be called to get info about the inputs to the funding
+// FetchOutpointInfo will be called to get info about the inputs to the funding
 // transaction.
-func (w *mockWalletController) FetchInputInfo(
+func (w *mockWalletController) FetchOutpointInfo(
 	prevOut *wire.OutPoint) (*Utxo, error) {
 
 	utxo := &Utxo{
@@ -145,7 +153,7 @@ func (w *mockWalletController) ImportTaprootScript(waddrmgr.KeyScope,
 }
 
 // SendOutputs currently returns dummy values.
-func (w *mockWalletController) SendOutputs([]*wire.TxOut,
+func (w *mockWalletController) SendOutputs(fn.Set[wire.OutPoint], []*wire.TxOut,
 	chainfee.SatPerKWeight, int32, string,
 	base.CoinSelectionStrategy) (*wire.MsgTx, error) {
 
@@ -153,9 +161,9 @@ func (w *mockWalletController) SendOutputs([]*wire.TxOut,
 }
 
 // CreateSimpleTx currently returns dummy values.
-func (w *mockWalletController) CreateSimpleTx([]*wire.TxOut,
-	chainfee.SatPerKWeight, int32, base.CoinSelectionStrategy,
-	bool) (*txauthor.AuthoredTx, error) {
+func (w *mockWalletController) CreateSimpleTx(fn.Set[wire.OutPoint],
+	[]*wire.TxOut, chainfee.SatPerKWeight, int32,
+	base.CoinSelectionStrategy, bool) (*txauthor.AuthoredTx, error) {
 
 	return nil, nil
 }
@@ -196,9 +204,9 @@ func (w *mockWalletController) ListTransactionDetails(int32, int32,
 
 // LeaseOutput returns the current time and a nil error.
 func (w *mockWalletController) LeaseOutput(wtxmgr.LockID, wire.OutPoint,
-	time.Duration) (time.Time, []byte, btcutil.Amount, error) {
+	time.Duration) (time.Time, error) {
 
-	return time.Now(), nil, 0, nil
+	return time.Now(), nil
 }
 
 // ReleaseOutput currently does nothing.
@@ -295,6 +303,14 @@ func (w *mockWalletController) RemoveDescendants(*wire.MsgTx) error {
 	return nil
 }
 
+// FetchDerivationInfo queries for the wallet's knowledge of the passed
+// pkScript and constructs the derivation info and returns it.
+func (w *mockWalletController) FetchDerivationInfo(
+	pkScript []byte) (*psbt.Bip32Derivation, error) {
+
+	return nil, nil
+}
+
 func (w *mockWalletController) CheckMempoolAcceptance(tx *wire.MsgTx) error {
 	return nil
 }
@@ -383,4 +399,108 @@ func (*mockChainIO) GetBlockHeader(
 	blockHash *chainhash.Hash) (*wire.BlockHeader, error) {
 
 	return nil, nil
+}
+
+type MockAuxLeafStore struct{}
+
+// A compile time check to ensure that MockAuxLeafStore implements the
+// AuxLeafStore interface.
+var _ AuxLeafStore = (*MockAuxLeafStore)(nil)
+
+// FetchLeavesFromView attempts to fetch the auxiliary leaves that
+// correspond to the passed aux blob, and pending original (unfiltered)
+// HTLC view.
+func (*MockAuxLeafStore) FetchLeavesFromView(
+	_ CommitDiffAuxInput) fn.Result[CommitDiffAuxResult] {
+
+	return fn.Ok(CommitDiffAuxResult{})
+}
+
+// FetchLeavesFromCommit attempts to fetch the auxiliary leaves that
+// correspond to the passed aux blob, and an existing channel
+// commitment.
+func (*MockAuxLeafStore) FetchLeavesFromCommit(_ AuxChanState,
+	_ channeldb.ChannelCommitment,
+	_ CommitmentKeyRing) fn.Result[CommitDiffAuxResult] {
+
+	return fn.Ok(CommitDiffAuxResult{})
+}
+
+// FetchLeavesFromRevocation attempts to fetch the auxiliary leaves
+// from a channel revocation that stores balance + blob information.
+func (*MockAuxLeafStore) FetchLeavesFromRevocation(
+	_ *channeldb.RevocationLog) fn.Result[CommitDiffAuxResult] {
+
+	return fn.Ok(CommitDiffAuxResult{})
+}
+
+// ApplyHtlcView serves as the state transition function for the custom
+// channel's blob. Given the old blob, and an HTLC view, then a new
+// blob should be returned that reflects the pending updates.
+func (*MockAuxLeafStore) ApplyHtlcView(
+	_ CommitDiffAuxInput) fn.Result[fn.Option[tlv.Blob]] {
+
+	return fn.Ok(fn.None[tlv.Blob]())
+}
+
+// MockAuxSigner is a mock implementation of the AuxSigner interface.
+type MockAuxSigner struct {
+	mock.Mock
+}
+
+// SubmitSecondLevelSigBatch takes a batch of aux sign jobs and
+// processes them asynchronously.
+func (a *MockAuxSigner) SubmitSecondLevelSigBatch(chanState AuxChanState,
+	tx *wire.MsgTx, jobs []AuxSigJob) error {
+
+	args := a.Called(chanState, tx, jobs)
+
+	// While we return, we'll also send back an instant response for the
+	// set of jobs.
+	for _, sigJob := range jobs {
+		sigJob.Resp <- AuxSigJobResp{}
+	}
+
+	return args.Error(0)
+}
+
+// PackSigs takes a series of aux signatures and packs them into a
+// single blob that can be sent alongside the CommitSig messages.
+func (a *MockAuxSigner) PackSigs(
+	sigs []fn.Option[tlv.Blob]) fn.Result[fn.Option[tlv.Blob]] {
+
+	args := a.Called(sigs)
+
+	return args.Get(0).(fn.Result[fn.Option[tlv.Blob]])
+}
+
+// UnpackSigs takes a packed blob of signatures and returns the
+// original signatures for each HTLC, keyed by HTLC index.
+func (a *MockAuxSigner) UnpackSigs(
+	sigs fn.Option[tlv.Blob]) fn.Result[[]fn.Option[tlv.Blob]] {
+
+	args := a.Called(sigs)
+
+	return args.Get(0).(fn.Result[[]fn.Option[tlv.Blob]])
+}
+
+// VerifySecondLevelSigs attempts to synchronously verify a batch of aux
+// sig jobs.
+func (a *MockAuxSigner) VerifySecondLevelSigs(chanState AuxChanState,
+	tx *wire.MsgTx, jobs []AuxVerifyJob) error {
+
+	args := a.Called(chanState, tx, jobs)
+
+	return args.Error(0)
+}
+
+type MockAuxContractResolver struct{}
+
+// ResolveContract is called to resolve a contract that needs
+// additional information to resolve properly. If no extra information
+// is required, a nil Result error is returned.
+func (*MockAuxContractResolver) ResolveContract(
+	ResolutionReq) fn.Result[tlv.Blob] {
+
+	return fn.Ok[tlv.Blob](nil)
 }

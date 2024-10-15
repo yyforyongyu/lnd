@@ -59,6 +59,7 @@ const (
 	defaultLogLevel           = "info"
 	defaultLogDirname         = "logs"
 	defaultLogFilename        = "lnd.log"
+	defaultLogCompressor      = build.Gzip
 	defaultRPCPort            = 10009
 	defaultRESTPort           = 8080
 	defaultPeerPort           = 9735
@@ -168,6 +169,17 @@ const (
 	defaultRSTimeout  = time.Second * 1
 	defaultRSBackoff  = time.Second * 30
 	defaultRSAttempts = 1
+
+	// Set defaults for a health check which ensures that the leader
+	// election is functioning correctly. Although this check is off by
+	// default (as etcd leader election is only used in a clustered setup),
+	// we still set the default values so that the health check can be
+	// easily enabled with sane defaults. Note that by default we only run
+	// this check once, as it is critical for the node's operation.
+	defaultLeaderCheckInterval = time.Minute
+	defaultLeaderCheckTimeout  = time.Second * 5
+	defaultLeaderCheckBackoff  = time.Second * 5
+	defaultLeaderCheckAttempts = 1
 
 	// defaultRemoteMaxHtlcs specifies the default limit for maximum
 	// concurrent HTLCs the remote party may add to commitment transactions.
@@ -304,6 +316,7 @@ type Config struct {
 	ReadMacPath     string        `long:"readonlymacaroonpath" description:"Path to write the read-only macaroon for lnd's RPC and REST services if it doesn't exist"`
 	InvoiceMacPath  string        `long:"invoicemacaroonpath" description:"Path to the invoice-only macaroon for lnd's RPC and REST services if it doesn't exist"`
 	LogDir          string        `long:"logdir" description:"Directory to log output."`
+	LogCompressor   string        `long:"logcompressor" description:"Compression algorithm to use when rotating logs." choice:"gzip" choice:"zstd"`
 	MaxLogFiles     int           `long:"maxlogfiles" description:"Maximum logfiles to keep (0 for no rotation)"`
 	MaxLogFileSize  int           `long:"maxlogfilesize" description:"Maximum logfile size in MB"`
 	AcceptorTimeout time.Duration `long:"acceptortimeout" description:"Time after which an RPCAcceptor will time out and return false if it hasn't yet received a response"`
@@ -441,7 +454,7 @@ type Config struct {
 
 	GcCanceledInvoicesOnTheFly bool `long:"gc-canceled-invoices-on-the-fly" description:"If true, we'll delete newly canceled invoices on the fly."`
 
-	DustThreshold uint64 `long:"dust-threshold" description:"Sets the dust sum threshold in satoshis for a channel after which dust HTLC's will be failed."`
+	MaxFeeExposure uint64 `long:"dust-threshold" description:"Sets the max fee exposure in satoshis for a channel after which HTLC's will be failed."`
 
 	Fee *lncfg.Fee `group:"fee" namespace:"fee"`
 
@@ -549,6 +562,7 @@ func DefaultConfig() Config {
 		LetsEncryptDir:    defaultLetsEncryptDir,
 		LetsEncryptListen: defaultLetsEncryptListen,
 		LogDir:            defaultLogDir,
+		LogCompressor:     defaultLogCompressor,
 		MaxLogFiles:       defaultMaxLogFiles,
 		MaxLogFileSize:    defaultMaxLogFileSize,
 		AcceptorTimeout:   defaultAcceptorTimeout,
@@ -672,6 +686,12 @@ func DefaultConfig() Config {
 				Attempts: defaultRSAttempts,
 				Backoff:  defaultRSBackoff,
 			},
+			LeaderCheck: &lncfg.CheckConfig{
+				Interval: defaultLeaderCheckInterval,
+				Timeout:  defaultLeaderCheckTimeout,
+				Attempts: defaultLeaderCheckAttempts,
+				Backoff:  defaultLeaderCheckBackoff,
+			},
 		},
 		Gossip: &lncfg.Gossip{
 			MaxChannelUpdateBurst: discovery.DefaultMaxChannelUpdateBurst,
@@ -681,10 +701,19 @@ func DefaultConfig() Config {
 		Invoices: &lncfg.Invoices{
 			HoldExpiryDelta: lncfg.DefaultHoldInvoiceExpiryDelta,
 		},
+		Routing: &lncfg.Routing{
+			BlindedPaths: lncfg.BlindedPaths{
+				MinNumRealHops:           lncfg.DefaultMinNumRealBlindedPathHops,
+				NumHops:                  lncfg.DefaultNumBlindedPathHops,
+				MaxNumPaths:              lncfg.DefaultMaxNumBlindedPaths,
+				PolicyIncreaseMultiplier: lncfg.DefaultBlindedPathPolicyIncreaseMultiplier,
+				PolicyDecreaseMultiplier: lncfg.DefaultBlindedPathPolicyDecreaseMultiplier,
+			},
+		},
 		MaxOutgoingCltvExpiry:     htlcswitch.DefaultMaxOutgoingCltvExpiry,
 		MaxChannelFeeAllocation:   htlcswitch.DefaultMaxLinkFeeAllocation,
 		MaxCommitFeeRateAnchors:   lnwallet.DefaultAnchorsCommitMaxFeeRateSatPerVByte,
-		DustThreshold:             uint64(htlcswitch.DefaultDustThreshold.ToSatoshis()),
+		MaxFeeExposure:            uint64(htlcswitch.DefaultMaxFeeExposure.ToSatoshis()),
 		LogWriter:                 build.NewRotatingLogWriter(),
 		DB:                        lncfg.DefaultDB(),
 		Cluster:                   lncfg.DefaultCluster(),
@@ -1420,11 +1449,16 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		os.Exit(0)
 	}
 
+	if !build.SuportedLogCompressor(cfg.LogCompressor) {
+		return nil, mkErr("invalid log compressor: %v",
+			cfg.LogCompressor)
+	}
+
 	// Initialize logging at the default logging level.
 	SetupLoggers(cfg.LogWriter, interceptor)
 	err = cfg.LogWriter.InitLogRotator(
 		filepath.Join(cfg.LogDir, defaultLogFilename),
-		cfg.MaxLogFileSize, cfg.MaxLogFiles,
+		cfg.LogCompressor, cfg.MaxLogFileSize, cfg.MaxLogFiles,
 	)
 	if err != nil {
 		str := "log rotation setup failed: %v"
@@ -1656,18 +1690,6 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		return nil, mkErr("error parsing gossip syncer: %v", err)
 	}
 
-	// Log a warning if our expiry delta is not greater than our incoming
-	// broadcast delta. We do not fail here because this value may be set
-	// to zero to intentionally keep lnd's behavior unchanged from when we
-	// didn't auto-cancel these invoices.
-	if cfg.Invoices.HoldExpiryDelta <= lncfg.DefaultIncomingBroadcastDelta {
-		ltndLog.Warnf("Invoice hold expiry delta: %v <= incoming "+
-			"delta: %v, accepted hold invoices will force close "+
-			"channels if they are not canceled manually",
-			cfg.Invoices.HoldExpiryDelta,
-			lncfg.DefaultIncomingBroadcastDelta)
-	}
-
 	// If the experimental protocol options specify any protocol messages
 	// that we want to handle as custom messages, set them now.
 	customMsg := cfg.ProtocolOptions.CustomMessageOverrides()
@@ -1690,6 +1712,8 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		cfg.RemoteSigner,
 		cfg.Sweeper,
 		cfg.Htlcswitch,
+		cfg.Invoices,
+		cfg.Routing,
 	)
 	if err != nil {
 		return nil, err

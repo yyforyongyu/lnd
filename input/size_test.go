@@ -13,6 +13,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/stretchr/testify/require"
 )
@@ -852,7 +853,7 @@ var witnessSizeTests = []witnessSizeTest{
 			signer := &dummySigner{}
 			commitScriptTree, err := input.NewLocalCommitScriptTree(
 				testCSVDelay, testKey.PubKey(),
-				testKey.PubKey(),
+				testKey.PubKey(), input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -886,7 +887,7 @@ var witnessSizeTests = []witnessSizeTest{
 			signer := &dummySigner{}
 			commitScriptTree, err := input.NewLocalCommitScriptTree(
 				testCSVDelay, testKey.PubKey(),
-				testKey.PubKey(),
+				testKey.PubKey(), input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -920,7 +921,7 @@ var witnessSizeTests = []witnessSizeTest{
 			signer := &dummySigner{}
 			//nolint:lll
 			commitScriptTree, err := input.NewRemoteCommitScriptTree(
-				testKey.PubKey(),
+				testKey.PubKey(), input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -987,6 +988,7 @@ var witnessSizeTests = []witnessSizeTest{
 
 			scriptTree, err := input.SecondLevelHtlcTapscriptTree(
 				testKey.PubKey(), testCSVDelay,
+				input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -1026,6 +1028,7 @@ var witnessSizeTests = []witnessSizeTest{
 
 			scriptTree, err := input.SecondLevelHtlcTapscriptTree(
 				testKey.PubKey(), testCSVDelay,
+				input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -1073,7 +1076,8 @@ var witnessSizeTests = []witnessSizeTest{
 
 			htlcScriptTree, err := input.SenderHTLCScriptTaproot(
 				senderKey.PubKey(), receiverKey.PubKey(),
-				revokeKey.PubKey(), payHash[:], false,
+				revokeKey.PubKey(), payHash[:], lntypes.Remote,
+				input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -1115,7 +1119,7 @@ var witnessSizeTests = []witnessSizeTest{
 			htlcScriptTree, err := input.ReceiverHTLCScriptTaproot(
 				testCLTVExpiry, senderKey.PubKey(),
 				receiverKey.PubKey(), revokeKey.PubKey(),
-				payHash[:], false,
+				payHash[:], lntypes.Remote, input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -1157,7 +1161,7 @@ var witnessSizeTests = []witnessSizeTest{
 			htlcScriptTree, err := input.ReceiverHTLCScriptTaproot(
 				testCLTVExpiry, senderKey.PubKey(),
 				receiverKey.PubKey(), revokeKey.PubKey(),
-				payHash[:], false,
+				payHash[:], lntypes.Remote, input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -1203,7 +1207,8 @@ var witnessSizeTests = []witnessSizeTest{
 
 			htlcScriptTree, err := input.SenderHTLCScriptTaproot(
 				senderKey.PubKey(), receiverKey.PubKey(),
-				revokeKey.PubKey(), payHash[:], false,
+				revokeKey.PubKey(), payHash[:], lntypes.Remote,
+				input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -1263,7 +1268,8 @@ var witnessSizeTests = []witnessSizeTest{
 
 			htlcScriptTree, err := input.SenderHTLCScriptTaproot(
 				senderKey.PubKey(), receiverKey.PubKey(),
-				revokeKey.PubKey(), payHash[:], false,
+				revokeKey.PubKey(), payHash[:], lntypes.Remote,
+				input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -1309,7 +1315,7 @@ var witnessSizeTests = []witnessSizeTest{
 			htlcScriptTree, err := input.ReceiverHTLCScriptTaproot(
 				testCLTVExpiry, senderKey.PubKey(),
 				receiverKey.PubKey(), revokeKey.PubKey(),
-				payHash[:], false,
+				payHash[:], lntypes.Remote, input.NoneTapLeaf(),
 			)
 			require.NoError(t, err)
 
@@ -1382,7 +1388,7 @@ func genTimeoutTx(t *testing.T,
 	// Create the unsigned timeout tx.
 	timeoutTx, err := lnwallet.CreateHtlcTimeoutTx(
 		chanType, false, testOutPoint, testAmt, testCLTVExpiry,
-		testCSVDelay, 0, testPubkey, testPubkey,
+		testCSVDelay, 0, testPubkey, testPubkey, input.NoneTapLeaf(),
 	)
 	require.NoError(t, err)
 
@@ -1394,7 +1400,8 @@ func genTimeoutTx(t *testing.T,
 	)
 	if chanType.IsTaproot() {
 		tapscriptTree, err = input.SenderHTLCScriptTaproot(
-			testPubkey, testPubkey, testPubkey, testHash160, false,
+			testPubkey, testPubkey, testPubkey, testHash160,
+			lntypes.Remote, input.NoneTapLeaf(),
 		)
 		require.NoError(t, err)
 
@@ -1450,7 +1457,7 @@ func genSuccessTx(t *testing.T, chanType channeldb.ChannelType) *wire.MsgTx {
 	// Create the unsigned success tx.
 	successTx, err := lnwallet.CreateHtlcSuccessTx(
 		chanType, false, testOutPoint, testAmt, testCSVDelay, 0,
-		testPubkey, testPubkey,
+		testPubkey, testPubkey, input.NoneTapLeaf(),
 	)
 	require.NoError(t, err)
 
@@ -1463,7 +1470,7 @@ func genSuccessTx(t *testing.T, chanType channeldb.ChannelType) *wire.MsgTx {
 	if chanType.IsTaproot() {
 		tapscriptTree, err = input.ReceiverHTLCScriptTaproot(
 			testCLTVExpiry, testPubkey, testPubkey, testPubkey,
-			testHash160, false,
+			testHash160, lntypes.Remote, input.NoneTapLeaf(),
 		)
 		require.NoError(t, err)
 

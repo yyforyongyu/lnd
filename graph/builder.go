@@ -11,13 +11,14 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/batch"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnutils"
@@ -26,6 +27,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/chanvalidate"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/multimutex"
+	"github.com/lightningnetwork/lnd/netann"
 	"github.com/lightningnetwork/lnd/routing/chainview"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/ticker"
@@ -301,6 +303,8 @@ func (b *Builder) Start() error {
 	b.wg.Add(1)
 	go b.networkHandler()
 
+	log.Debug("Builder started")
+
 	return nil
 }
 
@@ -313,7 +317,6 @@ func (b *Builder) Stop() error {
 	}
 
 	log.Info("Builder shutting down...")
-	defer log.Debug("Builder shutdown complete")
 
 	// Our filtered chain view could've only been started if
 	// AssumeChannelValid isn't present.
@@ -325,6 +328,8 @@ func (b *Builder) Stop() error {
 
 	close(b.quit)
 	b.wg.Wait()
+
+	log.Debug("Builder shutdown complete")
 
 	return nil
 }
@@ -679,7 +684,7 @@ func (b *Builder) handleNetworkUpdate(vb *ValidationBarrier,
 			update.err <- err
 
 		case IsError(err, ErrParentValidationFailed):
-			update.err <- newErrf(ErrIgnored, err.Error())
+			update.err <- NewErrf(ErrIgnored, err.Error()) //nolint
 
 		default:
 			log.Warnf("unexpected error during validation "+
@@ -1051,7 +1056,7 @@ func (b *Builder) assertNodeAnnFreshness(node route.Vertex,
 			"existence of node: %v", err)
 	}
 	if !exists {
-		return newErrf(ErrIgnored, "Ignoring node announcement"+
+		return NewErrf(ErrIgnored, "Ignoring node announcement"+
 			" for node not found in channel graph (%x)",
 			node[:])
 	}
@@ -1061,7 +1066,7 @@ func (b *Builder) assertNodeAnnFreshness(node route.Vertex,
 	// if not then we won't accept the new data as it would override newer
 	// data.
 	if !lastUpdate.Before(msgTimestamp) {
-		return newErrf(ErrOutdated, "Ignoring outdated "+
+		return NewErrf(ErrOutdated, "Ignoring outdated "+
 			"announcement for %x", node[:])
 	}
 
@@ -1088,8 +1093,8 @@ func (b *Builder) addZombieEdge(chanID uint64) error {
 // segwit v1 (taproot) channels.
 //
 // TODO(roasbeef: export and use elsewhere?
-func makeFundingScript(bitcoinKey1, bitcoinKey2 []byte,
-	chanFeatures []byte) ([]byte, error) {
+func makeFundingScript(bitcoinKey1, bitcoinKey2 []byte, chanFeatures []byte,
+	tapscriptRoot fn.Option[chainhash.Hash]) ([]byte, error) {
 
 	legacyFundingScript := func() ([]byte, error) {
 		witnessScript, err := input.GenMultiSigScript(
@@ -1136,11 +1141,13 @@ func makeFundingScript(bitcoinKey1, bitcoinKey2 []byte,
 		}
 
 		fundingScript, _, err := input.GenTaprootFundingScript(
-			pubKey1, pubKey2, 0,
+			pubKey1, pubKey2, 0, tapscriptRoot,
 		)
 		if err != nil {
 			return nil, err
 		}
+
+		// TODO(roasbeef): add tapscript root to gossip v1.5
 
 		return fundingScript, nil
 	}
@@ -1191,11 +1198,11 @@ func (b *Builder) processUpdate(msg interface{},
 				"existence: %v", err)
 		}
 		if isZombie {
-			return newErrf(ErrIgnored, "ignoring msg for zombie "+
+			return NewErrf(ErrIgnored, "ignoring msg for zombie "+
 				"chan_id=%v", msg.ChannelID)
 		}
 		if exists {
-			return newErrf(ErrIgnored, "ignoring msg for known "+
+			return NewErrf(ErrIgnored, "ignoring msg for known "+
 				"chan_id=%v", msg.ChannelID)
 		}
 
@@ -1225,7 +1232,9 @@ func (b *Builder) processUpdate(msg interface{},
 		// to obtain the full funding outpoint that's encoded within
 		// the channel ID.
 		channelID := lnwire.NewShortChanIDFromInt(msg.ChannelID)
-		fundingTx, err := b.fetchFundingTxWrapper(&channelID)
+		fundingTx, err := lnwallet.FetchFundingTxWrapper(
+			b.cfg.Chain, &channelID, b.quit,
+		)
 		if err != nil {
 			//nolint:lll
 			//
@@ -1257,7 +1266,7 @@ func (b *Builder) processUpdate(msg interface{},
 			default:
 			}
 
-			return newErrf(ErrNoFundingTransaction, "unable to "+
+			return NewErrf(ErrNoFundingTransaction, "unable to "+
 				"locate funding tx: %v", err)
 		}
 
@@ -1266,7 +1275,7 @@ func (b *Builder) processUpdate(msg interface{},
 		// reality.
 		fundingPkScript, err := makeFundingScript(
 			msg.BitcoinKey1Bytes[:], msg.BitcoinKey2Bytes[:],
-			msg.Features,
+			msg.Features, msg.TapscriptRoot,
 		)
 		if err != nil {
 			return err
@@ -1292,7 +1301,7 @@ func (b *Builder) processUpdate(msg interface{},
 				return err
 			}
 
-			return newErrf(ErrInvalidFundingOutput, "output "+
+			return NewErrf(ErrInvalidFundingOutput, "output "+
 				"failed validation: %w", err)
 		}
 
@@ -1311,7 +1320,7 @@ func (b *Builder) processUpdate(msg interface{},
 				}
 			}
 
-			return newErrf(ErrChannelSpent, "unable to fetch utxo "+
+			return NewErrf(ErrChannelSpent, "unable to fetch utxo "+
 				"for chan_id=%v, chan_point=%v: %v",
 				msg.ChannelID, fundingPoint, err)
 		}
@@ -1376,7 +1385,7 @@ func (b *Builder) processUpdate(msg interface{},
 			b.cfg.ChannelPruneExpiry
 
 		if isZombie && isStaleUpdate {
-			return newErrf(ErrIgnored, "ignoring stale update "+
+			return NewErrf(ErrIgnored, "ignoring stale update "+
 				"(flags=%v|%v) for zombie chan_id=%v",
 				msg.MessageFlags, msg.ChannelFlags,
 				msg.ChannelID)
@@ -1385,7 +1394,7 @@ func (b *Builder) processUpdate(msg interface{},
 		// If the channel doesn't exist in our database, we cannot
 		// apply the updated policy.
 		if !exists {
-			return newErrf(ErrIgnored, "ignoring update "+
+			return NewErrf(ErrIgnored, "ignoring update "+
 				"(flags=%v|%v) for unknown chan_id=%v",
 				msg.MessageFlags, msg.ChannelFlags,
 				msg.ChannelID)
@@ -1403,7 +1412,7 @@ func (b *Builder) processUpdate(msg interface{},
 
 			// Ignore outdated message.
 			if !edge1Timestamp.Before(msg.LastUpdate) {
-				return newErrf(ErrOutdated, "Ignoring "+
+				return NewErrf(ErrOutdated, "Ignoring "+
 					"outdated update (flags=%v|%v) for "+
 					"known chan_id=%v", msg.MessageFlags,
 					msg.ChannelFlags, msg.ChannelID)
@@ -1415,7 +1424,7 @@ func (b *Builder) processUpdate(msg interface{},
 
 			// Ignore outdated message.
 			if !edge2Timestamp.Before(msg.LastUpdate) {
-				return newErrf(ErrOutdated, "Ignoring "+
+				return NewErrf(ErrOutdated, "Ignoring "+
 					"outdated update (flags=%v|%v) for "+
 					"known chan_id=%v", msg.MessageFlags,
 					msg.ChannelFlags, msg.ChannelID)
@@ -1432,7 +1441,7 @@ func (b *Builder) processUpdate(msg interface{},
 		}
 
 		log.Tracef("New channel update applied: %v",
-			newLogClosure(func() string { return spew.Sdump(msg) }))
+			lnutils.SpewLogClosure(msg))
 		b.stats.incNumChannelUpdates()
 
 	default:
@@ -1440,69 +1449,6 @@ func (b *Builder) processUpdate(msg interface{},
 	}
 
 	return nil
-}
-
-// fetchFundingTxWrapper is a wrapper around fetchFundingTx, except that it
-// will exit if the router has stopped.
-func (b *Builder) fetchFundingTxWrapper(chanID *lnwire.ShortChannelID) (
-	*wire.MsgTx, error) {
-
-	txChan := make(chan *wire.MsgTx, 1)
-	errChan := make(chan error, 1)
-
-	go func() {
-		tx, err := b.fetchFundingTx(chanID)
-		if err != nil {
-			errChan <- err
-			return
-		}
-
-		txChan <- tx
-	}()
-
-	select {
-	case tx := <-txChan:
-		return tx, nil
-
-	case err := <-errChan:
-		return nil, err
-
-	case <-b.quit:
-		return nil, ErrGraphBuilderShuttingDown
-	}
-}
-
-// fetchFundingTx returns the funding transaction identified by the passed
-// short channel ID.
-//
-// TODO(roasbeef): replace with call to GetBlockTransaction? (would allow to
-// later use getblocktxn).
-func (b *Builder) fetchFundingTx(
-	chanID *lnwire.ShortChannelID) (*wire.MsgTx, error) {
-
-	// First fetch the block hash by the block number encoded, then use
-	// that hash to fetch the block itself.
-	blockNum := int64(chanID.BlockHeight)
-	blockHash, err := b.cfg.Chain.GetBlockHash(blockNum)
-	if err != nil {
-		return nil, err
-	}
-	fundingBlock, err := b.cfg.Chain.GetBlock(blockHash)
-	if err != nil {
-		return nil, err
-	}
-
-	// As a sanity check, ensure that the advertised transaction index is
-	// within the bounds of the total number of transactions within a
-	// block.
-	numTxns := uint32(len(fundingBlock.Transactions))
-	if chanID.TxIndex > numTxns-1 {
-		return nil, fmt.Errorf("tx_index=#%v "+
-			"is out of range (max_index=%v), network_chan_id=%v",
-			chanID.TxIndex, numTxns-1, chanID)
-	}
-
-	return fundingBlock.Transactions[chanID.TxIndex].Copy(), nil
 }
 
 // routingMsg couples a routing related routing topology update to the
@@ -1515,7 +1461,7 @@ type routingMsg struct {
 
 // ApplyChannelUpdate validates a channel update and if valid, applies it to the
 // database. It returns a bool indicating whether the updates were successful.
-func (b *Builder) ApplyChannelUpdate(msg *lnwire.ChannelUpdate) bool {
+func (b *Builder) ApplyChannelUpdate(msg *lnwire.ChannelUpdate1) bool {
 	ch, _, _, err := b.GetChannelByID(msg.ShortChannelID)
 	if err != nil {
 		log.Errorf("Unable to retrieve channel by id: %v", err)
@@ -1539,7 +1485,7 @@ func (b *Builder) ApplyChannelUpdate(msg *lnwire.ChannelUpdate) bool {
 		return false
 	}
 
-	err = ValidateChannelUpdateAnn(pubKey, ch.Capacity, msg)
+	err = netann.ValidateChannelUpdateAnn(pubKey, ch.Capacity, msg)
 	if err != nil {
 		log.Errorf("Unable to validate channel update: %v", err)
 		return false

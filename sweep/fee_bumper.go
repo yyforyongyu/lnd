@@ -12,7 +12,6 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
@@ -21,6 +20,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 var (
@@ -44,6 +44,19 @@ var (
 	ErrThirdPartySpent = errors.New("third party spent the output")
 )
 
+var (
+	// dummyChangePkScript is a dummy tapscript change script that's used
+	// when we don't need a real address, just something that can be used
+	// for fee estimation.
+	dummyChangePkScript = []byte{
+		0x51, 0x20,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+)
+
 // Bumper defines an interface that can be used by other subsystems for fee
 // bumping.
 type Bumper interface {
@@ -52,7 +65,7 @@ type Bumper interface {
 	// and monitors its confirmation status for potential fee bumping. It
 	// returns a chan that the caller can use to receive updates about the
 	// broadcast result and potential RBF attempts.
-	Broadcast(req *BumpRequest) (<-chan *BumpResult, error)
+	Broadcast(req *BumpRequest) <-chan *BumpResult
 }
 
 // BumpEvent represents the event of a fee bumping attempt.
@@ -71,6 +84,9 @@ const (
 	// TxConfirmed is sent when the tx is confirmed.
 	TxConfirmed
 
+	// TxError is sent when there's an error creating the tx.
+	TxError
+
 	// sentinalEvent is used to check if an event is unknown.
 	sentinalEvent
 )
@@ -86,6 +102,8 @@ func (e BumpEvent) String() string {
 		return "Replaced"
 	case TxConfirmed:
 		return "Confirmed"
+	case TxError:
+		return "Error"
 	default:
 		return "Unknown"
 	}
@@ -111,7 +129,7 @@ type BumpRequest struct {
 	DeadlineHeight int32
 
 	// DeliveryAddress is the script to send the change output to.
-	DeliveryAddress []byte
+	DeliveryAddress lnwallet.AddrWithKey
 
 	// MaxFeeRate is the maximum fee rate that can be used for fee bumping.
 	MaxFeeRate chainfee.SatPerKWeight
@@ -119,6 +137,14 @@ type BumpRequest struct {
 	// StartingFeeRate is an optional parameter that can be used to specify
 	// the initial fee rate to use for the fee function.
 	StartingFeeRate fn.Option[chainfee.SatPerKWeight]
+
+	// ExtraTxOut tracks if this bump request has an optional set of extra
+	// outputs to add to the transaction.
+	ExtraTxOut fn.Option[SweepOutput]
+
+	// Immediate is an optional parameter that can be used to specify that
+	// the tx should be broadcast immediately.
+	Immediate bool
 }
 
 // MaxFeeRateAllowed returns the maximum fee rate allowed for the given
@@ -126,9 +152,34 @@ type BumpRequest struct {
 // compares it with the specified MaxFeeRate, and returns the smaller of the
 // two.
 func (r *BumpRequest) MaxFeeRateAllowed() (chainfee.SatPerKWeight, error) {
+	// We'll want to know if we have any blobs, as we need to factor this
+	// into the max fee rate for this bump request.
+	hasBlobs := fn.Any(func(i input.Input) bool {
+		return fn.MapOptionZ(
+			i.ResolutionBlob(), func(b tlv.Blob) bool {
+				return len(b) > 0
+			},
+		)
+	}, r.Inputs)
+
+	sweepAddrs := [][]byte{
+		r.DeliveryAddress.DeliveryAddress,
+	}
+
+	// If we have blobs, then we'll add an extra sweep addr for the size
+	// estimate below. We know that these blobs will also always be based on
+	// p2tr addrs.
+	if hasBlobs {
+		// We need to pass in a real address, so we'll use a dummy
+		// tapscript change script that's used elsewhere for tests.
+		sweepAddrs = append(sweepAddrs, dummyChangePkScript)
+	}
+
 	// Get the size of the sweep tx, which will be used to calculate the
 	// budget fee rate.
-	size, err := calcSweepTxWeight(r.Inputs, r.DeliveryAddress)
+	size, err := calcSweepTxWeight(
+		r.Inputs, sweepAddrs,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -156,7 +207,7 @@ func (r *BumpRequest) MaxFeeRateAllowed() (chainfee.SatPerKWeight, error) {
 // calcSweepTxWeight calculates the weight of the sweep tx. It assumes a
 // sweeping tx always has a single output(change).
 func calcSweepTxWeight(inputs []input.Input,
-	outputPkScript []byte) (lntypes.WeightUnit, error) {
+	outputPkScript [][]byte) (lntypes.WeightUnit, error) {
 
 	// Use a const fee rate as we only use the weight estimator to
 	// calculate the size.
@@ -204,6 +255,16 @@ type BumpResult struct {
 	requestID uint64
 }
 
+// String returns a human-readable string for the result.
+func (b *BumpResult) String() string {
+	desc := fmt.Sprintf("Event=%v", b.Event)
+	if b.Tx != nil {
+		desc += fmt.Sprintf(", Tx=%v", b.Tx.TxHash())
+	}
+
+	return fmt.Sprintf("[%s]", desc)
+}
+
 // Validate validates the BumpResult so it's safe to use.
 func (b *BumpResult) Validate() error {
 	// Every result must have a tx.
@@ -249,6 +310,10 @@ type TxPublisherConfig struct {
 
 	// Notifier is used to monitor the confirmation status of the tx.
 	Notifier chainntnfs.ChainNotifier
+
+	// AuxSweeper is an optional interface that can be used to modify the
+	// way sweep transaction are generated.
+	AuxSweeper fn.Option[AuxSweeper]
 }
 
 // TxPublisher is an implementation of the Bumper interface. It utilizes the
@@ -262,6 +327,9 @@ type TxPublisherConfig struct {
 // until the tx is confirmed or the fee rate reaches the maximum fee rate
 // specified by the caller.
 type TxPublisher struct {
+	started atomic.Bool
+	stopped atomic.Bool
+
 	wg sync.WaitGroup
 
 	// cfg specifies the configuration of the TxPublisher.
@@ -304,42 +372,52 @@ func (t *TxPublisher) isNeutrinoBackend() bool {
 	return t.cfg.Wallet.BackEnd() == "neutrino"
 }
 
-// Broadcast is used to publish the tx created from the given inputs. It will,
-// 1. init a fee function based on the given strategy.
-// 2. create an RBF-compliant tx and monitor it for confirmation.
-// 3. notify the initial broadcast result back to the caller.
-// The initial broadcast is guaranteed to be RBF-compliant unless the budget
-// specified cannot cover the fee.
+// Broadcast is used to publish the tx created from the given inputs. It will
+// register the broadcast request and return a chan to the caller to subscribe
+// the broadcast result. The initial broadcast is guaranteed to be
+// RBF-compliant unless the budget specified cannot cover the fee.
 //
 // NOTE: part of the Bumper interface.
-func (t *TxPublisher) Broadcast(req *BumpRequest) (<-chan *BumpResult, error) {
-	log.Tracef("Received broadcast request: %s", newLogClosure(
-		func() string {
-			return spew.Sdump(req)
-		})())
+func (t *TxPublisher) Broadcast(req *BumpRequest) <-chan *BumpResult {
+	log.Tracef("Received broadcast request: %s",
+		lnutils.SpewLogClosure(req))
 
-	// Attempt an initial broadcast which is guaranteed to comply with the
-	// RBF rules.
-	result, err := t.initialBroadcast(req)
-	if err != nil {
-		log.Errorf("Initial broadcast failed: %v", err)
-
-		return nil, err
-	}
+	// Store the request.
+	requestID, record := t.storeInitialRecord(req)
 
 	// Create a chan to send the result to the caller.
 	subscriber := make(chan *BumpResult, 1)
-	t.subscriberChans.Store(result.requestID, subscriber)
+	t.subscriberChans.Store(requestID, subscriber)
 
-	// Send the initial broadcast result to the caller.
-	t.handleResult(result)
+	// Publish the tx immediately if specified.
+	if req.Immediate {
+		t.handleInitialBroadcast(record, requestID)
+	}
 
-	return subscriber, nil
+	return subscriber
+}
+
+// storeInitialRecord initializes a monitor record and saves it in the map.
+func (t *TxPublisher) storeInitialRecord(req *BumpRequest) (
+	uint64, *monitorRecord) {
+
+	// Increase the request counter.
+	//
+	// NOTE: this is the only place where we increase the counter.
+	requestID := t.requestCounter.Add(1)
+
+	// Register the record.
+	record := &monitorRecord{req: req}
+	t.records.Store(requestID, record)
+
+	return requestID, record
 }
 
 // initialBroadcast initializes a fee function, creates an RBF-compliant tx and
 // broadcasts it.
-func (t *TxPublisher) initialBroadcast(req *BumpRequest) (*BumpResult, error) {
+func (t *TxPublisher) initialBroadcast(requestID uint64,
+	req *BumpRequest) (*BumpResult, error) {
+
 	// Create a fee bumping algorithm to be used for future RBF.
 	feeAlgo, err := t.initializeFeeFunction(req)
 	if err != nil {
@@ -348,7 +426,7 @@ func (t *TxPublisher) initialBroadcast(req *BumpRequest) (*BumpResult, error) {
 
 	// Create the initial tx to be broadcasted. This tx is guaranteed to
 	// comply with the RBF restrictions.
-	requestID, err := t.createRBFCompliantTx(req, feeAlgo)
+	err = t.createRBFCompliantTx(requestID, req, feeAlgo)
 	if err != nil {
 		return nil, fmt.Errorf("create RBF-compliant tx: %w", err)
 	}
@@ -395,25 +473,28 @@ func (t *TxPublisher) initializeFeeFunction(
 // so by creating a tx, validate it using `TestMempoolAccept`, and bump its fee
 // and redo the process until the tx is valid, or return an error when non-RBF
 // related errors occur or the budget has been used up.
-func (t *TxPublisher) createRBFCompliantTx(req *BumpRequest,
-	f FeeFunction) (uint64, error) {
+func (t *TxPublisher) createRBFCompliantTx(requestID uint64, req *BumpRequest,
+	f FeeFunction) error {
 
 	for {
 		// Create a new tx with the given fee rate and check its
 		// mempool acceptance.
-		tx, fee, err := t.createAndCheckTx(req, f)
+		sweepCtx, err := t.createAndCheckTx(req, f)
 
 		switch {
 		case err == nil:
-			// The tx is valid, return the request ID.
-			requestID := t.storeRecord(tx, req, f, fee)
+			// The tx is valid, store it.
+			t.storeRecord(
+				requestID, sweepCtx.tx, req, f, sweepCtx.fee,
+			)
 
-			log.Infof("Created tx %v for %v inputs: feerate=%v, "+
-				"fee=%v, inputs=%v", tx.TxHash(),
-				len(req.Inputs), f.FeeRate(), fee,
+			log.Infof("Created initial sweep tx=%v for %v inputs: "+
+				"feerate=%v, fee=%v, inputs:\n%v",
+				sweepCtx.tx.TxHash(), len(req.Inputs),
+				f.FeeRate(), sweepCtx.fee,
 				inputTypeSummary(req.Inputs))
 
-			return requestID, nil
+			return nil
 
 		// If the error indicates the fees paid is not enough, we will
 		// ask the fee function to increase the fee rate and retry.
@@ -421,8 +502,8 @@ func (t *TxPublisher) createRBFCompliantTx(req *BumpRequest,
 			// We should at least start with a feerate above the
 			// mempool min feerate, so if we get this error, it
 			// means something is wrong earlier in the pipeline.
-			log.Errorf("Current fee=%v, feerate=%v, %v", fee,
-				f.FeeRate(), err)
+			log.Errorf("Current fee=%v, feerate=%v, %v",
+				sweepCtx.fee, f.FeeRate(), err)
 
 			fallthrough
 
@@ -434,8 +515,8 @@ func (t *TxPublisher) createRBFCompliantTx(req *BumpRequest,
 			// increased or maxed out.
 			for !increased {
 				log.Debugf("Increasing fee for next round, "+
-					"current fee=%v, feerate=%v", fee,
-					f.FeeRate())
+					"current fee=%v, feerate=%v",
+					sweepCtx.fee, f.FeeRate())
 
 				// If the fee function tells us that we have
 				// used up the budget, we will return an error
@@ -444,7 +525,7 @@ func (t *TxPublisher) createRBFCompliantTx(req *BumpRequest,
 				// cluster these inputs differetly.
 				increased, err = f.Increment()
 				if err != nil {
-					return 0, err
+					return err
 				}
 			}
 
@@ -454,20 +535,14 @@ func (t *TxPublisher) createRBFCompliantTx(req *BumpRequest,
 		// mempool acceptance.
 		default:
 			log.Debugf("Failed to create RBF-compliant tx: %v", err)
-			return 0, err
+			return err
 		}
 	}
 }
 
 // storeRecord stores the given record in the records map.
-func (t *TxPublisher) storeRecord(tx *wire.MsgTx, req *BumpRequest,
-	f FeeFunction, fee btcutil.Amount) uint64 {
-
-	// Increase the request counter.
-	//
-	// NOTE: this is the only place where we increase the
-	// counter.
-	requestID := t.requestCounter.Add(1)
+func (t *TxPublisher) storeRecord(requestID uint64, tx *wire.MsgTx,
+	req *BumpRequest, f FeeFunction, fee btcutil.Amount) {
 
 	// Register the record.
 	t.records.Store(requestID, &monitorRecord{
@@ -476,38 +551,40 @@ func (t *TxPublisher) storeRecord(tx *wire.MsgTx, req *BumpRequest,
 		feeFunction: f,
 		fee:         fee,
 	})
-
-	return requestID
 }
 
 // createAndCheckTx creates a tx based on the given inputs, change output
 // script, and the fee rate. In addition, it validates the tx's mempool
 // acceptance before returning a tx that can be published directly, along with
 // its fee.
-func (t *TxPublisher) createAndCheckTx(req *BumpRequest, f FeeFunction) (
-	*wire.MsgTx, btcutil.Amount, error) {
+func (t *TxPublisher) createAndCheckTx(req *BumpRequest,
+	f FeeFunction) (*sweepTxCtx, error) {
 
 	// Create the sweep tx with max fee rate of 0 as the fee function
 	// guarantees the fee rate used here won't exceed the max fee rate.
-	tx, fee, err := t.createSweepTx(
+	sweepCtx, err := t.createSweepTx(
 		req.Inputs, req.DeliveryAddress, f.FeeRate(),
 	)
 	if err != nil {
-		return nil, fee, fmt.Errorf("create sweep tx: %w", err)
+		return sweepCtx, fmt.Errorf("create sweep tx: %w", err)
 	}
 
 	// Sanity check the budget still covers the fee.
-	if fee > req.Budget {
-		return nil, fee, fmt.Errorf("%w: budget=%v, fee=%v",
-			ErrNotEnoughBudget, req.Budget, fee)
+	if sweepCtx.fee > req.Budget {
+		return sweepCtx, fmt.Errorf("%w: budget=%v, fee=%v",
+			ErrNotEnoughBudget, req.Budget, sweepCtx.fee)
 	}
 
+	// If we had an extra txOut, then we'll update the result to include
+	// it.
+	req.ExtraTxOut = sweepCtx.extraTxOut
+
 	// Validate the tx's mempool acceptance.
-	err = t.cfg.Wallet.CheckMempoolAcceptance(tx)
+	err = t.cfg.Wallet.CheckMempoolAcceptance(sweepCtx.tx)
 
 	// Exit early if the tx is valid.
 	if err == nil {
-		return tx, fee, nil
+		return sweepCtx, nil
 	}
 
 	// Print an error log if the chain backend doesn't support the mempool
@@ -515,18 +592,18 @@ func (t *TxPublisher) createAndCheckTx(req *BumpRequest, f FeeFunction) (
 	if errors.Is(err, rpcclient.ErrBackendVersion) {
 		log.Errorf("TestMempoolAccept not supported by backend, " +
 			"consider upgrading it to a newer version")
-		return tx, fee, nil
+		return sweepCtx, nil
 	}
 
 	// We are running on a backend that doesn't implement the RPC
 	// testmempoolaccept, eg, neutrino, so we'll skip the check.
 	if errors.Is(err, chain.ErrUnimplemented) {
 		log.Debug("Skipped testmempoolaccept due to not implemented")
-		return tx, fee, nil
+		return sweepCtx, nil
 	}
 
-	return nil, fee, fmt.Errorf("tx=%v failed mempool check: %w",
-		tx.TxHash(), err)
+	return sweepCtx, fmt.Errorf("tx=%v failed mempool check: %w",
+		sweepCtx.tx.TxHash(), err)
 }
 
 // broadcast takes a monitored tx and publishes it to the network. Prior to the
@@ -547,6 +624,15 @@ func (t *TxPublisher) broadcast(requestID uint64) (*BumpResult, error) {
 	log.Debugf("Publishing sweep tx %v, num_inputs=%v, height=%v",
 		txid, len(tx.TxIn), t.currentHeight.Load())
 
+	// Before we go to broadcast, we'll notify the aux sweeper, if it's
+	// present of this new broadcast attempt.
+	err := fn.MapOptionZ(t.cfg.AuxSweeper, func(aux AuxSweeper) error {
+		return aux.NotifyBroadcast(record.req, tx, record.fee)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to notify aux sweeper: %w", err)
+	}
+
 	// Set the event, and change it to TxFailed if the wallet fails to
 	// publish it.
 	event := TxPublished
@@ -554,7 +640,7 @@ func (t *TxPublisher) broadcast(requestID uint64) (*BumpResult, error) {
 	// Publish the sweeping tx with customized label. If the publish fails,
 	// this error will be saved in the `BumpResult` and it will be removed
 	// from being monitored.
-	err := t.cfg.Wallet.PublishTransaction(
+	err = t.cfg.Wallet.PublishTransaction(
 		tx, labels.MakeLabel(labels.LabelTypeSweepTransaction, nil),
 	)
 	if err != nil {
@@ -592,8 +678,7 @@ func (t *TxPublisher) notifyResult(result *BumpResult) {
 		return
 	}
 
-	log.Debugf("Sending result for requestID=%v, tx=%v", id,
-		result.Tx.TxHash())
+	log.Debugf("Sending result %v for requestID=%v", result, id)
 
 	select {
 	// Send the result to the subscriber.
@@ -611,20 +696,24 @@ func (t *TxPublisher) notifyResult(result *BumpResult) {
 func (t *TxPublisher) removeResult(result *BumpResult) {
 	id := result.requestID
 
-	// Remove the record from the maps if there's an error. This means this
-	// tx has failed its broadcast and cannot be retried. There are two
-	// cases,
+	// Remove the record from the maps if there's an error or the tx is
+	// confirmed. When there's an error, it means this tx has failed its
+	// broadcast and cannot be retried. There are two cases,
 	// - when the budget cannot cover the fee.
-	// - when a non-RBF related error occurs.
+	// - when a non-fee related error returned from PublishTransaction.
 	switch result.Event {
 	case TxFailed:
 		log.Errorf("Removing monitor record=%v, tx=%v, due to err: %v",
 			id, result.Tx.TxHash(), result.Err)
 
 	case TxConfirmed:
-		// Remove the record is the tx is confirmed.
+		// Remove the record if the tx is confirmed.
 		log.Debugf("Removing confirmed monitor record=%v, tx=%v", id,
 			result.Tx.TxHash())
+
+	case TxError:
+		// Remove the record if there's an error.
+		log.Debugf("Removing monitor record=%v due to error", id)
 
 	// Do nothing if it's neither failed or confirmed.
 	default:
@@ -669,7 +758,10 @@ type monitorRecord struct {
 // off the monitor loop.
 func (t *TxPublisher) Start() error {
 	log.Info("TxPublisher starting...")
-	defer log.Debugf("TxPublisher started")
+
+	if t.started.Swap(true) {
+		return fmt.Errorf("TxPublisher started more than once")
+	}
 
 	blockEvent, err := t.cfg.Notifier.RegisterBlockEpochNtfn(nil)
 	if err != nil {
@@ -679,17 +771,25 @@ func (t *TxPublisher) Start() error {
 	t.wg.Add(1)
 	go t.monitor(blockEvent)
 
+	log.Debugf("TxPublisher started")
+
 	return nil
 }
 
 // Stop stops the publisher and waits for the monitor loop to exit.
-func (t *TxPublisher) Stop() {
+func (t *TxPublisher) Stop() error {
 	log.Info("TxPublisher stopping...")
-	defer log.Debugf("TxPublisher stopped")
+
+	if t.stopped.Swap(true) {
+		return fmt.Errorf("TxPublisher stopped more than once")
+	}
 
 	close(t.quit)
-
 	t.wg.Wait()
+
+	log.Debug("TxPublisher stopped")
+
+	return nil
 }
 
 // monitor is the main loop driven by new blocks. Whevenr a new block arrives,
@@ -738,18 +838,27 @@ func (t *TxPublisher) processRecords() {
 	// confirmed.
 	confirmedRecords := make(map[uint64]*monitorRecord)
 
-	// feeBumpRecords stores a map of the records which need to be bumped.
+	// feeBumpRecords stores a map of records which need to be bumped.
 	feeBumpRecords := make(map[uint64]*monitorRecord)
 
-	// failedRecords stores a map of the records which has inputs being
-	// spent by a third party.
+	// failedRecords stores a map of records which has inputs being spent
+	// by a third party.
 	//
 	// NOTE: this is only used for neutrino backend.
 	failedRecords := make(map[uint64]*monitorRecord)
 
+	// initialRecords stores a map of records which are being created and
+	// published for the first time.
+	initialRecords := make(map[uint64]*monitorRecord)
+
 	// visitor is a helper closure that visits each record and divides them
 	// into two groups.
 	visitor := func(requestID uint64, r *monitorRecord) error {
+		if r.tx == nil {
+			initialRecords[requestID] = r
+			return nil
+		}
+
 		log.Tracef("Checking monitor recordID=%v for tx=%v", requestID,
 			r.tx.TxHash())
 
@@ -777,8 +886,13 @@ func (t *TxPublisher) processRecords() {
 		return nil
 	}
 
-	// Iterate through all the records and divide them into two groups.
+	// Iterate through all the records and divide them into four groups.
 	t.records.ForEach(visitor)
+
+	// Handle the initial broadcast.
+	for requestID, r := range initialRecords {
+		t.handleInitialBroadcast(r, requestID)
+	}
 
 	// For records that are confirmed, we'll notify the caller about this
 	// result.
@@ -832,6 +946,72 @@ func (t *TxPublisher) handleTxConfirmed(r *monitorRecord, requestID uint64) {
 	}
 
 	// Notify that this tx is confirmed and remove the record from the map.
+	t.handleResult(result)
+}
+
+// handleInitialBroadcast is called when a new request is received. It will
+// handle the initial tx creation and broadcast. In details,
+// 1. init a fee function based on the given strategy.
+// 2. create an RBF-compliant tx and monitor it for confirmation.
+// 3. notify the initial broadcast result back to the caller.
+func (t *TxPublisher) handleInitialBroadcast(r *monitorRecord,
+	requestID uint64) {
+
+	log.Debugf("Initial broadcast for requestID=%v", requestID)
+
+	var (
+		result *BumpResult
+		err    error
+	)
+
+	// Attempt an initial broadcast which is guaranteed to comply with the
+	// RBF rules.
+	result, err = t.initialBroadcast(requestID, r.req)
+	if err != nil {
+		log.Errorf("Initial broadcast failed: %v", err)
+
+		// Create a tx so the caller knows which inputs have failed.
+		sweepTx := wire.NewMsgTx(2)
+		for _, o := range r.req.Inputs {
+			sweepTx.AddTxIn(&wire.TxIn{
+				PreviousOutPoint: o.OutPoint(),
+				Sequence:         o.BlocksToMaturity(),
+			})
+		}
+
+		// We now decide what type of event to send.
+		var event BumpEvent
+
+		switch {
+		// When the error is due to a dust output, we'll send a
+		// TxFailed so these inputs can be retried with a different
+		// group in the next block.
+		case errors.Is(err, ErrTxNoOutput):
+			event = TxFailed
+
+		// When the error is due to budget being used up, we'll send a
+		// TxFailed so these inputs can be retried with a different
+		// group in the next block.
+		case errors.Is(err, ErrMaxPosition):
+			event = TxFailed
+
+		// When the error is due to zero fee rate delta, we'll send a
+		// TxFailed so these inputs can be retried in the next block.
+		case errors.Is(err, ErrZeroFeeRateDelta):
+			event = TxFailed
+
+		default:
+			event = TxError
+		}
+
+		result = &BumpResult{
+			Event:     event,
+			Err:       err,
+			requestID: requestID,
+			Tx:        sweepTx,
+		}
+	}
+
 	t.handleResult(result)
 }
 
@@ -922,7 +1102,7 @@ func (t *TxPublisher) createAndPublishTx(requestID uint64,
 	// NOTE: The fee function is expected to have increased its returned
 	// fee rate after calling the SkipFeeBump method. So we can use it
 	// directly here.
-	tx, fee, err := t.createAndCheckTx(r.req, r.feeFunction)
+	sweepCtx, err := t.createAndCheckTx(r.req, r.feeFunction)
 
 	// If the error is fee related, we will return no error and let the fee
 	// bumper retry it at next block.
@@ -969,17 +1149,17 @@ func (t *TxPublisher) createAndPublishTx(requestID uint64,
 	// The tx has been created without any errors, we now register a new
 	// record by overwriting the same requestID.
 	t.records.Store(requestID, &monitorRecord{
-		tx:          tx,
+		tx:          sweepCtx.tx,
 		req:         r.req,
 		feeFunction: r.feeFunction,
-		fee:         fee,
+		fee:         sweepCtx.fee,
 	})
 
 	// Attempt to broadcast this new tx.
 	result, err := t.broadcast(requestID)
 	if err != nil {
 		log.Infof("Failed to broadcast replacement tx %v: %v",
-			tx.TxHash(), err)
+			sweepCtx.tx.TxHash(), err)
 
 		return fn.None[BumpResult]()
 	}
@@ -1005,7 +1185,8 @@ func (t *TxPublisher) createAndPublishTx(requestID uint64,
 		return fn.Some(*result)
 	}
 
-	log.Infof("Replaced tx=%v with new tx=%v", oldTx.TxHash(), tx.TxHash())
+	log.Infof("Replaced tx=%v with new tx=%v", oldTx.TxHash(),
+		sweepCtx.tx.TxHash())
 
 	// Otherwise, it's a successful RBF, set the event and return.
 	result.Event = TxReplaced
@@ -1118,17 +1299,28 @@ func calcCurrentConfTarget(currentHeight, deadline int32) uint32 {
 	return confTarget
 }
 
+// sweepTxCtx houses a sweep transaction with additional context.
+type sweepTxCtx struct {
+	tx *wire.MsgTx
+
+	fee btcutil.Amount
+
+	extraTxOut fn.Option[SweepOutput]
+}
+
 // createSweepTx creates a sweeping tx based on the given inputs, change
 // address and fee rate.
-func (t *TxPublisher) createSweepTx(inputs []input.Input, changePkScript []byte,
-	feeRate chainfee.SatPerKWeight) (*wire.MsgTx, btcutil.Amount, error) {
+func (t *TxPublisher) createSweepTx(inputs []input.Input,
+	changePkScript lnwallet.AddrWithKey,
+	feeRate chainfee.SatPerKWeight) (*sweepTxCtx, error) {
 
 	// Validate and calculate the fee and change amount.
-	txFee, changeAmtOpt, locktimeOpt, err := prepareSweepTx(
+	txFee, changeOutputsOpt, locktimeOpt, err := prepareSweepTx(
 		inputs, changePkScript, feeRate, t.currentHeight.Load(),
+		t.cfg.AuxSweeper,
 	)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	var (
@@ -1171,12 +1363,12 @@ func (t *TxPublisher) createSweepTx(inputs []input.Input, changePkScript []byte,
 		})
 	}
 
-	// If there's a change amount, add it to the transaction.
-	changeAmtOpt.WhenSome(func(changeAmt btcutil.Amount) {
-		sweepTx.AddTxOut(&wire.TxOut{
-			PkScript: changePkScript,
-			Value:    int64(changeAmt),
-		})
+	// If we have change outputs to add, then add it the sweep transaction
+	// here.
+	changeOutputsOpt.WhenSome(func(changeOuts []SweepOutput) {
+		for i := range changeOuts {
+			sweepTx.AddTxOut(&changeOuts[i].TxOut)
+		}
 	})
 
 	// We'll default to using the current block height as locktime, if none
@@ -1185,7 +1377,7 @@ func (t *TxPublisher) createSweepTx(inputs []input.Input, changePkScript []byte,
 
 	prevInputFetcher, err := input.MultiPrevOutFetcher(inputs)
 	if err != nil {
-		return nil, 0, fmt.Errorf("error creating prev input fetcher "+
+		return nil, fmt.Errorf("error creating prev input fetcher "+
 			"for hash cache: %v", err)
 	}
 	hashCache := txscript.NewTxSigHashes(sweepTx, prevInputFetcher)
@@ -1213,35 +1405,87 @@ func (t *TxPublisher) createSweepTx(inputs []input.Input, changePkScript []byte,
 
 	for idx, inp := range idxs {
 		if err := addInputScript(idx, inp); err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 	}
 
 	log.Debugf("Created sweep tx %v for inputs:\n%v", sweepTx.TxHash(),
 		inputTypeSummary(inputs))
 
-	return sweepTx, txFee, nil
+	// Try to locate the extra change output, though there might be None.
+	extraTxOut := fn.MapOption(
+		func(sweepOuts []SweepOutput) fn.Option[SweepOutput] {
+			for _, sweepOut := range sweepOuts {
+				if !sweepOut.IsExtra {
+					continue
+				}
+
+				// If we sweep outputs of a custom channel, the
+				// custom leaves in those outputs will be merged
+				// into a single output, even if we sweep
+				// multiple outputs (e.g. to_remote and breached
+				// to_local of a breached channel) at the same
+				// time. So there will only ever be one extra
+				// output.
+				log.Debugf("Sweep produced extra_sweep_out=%v",
+					lnutils.SpewLogClosure(sweepOut))
+
+				return fn.Some(sweepOut)
+			}
+
+			return fn.None[SweepOutput]()
+		},
+	)(changeOutputsOpt)
+
+	return &sweepTxCtx{
+		tx:         sweepTx,
+		fee:        txFee,
+		extraTxOut: fn.FlattenOption(extraTxOut),
+	}, nil
 }
 
-// prepareSweepTx returns the tx fee, an optional change amount and an optional
-// locktime after a series of validations:
+// prepareSweepTx returns the tx fee, a set of optional change outputs and an
+// optional locktime after a series of validations:
 // 1. check the locktime has been reached.
 // 2. check the locktimes are the same.
 // 3. check the inputs cover the outputs.
 //
 // NOTE: if the change amount is below dust, it will be added to the tx fee.
-func prepareSweepTx(inputs []input.Input, changePkScript []byte,
-	feeRate chainfee.SatPerKWeight, currentHeight int32) (
-	btcutil.Amount, fn.Option[btcutil.Amount], fn.Option[int32], error) {
+func prepareSweepTx(inputs []input.Input, changePkScript lnwallet.AddrWithKey,
+	feeRate chainfee.SatPerKWeight, currentHeight int32,
+	auxSweeper fn.Option[AuxSweeper]) (
+	btcutil.Amount, fn.Option[[]SweepOutput], fn.Option[int32], error) {
 
-	noChange := fn.None[btcutil.Amount]()
+	noChange := fn.None[[]SweepOutput]()
 	noLocktime := fn.None[int32]()
+
+	// Given the set of inputs we have, if we have an aux sweeper, then
+	// we'll attempt to see if we have any other change outputs we'll need
+	// to add to the sweep transaction.
+	changePkScripts := [][]byte{changePkScript.DeliveryAddress}
+
+	var extraChangeOut fn.Option[SweepOutput]
+	err := fn.MapOptionZ(
+		auxSweeper, func(aux AuxSweeper) error {
+			extraOut := aux.DeriveSweepAddr(inputs, changePkScript)
+			if err := extraOut.Err(); err != nil {
+				return err
+			}
+
+			extraChangeOut = extraOut.LeftToOption()
+
+			return nil
+		},
+	)
+	if err != nil {
+		return 0, noChange, noLocktime, err
+	}
 
 	// Creating a weight estimator with nil outputs and zero max fee rate.
 	// We don't allow adding customized outputs in the sweeping tx, and the
 	// fee rate is already being managed before we get here.
 	inputs, estimator, err := getWeightEstimate(
-		inputs, nil, feeRate, 0, changePkScript,
+		inputs, nil, feeRate, 0, changePkScripts,
 	)
 	if err != nil {
 		return 0, noChange, noLocktime, err
@@ -1258,6 +1502,12 @@ func prepareSweepTx(inputs []input.Input, changePkScript []byte,
 		totalInput     btcutil.Amount
 		requiredOutput btcutil.Amount
 	)
+
+	// If we have an extra change output, then we'll add it as a required
+	// output amt.
+	extraChangeOut.WhenSome(func(o SweepOutput) {
+		requiredOutput += btcutil.Amount(o.Value)
+	})
 
 	// Go through each input and check if the required lock times have
 	// reached and are the same.
@@ -1305,14 +1555,22 @@ func prepareSweepTx(inputs []input.Input, changePkScript []byte,
 	// The value remaining after the required output and fees is the
 	// change output.
 	changeAmt := totalInput - requiredOutput - txFee
-	changeAmtOpt := fn.Some(changeAmt)
+	changeOuts := make([]SweepOutput, 0, 2)
+
+	extraChangeOut.WhenSome(func(o SweepOutput) {
+		changeOuts = append(changeOuts, o)
+	})
 
 	// We'll calculate the dust limit for the given changePkScript since it
 	// is variable.
-	changeFloor := lnwallet.DustLimitForSize(len(changePkScript))
+	changeFloor := lnwallet.DustLimitForSize(
+		len(changePkScript.DeliveryAddress),
+	)
 
-	// If the change amount is dust, we'll move it into the fees.
-	if changeAmt < changeFloor {
+	switch {
+	// If the change amount is dust, we'll move it into the fees, and
+	// ignore it.
+	case changeAmt < changeFloor:
 		log.Infof("Change amt %v below dustlimit %v, not adding "+
 			"change output", changeAmt, changeFloor)
 
@@ -1327,14 +1585,27 @@ func prepareSweepTx(inputs []input.Input, changePkScript []byte,
 		// The dust amount is added to the fee.
 		txFee += changeAmt
 
-		// Set the change amount to none.
-		changeAmtOpt = fn.None[btcutil.Amount]()
+	// Otherwise, we'll actually recognize it as a change output.
+	default:
+		changeOuts = append(changeOuts, SweepOutput{
+			TxOut: wire.TxOut{
+				Value:    int64(changeAmt),
+				PkScript: changePkScript.DeliveryAddress,
+			},
+			IsExtra:     false,
+			InternalKey: changePkScript.InternalKey,
+		})
 	}
 
 	// Optionally set the locktime.
 	locktimeOpt := fn.Some(locktime)
 	if locktime == -1 {
 		locktimeOpt = noLocktime
+	}
+
+	var changeOutsOpt fn.Option[[]SweepOutput]
+	if len(changeOuts) > 0 {
+		changeOutsOpt = fn.Some(changeOuts)
 	}
 
 	log.Debugf("Creating sweep tx for %v inputs (%s) using %v, "+
@@ -1344,5 +1615,5 @@ func prepareSweepTx(inputs []input.Input, changePkScript []byte,
 		estimator.weight(), txFee, locktimeOpt, len(estimator.parents),
 		estimator.parentsFee, estimator.parentsWeight, currentHeight)
 
-	return txFee, changeAmtOpt, locktimeOpt, nil
+	return txFee, changeOutsOpt, locktimeOpt, nil
 }

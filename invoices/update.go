@@ -1,9 +1,11 @@
 package invoices
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/lightningnetwork/lnd/amp"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -19,16 +21,29 @@ type invoiceUpdateCtx struct {
 	expiry               uint32
 	currentHeight        int32
 	finalCltvRejectDelta int32
-	customRecords        record.CustomSet
-	mpp                  *record.MPP
-	amp                  *record.AMP
-	metadata             []byte
+
+	// wireCustomRecords are the custom records that were included with the
+	// HTLC wire message.
+	wireCustomRecords lnwire.CustomRecords
+
+	// customRecords is a map of custom records that were included with the
+	// HTLC onion payload.
+	customRecords record.CustomSet
+
+	mpp          *record.MPP
+	amp          *record.AMP
+	metadata     []byte
+	pathID       *chainhash.Hash
+	totalAmtMsat lnwire.MilliSatoshi
 }
 
 // invoiceRef returns an identifier that can be used to lookup or update the
 // invoice this HTLC is targeting.
 func (i *invoiceUpdateCtx) invoiceRef() InvoiceRef {
 	switch {
+	case i.pathID != nil:
+		return InvoiceRefByHashAndAddr(i.hash, *i.pathID)
+
 	case i.amp != nil && i.mpp != nil:
 		payAddr := i.mpp.PaymentAddr()
 		return InvoiceRefByAddr(payAddr)
@@ -88,12 +103,14 @@ func (i invoiceUpdateCtx) settleRes(preimage lntypes.Preimage,
 // acceptRes is a helper function which creates an accept resolution with
 // the information contained in the invoiceUpdateCtx and the accept resolution
 // result provided.
-func (i invoiceUpdateCtx) acceptRes(outcome acceptResolutionResult) *htlcAcceptResolution {
+func (i invoiceUpdateCtx) acceptRes(
+	outcome acceptResolutionResult) *htlcAcceptResolution {
+
 	return newAcceptResolution(i.circuitKey, outcome)
 }
 
 // updateInvoice is a callback for DB.UpdateInvoice that contains the invoice
-// settlement logic. It returns a hltc resolution that indicates what the
+// settlement logic. It returns a HTLC resolution that indicates what the
 // outcome of the update was.
 func updateInvoice(ctx *invoiceUpdateCtx, inv *Invoice) (
 	*InvoiceUpdateDesc, HtlcResolution, error) {
@@ -112,7 +129,7 @@ func updateInvoice(ctx *invoiceUpdateCtx, inv *Invoice) (
 			pre := inv.Terms.PaymentPreimage
 
 			// Terms.PaymentPreimage will be nil for AMP invoices.
-			// Set it to the HTLC's AMP Preimage instead.
+			// Set it to the HTLCs AMP Preimage instead.
 			if pre == nil {
 				pre = htlc.AMP.Preimage
 			}
@@ -130,7 +147,7 @@ func updateInvoice(ctx *invoiceUpdateCtx, inv *Invoice) (
 	// If no MPP payload was provided, then we expect this to be a keysend,
 	// or a payment to an invoice created before we started to require the
 	// MPP payload.
-	if ctx.mpp == nil {
+	if ctx.mpp == nil && ctx.pathID == nil {
 		return updateLegacy(ctx, inv)
 	}
 
@@ -158,13 +175,34 @@ func updateMpp(ctx *invoiceUpdateCtx, inv *Invoice) (*InvoiceUpdateDesc,
 
 	setID := ctx.setID()
 
+	var (
+		totalAmt    = ctx.totalAmtMsat
+		paymentAddr []byte
+	)
+	// If an MPP record is present, then the payment address and total
+	// payment amount is extracted from it. Otherwise, the pathID is used
+	// to extract the payment address.
+	if ctx.mpp != nil {
+		totalAmt = ctx.mpp.TotalMsat()
+		payAddr := ctx.mpp.PaymentAddr()
+		paymentAddr = payAddr[:]
+	} else {
+		paymentAddr = ctx.pathID[:]
+	}
+
+	// For storage, we don't really care where the custom records came from.
+	// So we merge them together and store them in the same field.
+	customRecords := lnwire.CustomRecords(
+		ctx.customRecords,
+	).MergedCopy(ctx.wireCustomRecords)
+
 	// Start building the accept descriptor.
 	acceptDesc := &HtlcAcceptDesc{
 		Amt:           ctx.amtPaid,
 		Expiry:        ctx.expiry,
 		AcceptHeight:  ctx.currentHeight,
-		MppTotalAmt:   ctx.mpp.TotalMsat(),
-		CustomRecords: ctx.customRecords,
+		MppTotalAmt:   totalAmt,
+		CustomRecords: record.CustomSet(customRecords),
 	}
 
 	if ctx.amp != nil {
@@ -184,27 +222,27 @@ func updateMpp(ctx *invoiceUpdateCtx, inv *Invoice) (*InvoiceUpdateDesc,
 	}
 
 	// Check the payment address that authorizes the payment.
-	if ctx.mpp.PaymentAddr() != inv.Terms.PaymentAddr {
+	if !bytes.Equal(paymentAddr, inv.Terms.PaymentAddr[:]) {
 		return nil, ctx.failRes(ResultAddressMismatch), nil
 	}
 
 	// Don't accept zero-valued sets.
-	if ctx.mpp.TotalMsat() == 0 {
+	if totalAmt == 0 {
 		return nil, ctx.failRes(ResultHtlcSetTotalTooLow), nil
 	}
 
 	// Check that the total amt of the htlc set is high enough. In case this
 	// is a zero-valued invoice, it will always be enough.
-	if ctx.mpp.TotalMsat() < inv.Terms.Value {
+	if totalAmt < inv.Terms.Value {
 		return nil, ctx.failRes(ResultHtlcSetTotalTooLow), nil
 	}
 
 	htlcSet := inv.HTLCSet(setID, HtlcStateAccepted)
 
-	// Check whether total amt matches other htlcs in the set.
+	// Check whether total amt matches other HTLCs in the set.
 	var newSetTotal lnwire.MilliSatoshi
 	for _, htlc := range htlcSet {
-		if ctx.mpp.TotalMsat() != htlc.MppTotalAmt {
+		if totalAmt != htlc.MppTotalAmt {
 			return nil, ctx.failRes(ResultHtlcSetTotalMismatch), nil
 		}
 
@@ -238,12 +276,12 @@ func updateMpp(ctx *invoiceUpdateCtx, inv *Invoice) (*InvoiceUpdateDesc,
 	}
 
 	// If the invoice cannot be settled yet, only record the htlc.
-	setComplete := newSetTotal >= ctx.mpp.TotalMsat()
+	setComplete := newSetTotal >= totalAmt
 	if !setComplete {
 		return &update, ctx.acceptRes(resultPartialAccepted), nil
 	}
 
-	// Check to see if we can settle or this is an hold invoice and
+	// Check to see if we can settle or this is a hold invoice, and
 	// we need to wait for the preimage.
 	if inv.HodlInvoice {
 		update.State = &InvoiceStateUpdateDesc{
@@ -412,13 +450,19 @@ func updateLegacy(ctx *invoiceUpdateCtx,
 		return nil, ctx.failRes(ResultExpiryTooSoon), nil
 	}
 
+	// For storage, we don't really care where the custom records came from.
+	// So we merge them together and store them in the same field.
+	customRecords := lnwire.CustomRecords(
+		ctx.customRecords,
+	).MergedCopy(ctx.wireCustomRecords)
+
 	// Record HTLC in the invoice database.
 	newHtlcs := map[CircuitKey]*HtlcAcceptDesc{
 		ctx.circuitKey: {
 			Amt:           ctx.amtPaid,
 			Expiry:        ctx.expiry,
 			AcceptHeight:  ctx.currentHeight,
-			CustomRecords: ctx.customRecords,
+			CustomRecords: record.CustomSet(customRecords),
 		},
 	}
 

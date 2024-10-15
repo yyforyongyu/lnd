@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"sync"
 	"time"
@@ -31,6 +32,21 @@ const (
 	unknownFailureSourceIdx = -1
 )
 
+// missionControlDB is an interface that defines the database methods that a
+// single missionControlStore has access to. It allows the missionControlStore
+// to be unaware of the overall DB structure and restricts its access to the DB
+// by only providing it the bucket that it needs to care about.
+type missionControlDB interface {
+	// update can be used to perform reads and writes on the given bucket.
+	update(f func(bkt kvdb.RwBucket) error, reset func()) error
+
+	// view can be used to perform reads on the given bucket.
+	view(f func(bkt kvdb.RBucket) error, reset func()) error
+
+	// purge will delete all the contents in this store.
+	purge() error
+}
+
 // missionControlStore is a bolt db based implementation of a mission control
 // store. It stores the raw payment attempt data from which the internal mission
 // controls state can be rederived on startup. This allows the mission control
@@ -40,7 +56,7 @@ const (
 type missionControlStore struct {
 	done chan struct{}
 	wg   sync.WaitGroup
-	db   kvdb.Backend
+	db   missionControlDB
 
 	// queueCond is signalled when items are put into the queue.
 	queueCond *sync.Cond
@@ -66,7 +82,7 @@ type missionControlStore struct {
 	flushInterval time.Duration
 }
 
-func newMissionControlStore(db kvdb.Backend, maxRecords int,
+func newMissionControlStore(db missionControlDB, maxRecords int,
 	flushInterval time.Duration) (*missionControlStore, error) {
 
 	var (
@@ -75,13 +91,7 @@ func newMissionControlStore(db kvdb.Backend, maxRecords int,
 	)
 
 	// Create buckets if not yet existing.
-	err := kvdb.Update(db, func(tx kvdb.RwTx) error {
-		resultsBucket, err := tx.CreateTopLevelBucket(resultsKey)
-		if err != nil {
-			return fmt.Errorf("cannot create results bucket: %w",
-				err)
-		}
-
+	err := db.update(func(resultsBucket kvdb.RwBucket) error {
 		// Collect all keys to be able to quickly calculate the
 		// difference when updating the DB state.
 		c := resultsBucket.ReadCursor()
@@ -118,20 +128,12 @@ func (b *missionControlStore) clear() error {
 	b.queueCond.L.Lock()
 	defer b.queueCond.L.Unlock()
 
-	err := kvdb.Update(b.db, func(tx kvdb.RwTx) error {
-		if err := tx.DeleteTopLevelBucket(resultsKey); err != nil {
-			return err
-		}
-
-		_, err := tx.CreateTopLevelBucket(resultsKey)
-		return err
-	}, func() {})
-
-	if err != nil {
+	if err := b.db.purge(); err != nil {
 		return err
 	}
 
 	b.queue = list.New()
+
 	return nil
 }
 
@@ -139,8 +141,7 @@ func (b *missionControlStore) clear() error {
 func (b *missionControlStore) fetchAll() ([]*paymentResult, error) {
 	var results []*paymentResult
 
-	err := kvdb.View(b.db, func(tx kvdb.RTx) error {
-		resultBucket := tx.ReadBucket(resultsKey)
+	err := b.db.view(func(resultBucket kvdb.RBucket) error {
 		results = make([]*paymentResult, 0)
 
 		return resultBucket.ForEach(func(k, v []byte) error {
@@ -187,7 +188,7 @@ func serializeResult(rp *paymentResult) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 
-	if err := channeldb.SerializeRoute(&b, *rp.route); err != nil {
+	if err := serializeRoute(&b, rp.route); err != nil {
 		return nil, nil, err
 	}
 
@@ -209,6 +210,90 @@ func serializeResult(rp *paymentResult) ([]byte, []byte, error) {
 	key := getResultKey(rp)
 
 	return key, b.Bytes(), nil
+}
+
+// deserializeRoute deserializes the mcRoute from the given io.Reader.
+func deserializeRoute(r io.Reader) (*mcRoute, error) {
+	var rt mcRoute
+	if err := channeldb.ReadElements(r, &rt.totalAmount); err != nil {
+		return nil, err
+	}
+
+	var pub []byte
+	if err := channeldb.ReadElements(r, &pub); err != nil {
+		return nil, err
+	}
+	copy(rt.sourcePubKey[:], pub)
+
+	var numHops uint32
+	if err := channeldb.ReadElements(r, &numHops); err != nil {
+		return nil, err
+	}
+
+	var hops []*mcHop
+	for i := uint32(0); i < numHops; i++ {
+		hop, err := deserializeHop(r)
+		if err != nil {
+			return nil, err
+		}
+		hops = append(hops, hop)
+	}
+	rt.hops = hops
+
+	return &rt, nil
+}
+
+// deserializeHop deserializes the mcHop from the given io.Reader.
+func deserializeHop(r io.Reader) (*mcHop, error) {
+	var h mcHop
+
+	var pub []byte
+	if err := channeldb.ReadElements(r, &pub); err != nil {
+		return nil, err
+	}
+	copy(h.pubKeyBytes[:], pub)
+
+	if err := channeldb.ReadElements(r,
+		&h.channelID, &h.amtToFwd, &h.hasBlindingPoint,
+		&h.hasCustomRecords,
+	); err != nil {
+		return nil, err
+	}
+
+	return &h, nil
+}
+
+// serializeRoute serializes a mcRoute and writes the resulting bytes to the
+// given io.Writer.
+func serializeRoute(w io.Writer, r *mcRoute) error {
+	err := channeldb.WriteElements(w, r.totalAmount, r.sourcePubKey[:])
+	if err != nil {
+		return err
+	}
+
+	if err := channeldb.WriteElements(w, uint32(len(r.hops))); err != nil {
+		return err
+	}
+
+	for _, h := range r.hops {
+		if err := serializeHop(w, h); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// serializeHop serializes a mcHop and writes the resulting bytes to the given
+// io.Writer.
+func serializeHop(w io.Writer, h *mcHop) error {
+	return channeldb.WriteElements(w,
+		h.pubKeyBytes[:],
+		h.channelID,
+		h.amtToFwd,
+		h.hasBlindingPoint,
+		h.hasCustomRecords,
+	)
 }
 
 // deserializeResult deserializes a payment result.
@@ -244,11 +329,11 @@ func deserializeResult(k, v []byte) (*paymentResult, error) {
 	}
 
 	// Read route.
-	route, err := channeldb.DeserializeRoute(r)
+	route, err := deserializeRoute(r)
 	if err != nil {
 		return nil, err
 	}
-	result.route = &route
+	result.route = route
 
 	// Read failure.
 	failureBytes, err := wire.ReadVarBytes(
@@ -426,9 +511,7 @@ func (b *missionControlStore) storeResults() error {
 		}
 	}
 
-	err := kvdb.Update(b.db, func(tx kvdb.RwTx) error {
-		bucket := tx.ReadWriteBucket(resultsKey)
-
+	err := b.db.update(func(bucket kvdb.RwBucket) error {
 		for e := l.Front(); e != nil; e = e.Next() {
 			pr, ok := e.Value.(*paymentResult)
 			if !ok {
@@ -499,7 +582,7 @@ func getResultKey(rp *paymentResult) []byte {
 	// chronologically.
 	byteOrder.PutUint64(keyBytes[:], uint64(rp.timeReply.UnixNano()))
 	byteOrder.PutUint64(keyBytes[8:], rp.id)
-	copy(keyBytes[16:], rp.route.SourcePubKey[:])
+	copy(keyBytes[16:], rp.route.sourcePubKey[:])
 
 	return keyBytes[:]
 }

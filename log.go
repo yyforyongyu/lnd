@@ -2,6 +2,7 @@ package lnd
 
 import (
 	"github.com/btcsuite/btcd/connmgr"
+	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btclog"
 	"github.com/lightninglabs/neutrino"
 	sphinx "github.com/lightningnetwork/lightning-onion"
@@ -22,6 +23,7 @@ import (
 	"github.com/lightningnetwork/lnd/healthcheck"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/invoices"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc/autopilotrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/chainrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/devrpc"
@@ -42,6 +44,7 @@ import (
 	"github.com/lightningnetwork/lnd/peer"
 	"github.com/lightningnetwork/lnd/peernotifier"
 	"github.com/lightningnetwork/lnd/routing"
+	"github.com/lightningnetwork/lnd/routing/blindedpath"
 	"github.com/lightningnetwork/lnd/rpcperms"
 	"github.com/lightningnetwork/lnd/signal"
 	"github.com/lightningnetwork/lnd/sweep"
@@ -131,6 +134,7 @@ func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor)
 	// can be overwritten later.
 	AddSubLogger(root, "BTCN", interceptor, neutrino.UseLogger)
 	AddSubLogger(root, "CMGR", interceptor, connmgr.UseLogger)
+	AddSubLogger(root, "RPCC", interceptor, rpcclient.UseLogger)
 
 	// Some of the loggers declared in the main lnd package are also used
 	// in sub packages.
@@ -181,6 +185,10 @@ func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor)
 	AddSubLogger(root, rpcwallet.Subsystem, interceptor, rpcwallet.UseLogger)
 	AddSubLogger(root, peersrpc.Subsystem, interceptor, peersrpc.UseLogger)
 	AddSubLogger(root, graph.Subsystem, interceptor, graph.UseLogger)
+	AddSubLogger(root, lncfg.Subsystem, interceptor, lncfg.UseLogger)
+	AddSubLogger(
+		root, blindedpath.Subsystem, interceptor, blindedpath.UseLogger,
+	)
 }
 
 // AddSubLogger is a helper method to conveniently create and register the
@@ -207,20 +215,4 @@ func SetSubLogger(root *build.RotatingLogWriter, subsystem string,
 	for _, useLogger := range useLoggers {
 		useLogger(logger)
 	}
-}
-
-// logClosure is used to provide a closure over expensive logging operations so
-// don't have to be performed when the logging level doesn't warrant it.
-type logClosure func() string
-
-// String invokes the underlying function and returns the result.
-func (c logClosure) String() string {
-	return c()
-}
-
-// newLogClosure returns a new closure over a function that returns a string
-// which itself provides a Stringer interface so that it can be used with the
-// logging system.
-func newLogClosure(c func() string) logClosure {
-	return logClosure(c)
 }

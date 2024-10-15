@@ -17,6 +17,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	sphinx "github.com/lightningnetwork/lightning-onion"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/stretchr/testify/require"
 )
@@ -104,12 +105,8 @@ var (
 	testMessageSigner = MessageSigner{
 		SignCompact: func(msg []byte) ([]byte, error) {
 			hash := chainhash.HashB(msg)
-			sig, err := ecdsa.SignCompact(testPrivKey, hash, true)
-			if err != nil {
-				return nil, fmt.Errorf("can't sign the "+
-					"message: %v", err)
-			}
-			return sig, nil
+
+			return ecdsa.SignCompact(testPrivKey, hash, true), nil
 		},
 	}
 
@@ -191,6 +188,7 @@ func TestDecodeEncode(t *testing.T) {
 		encodedInvoice string
 		valid          bool
 		decodedInvoice func() *Invoice
+		decodeOpts     []DecodeOption
 		skipEncoding   bool
 		beforeEncoding func(*Invoice)
 	}{
@@ -561,7 +559,7 @@ func TestDecodeEncode(t *testing.T) {
 					MilliSat:    &testMillisat25mBTC,
 					Timestamp:   time.Unix(1496314658, 0),
 					PaymentHash: &testPaymentHash,
-					PaymentAddr: &specPaymentAddr,
+					PaymentAddr: fn.Some(specPaymentAddr),
 					Description: &testCoffeeBeans,
 					Destination: testPubKey,
 					Features: lnwire.NewFeatureVector(
@@ -588,7 +586,7 @@ func TestDecodeEncode(t *testing.T) {
 					MilliSat:    &testMillisat25mBTC,
 					Timestamp:   time.Unix(1496314658, 0),
 					PaymentHash: &testPaymentHash,
-					PaymentAddr: &specPaymentAddr,
+					PaymentAddr: fn.Some(specPaymentAddr),
 					Description: &testCoffeeBeans,
 					Destination: testPubKey,
 					Features: lnwire.NewFeatureVector(
@@ -717,7 +715,7 @@ func TestDecodeEncode(t *testing.T) {
 					PaymentHash: &testPaymentHash,
 					Description: &testPaymentMetadata,
 					Destination: testPubKey,
-					PaymentAddr: &specPaymentAddr,
+					PaymentAddr: fn.Some(specPaymentAddr),
 					Features: lnwire.NewFeatureVector(
 						lnwire.NewRawFeatureVector(8, 14, 48),
 						lnwire.Features,
@@ -758,6 +756,70 @@ func TestDecodeEncode(t *testing.T) {
 				i.Destination = nil
 			},
 		},
+		{
+			// Invoice with unknown feature bits but since the
+			// WithErrorOnUnknownFeatureBit option is not provided,
+			// it is not expected to error out.
+			encodedInvoice: "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q4psqqqqqqqqqqqqqqqpqsqq40wa3khl49yue3zsgm26jrepqr2eghqlx86rttutve3ugd05em86nsefzh4pfurpd9ek9w2vp95zxqnfe2u7ckudyahsa52q66tgzcp6t2dyk",
+			valid:          true,
+			skipEncoding:   true,
+			decodedInvoice: func() *Invoice {
+				return &Invoice{
+					Net:         &chaincfg.MainNetParams,
+					MilliSat:    &testMillisat25mBTC,
+					Timestamp:   time.Unix(1496314658, 0),
+					PaymentHash: &testPaymentHash,
+					PaymentAddr: fn.Some(specPaymentAddr),
+					Description: &testCoffeeBeans,
+					Destination: testPubKey,
+					Features: lnwire.NewFeatureVector(
+						lnwire.NewRawFeatureVector(
+							9, 15, 99, 100,
+						),
+						lnwire.Features,
+					),
+				}
+			},
+			decodeOpts: []DecodeOption{
+				WithKnownFeatureBits(map[lnwire.FeatureBit]string{
+					9:  "9",
+					15: "15",
+					99: "99",
+				}),
+			},
+		},
+		{
+			// Invoice with unknown feature bits with option set to
+			// error out on unknown feature bit.
+			encodedInvoice: "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q4psqqqqqqqqqqqqqqqpqsqq40wa3khl49yue3zsgm26jrepqr2eghqlx86rttutve3ugd05em86nsefzh4pfurpd9ek9w2vp95zxqnfe2u7ckudyahsa52q66tgzcp6t2dyk",
+			valid:          false,
+			skipEncoding:   true,
+			decodedInvoice: func() *Invoice {
+				return &Invoice{
+					Net:         &chaincfg.MainNetParams,
+					MilliSat:    &testMillisat25mBTC,
+					Timestamp:   time.Unix(1496314658, 0),
+					PaymentHash: &testPaymentHash,
+					PaymentAddr: fn.Some(specPaymentAddr),
+					Description: &testCoffeeBeans,
+					Destination: testPubKey,
+					Features: lnwire.NewFeatureVector(
+						lnwire.NewRawFeatureVector(
+							9, 15, 99, 100,
+						),
+						lnwire.Features,
+					),
+				}
+			},
+			decodeOpts: []DecodeOption{
+				WithKnownFeatureBits(map[lnwire.FeatureBit]string{
+					9:  "9",
+					15: "15",
+					99: "99",
+				}),
+				WithErrorOnUnknownFeatureBit(),
+			},
+		},
 	}
 
 	for i, test := range tests {
@@ -773,7 +835,9 @@ func TestDecodeEncode(t *testing.T) {
 				net = decodedInvoice.Net
 			}
 
-			invoice, err := Decode(test.encodedInvoice, net)
+			invoice, err := Decode(
+				test.encodedInvoice, net, test.decodeOpts...,
+			)
 			if !test.valid {
 				require.Error(t, err)
 			} else {
@@ -975,7 +1039,7 @@ func TestInvoiceChecksumMalleability(t *testing.T) {
 	msgSigner := MessageSigner{
 		SignCompact: func(msg []byte) ([]byte, error) {
 			hash := chainhash.HashB(msg)
-			return ecdsa.SignCompact(privKey, hash, true)
+			return ecdsa.SignCompact(privKey, hash, true), nil
 		},
 	}
 	opts := []func(*Invoice){Description("test")}

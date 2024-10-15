@@ -9,18 +9,19 @@ import (
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/stretchr/testify/require"
 )
 
 var (
-	testOnionHash     = []byte{}
+	testOnionHash     = [OnionPacketSize]byte{}
 	testAmount        = MilliSatoshi(1)
 	testCtlvExpiry    = uint32(2)
 	testFlags         = uint16(2)
 	testType          = uint64(3)
 	testOffset        = uint16(24)
 	sig, _            = NewSigFromSignature(testSig)
-	testChannelUpdate = ChannelUpdate{
+	testChannelUpdate = ChannelUpdate1{
 		Signature:       sig,
 		ShortChannelID:  NewShortChanIDFromInt(1),
 		Timestamp:       1,
@@ -43,9 +44,9 @@ var onionFailures = []FailureMessage{
 	&FailMPPTimeout{},
 
 	NewFailIncorrectDetails(99, 100),
-	NewInvalidOnionVersion(testOnionHash),
-	NewInvalidOnionHmac(testOnionHash),
-	NewInvalidOnionKey(testOnionHash),
+	NewInvalidOnionVersion(testOnionHash[:]),
+	NewInvalidOnionHmac(testOnionHash[:]),
+	NewInvalidOnionKey(testOnionHash[:]),
 	NewTemporaryChannelFailure(&testChannelUpdate),
 	NewTemporaryChannelFailure(nil),
 	NewAmountBelowMinimum(testAmount, testChannelUpdate),
@@ -56,7 +57,7 @@ var onionFailures = []FailureMessage{
 	NewFinalIncorrectCltvExpiry(testCtlvExpiry),
 	NewFinalIncorrectHtlcAmount(testAmount),
 	NewInvalidOnionPayload(testType, testOffset),
-	NewInvalidBlinding(testOnionHash),
+	NewInvalidBlinding(fn.Some(testOnionHash)),
 }
 
 // TestEncodeDecodeCode tests the ability of onion errors to be properly encoded
@@ -137,7 +138,7 @@ func TestChannelUpdateCompatibilityParsing(t *testing.T) {
 	// Now that we have the set of bytes encoded, we'll ensure that we're
 	// able to decode it using our compatibility method, as it's a regular
 	// encoded channel update message.
-	var newChanUpdate ChannelUpdate
+	var newChanUpdate ChannelUpdate1
 	err := parseChannelUpdateCompatibilityMode(
 		&b, uint16(b.Len()), &newChanUpdate, 0,
 	)
@@ -164,7 +165,7 @@ func TestChannelUpdateCompatibilityParsing(t *testing.T) {
 
 	// We should be able to properly parse the encoded channel update
 	// message even with the extra two bytes.
-	var newChanUpdate2 ChannelUpdate
+	var newChanUpdate2 ChannelUpdate1
 	err = parseChannelUpdateCompatibilityMode(
 		&b, uint16(b.Len()), &newChanUpdate2, 0,
 	)
