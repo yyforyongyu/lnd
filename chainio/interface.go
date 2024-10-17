@@ -39,4 +39,12 @@ type Blockbeat interface {
 type Consumer interface {
 	// Name returns a human-readable string for this subsystem.
 	Name() string
+
+	// ProcessBlock takes a blockbeat and processes it. A receive-only
+	// error chan must be returned.
+	//
+	// NOTE: When implementing this, it's very important to send back the
+	// error or nil to the channel `b.errChan` immediately, otherwise
+	// BlockbeatDispatcher will timeout and lnd will shutdown.
+	ProcessBlock(b Beat) <-chan error
 }
