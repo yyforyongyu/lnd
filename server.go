@@ -28,6 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/aliasmgr"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/brontide"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/chanacceptor"
 	"github.com/lightningnetwork/lnd/chanbackup"
@@ -1150,13 +1151,19 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		s.implCfg.AuxSweeper,
 	)
 
+	// Get the current blockbeat.
+	beat, err := s.getCurrentBeat()
+	if err != nil {
+		return nil, err
+	}
+
 	s.txPublisher = sweep.NewTxPublisher(sweep.TxPublisherConfig{
 		Signer:     cc.Wallet.Cfg.Signer,
 		Wallet:     cc.Wallet,
 		Estimator:  cc.FeeEstimator,
 		Notifier:   cc.ChainNotifier,
 		AuxSweeper: s.implCfg.AuxSweeper,
-	})
+	}, beat)
 
 	s.sweeper = sweep.New(&sweep.UtxoSweeperConfig{
 		FeeEstimator: cc.FeeEstimator,
@@ -1173,7 +1180,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		Aggregator:           aggregator,
 		Publisher:            s.txPublisher,
 		NoDeadlineConfTarget: cfg.Sweeper.NoDeadlineConfTarget,
-	})
+	}, beat)
 
 	s.utxoNursery = contractcourt.NewUtxoNursery(&contractcourt.NurseryConfig{
 		ChainIO:             cc.ChainIO,
@@ -1345,7 +1352,8 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		AuxLeafStore: implCfg.AuxLeafStore,
 		AuxSigner:    implCfg.AuxSigner,
 		AuxResolver:  implCfg.AuxContractResolver,
-	}, dbs.ChanStateDB)
+	}, dbs.ChanStateDB, beat,
+	)
 
 	// Select the configuration and funding parameters for Bitcoin.
 	chainCfg := cfg.Bitcoin
@@ -5120,4 +5128,35 @@ func (s *server) fetchClosedChannelSCIDs() map[lnwire.ShortChannelID]struct{} {
 	}
 
 	return closedSCIDs
+}
+
+// getCurrentBeat returns the current beat. This is used during the startup to
+// initialize blockbeat consumers.
+func (s *server) getCurrentBeat() (chainio.Beat, error) {
+	// beat is the current blockbeat.
+	var beat chainio.Beat
+
+	// We should get a notification with the current best block immediately
+	blockEpochs, err := s.cc.ChainNotifier.RegisterBlockEpochNtfn(nil)
+	if err != nil {
+		return beat, fmt.Errorf("register block epoch ntfn: %w", err)
+	}
+	defer blockEpochs.Cancel()
+
+	// We registered for the block epochs with a nil request. The notifier
+	// should send us the current best block immediately. So we need to
+	// wait for it here because we need to know the current best height.
+	select {
+	case bestBlock := <-blockEpochs.Epochs:
+		srvrLog.Infof("Received initial block %v at height %d",
+			bestBlock.Hash, bestBlock.Height)
+
+		// Update the current blockbeat.
+		beat = chainio.NewBeat(*bestBlock)
+
+	case <-s.quit:
+		srvrLog.Debug("LND shutting down")
+	}
+
+	return beat, nil
 }
