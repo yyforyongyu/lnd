@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
@@ -244,6 +245,8 @@ type ChainArbitrator struct {
 	started int32 // To be used atomically.
 	stopped int32 // To be used atomically.
 
+	chainio.BeatConsumer
+
 	sync.Mutex
 
 	// activeChannels is a map of all the active contracts that are still
@@ -269,17 +272,25 @@ type ChainArbitrator struct {
 
 // NewChainArbitrator returns a new instance of the ChainArbitrator using the
 // passed config struct, and backing persistent database.
-func NewChainArbitrator(cfg ChainArbitratorConfig,
-	db *channeldb.DB) *ChainArbitrator {
+func NewChainArbitrator(cfg ChainArbitratorConfig, db *channeldb.DB,
+	beat chainio.Beat) *ChainArbitrator {
 
-	return &ChainArbitrator{
+	c := &ChainArbitrator{
 		cfg:            cfg,
 		activeChannels: make(map[wire.OutPoint]*ChannelArbitrator),
 		activeWatchers: make(map[wire.OutPoint]*chainWatcher),
 		chanSource:     db,
 		quit:           make(chan struct{}),
 	}
+
+	// Mount the block consumer.
+	c.BeatConsumer = chainio.NewBeatConsumer(c.quit, c.Name(), beat)
+
+	return c
 }
+
+// Compile-time check for the chainio.Consumer interface.
+var _ chainio.Consumer = (*ChainArbitrator)(nil)
 
 // arbChannel is a wrapper around an open channel that channel arbitrators
 // interact with.
@@ -480,7 +491,7 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 	}
 
 	return NewChannelArbitrator(
-		arbCfg, htlcSets, chanLog,
+		arbCfg, c.CurrentBeat(), htlcSets, chanLog,
 	), nil
 }
 
@@ -688,7 +699,8 @@ func (c *ChainArbitrator) Start() error {
 		// channel is already in the process of being resolved, no new
 		// HTLCs will be added.
 		c.activeChannels[chanPoint] = NewChannelArbitrator(
-			arbCfg, make(map[HtlcSetKey]htlcSet), chanLog,
+			arbCfg, c.CurrentBeat(), make(map[HtlcSetKey]htlcSet),
+			chanLog,
 		)
 	}
 
@@ -1358,3 +1370,8 @@ func (c *ChainArbitrator) FindOutgoingHTLCDeadline(scid lnwire.ShortChannelID,
 
 // TODO(roasbeef): arbitration reports
 //  * types: contested, waiting for success conf, etc
+
+// NOTE: part of the `chainio.Consumer` interface.
+func (c *ChainArbitrator) Name() string {
+	return "ChainArbitrator"
+}
