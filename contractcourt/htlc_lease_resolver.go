@@ -53,21 +53,15 @@ func (h *htlcLeaseResolver) deriveWaitHeight(csvDelay uint32,
 func (h *htlcLeaseResolver) makeSweepInput(op *wire.OutPoint,
 	wType, cltvWtype input.StandardWitnessType,
 	signDesc *input.SignDescriptor,
-	csvDelay, broadcastHeight uint32, payHash [32]byte) *input.BaseInput {
+	csvDelay, broadcastHeight uint32) *input.BaseInput {
 
 	if h.hasCLTV() {
-		log.Infof("%T(%x): CSV and CLTV locks expired, offering "+
-			"second-layer output to sweeper: %v", h, payHash, op)
-
 		return input.NewCsvInputWithCltv(
 			op, cltvWtype, signDesc,
 			broadcastHeight, csvDelay,
 			h.leaseExpiry,
 		)
 	}
-
-	log.Infof("%T(%x): CSV lock expired, offering second-layer output to "+
-		"sweeper: %v", h, payHash, op)
 
 	return input.NewCsvInput(op, wType, signDesc, broadcastHeight, csvDelay)
 }

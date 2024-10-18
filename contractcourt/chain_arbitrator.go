@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
@@ -244,6 +245,8 @@ type ChainArbitrator struct {
 	started int32 // To be used atomically.
 	stopped int32 // To be used atomically.
 
+	chainio.BeatConsumer
+
 	sync.Mutex
 
 	// activeChannels is a map of all the active contracts that are still
@@ -269,17 +272,25 @@ type ChainArbitrator struct {
 
 // NewChainArbitrator returns a new instance of the ChainArbitrator using the
 // passed config struct, and backing persistent database.
-func NewChainArbitrator(cfg ChainArbitratorConfig,
-	db *channeldb.DB) *ChainArbitrator {
+func NewChainArbitrator(cfg ChainArbitratorConfig, db *channeldb.DB,
+	beat chainio.Beat) *ChainArbitrator {
 
-	return &ChainArbitrator{
+	c := &ChainArbitrator{
 		cfg:            cfg,
 		activeChannels: make(map[wire.OutPoint]*ChannelArbitrator),
 		activeWatchers: make(map[wire.OutPoint]*chainWatcher),
 		chanSource:     db,
 		quit:           make(chan struct{}),
 	}
+
+	// Mount the block consumer.
+	c.BeatConsumer = chainio.NewBeatConsumer(c.quit, c.Name(), beat)
+
+	return c
 }
+
+// Compile-time check for the chainio.Consumer interface.
+var _ chainio.Consumer = (*ChainArbitrator)(nil)
 
 // arbChannel is a wrapper around an open channel that channel arbitrators
 // interact with.
@@ -480,7 +491,7 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 	}
 
 	return NewChannelArbitrator(
-		arbCfg, htlcSets, chanLog,
+		arbCfg, c.CurrentBeat(), htlcSets, chanLog,
 	), nil
 }
 
@@ -526,7 +537,7 @@ func (c *ChainArbitrator) ResolveContract(chanPoint wire.OutPoint) error {
 
 		if err := chainArb.Stop(); err != nil {
 			log.Warnf("unable to stop ChannelArbitrator(%v): %v",
-				chanPoint, err)
+				chainArb.id(), err)
 		}
 	}
 	if chainWatcher != nil {
@@ -594,6 +605,7 @@ func (c *ChainArbitrator) Start() error {
 				auxLeafStore:        c.cfg.AuxLeafStore,
 				auxResolver:         c.cfg.AuxResolver,
 			},
+			c.CurrentBeat(),
 		)
 		if err != nil {
 			return err
@@ -688,7 +700,8 @@ func (c *ChainArbitrator) Start() error {
 		// channel is already in the process of being resolved, no new
 		// HTLCs will be added.
 		c.activeChannels[chanPoint] = NewChannelArbitrator(
-			arbCfg, make(map[HtlcSetKey]htlcSet), chanLog,
+			arbCfg, c.CurrentBeat(), make(map[HtlcSetKey]htlcSet),
+			chanLog,
 		)
 	}
 
@@ -781,18 +794,11 @@ func (c *ChainArbitrator) Start() error {
 		}
 	}
 
-	// Subscribe to a single stream of block epoch notifications that we
-	// will dispatch to all active arbitrators.
-	blockEpoch, err := c.cfg.Notifier.RegisterBlockEpochNtfn(nil)
-	if err != nil {
-		return err
-	}
-
 	// Start our goroutine which will dispatch blocks to each arbitrator.
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.dispatchBlocks(blockEpoch)
+		c.dispatchBlocks()
 	}()
 
 	// TODO(roasbeef): eventually move all breach watching here
@@ -800,99 +806,69 @@ func (c *ChainArbitrator) Start() error {
 	return nil
 }
 
-// blockRecipient contains the information we need to dispatch a block to a
-// channel arbitrator.
-type blockRecipient struct {
-	// chanPoint is the funding outpoint of the channel.
-	chanPoint wire.OutPoint
-
-	// blocks is the channel that new block heights are sent into. This
-	// channel should be sufficiently buffered as to not block the sender.
-	blocks chan<- int32
-
-	// quit is closed if the receiving entity is shutting down.
-	quit chan struct{}
-}
-
 // dispatchBlocks consumes a block epoch notification stream and dispatches
 // blocks to each of the chain arb's active channel arbitrators. This function
 // must be run in a goroutine.
-func (c *ChainArbitrator) dispatchBlocks(
-	blockEpoch *chainntnfs.BlockEpochEvent) {
-
-	// getRecipients is a helper function which acquires the chain arb
-	// lock and returns a set of block recipients which can be used to
-	// dispatch blocks.
-	getRecipients := func() []blockRecipient {
-		c.Lock()
-		blocks := make([]blockRecipient, 0, len(c.activeChannels))
-		for _, channel := range c.activeChannels {
-			blocks = append(blocks, blockRecipient{
-				chanPoint: channel.cfg.ChanPoint,
-				blocks:    channel.blocks,
-				quit:      channel.quit,
-			})
-		}
-		c.Unlock()
-
-		return blocks
-	}
-
-	// On exit, cancel our blocks subscription and close each block channel
-	// so that the arbitrators know they will no longer be receiving blocks.
-	defer func() {
-		blockEpoch.Cancel()
-
-		recipients := getRecipients()
-		for _, recipient := range recipients {
-			close(recipient.blocks)
-		}
-	}()
-
+func (c *ChainArbitrator) dispatchBlocks() {
 	// Consume block epochs until we receive the instruction to shutdown.
 	for {
 		select {
 		// Consume block epochs, exiting if our subscription is
 		// terminated.
-		case block, ok := <-blockEpoch.Epochs:
+		case beat, ok := <-c.BlockbeatChan:
 			if !ok {
 				log.Trace("dispatchBlocks block epoch " +
 					"cancelled")
 				return
 			}
 
-			// Get the set of currently active channels block
-			// subscription channels and dispatch the block to
-			// each.
-			for _, recipient := range getRecipients() {
-				select {
-				// Deliver the block to the arbitrator.
-				case recipient.blocks <- block.Height:
-
-				// If the recipient is shutting down, exit
-				// without delivering the block. This may be
-				// the case when two blocks are mined in quick
-				// succession, and the arbitrator resolves
-				// after the first block, and does not need to
-				// consume the second block.
-				case <-recipient.quit:
-					log.Debugf("channel: %v exit without "+
-						"receiving block: %v",
-						recipient.chanPoint,
-						block.Height)
-
-				// If the chain arb is shutting down, we don't
-				// need to deliver any more blocks (everything
-				// will be shutting down).
-				case <-c.quit:
-					return
-				}
-			}
+			// Send this blockbeat to all the active channels and
+			// wait for them to finish processing it.
+			c.handleBlockbeat(beat)
 
 		// Exit if the chain arbitrator is shutting down.
 		case <-c.quit:
 			return
 		}
+	}
+}
+
+// handleBlockbeat sends the blockbeat to all active channel arbitrator in
+// parallel and wait for them to finish processing it.
+func (c *ChainArbitrator) handleBlockbeat(beat chainio.Blockbeat) {
+	// Notify the chain arbitrator has processed the block.
+	defer beat.NotifyBlockProcessed(nil, c.quit)
+
+	// Read the active channels in a lock.
+	c.Lock()
+
+	// Create a slice to record active channel arbitrator.
+	channels := make([]chainio.Consumer, 0, len(c.activeChannels))
+	watchers := make([]chainio.Consumer, 0, len(c.activeWatchers))
+
+	// Copy the active channels to the slice.
+	for _, channel := range c.activeChannels {
+		channels = append(channels, channel)
+	}
+
+	for _, watcher := range c.activeWatchers {
+		watchers = append(watchers, watcher)
+	}
+
+	c.Unlock()
+
+	// Iterate all the copied watchers and send the blockbeat to them.
+	err := beat.DispatchConcurrent(watchers)
+	if err != nil {
+		// Shutdown lnd if there's an error processing the block.
+		log.Criticalf("Notify blockbeat failed: %v", err)
+	}
+
+	// Iterate all the copied channels and send the blockbeat to them.
+	err = beat.DispatchConcurrent(channels)
+	if err != nil {
+		// Shutdown lnd if there's an error processing the block.
+		log.Criticalf("Notify blockbeat failed: %v", err)
 	}
 }
 
@@ -1023,7 +999,7 @@ func (c *ChainArbitrator) Stop() error {
 	}
 	for chanPoint, arbitrator := range activeChannels {
 		log.Tracef("Attempting to stop ChannelArbitrator(%v)",
-			chanPoint)
+			arbitrator.id())
 
 		if err := arbitrator.Stop(); err != nil {
 			log.Errorf("unable to stop arbitrator for "+
@@ -1198,7 +1174,7 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 	chanPoint := newChan.FundingOutpoint
 
 	log.Infof("Creating new ChannelArbitrator for ChannelPoint(%v)",
-		chanPoint)
+		newChan.FundingOutpoint)
 
 	// If we're already watching this channel, then we'll ignore this
 	// request.
@@ -1225,6 +1201,7 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 			auxLeafStore:        c.cfg.AuxLeafStore,
 			auxResolver:         c.cfg.AuxResolver,
 		},
+		c.CurrentBeat(),
 	)
 	if err != nil {
 		return err
@@ -1340,8 +1317,9 @@ func (c *ChainArbitrator) FindOutgoingHTLCDeadline(scid lnwire.ShortChannelID,
 
 				log.Debugf("ChannelArbitrator(%v): found "+
 					"incoming HTLC in channel=%v using "+
-					"rHash=%x, refundTimeout=%v", scid,
-					cp, rHash, htlc.RefundTimeout)
+					"rHash=%x, refundTimeout=%v",
+					channelArb.id(), cp, rHash,
+					htlc.RefundTimeout)
 
 				return fn.Some(int32(htlc.RefundTimeout))
 			}
@@ -1358,3 +1336,47 @@ func (c *ChainArbitrator) FindOutgoingHTLCDeadline(scid lnwire.ShortChannelID,
 
 // TODO(roasbeef): arbitration reports
 //  * types: contested, waiting for success conf, etc
+
+// NOTE: part of the `chainio.Consumer` interface.
+func (c *ChainArbitrator) Name() string {
+	return "ChainArbitrator"
+}
+
+// RedispatchBlockbeat resends the current blockbeat to the channels specified
+// by the chanPoints. It is used when a channel is added to the chain
+// arbitrator after it has been started, e.g., during the channel restore
+// process.
+func (c *ChainArbitrator) RedispatchBlockbeat(chanPoints []wire.OutPoint) {
+	// Get the current blockbeat.
+	beat := c.CurrentBeat()
+
+	// Prepare two sets of consumers.
+	channels := make([]chainio.Consumer, 0, len(chanPoints))
+	watchers := make([]chainio.Consumer, 0, len(chanPoints))
+
+	// Read the active channels in a lock.
+	c.Lock()
+	for _, op := range chanPoints {
+		if channel, ok := c.activeChannels[op]; ok {
+			channels = append(channels, channel)
+		}
+
+		if watcher, ok := c.activeWatchers[op]; ok {
+			watchers = append(watchers, watcher)
+		}
+	}
+	c.Unlock()
+
+	// Iterate all the copied watchers and send the blockbeat to them.
+	err := beat.DispatchConcurrent(watchers)
+	if err != nil {
+		log.Errorf("Notify blockbeat failed: %v", err)
+	}
+
+	// Iterate all the copied channels and send the blockbeat to them.
+	err = beat.DispatchConcurrent(channels)
+	if err != nil {
+		// Shutdown lnd if there's an error processing the block.
+		log.Errorf("Notify blockbeat failed: %v", err)
+	}
+}
