@@ -3774,8 +3774,10 @@ func (r *rpcServer) ChannelBalance(ctx context.Context,
 }
 
 type (
+	pendingForceClose *lnrpc.PendingChannelsResponse_ForceClosedChannel
+
 	pendingOpenChannels  []*lnrpc.PendingChannelsResponse_PendingOpenChannel
-	pendingForceClose    []*lnrpc.PendingChannelsResponse_ForceClosedChannel
+	pendingForceCloses   []*lnrpc.PendingChannelsResponse_ForceClosedChannel
 	waitingCloseChannels []*lnrpc.PendingChannelsResponse_WaitingCloseChannel
 )
 
@@ -3861,7 +3863,7 @@ func (r *rpcServer) fetchPendingOpenChannels() (pendingOpenChannels, error) {
 // fetchPendingForceCloseChannels queries the database for a list of channels
 // that have their closing transactions confirmed but not fully resolved yet.
 // The returned result is used in the response of the PendingChannels RPC.
-func (r *rpcServer) fetchPendingForceCloseChannels() (pendingForceClose,
+func (r *rpcServer) fetchPendingForceCloseChannels() (pendingForceCloses,
 	int64, error) {
 
 	_, currentHeight, err := r.server.cc.ChainIO.GetBestBlock()
@@ -3877,7 +3879,7 @@ func (r *rpcServer) fetchPendingForceCloseChannels() (pendingForceClose,
 		return nil, 0, err
 	}
 
-	result := make(pendingForceClose, 0)
+	result := make(pendingForceCloses, 0)
 	limboBalance := int64(0)
 
 	for _, pendingClose := range channels {
@@ -3992,11 +3994,45 @@ func (r *rpcServer) fetchPendingForceCloseChannels() (pendingForceClose,
 			}
 
 			limboBalance += forceClose.LimboBalance
+
+			// Dedup pending HTLCs.
+			dedupPendingHTLCs(forceClose)
 			result = append(result, forceClose)
 		}
 	}
 
 	return result, limboBalance, nil
+}
+
+// dedupPendingHTLCs takes a pending force close response and removes the
+// duplicated HTLCs found in the report.
+//
+// TODO(yy): remove the utxo nursery so there won't be duplicate reports.
+func dedupPendingHTLCs(forceClose pendingForceClose) {
+	// Make an outpoint map for lookup.
+	ops := make(map[string]struct{}, len(forceClose.PendingHtlcs))
+
+	// Create a set to store the result.
+	htlcSet := make([]*lnrpc.PendingHTLC, 0, len(forceClose.PendingHtlcs))
+
+	// Go through each pending HTLC, if it's outpoint hasn't been seen
+	// before, it will be added to the set.
+	for _, htlc := range forceClose.PendingHtlcs {
+		op := htlc.Outpoint
+		_, found := ops[op]
+
+		// Already seen, skip.
+		if found {
+			continue
+		}
+
+		// Otherwise save it to the set.
+		ops[op] = struct{}{}
+		htlcSet = append(htlcSet, htlc)
+	}
+
+	// Attach the dedupped set.
+	forceClose.PendingHtlcs = htlcSet
 }
 
 // fetchWaitingCloseChannels queries the database for a list of channels
