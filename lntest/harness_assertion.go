@@ -28,6 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntest/rpc"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -1567,8 +1568,9 @@ func (h *HarnessTest) AssertNumHTLCsAndStage(hn *node.HarnessNode,
 		}
 
 		if len(target.PendingHtlcs) != num {
-			return fmt.Errorf("got %d pending htlcs, want %d",
-				len(target.PendingHtlcs), num)
+			return fmt.Errorf("got %d pending htlcs, want %d, %s",
+				len(target.PendingHtlcs), num,
+				lnutils.SpewLogClosure(target.PendingHtlcs)())
 		}
 
 		for i, htlc := range target.PendingHtlcs {
