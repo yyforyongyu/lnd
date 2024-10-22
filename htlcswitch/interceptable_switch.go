@@ -310,12 +310,19 @@ func (s *InterceptableSwitch) run() error {
 					)
 				}
 			}
+
+			log.Debugf("InterceptableSwitc: forwarding %v "+
+				"packets to switch", len(notIntercepted))
+
 			err := s.htlcSwitch.ForwardPackets(
 				packets.linkQuit, notIntercepted...,
 			)
 			if err != nil {
 				log.Errorf("Cannot forward packets: %v", err)
 			}
+
+			log.Debugf("InterceptableSwitc: forwarded %v "+
+				"packets to switch", len(notIntercepted))
 
 		case fwd := <-s.onchainIntercepted:
 			// For on-chain interceptions, we don't know if it has

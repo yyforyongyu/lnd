@@ -111,6 +111,11 @@ type htlcPacket struct {
 
 	// inboundFee is the fee schedule of the incoming channel.
 	inboundFee models.InboundFee
+
+	// skipLinkEligibilityCheck specifies whether we need to query the
+	// link's current state to decide forwarding this packet. When set to
+	// true, the call `link.EligibleToForward` will be skipped.
+	skipLinkEligibilityCheck bool
 }
 
 // inKey returns the circuit key used to identify the incoming htlc.

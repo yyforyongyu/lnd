@@ -2873,9 +2873,24 @@ func (s *Switch) handlePacketAdd(packet *htlcPacket,
 	for _, link := range interfaceLinks {
 		var failure *LinkError
 
+		// canForward specifies whether this link can forward this
+		// packet.
+		canForward := true
+
+		// Skip the check if specified.
+		if !packet.skipLinkEligibilityCheck {
+			log.Tracef("Checking if link(%v) is eligible to "+
+				"forward", link.ShortChanID())
+
+			canForward := link.EligibleToForward()
+
+			log.Tracef("Link(%v) has canForward=%v",
+				link.ShortChanID(), canForward)
+		}
+
 		// We'll skip any links that aren't yet eligible for
 		// forwarding.
-		if !link.EligibleToForward() {
+		if !canForward {
 			failure = NewDetailedLinkError(
 				&lnwire.FailUnknownNextPeer{},
 				OutgoingFailureLinkNotEligible,
@@ -3005,7 +3020,7 @@ func (s *Switch) handlePacketSettle(packet *htlcPacket) error {
 	// and when `UpdateFulfillHTLC` is received. After which `RevokeAndAck`
 	// is received, which invokes `processRemoteSettleFails` in its link.
 	if circuit == nil {
-		log.Debugf("Found nil circuit: packet=%v", spew.Sdump(packet))
+		log.Tracef("Found nil circuit: packet=%v", spew.Sdump(packet))
 		return nil
 	}
 

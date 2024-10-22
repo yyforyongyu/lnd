@@ -479,7 +479,7 @@ type hodlHtlc struct {
 func NewChannelLink(cfg ChannelLinkConfig,
 	channel *lnwallet.LightningChannel) ChannelLink {
 
-	logPrefix := fmt.Sprintf("ChannelLink(%v):", channel.ChannelPoint())
+	logPrefix := fmt.Sprintf("Link(%v):", channel.ShortChanID())
 
 	// If the max fee exposure isn't set, use the default.
 	if cfg.MaxFeeExposure == 0 {
@@ -685,7 +685,13 @@ func (l *channelLink) EligibleToForward() bool {
 //
 // NOTE: MUST be called from the main event loop.
 func (l *channelLink) eligibleToForward() bool {
-	return l.eligibleToUpdate() && !l.IsFlushing(Outgoing)
+	canUpdate := l.eligibleToUpdate()
+	isFlushing := l.IsFlushing(Outgoing)
+
+	log.Tracef("Link(%v): eligibleToForward=%v, isFlushing=%v",
+		l.channel.ShortChanID(), canUpdate, isFlushing)
+
+	return canUpdate && !isFlushing
 }
 
 // EligibleToUpdate returns a bool indicating if the channel is able to update
@@ -709,10 +715,16 @@ func (l *channelLink) EligibleToUpdate() bool {
 //
 // NOTE: MUST be called from the main event loop.
 func (l *channelLink) eligibleToUpdate() bool {
-	return l.channel.RemoteNextRevocation() != nil &&
-		l.channel.ShortChanID() != hop.Source &&
-		l.isReestablished() &&
-		l.quiescer.canSendUpdates()
+	hasNextRevocation := l.channel.RemoteNextRevocation() != nil
+	isZeroSource := l.channel.ShortChanID() == hop.Source
+	reestablished := l.isReestablished()
+	stfuNotSent := l.quiescer.canSendUpdates()
+
+	log.Tracef("Link(%v): hasNextRevocation=%v, isZeroSource=%v, "+
+		"reestablished=%v, stfuNotSent=%v", l.channel.ShortChanID(),
+		hasNextRevocation, isZeroSource, reestablished, stfuNotSent)
+
+	return hasNextRevocation && !isZeroSource && reestablished && stfuNotSent
 }
 
 // EnableAdds sets the ChannelUpdateHandler state to allow UpdateAddHtlc's in
@@ -1510,7 +1522,12 @@ func (l *channelLink) htlcManager() {
 		// indicates that we have a new incoming HTLC, either directly
 		// for us, or part of a multi-hop HTLC circuit.
 		case msg := <-l.upstream:
+			l.log.Tracef("handling upstream msg %v", msg.MsgType())
+
 			l.handleUpstreamMsg(msg)
+
+			l.log.Tracef("finished handling upstream msg %v",
+				msg.MsgType())
 
 		// A htlc resolution is received. This means that we now have a
 		// resolution for a previously accepted htlc.
@@ -1548,7 +1565,11 @@ func (l *channelLink) htlcManager() {
 			}
 
 		case runQuery := <-l.stateQueries:
+			l.log.Tracef("received state query")
+
 			runQuery()
+
+			l.log.Tracef("finished state query")
 
 		case <-l.quit:
 			return
@@ -3578,7 +3599,9 @@ func (l *channelLink) processRemoteSettleFails(fwdPkg *channeldb.FwdPkg) {
 //
 //nolint:funlen
 func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg) {
-	l.log.Tracef("processing %d remote adds for height %d",
+	l.log.Debugf("processing %d remote adds for height %d",
+		len(fwdPkg.Adds), fwdPkg.Height)
+	defer l.log.Debugf("processed %d remote adds for height %d",
 		len(fwdPkg.Adds), fwdPkg.Height)
 
 	decodeReqs := make(
@@ -3831,19 +3854,20 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg) {
 
 				//nolint:lll
 				updatePacket := &htlcPacket{
-					incomingChanID:       l.ShortChanID(),
-					incomingHTLCID:       add.ID,
-					outgoingChanID:       fwdInfo.NextHop,
-					sourceRef:            &sourceRef,
-					incomingAmount:       add.Amount,
-					amount:               outgoingAdd.Amount,
-					htlc:                 outgoingAdd,
-					obfuscator:           obfuscator,
-					incomingTimeout:      add.Expiry,
-					outgoingTimeout:      fwdInfo.OutgoingCTLV,
-					inOnionCustomRecords: pld.CustomRecords(),
-					inboundFee:           inboundFee,
-					inWireCustomRecords:  add.CustomRecords.Copy(),
+					incomingChanID:           l.ShortChanID(),
+					incomingHTLCID:           add.ID,
+					outgoingChanID:           fwdInfo.NextHop,
+					sourceRef:                &sourceRef,
+					incomingAmount:           add.Amount,
+					amount:                   outgoingAdd.Amount,
+					htlc:                     outgoingAdd,
+					obfuscator:               obfuscator,
+					incomingTimeout:          add.Expiry,
+					outgoingTimeout:          fwdInfo.OutgoingCTLV,
+					inOnionCustomRecords:     pld.CustomRecords(),
+					inboundFee:               inboundFee,
+					inWireCustomRecords:      add.CustomRecords.Copy(),
+					skipLinkEligibilityCheck: true,
 				}
 				switchPackets = append(
 					switchPackets, updatePacket,
@@ -3902,19 +3926,20 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg) {
 
 				//nolint:lll
 				updatePacket := &htlcPacket{
-					incomingChanID:       l.ShortChanID(),
-					incomingHTLCID:       add.ID,
-					outgoingChanID:       fwdInfo.NextHop,
-					sourceRef:            &sourceRef,
-					incomingAmount:       add.Amount,
-					amount:               addMsg.Amount,
-					htlc:                 addMsg,
-					obfuscator:           obfuscator,
-					incomingTimeout:      add.Expiry,
-					outgoingTimeout:      fwdInfo.OutgoingCTLV,
-					inOnionCustomRecords: pld.CustomRecords(),
-					inboundFee:           inboundFee,
-					inWireCustomRecords:  add.CustomRecords.Copy(),
+					incomingChanID:           l.ShortChanID(),
+					incomingHTLCID:           add.ID,
+					outgoingChanID:           fwdInfo.NextHop,
+					sourceRef:                &sourceRef,
+					incomingAmount:           add.Amount,
+					amount:                   addMsg.Amount,
+					htlc:                     addMsg,
+					obfuscator:               obfuscator,
+					incomingTimeout:          add.Expiry,
+					outgoingTimeout:          fwdInfo.OutgoingCTLV,
+					inOnionCustomRecords:     pld.CustomRecords(),
+					inboundFee:               inboundFee,
+					inWireCustomRecords:      add.CustomRecords.Copy(),
+					skipLinkEligibilityCheck: true,
 				}
 
 				fwdPkg.FwdFilter.Set(idx)
@@ -3950,6 +3975,9 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg) {
 	// opened circuits, which violates assumptions made by the circuit
 	// trimming.
 	l.forwardBatch(replay, switchPackets...)
+
+	l.log.Debugf("forwarded %d packets to switch: replay=%v",
+		len(switchPackets), replay)
 }
 
 // processExitHop handles an htlc for which this link is the exit hop. It
@@ -4340,11 +4368,19 @@ func runInEventLoop[A, B any](l *channelLink, a A, f func(A) B) fn.Result[B] {
 		req.Resolve(f(a))
 	}
 
+	l.log.Debug("Running query in event loop")
+
 	// Chuck that closure into the event loop to ensure it is executed by
 	// the thread that writes this state.
 	if !fn.SendOrQuit(l.stateQueries, query, l.quit) {
 		return fn.Errf[B]("channel link is shutting down")
 	}
 
-	return fn.NewResult(fn.RecvResp(res, nil, l.quit))
+	l.log.Debugf("Query sent")
+
+	result := fn.NewResult(fn.RecvResp(res, nil, l.quit))
+
+	l.log.Debugf("Query result received")
+
+	return result
 }
