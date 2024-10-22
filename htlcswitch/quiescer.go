@@ -84,6 +84,9 @@ type quiescer interface {
 	// the channel has been quiescent and then resets the quiescer state to
 	// its initial state.
 	resume()
+
+	handleLocalQuiescenceReq(req StfuReq) error
+	handleRemoteStfu(msg *lnwire.Stfu) error
 }
 
 // quiescerCfg is a config structure used to initialize a quiescer giving it the
@@ -346,6 +349,118 @@ func (q *quiescerLive) resume() {
 	q.resumeQueue = nil
 }
 
+// handleLocalQuiescenceReq...
+func (q *quiescerLive) handleLocalQuiescenceReq(req StfuReq) error {
+	// Fail if we've already initiated quiescence.
+	if q.localInit {
+		return fmt.Errorf("quiescence already requested")
+	}
+
+	// Fail if we are in the process of handling a remote-initiated
+	// quiescence, we will leave it to be handled automatically.
+	if q.remoteInit {
+		return fmt.Errorf("quiescence already requested by remote")
+	}
+
+	// Impossible state?
+	if q.sent {
+		return fmt.Errorf("impossible state: already sent STFU")
+	}
+
+	q.localInit = true
+
+	return q.sendStfu()
+}
+
+// handleRemoteQuiescenceReq...
+func (q *quiescerLive) handleRemoteStfu(msg *lnwire.Stfu) error {
+	// Received twice, return an error.
+	if q.received {
+		return fmt.Errorf("%w for channel %v", ErrStfuAlreadyRcvd,
+			q.cfg.chanID)
+	}
+	q.received = true
+
+	// need to know if we are handling a rely of a locally-initialized stfu
+	// from us or if we are handling a remote-initiated stfu.
+	//
+	// We are handling a rely of a locally-initiated stfu, the initiator
+	// field must be false.
+	if q.localInit {
+		return q.handleRemoteReply(msg)
+	}
+
+	// We are handling a remote-initiated stfu.
+	return q.handleRemoteInit(msg)
+}
+
+// handleRemoteReply handles a remote reply to our STFU request...
+func (q *quiescerLive) handleRemoteReply(msg *lnwire.Stfu) error {
+	// If the remote thinks they are the initiator, we may have entered a
+	// race where both parties send the STFU simultaneously. We need to
+	// break the tie.
+	if msg.Initiator {
+		log.Warnf("breaking tie...")
+
+		// Get the channel opener...
+		result := q.quiescenceInitiator()
+		chanInitiator, err := result.Unpack()
+		if err != nil {
+			return err
+		}
+
+		// Update localInit and remoteInit...
+		q.localInit = chanInitiator.IsLocal()
+		q.remoteInit = chanInitiator.IsRemote()
+	}
+
+	// We haven't sent an Stfu yet, so we need to send one now.
+	//
+	// this should be impossible since we always set `sent` and `localInit`
+	// in the same method?
+	if !q.sent {
+		return q.sendStfu()
+	}
+
+	return nil
+
+}
+
+// handleRemoteInit handles a remote-initiated quiescence request...
+func (q *quiescerLive) handleRemoteInit(msg *lnwire.Stfu) error {
+	// impossible state...?
+	if q.sent {
+	}
+
+	// The remote initiated quiescence, but they didn't set the
+	// field, which violates the protocol.
+	if !msg.Initiator {
+		return fmt.Errorf("remote must be the initiator...")
+	}
+
+	// Update the state.
+	q.remoteInit = true
+
+	// State check passed, now send the stfu.
+	return q.sendStfu()
+}
+
+// sendStfu creates and sends an Stfu message, also update the state.
+func (q *quiescerLive) sendStfu() error {
+	stfu, err := q.makeStfu().Unpack()
+	if err != nil {
+		return err
+	}
+
+	err = q.cfg.sendMsg(stfu)
+	if err != nil {
+		return err
+	}
+
+	q.sent = true
+	return nil
+}
+
 type quiescerNoop struct{}
 
 var _ quiescer = (*quiescerNoop)(nil)
@@ -363,3 +478,5 @@ func (q *quiescerNoop) resume()                      {}
 func (q *quiescerNoop) quiescenceInitiator() fn.Result[lntypes.ChannelParty] {
 	return fn.Err[lntypes.ChannelParty](ErrNoQuiescenceInitiator)
 }
+func (q *quiescerNoop) handleLocalQuiescenceReq(_ StfuReq) error { return nil }
+func (q *quiescerNoop) handleRemoteStfu(_ *lnwire.Stfu) error    { return nil }

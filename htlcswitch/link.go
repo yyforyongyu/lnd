@@ -1558,10 +1558,19 @@ func (l *channelLink) htlcManager() {
 			}
 
 		case qReq := <-l.quiescenceReqs:
-			l.quiescer.initStfu(qReq)
+			// Check link's state...
+			if !l.canSendStfu() {
+				qReq.Resolve(fn.Errf[lntypes.ChannelParty](
+					"channel has pending updates",
+				))
 
-			if err := l.quiescer.sendOwedStfu(); err != nil {
-				l.stfuFailf("%s", err.Error())
+				continue
+			}
+
+			// Handle...
+			err := l.quiescer.handleLocalQuiescenceReq(qReq)
+			if err != nil {
+				qReq.Resolve(fn.Err[lntypes.ChannelParty](err))
 			}
 
 		case runQuery := <-l.stateQueries:
@@ -1575,6 +1584,18 @@ func (l *channelLink) htlcManager() {
 			return
 		}
 	}
+}
+
+// canSendStfu returns true if we can send an Stfu.
+func (l *channelLink) canSendStfu() bool {
+	return l.channel.NumPendingUpdates(lntypes.Local, lntypes.Local) == 0 &&
+		l.channel.NumPendingUpdates(lntypes.Local, lntypes.Remote) == 0
+}
+
+// canRecvStfu returns true if we can receive an Stfu.
+func (l *channelLink) canRecvStfu() bool {
+	return l.channel.NumPendingUpdates(lntypes.Remote, lntypes.Local) == 0 &&
+		l.channel.NumPendingUpdates(lntypes.Remote, lntypes.Remote) == 0
 }
 
 // processHodlQueue processes a received htlc resolution and continues reading
@@ -2618,7 +2639,13 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		l.mailBox.SetFeeRate(fee)
 
 	case *lnwire.Stfu:
-		err := l.handleStfu(msg)
+		// Check link's state...
+		if !l.canRecvStfu() {
+			l.stfuFailf("sth sth")
+			return
+		}
+
+		err := l.quiescer.handleRemoteStfu(msg)
 		if err != nil {
 			l.stfuFailf("%s", err.Error())
 		}
