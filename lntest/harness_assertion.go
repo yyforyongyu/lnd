@@ -241,9 +241,9 @@ func (h *HarnessTest) EnsureConnected(a, b *node.HarnessNode) {
 	h.AssertPeerConnected(b, a)
 }
 
-// AssertNumEdges checks that an expected number of edges can be found in the
-// node specified.
-func (h *HarnessTest) AssertNumEdges(hn *node.HarnessNode,
+// AssertNumActiveEdges checks that an expected number of active edges can be
+// found in the node specified.
+func (h *HarnessTest) AssertNumActiveEdges(hn *node.HarnessNode,
 	expected int, includeUnannounced bool) []*lnrpc.ChannelEdge {
 
 	var edges []*lnrpc.ChannelEdge
