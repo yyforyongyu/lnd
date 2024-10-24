@@ -2,7 +2,11 @@
 
 package itest
 
-import "github.com/lightningnetwork/lnd/lntest"
+import (
+	"math/rand"
+
+	"github.com/lightningnetwork/lnd/lntest"
+)
 
 var allTestCases = []*lntest.TestCase{
 	{
@@ -683,4 +687,12 @@ var allTestCases = []*lntest.TestCase{
 func init() {
 	// Register subtests.
 	allTestCases = append(allTestCases, multiHopForceCloseTestCases...)
+
+	// Shuffle the test cases so they are executed in a random order. This
+	// is done to even out the blocks mined in each test tranche so they
+	// can run faster.
+	rand.Shuffle(len(allTestCases), func(i, j int) {
+		allTestCases[i], allTestCases[j] =
+			allTestCases[j], allTestCases[i]
+	})
 }
