@@ -8,16 +8,19 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb/etcd"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lntest/miner"
 	"github.com/lightningnetwork/lnd/lntest/node"
@@ -26,6 +29,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,6 +53,9 @@ const (
 	// maxBlocksAllowed specifies the max allowed value to be used when
 	// mining blocks.
 	maxBlocksAllowed = 100
+
+	finalCltvDelta  = routing.MinCLTVDelta // 18.
+	thawHeightDelta = finalCltvDelta * 2   // 36.
 )
 
 // TestCase defines a test case that's been used in the integration test.
@@ -342,7 +349,6 @@ func (h *HarnessTest) SetupStandbyNodes() {
 	// above a good number of confirmations.
 	const totalTxes = 200
 	h.MineBlocksAndAssertNumTxes(numBlocksSendOutput, totalTxes)
-	h.MineBlocks(numBlocksSendOutput)
 
 	// Now we want to wait for the nodes to catch up.
 	h.WaitForBlockchainSync(h.Alice)
@@ -908,6 +914,18 @@ func (h *HarnessTest) validateNodeState(hn *node.HarnessNode) error {
 	if hn.State.Payment.Total != 0 {
 		return fmt.Errorf("%s: found uncleaned payments, please "+
 			"delete all of them properly", hn.Name())
+	}
+
+	// The number of public edges should be zero.
+	if hn.State.Edge.Public != 0 {
+		return fmt.Errorf("%s: found active public egdes, please "+
+			"clean them properly", hn.Name())
+	}
+
+	// The number of edges should be zero.
+	if hn.State.Edge.Total != 0 {
+		return fmt.Errorf("%s: found active edges, please "+
+			"clean them properly", hn.Name())
 	}
 
 	return nil
@@ -1638,6 +1656,22 @@ func (h *HarnessTest) CleanupForceClose(hn *node.HarnessNode) {
 	// Wait for the channel to be marked pending force close.
 	h.AssertNumPendingForceClose(hn, 1)
 
+	// Mine enough blocks for the node to sweep its funds from the force
+	// closed channel. The commit sweep resolver is offers the input to the
+	// sweeper when it's force closed, and broadcast the sweep tx at
+	// defaulCSV-1.
+	//
+	// NOTE: we might empty blocks here as we don't know the exact number
+	// of blocks to mine. This may end up mining more blocks than needed.
+	h.MineEmptyBlocks(node.DefaultCSV - 1)
+
+	// Assert there is one pending sweep.
+	h.AssertNumPendingSweeps(hn, 1)
+
+	// The node should now sweep the funds, clean up by mining the sweeping
+	// tx.
+	h.MineBlocksAndAssertNumTxes(1, 1)
+
 	// Mine blocks to get any second level HTLC resolved. If there are no
 	// HTLCs, this will behave like h.AssertNumPendingCloseChannels.
 	h.mineTillForceCloseResolved(hn)
@@ -1979,7 +2013,8 @@ func (h *HarnessTest) AssertSweepFound(hn *node.HarnessNode,
 			return nil
 		}
 
-		return fmt.Errorf("sweep tx %v not found", sweep)
+		return fmt.Errorf("sweep tx %v not found in resp %v", sweep,
+			sweepResp)
 	}, wait.DefaultTimeout)
 	require.NoError(h, err, "%s: timeout checking sweep tx", hn.Name())
 }
@@ -2197,4 +2232,295 @@ func (h *HarnessTest) SendCoins(a, b *node.HarnessNode,
 	tx := h.GetNumTxsFromMempool(1)[0]
 
 	return tx
+}
+
+// CreateSimpleNetwork creates the number of nodes specified by the number of
+// configs and makes a topology of `node1 -> node2 -> node3...`. Each node is
+// created using the specified config, the neighbors are connected, and the
+// channels are opened. Each node will be funded with a single UTXO of 1 BTC
+// except the last one.
+//
+// For instance, to create a network with 2 nodes that share the same node
+// config,
+//
+//	cfg := []string{"--protocol.anchors"}
+//	cfgs := [][]string{cfg, cfg}
+//	params := OpenChannelParams{...}
+//	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, params)
+//
+// This will create two nodes and open an anchor channel between them.
+func (h *HarnessTest) CreateSimpleNetwork(nodeCfgs [][]string,
+	p OpenChannelParams) ([]*lnrpc.ChannelPoint, []*node.HarnessNode) {
+
+	// Create new nodes.
+	nodes := h.createNodes(nodeCfgs)
+
+	var resp []*lnrpc.ChannelPoint
+
+	// Open zero-conf channels if specified.
+	if p.ZeroConf {
+		resp = h.openZeroConfChannelsForNodes(nodes, p)
+	} else {
+		// Open channels between the nodes.
+		resp = h.openChannelsForNodes(nodes, p)
+	}
+
+	return resp, nodes
+}
+
+// acceptChannel is used to accept a single channel that comes across. This
+// should be run in a goroutine and is used to test nodes with the zero-conf
+// feature bit.
+func acceptChannel(t *testing.T, zeroConf bool, stream rpc.AcceptorClient) {
+	req, err := stream.Recv()
+	require.NoError(t, err)
+
+	resp := &lnrpc.ChannelAcceptResponse{
+		Accept:        true,
+		PendingChanId: req.PendingChanId,
+		ZeroConf:      zeroConf,
+	}
+	err = stream.Send(resp)
+	require.NoError(t, err)
+}
+
+// createNodes creates the number of nodes specified by the number of configs.
+// Each node is created using the specified config, the neighbors are
+// connected,
+func (h *HarnessTest) createNodes(nodeCfgs [][]string) []*node.HarnessNode {
+	// Get the number of nodes.
+	numNodes := len(nodeCfgs)
+
+	// Make a slice of nodes.
+	nodes := make([]*node.HarnessNode, numNodes)
+
+	// Create new nodes.
+	for i, nodeCfg := range nodeCfgs {
+		nodeName := fmt.Sprintf("Node%q", string(rune('A'+i)))
+		n := h.NewNode(nodeName, nodeCfg)
+		nodes[i] = n
+	}
+
+	// Connect the nodes in a chain.
+	for i := 1; i < len(nodes); i++ {
+		nodeA := nodes[i-1]
+		nodeB := nodes[i]
+		h.EnsureConnected(nodeA, nodeB)
+	}
+
+	// Fund all the nodes expect the last one.
+	for i := 0; i < len(nodes)-1; i++ {
+		node := nodes[i]
+		h.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, node)
+	}
+
+	// Mine 1 block to get the above coins confirmed.
+	h.MineBlocksAndAssertNumTxes(1, numNodes-1)
+
+	return nodes
+}
+
+// openChannelsForNodes takes a list of nodes and makes a topology of `node1 ->
+// node2 -> node3...`.
+func (h *HarnessTest) openChannelsForNodes(nodes []*node.HarnessNode,
+	p OpenChannelParams) []*lnrpc.ChannelPoint {
+
+	// attachFundingShim is a helper closure that optionally attaches a
+	// funding shim to the open channel params and returns it.
+	attachFundingShim := func(
+		nodeA, nodeB *node.HarnessNode) OpenChannelParams {
+
+		// If this channel is not a script enforced lease channel,
+		// we'll do nothing and return the params.
+		leasedType := lnrpc.CommitmentType_SCRIPT_ENFORCED_LEASE
+		if p.CommitmentType != leasedType {
+			return p
+		}
+
+		// Otherwise derive the funding shim, attach it to the original
+		// open channel params and return it.
+		minerHeight := h.CurrentHeight()
+		thawHeight := minerHeight + thawHeightDelta
+		fundingShim, _ := h.deriveFundingShim(
+			nodeA, nodeB, p.Amt, thawHeight, true, leasedType,
+		)
+
+		p.FundingShim = fundingShim
+		return p
+	}
+
+	// Open channels in batch to save blocks mined.
+	reqs := make([]*OpenChannelRequest, 0, len(nodes)-1)
+	for i := 0; i < len(nodes)-1; i++ {
+		nodeA := nodes[i]
+		nodeB := nodes[i+1]
+
+		// Optionally attach a funding shim to the open channel params.
+		p = attachFundingShim(nodeA, nodeB)
+
+		req := &OpenChannelRequest{
+			Local:  nodeA,
+			Remote: nodeB,
+			Param:  p,
+		}
+		reqs = append(reqs, req)
+	}
+	resp := h.OpenMultiChannelsAsync(reqs)
+
+	// Make sure the nodes know each other's channels if they are public.
+	if !p.Private {
+		for _, node := range nodes {
+			for _, chanPoint := range resp {
+				h.AssertTopologyChannelOpen(node, chanPoint)
+			}
+		}
+	}
+
+	return resp
+}
+
+// openZeroConfChannelsForNodes takes a list of nodes and makes a topology of
+// `node1 -> node2 -> node3...` with zero-conf channels.
+func (h *HarnessTest) openZeroConfChannelsForNodes(nodes []*node.HarnessNode,
+	p OpenChannelParams) []*lnrpc.ChannelPoint {
+
+	// Sanity check the params.
+	require.True(h, p.ZeroConf, "zero-conf channels must be enabled")
+	require.Greater(h, len(nodes), 1, "need at least 2 nodes")
+
+	// We are opening numNodes-1 channels.
+	cancels := make([]context.CancelFunc, 0, len(nodes)-1)
+
+	// Create the channel acceptors.
+	for _, node := range nodes[1:] {
+		acceptor, cancel := node.RPC.ChannelAcceptor()
+		go acceptChannel(h.T, true, acceptor)
+
+		cancels = append(cancels, cancel)
+	}
+
+	// Open channels between the nodes.
+	resp := h.openChannelsForNodes(nodes, p)
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+
+	return resp
+}
+
+// deriveFundingShim creates a channel funding shim by deriving the necessary
+// keys on both sides.
+func (h *HarnessTest) deriveFundingShim(alice, bob *node.HarnessNode,
+	chanSize btcutil.Amount, thawHeight uint32, publish bool,
+	commitType lnrpc.CommitmentType) (*lnrpc.FundingShim,
+	*lnrpc.ChannelPoint) {
+
+	keyLoc := &signrpc.KeyLocator{KeyFamily: 9999}
+	carolFundingKey := alice.RPC.DeriveKey(keyLoc)
+	daveFundingKey := bob.RPC.DeriveKey(keyLoc)
+
+	// Now that we have the multi-sig keys for each party, we can manually
+	// construct the funding transaction. We'll instruct the backend to
+	// immediately create and broadcast a transaction paying out an exact
+	// amount. Normally this would reside in the mempool, but we just
+	// confirm it now for simplicity.
+	var (
+		fundingOutput *wire.TxOut
+		musig2        bool
+		err           error
+	)
+	if commitType == lnrpc.CommitmentType_SIMPLE_TAPROOT {
+		var carolKey, daveKey *btcec.PublicKey
+		carolKey, err = btcec.ParsePubKey(carolFundingKey.RawKeyBytes)
+		require.NoError(h, err)
+		daveKey, err = btcec.ParsePubKey(daveFundingKey.RawKeyBytes)
+		require.NoError(h, err)
+
+		_, fundingOutput, err = input.GenTaprootFundingScript(
+			carolKey, daveKey, int64(chanSize),
+			fn.None[chainhash.Hash](),
+		)
+		require.NoError(h, err)
+
+		musig2 = true
+	} else {
+		_, fundingOutput, err = input.GenFundingPkScript(
+			carolFundingKey.RawKeyBytes, daveFundingKey.RawKeyBytes,
+			int64(chanSize),
+		)
+		require.NoError(h, err)
+	}
+
+	var txid *chainhash.Hash
+	targetOutputs := []*wire.TxOut{fundingOutput}
+	if publish {
+		txid = h.SendOutputsWithoutChange(targetOutputs, 5)
+	} else {
+		tx := h.CreateTransaction(targetOutputs, 5)
+
+		txHash := tx.TxHash()
+		txid = &txHash
+	}
+
+	// At this point, we can being our external channel funding workflow.
+	// We'll start by generating a pending channel ID externally that will
+	// be used to track this new funding type.
+	pendingChanID := h.Random32Bytes()
+
+	// Now that we have the pending channel ID, Dave (our responder) will
+	// register the intent to receive a new channel funding workflow using
+	// the pending channel ID.
+	chanPoint := &lnrpc.ChannelPoint{
+		FundingTxid: &lnrpc.ChannelPoint_FundingTxidBytes{
+			FundingTxidBytes: txid[:],
+		},
+	}
+	chanPointShim := &lnrpc.ChanPointShim{
+		Amt:       int64(chanSize),
+		ChanPoint: chanPoint,
+		LocalKey: &lnrpc.KeyDescriptor{
+			RawKeyBytes: daveFundingKey.RawKeyBytes,
+			KeyLoc: &lnrpc.KeyLocator{
+				KeyFamily: daveFundingKey.KeyLoc.KeyFamily,
+				KeyIndex:  daveFundingKey.KeyLoc.KeyIndex,
+			},
+		},
+		RemoteKey:     carolFundingKey.RawKeyBytes,
+		PendingChanId: pendingChanID,
+		ThawHeight:    thawHeight,
+		Musig2:        musig2,
+	}
+	fundingShim := &lnrpc.FundingShim{
+		Shim: &lnrpc.FundingShim_ChanPointShim{
+			ChanPointShim: chanPointShim,
+		},
+	}
+	bob.RPC.FundingStateStep(&lnrpc.FundingTransitionMsg{
+		Trigger: &lnrpc.FundingTransitionMsg_ShimRegister{
+			ShimRegister: fundingShim,
+		},
+	})
+
+	// If we attempt to register the same shim (has the same pending chan
+	// ID), then we should get an error.
+	bob.RPC.FundingStateStepAssertErr(&lnrpc.FundingTransitionMsg{
+		Trigger: &lnrpc.FundingTransitionMsg_ShimRegister{
+			ShimRegister: fundingShim,
+		},
+	})
+
+	// We'll take the chan point shim we just registered for Dave (the
+	// responder), and swap the local/remote keys before we feed it in as
+	// Carol's funding shim as the initiator.
+	fundingShim.GetChanPointShim().LocalKey = &lnrpc.KeyDescriptor{
+		RawKeyBytes: carolFundingKey.RawKeyBytes,
+		KeyLoc: &lnrpc.KeyLocator{
+			KeyFamily: carolFundingKey.KeyLoc.KeyFamily,
+			KeyIndex:  carolFundingKey.KeyLoc.KeyIndex,
+		},
+	}
+	fundingShim.GetChanPointShim().RemoteKey = daveFundingKey.RawKeyBytes
+
+	return fundingShim, chanPoint
 }

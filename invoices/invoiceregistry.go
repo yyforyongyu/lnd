@@ -1791,6 +1791,10 @@ func (i *InvoiceRegistry) notifyHodlSubscribers(htlcResolution HtlcResolution) {
 func (i *InvoiceRegistry) hodlSubscribe(subscriber chan<- interface{},
 	circuitKey CircuitKey) {
 
+	if subscriber == nil {
+		return
+	}
+
 	i.hodlSubscriptionsMux.Lock()
 	defer i.hodlSubscriptionsMux.Unlock()
 
