@@ -930,8 +930,12 @@ func testFailingChannel(ht *lntest.HarnessTest) {
 	// won't happen.
 	ht.SetFeeEstimate(chainfee.FeePerKwFloor)
 
-	// Mine a block to trigger Carol's sweeper to broadcast the sweeping
-	// tx.
+	// Mine a block to trigger the sweep. This is needed because the
+	// preimage extraction logic from the link is not managed by the
+	// blockbeat, which means the preimage may be sent to the contest
+	// resolver after it's launched.
+	//
+	// TODO(yy): Expose blockbeat to the link layer.
 	ht.MineEmptyBlocks(1)
 
 	// Carol should have broadcast her sweeping tx.
@@ -943,9 +947,6 @@ func testFailingChannel(ht *lntest.HarnessTest) {
 
 	// Alice's should have one pending sweep request for her commit output.
 	ht.AssertNumPendingSweeps(alice, 1)
-
-	// Mine a block to trigger the sweep.
-	ht.MineEmptyBlocks(1)
 
 	// Mine Alice's sweeping tx.
 	ht.MineBlocksAndAssertNumTxes(1, 1)
