@@ -2,7 +2,11 @@
 
 package itest
 
-import "github.com/lightningnetwork/lnd/lntest"
+import (
+	"math/rand"
+
+	"github.com/lightningnetwork/lnd/lntest"
+)
 
 var allTestCases = []*lntest.TestCase{
 	{
@@ -12,10 +16,6 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "basic funding flow",
 		TestFunc: testBasicChannelFunding,
-	},
-	{
-		Name:     "multi hop receiver chain claim",
-		TestFunc: testMultiHopReceiverChainClaim,
 	},
 	{
 		Name:     "external channel funding",
@@ -154,18 +154,6 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testAddPeerConfig,
 	},
 	{
-		Name:     "multi hop htlc local timeout",
-		TestFunc: testMultiHopHtlcLocalTimeout,
-	},
-	{
-		Name:     "multi hop local force close on-chain htlc timeout",
-		TestFunc: testMultiHopLocalForceCloseOnChainHtlcTimeout,
-	},
-	{
-		Name:     "multi hop remote force close on-chain htlc timeout",
-		TestFunc: testMultiHopRemoteForceCloseOnChainHtlcTimeout,
-	},
-	{
 		Name:     "private channel update policy",
 		TestFunc: testUpdateChannelPolicyForPrivateChannel,
 	},
@@ -226,11 +214,15 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testChannelUnsettledBalance,
 	},
 	{
-		Name:     "channel force closure",
-		TestFunc: testChannelForceClosure,
+		Name:     "channel force closure anchor",
+		TestFunc: testChannelForceClosureAnchor,
 	},
 	{
-		Name:     "failing link",
+		Name:     "channel force closure simple taproot",
+		TestFunc: testChannelForceClosureSimpleTaproot,
+	},
+	{
+		Name:     "failing channel",
 		TestFunc: testFailingChannel,
 	},
 	{
@@ -312,18 +304,6 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "REST API",
 		TestFunc: testRestAPI,
-	},
-	{
-		Name:     "multi hop htlc local chain claim",
-		TestFunc: testMultiHopHtlcLocalChainClaim,
-	},
-	{
-		Name:     "multi hop htlc remote chain claim",
-		TestFunc: testMultiHopHtlcRemoteChainClaim,
-	},
-	{
-		Name:     "multi hop htlc aggregation",
-		TestFunc: testMultiHopHtlcAggregation,
 	},
 	{
 		Name:     "revoked uncooperative close retribution",
@@ -702,4 +682,17 @@ var allTestCases = []*lntest.TestCase{
 		Name:     "send to route failed htlc timeout",
 		TestFunc: testSendToRouteFailHTLCTimeout,
 	},
+}
+
+func init() {
+	// Register subtests.
+	allTestCases = append(allTestCases, multiHopForceCloseTestCases...)
+
+	// Shuffle the test cases so they are executed in a random order. This
+	// is done to even out the blocks mined in each test tranche so they
+	// can run faster.
+	rand.Shuffle(len(allTestCases), func(i, j int) {
+		allTestCases[i], allTestCases[j] =
+			allTestCases[j], allTestCases[i]
+	})
 }

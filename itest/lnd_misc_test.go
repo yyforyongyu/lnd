@@ -632,8 +632,10 @@ func testRejectHTLC(ht *lntest.HarnessTest) {
 		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 	}
-	payStream := alice.RPC.SendPayment(paymentReq)
-	ht.AssertPaymentStatusFromStream(payStream, lnrpc.Payment_FAILED)
+	ht.SendPaymentAssertFail(
+		alice, paymentReq,
+		lnrpc.PaymentFailureReason_FAILURE_REASON_NO_ROUTE,
+	)
 
 	ht.AssertLastHTLCError(alice, lnrpc.Failure_CHANNEL_DISABLED)
 
@@ -1421,9 +1423,10 @@ func testSendSelectedCoinsChannelReserve(ht *lntest.HarnessTest) {
 	// Create a two-hop network: Alice -> Bob.
 	//
 	// NOTE: Alice will have one UTXO after the funding.
-	_, nodes := createSimpleNetwork(
-		ht, []string{"--protocol.anchors"}, 2,
-		lntest.OpenChannelParams{
+	cfg := []string{"--protocol.anchors"}
+	cfgs := [][]string{cfg, cfg}
+	_, nodes := ht.CreateSimpleNetwork(
+		cfgs, lntest.OpenChannelParams{
 			Amt: chanAmt,
 		},
 	)
