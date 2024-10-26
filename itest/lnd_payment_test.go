@@ -346,7 +346,8 @@ func runTestPaymentHTLCTimeout(ht *lntest.HarnessTest, restartAlice bool) {
 // to return floor fee rate(1 sat/vb).
 func testSendDirectPayment(ht *lntest.HarnessTest) {
 	// Grab Alice and Bob's nodes for convenience.
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNodeWithCoins("Bob", nil)
 
 	// Create a list of commitment types we want to test.
 	commitmentTypes := []lnrpc.CommitmentType{
@@ -448,6 +449,9 @@ func testSendDirectPayment(ht *lntest.HarnessTest) {
 			// Make sure they are connected.
 			st.EnsureConnected(alice, bob)
 
+			// TODO(yy): remove this line to fix the ListCoins bug.
+			st.FundCoins(btcutil.SatoshiPerBitcoin, alice)
+
 			// Open a channel with 100k satoshis between Alice and
 			// Bob with Alice being the sole funder of the channel.
 			params := lntest.OpenChannelParams{
@@ -466,7 +470,9 @@ func testSendDirectPayment(ht *lntest.HarnessTest) {
 }
 
 func testListPayments(ht *lntest.HarnessTest) {
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	// Check that there are no payments before test.
 	ht.AssertNumPayments(alice, 0)
@@ -658,7 +664,10 @@ func testPaymentFollowingChannelOpen(ht *lntest.HarnessTest) {
 	channelCapacity := paymentAmt * 1000
 
 	// We first establish a channel between Alice and Bob.
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
+	ht.EnsureConnected(alice, bob)
+
 	p := lntest.OpenChannelParams{
 		Amt: channelCapacity,
 	}
@@ -934,7 +943,9 @@ func testBidirectionalAsyncPayments(ht *lntest.HarnessTest) {
 func testInvoiceSubscriptions(ht *lntest.HarnessTest) {
 	const chanAmt = btcutil.Amount(500000)
 
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	// Create a new invoice subscription client for Bob, the notification
 	// should be dispatched shortly below.

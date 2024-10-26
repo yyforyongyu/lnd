@@ -110,10 +110,6 @@ func TestLightningNetworkDaemon(t *testing.T) {
 	)
 	defer harnessTest.Stop()
 
-	// Setup standby nodes, Alice and Bob, which will be alive and shared
-	// among all the test cases.
-	harnessTest.SetupStandbyNodes()
-
 	// Get the current block height.
 	height := harnessTest.CurrentHeight()
 
@@ -131,21 +127,10 @@ func TestLightningNetworkDaemon(t *testing.T) {
 			// tied to the parent test.
 			ht := harnessTest.Subtest(t1)
 
-			// TODO(yy): split log files.
 			cleanTestCaseName := strings.ReplaceAll(
 				testCase.Name, " ", "_",
 			)
 			ht.SetTestName(cleanTestCaseName)
-
-			logLine := fmt.Sprintf(
-				"STARTING ============ %v ============\n",
-				testCase.Name,
-			)
-
-			ht.Alice.AddToLogf(logLine)
-			ht.Bob.AddToLogf(logLine)
-
-			ht.EnsureConnected(ht.Alice, ht.Bob)
 
 			ht.RunTestCase(testCase)
 		})
