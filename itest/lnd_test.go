@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -126,11 +125,7 @@ func TestLightningNetworkDaemon(t *testing.T) {
 			// avoid overwriting the external harness test that is
 			// tied to the parent test.
 			ht := harnessTest.Subtest(t1)
-
-			cleanTestCaseName := strings.ReplaceAll(
-				testCase.Name, " ", "_",
-			)
-			ht.SetTestName(cleanTestCaseName)
+			ht.SetTestName(testCase.Name)
 
 			ht.RunTestCase(testCase)
 		})
