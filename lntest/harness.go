@@ -332,6 +332,9 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 			"mined blocks=%d", st.manager.currentTestCase,
 			startHeight, endHeight, endHeight-startHeight)
 
+		fmt.Printf("finished test: %s, %d, %d, %d\n", st.manager.currentTestCase,
+			startHeight, endHeight, endHeight-startHeight)
+
 		// Don't bother run the cleanups if the test is failed.
 		if st.Failed() {
 			st.Log("test failed, skipped cleanup")
