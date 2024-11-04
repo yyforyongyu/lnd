@@ -1386,6 +1386,36 @@ func (s *Server) trackPaymentStream(context context.Context,
 
 	defer subscription.Close()
 
+	notifyPayment := func(result *channeldb.MPPayment) error {
+		log.Tracef("Payment %v updated to state %v",
+			result.Info.PaymentIdentifier, result.Status)
+
+		// Skip in-flight updates unless requested.
+		if noInflightUpdates {
+			if result.Status == channeldb.StatusInitiated {
+				return nil
+			}
+			if result.Status == channeldb.StatusInFlight {
+				return nil
+			}
+		}
+
+		rpcPayment, err := s.cfg.RouterBackend.MarshallPayment(
+			result,
+		)
+		if err != nil {
+			return err
+		}
+
+		// Send event to the client.
+		err = send(rpcPayment)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}
+
 	// Stream updates back to the client.
 	for {
 		select {
@@ -1394,32 +1424,16 @@ func (s *Server) trackPaymentStream(context context.Context,
 				// No more payment updates.
 				return nil
 			}
-			result := item.(*channeldb.MPPayment)
-
-			log.Tracef("Payment %v updated to state %v",
-				result.Info.PaymentIdentifier, result.Status)
-
-			// Skip in-flight updates unless requested.
-			if noInflightUpdates {
-				if result.Status == channeldb.StatusInitiated {
-					continue
+			switch result := item.(type) {
+			case *channeldb.MPPayment:
+				err := notifyPayment(result)
+				if err != nil {
+					return err
 				}
-				if result.Status == channeldb.StatusInFlight {
-					continue
-				}
-			}
-
-			rpcPayment, err := s.cfg.RouterBackend.MarshallPayment(
-				result,
-			)
-			if err != nil {
-				return err
-			}
-
-			// Send event to the client.
-			err = send(rpcPayment)
-			if err != nil {
-				return err
+			case error:
+				// Also notify the stream about this error,
+				// which requires a RPC update.
+				return result
 			}
 
 		case <-s.quit:

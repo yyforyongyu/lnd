@@ -99,6 +99,8 @@ type ControlTower interface {
 	// update with the current state of every inflight payment is always
 	// sent out immediately.
 	SubscribeAllPayments() (ControlTowerSubscriber, error)
+
+	NotifyPaymentExit(paymentHash lntypes.Hash, err error)
 }
 
 // ControlTowerSubscriber contains the state for a payment update subscriber.
@@ -229,6 +231,55 @@ func (p *controlTower) RegisterAttempt(paymentHash lntypes.Hash,
 	p.notifySubscribers(paymentHash, payment)
 
 	return nil
+}
+
+// NotifyPaymentExit...
+func (p *controlTower) NotifyPaymentExit(paymentHash lntypes.Hash, err error) {
+	// Get all subscribers for this payment.
+	p.subscribersMtx.Lock()
+
+	subscribersPaymentHash, ok := p.subscribers[paymentHash]
+	if !ok && len(p.subscribersAllPayments) == 0 {
+		p.subscribersMtx.Unlock()
+		return
+	}
+
+	// Copy subscribers to all payments locally while holding the lock in
+	// order to avoid concurrency issues while reading/writing the map.
+	subscribersAllPayments := make(map[uint64]*controlTowerSubscriberImpl)
+	for k, v := range p.subscribersAllPayments {
+		subscribersAllPayments[k] = v
+	}
+	p.subscribersMtx.Unlock()
+
+	// Notify all subscribers that subscribed to the current payment hash.
+	for _, subscriber := range subscribersPaymentHash {
+		select {
+		case subscriber.queue.ChanIn() <- err:
+			// If this event is the last, close the incoming channel
+			// of the queue. This will signal the subscriber that
+			// there won't be any more updates.
+			close(subscriber.queue.ChanIn())
+
+		// If subscriber disappeared, skip notification. For further
+		// notifications, we'll keep skipping over this subscriber.
+		case <-subscriber.quit:
+		}
+	}
+
+	// Notify all subscribers that subscribed to all payments.
+	for key, subscriber := range subscribersAllPayments {
+		select {
+		case subscriber.queue.ChanIn() <- err:
+
+		case <-subscriber.quit:
+		}
+
+		// Remove it from the subscribers list.
+		p.subscribersMtx.Lock()
+		delete(p.subscribersAllPayments, key)
+		p.subscribersMtx.Unlock()
+	}
 }
 
 // SettleAttempt marks the given attempt settled with the preimage. If

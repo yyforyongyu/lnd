@@ -185,6 +185,10 @@ func (p *paymentLifecycle) resumePayment(ctx context.Context) ([32]byte,
 	exitWithErr := func(err error) ([32]byte, *route.Route, error) {
 		log.Errorf("Payment %v with status=%v failed: %v",
 			p.identifier, payment.GetStatus(), err)
+
+		// Notify the subscribers that the payment has failed.
+		p.router.cfg.Control.NotifyPaymentExit(p.identifier, err)
+
 		return [32]byte{}, nil, err
 	}
 
