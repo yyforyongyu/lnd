@@ -2626,8 +2626,14 @@ func (c *ChannelGraph) delChannelEdgeUnsafe(edges, edgeIndex, chanIndex,
 
 	// As part of deleting the edge we also remove all disabled entries
 	// from the edgePolicyDisabledIndex bucket. We do that for both directions.
-	updateEdgePolicyDisabledIndex(edges, cid, false, false)
-	updateEdgePolicyDisabledIndex(edges, cid, true, false)
+	err = updateEdgePolicyDisabledIndex(edges, cid, false, false)
+	if err != nil {
+		return err
+	}
+	err = updateEdgePolicyDisabledIndex(edges, cid, true, false)
+	if err != nil {
+		return err
+	}
 
 	// With the edge data deleted, we can purge the information from the two
 	// edge indexes.
