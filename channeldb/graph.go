@@ -4462,11 +4462,14 @@ func putChanEdgePolicy(edges kvdb.RwBucket, edge *models.ChannelEdgePolicy,
 		return err
 	}
 
-	updateEdgePolicyDisabledIndex(
+	err = updateEdgePolicyDisabledIndex(
 		edges, edge.ChannelID,
 		edge.ChannelFlags&lnwire.ChanUpdateDirection > 0,
 		edge.IsDisabled(),
 	)
+	if err != nil {
+		return err
+	}
 
 	return edges.Put(edgeKey[:], b.Bytes()[:])
 }
