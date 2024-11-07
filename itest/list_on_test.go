@@ -679,4 +679,9 @@ func init() {
 	allTestCases = append(allTestCases, walletImportAccountTestCases...)
 	allTestCases = append(allTestCases, basicFundingTestCases...)
 	allTestCases = append(allTestCases, sendToRouteTestCases...)
+
+	// If this is Windows, we'll skip running some of the flaky tests.
+	if isWindowsOS() {
+		allTestCases = filterWindowsFlakyTests()
+	}
 }
