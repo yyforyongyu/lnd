@@ -557,10 +557,6 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testCustomFeatures,
 	},
 	{
-		Name:     "utxo selection funding",
-		TestFunc: testChannelUtxoSelection,
-	},
-	{
 		Name:     "update pending open channels",
 		TestFunc: testUpdateOnPendingOpenChannels,
 	},
@@ -677,4 +673,5 @@ func init() {
 	allTestCases = append(allTestCases, psbtFundingTestCases...)
 	allTestCases = append(allTestCases, remoteSignerTestCases...)
 	allTestCases = append(allTestCases, channelRestoreTestCases...)
+	allTestCases = append(allTestCases, fundUtxoSelectionTestCases...)
 }
