@@ -485,10 +485,6 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testSimpleTaprootChannelActivation,
 	},
 	{
-		Name:     "wallet import account",
-		TestFunc: testWalletImportAccount,
-	},
-	{
 		Name:     "wallet import pubkey",
 		TestFunc: testWalletImportPubKey,
 	},
@@ -672,4 +668,5 @@ func init() {
 	allTestCases = append(allTestCases, fundUtxoSelectionTestCases...)
 	allTestCases = append(allTestCases, zeroConfPolicyTestCases...)
 	allTestCases = append(allTestCases, channelFeePolicyTestCases...)
+	allTestCases = append(allTestCases, walletImportAccountTestCases...)
 }
