@@ -2995,7 +2995,9 @@ func (s *Switch) handlePacketSettle(packet *htlcPacket) error {
 	// to lookup the origin.
 	circuit, err := s.closeCircuit(packet)
 	if err != nil {
-		return err
+		if !errors.Is(err, ErrCircuitClosing) {
+			return err
+		}
 	}
 
 	// closeCircuit returns a nil circuit when a settle packet returns an
