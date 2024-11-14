@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -661,8 +660,7 @@ func (hn *HarnessNode) WaitForProcessExit() error {
 		break
 
 	case <-time.After(wait.DefaultTimeout):
-		err = errors.New("timeout waiting for process to exit")
-		hn.printErrf(err.Error())
+		hn.printErrf("timeout waiting for process to exit")
 	}
 
 	// Make sure log file is closed and renamed if necessary.
@@ -796,6 +794,18 @@ func (hn *HarnessNode) Shutdown() error {
 // Kill kills the lnd process.
 func (hn *HarnessNode) Kill() error {
 	return hn.cmd.Process.Kill()
+}
+
+// KillAndWait kills the lnd process and waits for it to finish.
+func (hn *HarnessNode) KillAndWait() error {
+	err := hn.cmd.Process.Kill()
+	if err != nil {
+		return err
+	}
+
+	_, err = hn.cmd.Process.Wait()
+
+	return err
 }
 
 // printErrf prints an error to the console.

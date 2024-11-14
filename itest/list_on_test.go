@@ -46,8 +46,16 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testDataLossProtection,
 	},
 	{
-		Name:     "sweep coins",
-		TestFunc: testSweepAllCoins,
+		Name:     "send all coins",
+		TestFunc: testSendAllCoins,
+	},
+	{
+		Name:     "send selected coins",
+		TestFunc: testSendSelectedCoins,
+	},
+	{
+		Name:     "send selected coins channel reserve",
+		TestFunc: testSendSelectedCoinsChannelReserve,
 	},
 	{
 		Name:     "disconnecting target peer",
@@ -194,6 +202,10 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testPaymentFollowingChannelOpen,
 	},
 	{
+		Name:     "payment failure reason canceled",
+		TestFunc: testPaymentFailureReasonCanceled,
+	},
+	{
 		Name:     "invoice update subscription",
 		TestFunc: testInvoiceSubscriptions,
 	},
@@ -232,6 +244,10 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "etcd failover",
 		TestFunc: testEtcdFailover,
+	},
+	{
+		Name:     "leader health check",
+		TestFunc: testLeaderHealthCheck,
 	},
 	{
 		Name:     "hold invoice force close",
@@ -343,6 +359,10 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testInvoiceRoutingHints,
 	},
 	{
+		Name:     "scid alias routing hints",
+		TestFunc: testScidAliasRoutingHints,
+	},
+	{
 		Name:     "multi-hop payments over private channels",
 		TestFunc: testMultiHopOverPrivateChannels,
 	},
@@ -353,6 +373,10 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "route fee cutoff",
 		TestFunc: testRouteFeeCutoff,
+	},
+	{
+		Name:     "route fee limit after queryroutes",
+		TestFunc: testFeeLimitAfterQueryRoutes,
 	},
 	{
 		Name:     "rpc middleware interceptor",
@@ -431,6 +455,22 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testForwardInterceptorBasic,
 	},
 	{
+		Name:     "forward interceptor modified htlc",
+		TestFunc: testForwardInterceptorModifiedHtlc,
+	},
+	{
+		Name:     "forward interceptor wire records",
+		TestFunc: testForwardInterceptorWireRecords,
+	},
+	{
+		Name:     "forward interceptor restart",
+		TestFunc: testForwardInterceptorRestart,
+	},
+	{
+		Name:     "invoice HTLC modifier basic",
+		TestFunc: testInvoiceHtlcModifierBasic,
+	},
+	{
 		Name:     "zero conf channel open",
 		TestFunc: testZeroConfChannelOpen,
 	},
@@ -469,6 +509,10 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "bumpfee",
 		TestFunc: testBumpFee,
+	},
+	{
+		Name:     "bumpforceclosefee",
+		TestFunc: testBumpForceCloseFee,
 	},
 	{
 		Name:     "taproot",
@@ -559,12 +603,16 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testUpdateOnPendingOpenChannels,
 	},
 	{
+		Name:     "blinded payment htlc re-forward",
+		TestFunc: testBlindedPaymentHTLCReForward,
+	},
+	{
 		Name:     "query blinded route",
 		TestFunc: testQueryBlindedRoutes,
 	},
 	{
-		Name:     "forward blinded",
-		TestFunc: testForwardBlindedRoute,
+		Name:     "route blinding invoices",
+		TestFunc: testBlindedRouteInvoices,
 	},
 	{
 		Name:     "receiver blinded error",
@@ -585,6 +633,18 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "on chain to blinded",
 		TestFunc: testErrorHandlingOnChainFailure,
+	},
+	{
+		Name:     "mpp to single blinded path",
+		TestFunc: testMPPToSingleBlindedPath,
+	},
+	{
+		Name:     "mpp to multiple blinded paths",
+		TestFunc: testMPPToMultipleBlindedPaths,
+	},
+	{
+		Name:     "route blinding dummy hops",
+		TestFunc: testBlindedRouteDummyHops,
 	},
 	{
 		Name:     "removetx",
@@ -629,5 +689,17 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "coop close with external delivery",
 		TestFunc: testCoopCloseWithExternalDelivery,
+	},
+	{
+		Name:     "payment failed htlc local swept",
+		TestFunc: testPaymentFailedHTLCLocalSwept,
+	},
+	{
+		Name:     "payment succeeded htlc remote swept",
+		TestFunc: testPaymentSucceededHTLCRemoteSwept,
+	},
+	{
+		Name:     "send to route failed htlc timeout",
+		TestFunc: testSendToRouteFailHTLCTimeout,
 	},
 }

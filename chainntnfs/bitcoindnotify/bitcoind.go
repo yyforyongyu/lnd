@@ -139,6 +139,7 @@ func (b *BitcoindNotifier) Stop() error {
 	// Shutdown the rpc client, this gracefully disconnects from bitcoind,
 	// and cleans up all related resources.
 	b.chainConn.Stop()
+	b.chainConn.WaitForShutdown()
 
 	close(b.quit)
 	b.wg.Wait()
@@ -151,7 +152,12 @@ func (b *BitcoindNotifier) Stop() error {
 
 		close(epochClient.epochChan)
 	}
-	b.txNotifier.TearDown()
+
+	// The txNotifier is only initialized in the start method therefore we
+	// need to make sure we don't access a nil pointer here.
+	if b.txNotifier != nil {
+		b.txNotifier.TearDown()
+	}
 
 	// Stop the mempool notifier.
 	b.memNotifier.TearDown()

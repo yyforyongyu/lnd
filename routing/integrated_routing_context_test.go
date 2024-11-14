@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/lightningnetwork/lnd/zpay32"
 	"github.com/stretchr/testify/require"
 )
@@ -33,6 +35,10 @@ func (m *mockBandwidthHints) availableChanBandwidth(channelID uint64,
 
 	balance, ok := m.hints[channelID]
 	return balance, ok
+}
+
+func (m *mockBandwidthHints) firstHopCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
 }
 
 // integratedRoutingContext defines the context in which integrated routing
@@ -157,12 +163,15 @@ func (c *integratedRoutingContext) testPayment(maxParts uint32,
 		}
 	})
 
-	// Instantiate a new mission control with the current configuration
+	// Instantiate a new mission controller with the current configuration
 	// values.
-	mc, err := NewMissionControl(db, c.source.pubkey, &c.mcCfg)
-	if err != nil {
-		c.t.Fatal(err)
-	}
+	mcController, err := NewMissionController(db, c.source.pubkey, &c.mcCfg)
+	require.NoError(c.t, err)
+
+	mc, err := mcController.GetNamespacedStore(
+		DefaultMissionControlNamespace,
+	)
+	require.NoError(c.t, err)
 
 	getBandwidthHints := func(_ Graph) (bandwidthHints, error) {
 		// Create bandwidth hints based on local channel balances.
@@ -181,7 +190,7 @@ func (c *integratedRoutingContext) testPayment(maxParts uint32,
 		FinalCLTVDelta: uint16(c.finalExpiry),
 		FeeLimit:       lnwire.MaxMilliSatoshi,
 		Target:         c.target.pubkey,
-		PaymentAddr:    &paymentAddr,
+		PaymentAddr:    fn.Some(paymentAddr),
 		DestFeatures: lnwire.NewFeatureVector(
 			baseFeatureBits, lnwire.Features,
 		),
@@ -227,6 +236,9 @@ func (c *integratedRoutingContext) testPayment(maxParts uint32,
 		// Find a route.
 		route, err := session.RequestRoute(
 			amtRemaining, lnwire.MaxMilliSatoshi, inFlightHtlcs, 0,
+			lnwire.CustomRecords{
+				lnwire.MinCustomRecordsTlvType: []byte{1, 2, 3},
+			},
 		)
 		if err != nil {
 			return attempts, err

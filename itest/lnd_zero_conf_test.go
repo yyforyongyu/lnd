@@ -31,7 +31,11 @@ func testZeroConfChannelOpen(ht *lntest.HarnessTest) {
 		"--protocol.anchors",
 	}
 
-	bob := ht.Bob
+	bob := ht.NewNode("Bob", nil)
+
+	// We'll give Bob some coins in order to fund the channel.
+	ht.FundCoins(btcutil.SatoshiPerBitcoin, bob)
+
 	carol := ht.NewNode("Carol", scidAliasArgs)
 	ht.EnsureConnected(bob, carol)
 
@@ -40,7 +44,7 @@ func testZeroConfChannelOpen(ht *lntest.HarnessTest) {
 	p := lntest.OpenChannelParams{
 		Amt: chanAmt,
 	}
-	chanPoint := ht.OpenChannel(bob, carol, p)
+	ht.OpenChannel(bob, carol, p)
 
 	// Spin-up Dave so Carol can open a zero-conf channel to him.
 	dave := ht.NewNode("Dave", scidAliasArgs)
@@ -71,8 +75,8 @@ func testZeroConfChannelOpen(ht *lntest.HarnessTest) {
 	// having to mine any blocks.
 	fundingPoint2 := ht.WaitForChannelOpenEvent(stream)
 
-	ht.AssertTopologyChannelOpen(carol, fundingPoint2)
-	ht.AssertTopologyChannelOpen(dave, fundingPoint2)
+	ht.AssertChannelInGraph(carol, fundingPoint2)
+	ht.AssertChannelInGraph(dave, fundingPoint2)
 
 	// Attempt to send a 10K satoshi payment from Carol to Dave.
 	daveInvoiceParams := &lnrpc.Invoice{
@@ -140,8 +144,8 @@ func testZeroConfChannelOpen(ht *lntest.HarnessTest) {
 	// Wait to receive the OpenStatusUpdate_ChanOpen update.
 	fundingPoint3 := ht.WaitForChannelOpenEvent(stream)
 
-	ht.AssertTopologyChannelOpen(eve, fundingPoint3)
-	ht.AssertTopologyChannelOpen(carol, fundingPoint3)
+	ht.AssertChannelInGraph(eve, fundingPoint3)
+	ht.AssertChannelInGraph(carol, fundingPoint3)
 
 	// Attempt to send a 20K satoshi payment from Eve to Dave.
 	daveInvoiceParams.Value = int64(20_000)
@@ -178,13 +182,10 @@ func testZeroConfChannelOpen(ht *lntest.HarnessTest) {
 	require.Len(ht, payReq.RouteHints, 0)
 
 	// Make sure Dave is aware of this channel and send the payment.
-	ht.AssertTopologyChannelOpen(dave, fundingPoint3)
+	ht.AssertChannelInGraph(dave, fundingPoint3)
 	ht.CompletePaymentRequests(
 		dave, []string{eveInvoiceResp.PaymentRequest},
 	)
-
-	// Close standby node's channels.
-	ht.CloseChannel(bob, chanPoint)
 }
 
 // testOptionScidAlias checks that opening an option_scid_alias channel-type
@@ -239,7 +240,11 @@ func optionScidAliasScenario(ht *lntest.HarnessTest, chantype, private bool) {
 		"--protocol.anchors",
 	}
 
-	bob := ht.Bob
+	bob := ht.NewNode("Bob", nil)
+
+	// We'll give Bob some coins in order to fund the channel.
+	ht.FundCoins(btcutil.SatoshiPerBitcoin, bob)
+
 	carol := ht.NewNode("Carol", scidAliasArgs)
 	dave := ht.NewNode("Dave", scidAliasArgs)
 
@@ -264,7 +269,7 @@ func optionScidAliasScenario(ht *lntest.HarnessTest, chantype, private bool) {
 
 	// Make sure Bob knows this channel if it's public.
 	if !private {
-		ht.AssertTopologyChannelOpen(bob, fundingPoint)
+		ht.AssertChannelInGraph(bob, fundingPoint)
 	}
 
 	// Assert that a payment from Carol to Dave works as expected.
@@ -285,23 +290,8 @@ func optionScidAliasScenario(ht *lntest.HarnessTest, chantype, private bool) {
 	}
 	fundingPoint2 := ht.OpenChannel(bob, carol, p)
 
-	defer func() {
-		// TODO(yy): remove the sleep once the following bug is fixed.
-		// When the payment is reported as settled by Bob, it's
-		// expected the commitment dance is finished and all subsequent
-		// states have been updated. Yet we'd receive the error `cannot
-		// co-op close channel with active htlcs` or `link failed to
-		// shutdown` if we close the channel. We need to investigate
-		// the order of settling the payments and updating commitments
-		// to understand and fix.
-		time.Sleep(2 * time.Second)
-
-		// Close standby node's channels.
-		ht.CloseChannel(bob, fundingPoint2)
-	}()
-
 	// Wait until Dave receives the Bob<->Carol channel.
-	ht.AssertTopologyChannelOpen(dave, fundingPoint2)
+	ht.AssertChannelInGraph(dave, fundingPoint2)
 
 	daveInvoiceResp2 := dave.RPC.AddInvoice(daveInvoiceParams)
 	decodedReq := dave.RPC.DecodePayReq(daveInvoiceResp2.PaymentRequest)
@@ -500,7 +490,7 @@ func testPrivateUpdateAlias(ht *lntest.HarnessTest,
 	fundingPoint := ht.OpenChannel(eve, carol, p)
 
 	// Make sure Dave has seen this public channel.
-	ht.AssertTopologyChannelOpen(dave, fundingPoint)
+	ht.AssertChannelInGraph(dave, fundingPoint)
 
 	// Setup a ChannelAcceptor for Dave.
 	acceptStream, cancel := dave.RPC.ChannelAcceptor()
@@ -802,7 +792,7 @@ func testOptionScidUpgrade(ht *lntest.HarnessTest) {
 	fundingPoint2 := ht.OpenChannel(bob, carol, p)
 
 	// Make sure Dave knows this channel.
-	ht.AssertTopologyChannelOpen(dave, fundingPoint2)
+	ht.AssertChannelInGraph(dave, fundingPoint2)
 
 	// Carol will now set the option-scid-alias feature bit and restart.
 	carolArgs = append(carolArgs, "--protocol.option-scid-alias")

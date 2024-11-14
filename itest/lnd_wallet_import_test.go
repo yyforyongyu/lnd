@@ -372,7 +372,7 @@ func fundChanAndCloseFromImportedAccount(ht *lntest.HarnessTest, srcNode,
 		)
 
 		block := ht.MineBlocksAndAssertNumTxes(6, 1)[0]
-		ht.AssertTxInBlock(block, txHash)
+		ht.AssertTxInBlock(block, *txHash)
 
 		confBalanceAfterChan += chanChangeUtxoAmt
 		ht.AssertWalletAccountBalance(srcNode, account, 0, 0)
@@ -389,7 +389,7 @@ func fundChanAndCloseFromImportedAccount(ht *lntest.HarnessTest, srcNode,
 		)
 
 		block := ht.MineBlocksAndAssertNumTxes(6, 1)[0]
-		ht.AssertTxInBlock(block, txHash)
+		ht.AssertTxInBlock(block, *txHash)
 
 		confBalanceAfterChan += chanChangeUtxoAmt
 		ht.AssertWalletAccountBalance(
@@ -413,8 +413,8 @@ func fundChanAndCloseFromImportedAccount(ht *lntest.HarnessTest, srcNode,
 		},
 		OutputIndex: upd.ChanPending.OutputIndex,
 	}
-	ht.AssertTopologyChannelOpen(srcNode, chanPoint)
-	ht.AssertTopologyChannelOpen(destNode, chanPoint)
+	ht.AssertChannelInGraph(srcNode, chanPoint)
+	ht.AssertChannelInGraph(destNode, chanPoint)
 
 	// Send a test payment to ensure the channel is operating as normal.
 	const invoiceAmt = 100000

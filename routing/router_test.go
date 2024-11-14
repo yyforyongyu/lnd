@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/clock"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/graph"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/input"
@@ -91,6 +93,8 @@ func (c *testCtx) getChannelIDFromAlias(t *testing.T, a, b string) uint64 {
 	return channelID
 }
 
+var mockClosedSCIDs map[lnwire.ShortChannelID]struct{}
+
 func createTestCtxFromGraphInstance(t *testing.T, startingHeight uint32,
 	graphInstance *testGraphInstance) *testCtx {
 
@@ -124,10 +128,15 @@ func createTestCtxFromGraphInstanceAssumeValid(t *testing.T,
 
 	mcConfig := &MissionControlConfig{Estimator: estimator}
 
-	mc, err := NewMissionControl(
+	mcController, err := NewMissionController(
 		graphInstance.graphBackend, route.Vertex{}, mcConfig,
 	)
 	require.NoError(t, err, "failed to create missioncontrol")
+
+	mc, err := mcController.GetNamespacedStore(
+		DefaultMissionControlNamespace,
+	)
+	require.NoError(t, err)
 
 	sourceNode, err := graphInstance.graph.SourceNode()
 	require.NoError(t, err)
@@ -159,6 +168,10 @@ func createTestCtxFromGraphInstanceAssumeValid(t *testing.T,
 		PathFindingConfig:  pathFindingConfig,
 		Clock:              clock.NewTestClock(time.Unix(1, 0)),
 		ApplyChannelUpdate: graphBuilder.ApplyChannelUpdate,
+		ClosedSCIDs:        mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](
+			&mockTrafficShaper{},
+		),
 	})
 	require.NoError(t, router.Start(), "unable to start router")
 
@@ -215,7 +228,7 @@ func createTestCtxFromFile(t *testing.T,
 // Add valid signature to channel update simulated as error received from the
 // network.
 func signErrChanUpdate(t *testing.T, key *btcec.PrivateKey,
-	errChanUpdate *lnwire.ChannelUpdate) {
+	errChanUpdate *lnwire.ChannelUpdate1) {
 
 	chanUpdateMsg, err := errChanUpdate.DataToSign()
 	require.NoError(t, err, "failed to retrieve data to sign")
@@ -480,7 +493,7 @@ func TestChannelUpdateValidation(t *testing.T) {
 	// Set up a channel update message with an invalid signature to be
 	// returned to the sender.
 	var invalidSignature lnwire.Sig
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		Signature:       invalidSignature,
 		FeeRate:         500,
 		ShortChannelID:  lnwire.NewShortChanIDFromInt(1),
@@ -514,7 +527,7 @@ func TestChannelUpdateValidation(t *testing.T) {
 	// Send off the payment request to the router. The specified route
 	// should be attempted and the channel update should be received by
 	// graph and ignored because it is missing a valid signature.
-	_, err = ctx.router.SendToRoute(payment, rt)
+	_, err = ctx.router.SendToRoute(payment, rt, nil)
 	require.Error(t, err, "expected route to fail with channel update")
 
 	_, e1, e2, err = ctx.graph.FetchChannelEdgesByID(
@@ -534,7 +547,7 @@ func TestChannelUpdateValidation(t *testing.T) {
 	ctx.graphBuilder.setNextReject(false)
 
 	// Retry the payment using the same route as before.
-	_, err = ctx.router.SendToRoute(payment, rt)
+	_, err = ctx.router.SendToRoute(payment, rt, nil)
 	require.Error(t, err, "expected route to fail with channel update")
 
 	// This time a valid signature was supplied and the policy change should
@@ -585,7 +598,7 @@ func TestSendPaymentErrorRepeatedFeeInsufficient(t *testing.T) {
 	)
 	require.NoError(t, err, "unable to fetch chan id")
 
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(
 			songokuSophonChanID,
 		),
@@ -704,7 +717,7 @@ func TestSendPaymentErrorFeeInsufficientPrivateEdge(t *testing.T) {
 	// Prepare an error update for the private channel, with twice the
 	// original fee.
 	updatedFeeBaseMSat := feeBaseMSat * 2
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(privateChannelID),
 		Timestamp:      uint32(testTime.Add(time.Minute).Unix()),
 		BaseFee:        updatedFeeBaseMSat,
@@ -830,7 +843,7 @@ func TestSendPaymentPrivateEdgeUpdateFeeExceedsLimit(t *testing.T) {
 	// Prepare an error update for the private channel. The updated fee
 	// will exceeds the feeLimit.
 	updatedFeeBaseMSat := feeBaseMSat + uint32(feeLimit)
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		ShortChannelID: lnwire.NewShortChanIDFromInt(privateChannelID),
 		Timestamp:      uint32(testTime.Add(time.Minute).Unix()),
 		BaseFee:        updatedFeeBaseMSat,
@@ -931,7 +944,7 @@ func TestSendPaymentErrorNonFinalTimeLockErrors(t *testing.T) {
 	_, _, edgeUpdateToFail, err := ctx.graph.FetchChannelEdgesByID(chanID)
 	require.NoError(t, err, "unable to fetch chan id")
 
-	errChanUpdate := lnwire.ChannelUpdate{
+	errChanUpdate := lnwire.ChannelUpdate1{
 		ShortChannelID:  lnwire.NewShortChanIDFromInt(chanID),
 		Timestamp:       uint32(edgeUpdateToFail.LastUpdate.Unix()),
 		MessageFlags:    edgeUpdateToFail.MessageFlags,
@@ -1073,11 +1086,15 @@ func TestSendPaymentErrorPathPruning(t *testing.T) {
 			return preImage, nil
 		})
 
-	ctx.router.cfg.MissionControl.(*MissionControl).ResetHistory()
+	require.IsType(t, ctx.router.cfg.MissionControl, &MissionControl{})
+	mc, _ := ctx.router.cfg.MissionControl.(*MissionControl)
+
+	err := mc.ResetHistory()
+	require.NoError(t, err)
 
 	// When we try to dispatch that payment, we should receive an error as
 	// both attempts should fail and cause both routes to be pruned.
-	_, _, err := ctx.router.SendPayment(payment)
+	_, _, err = ctx.router.SendPayment(payment)
 	require.Error(t, err, "payment didn't return error")
 
 	// The final error returned should also indicate that the peer wasn't
@@ -1094,12 +1111,10 @@ func TestSendPaymentErrorPathPruning(t *testing.T) {
 	// We expect the first attempt to have failed with a
 	// TemporaryChannelFailure, the second with UnknownNextPeer.
 	msg := htlcs[0].Failure.Message
-	_, ok := msg.(*lnwire.FailTemporaryChannelFailure)
-	require.True(t, ok, "unexpected fail message")
+	require.IsType(t, msg, &lnwire.FailTemporaryChannelFailure{})
 
 	msg = htlcs[1].Failure.Message
-	_, ok = msg.(*lnwire.FailUnknownNextPeer)
-	require.True(t, ok, "unexpected fail message")
+	require.IsType(t, msg, &lnwire.FailUnknownNextPeer{})
 
 	err = ctx.router.cfg.MissionControl.(*MissionControl).ResetHistory()
 	require.NoError(t, err, "reset history failed")
@@ -1136,7 +1151,11 @@ func TestSendPaymentErrorPathPruning(t *testing.T) {
 		getAliasFromPubKey(rt.Hops[0].PubKeyBytes, ctx.aliases),
 	)
 
-	ctx.router.cfg.MissionControl.(*MissionControl).ResetHistory()
+	require.IsType(t, ctx.router.cfg.MissionControl, &MissionControl{})
+	mc, _ = ctx.router.cfg.MissionControl.(*MissionControl)
+
+	err = mc.ResetHistory()
+	require.NoError(t, err)
 
 	// Finally, we'll modify the SendToSwitch function to indicate that the
 	// roasbeef -> luoji channel has insufficient capacity. This should
@@ -1394,7 +1413,7 @@ func TestSendToRouteStructuredError(t *testing.T) {
 	testCases := map[int]lnwire.FailureMessage{
 		finalHopIndex: lnwire.NewFailIncorrectDetails(payAmt, 100),
 		1: &lnwire.FailFeeInsufficient{
-			Update: lnwire.ChannelUpdate{},
+			Update: lnwire.ChannelUpdate1{},
 		},
 	}
 
@@ -1423,7 +1442,7 @@ func TestSendToRouteStructuredError(t *testing.T) {
 			// update should be received by router and ignored
 			// because it is missing a valid
 			// signature.
-			_, err = ctx.router.SendToRoute(payment, rt)
+			_, err = ctx.router.SendToRoute(payment, rt, nil)
 
 			fErr, ok := err.(*htlcswitch.ForwardingError)
 			require.True(
@@ -1502,7 +1521,7 @@ func TestSendToRouteMaxHops(t *testing.T) {
 	// Send off the payment request to the router. We expect an error back
 	// indicating that the route is too long.
 	var payHash lntypes.Hash
-	_, err = ctx.router.SendToRoute(payHash, rt)
+	_, err = ctx.router.SendToRoute(payHash, rt, nil)
 	if err != route.ErrMaxRouteHopsExceeded {
 		t.Fatalf("expected ErrMaxRouteHopsExceeded, but got %v", err)
 	}
@@ -1535,10 +1554,10 @@ func TestBuildRoute(t *testing.T) {
 		}, 6),
 
 		// Create two channels from b to c. For building routes, we
-		// expect the lowest cost channel to be selected. Note that this
-		// isn't a situation that we are expecting in reality. Routing
-		// nodes are recommended to keep their channel policies towards
-		// the same peer identical.
+		// expect the highest cost channel to be selected. Note that
+		// this isn't a situation that we are expecting in reality.
+		// Routing nodes are recommended to keep their channel policies
+		// towards the same peer identical.
 		symmetricTestChannel("b", "c", chanCapSat, &testChannelPolicy{
 			Expiry:   144,
 			FeeRate:  50000,
@@ -1554,6 +1573,8 @@ func TestBuildRoute(t *testing.T) {
 			Features: paymentAddrFeatures,
 		}, 7),
 
+		// Create some channels that have conflicting min/max
+		// constraints.
 		symmetricTestChannel("a", "e", chanCapSat, &testChannelPolicy{
 			Expiry:   144,
 			FeeRate:  80000,
@@ -1568,9 +1589,50 @@ func TestBuildRoute(t *testing.T) {
 			MaxHTLC:  lnwire.NewMSatFromSatoshis(chanCapSat),
 			Features: paymentAddrFeatures,
 		}, 4),
+
+		// Create some channels that have a conflicting max HTLC
+		// constraint for one node pair, similar to the b->c channels.
+		symmetricTestChannel("b", "z", chanCapSat, &testChannelPolicy{
+			Expiry:   144,
+			FeeRate:  50000,
+			MinHTLC:  lnwire.NewMSatFromSatoshis(20),
+			MaxHTLC:  lnwire.NewMSatFromSatoshis(25),
+			Features: paymentAddrFeatures,
+		}, 3),
+		symmetricTestChannel("b", "z", chanCapSat, &testChannelPolicy{
+			Expiry:   144,
+			FeeRate:  60000,
+			MinHTLC:  lnwire.NewMSatFromSatoshis(20),
+			MaxHTLC:  lnwire.MilliSatoshi(20100),
+			Features: paymentAddrFeatures,
+		}, 8),
+
+		// Create a route with inbound fees.
+		symmetricTestChannel("a", "d", chanCapSat, &testChannelPolicy{
+			Expiry:  144,
+			FeeRate: 20000,
+			MinHTLC: lnwire.NewMSatFromSatoshis(5),
+			MaxHTLC: lnwire.NewMSatFromSatoshis(
+				chanCapSat,
+			),
+			InboundFeeBaseMsat: -1000,
+			InboundFeeRate:     -1000,
+		}, 9),
+		symmetricTestChannel("d", "f", chanCapSat, &testChannelPolicy{
+			Expiry:   144,
+			FeeRate:  60000,
+			MinHTLC:  lnwire.NewMSatFromSatoshis(20),
+			MaxHTLC:  lnwire.NewMSatFromSatoshis(120),
+			Features: paymentAddrFeatures,
+			// The inbound fee will not be active for the last hop.
+			InboundFeeBaseMsat: 2000,
+			InboundFeeRate:     2000,
+		}, 10),
 	}
 
-	testGraph, err := createTestGraphFromChannels(t, true, testChannels, "a")
+	testGraph, err := createTestGraphFromChannels(
+		t, true, testChannels, "a",
+	)
 	require.NoError(t, err, "unable to create graph")
 
 	const startingBlockHeight = 101
@@ -1582,15 +1644,10 @@ func TestBuildRoute(t *testing.T) {
 
 		t.Helper()
 
-		if len(rt.Hops) != len(expected) {
-			t.Fatal("hop count mismatch")
-		}
+		require.Len(t, rt.Hops, len(expected))
+
 		for i, hop := range rt.Hops {
-			if hop.ChannelID != expected[i] {
-				t.Fatalf("expected channel %v at pos %v, but "+
-					"got channel %v",
-					expected[i], i, hop.ChannelID)
-			}
+			require.Equal(t, expected[i], hop.ChannelID)
 		}
 
 		lastHop := rt.Hops[len(rt.Hops)-1]
@@ -1602,101 +1659,222 @@ func TestBuildRoute(t *testing.T) {
 	_, err = rand.Read(payAddr[:])
 	require.NoError(t, err)
 
+	noAmt := fn.None[lnwire.MilliSatoshi]()
+
+	// Test that we can't build a route when no hops are given.
+	hops = []route.Vertex{}
+	_, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, fn.None[[32]byte](), fn.None[[]byte](),
+	)
+	require.Error(t, err)
+
+	// Create hop list for an unknown destination.
+	hops := []route.Vertex{ctx.aliases["b"], ctx.aliases["y"]}
+	_, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, fn.Some(payAddr), fn.None[[]byte](),
+	)
+	noChanErr := ErrNoChannel{}
+	require.ErrorAs(t, err, &noChanErr)
+	require.Equal(t, 1, noChanErr.position)
+
 	// Create hop list from the route node pubkeys.
-	hops := []route.Vertex{
-		ctx.aliases["b"], ctx.aliases["c"],
-	}
+	hops = []route.Vertex{ctx.aliases["b"], ctx.aliases["c"]}
 	amt := lnwire.NewMSatFromSatoshis(100)
 
 	// Build the route for the given amount.
 	rt, err := ctx.router.BuildRoute(
-		&amt, hops, nil, 40, &payAddr,
+		fn.Some(amt), hops, nil, 40, fn.Some(payAddr),
+		fn.None[[]byte](),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Check that we get the expected route back. The total amount should be
 	// the amount to deliver to hop c (100 sats) plus the max fee for the
 	// connection b->c (6 sats).
 	checkHops(rt, []uint64{1, 7}, payAddr)
-	if rt.TotalAmount != 106000 {
-		t.Fatalf("unexpected total amount %v", rt.TotalAmount)
-	}
+	require.Equal(t, lnwire.MilliSatoshi(106000), rt.TotalAmount)
 
 	// Build the route for the minimum amount.
 	rt, err = ctx.router.BuildRoute(
-		nil, hops, nil, 40, &payAddr,
+		noAmt, hops, nil, 40, fn.Some(payAddr), fn.None[[]byte](),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Check that we get the expected route back. The minimum that we can
 	// send from b to c is 20 sats. Hop b charges 1200 msat for the
 	// forwarding. The channel between hop a and b can carry amounts in the
 	// range [5, 100], so 21200 msats is the minimum amount for this route.
 	checkHops(rt, []uint64{1, 7}, payAddr)
-	if rt.TotalAmount != 21200 {
-		t.Fatalf("unexpected total amount %v", rt.TotalAmount)
-	}
+	require.Equal(t, lnwire.MilliSatoshi(21200), rt.TotalAmount)
+
+	// The receiver gets sent the minimal HTLC amount.
+	require.Equal(t, lnwire.MilliSatoshi(20000), rt.Hops[1].AmtToForward)
 
 	// Test a route that contains incompatible channel htlc constraints.
 	// There is no amount that can pass through both channel 5 and 4.
-	hops = []route.Vertex{
-		ctx.aliases["e"], ctx.aliases["c"],
-	}
+	hops = []route.Vertex{ctx.aliases["e"], ctx.aliases["c"]}
 	_, err = ctx.router.BuildRoute(
-		nil, hops, nil, 40, nil,
+		noAmt, hops, nil, 40, fn.None[[32]byte](), fn.None[[]byte](),
 	)
-	errNoChannel, ok := err.(ErrNoChannel)
-	if !ok {
-		t.Fatalf("expected incompatible policies error, but got %v",
-			err)
-	}
-	if errNoChannel.position != 0 {
-		t.Fatalf("unexpected no channel error position")
-	}
-	if errNoChannel.fromNode != ctx.aliases["a"] {
-		t.Fatalf("unexpected no channel error node")
-	}
+	require.Error(t, err)
+	noChanErr = ErrNoChannel{}
+	require.ErrorAs(t, err, &noChanErr)
+	require.Equal(t, 0, noChanErr.position)
+
+	// Test a route that contains channel constraints that lead to a
+	// different selection of a unified edge, when the amount is rescaled
+	// for the final edge. From a backward pass we expect the policy of
+	// channel 8 to be used, because its policy has the highest fee rate,
+	// bumping the amount to 20000 msat leading to a sender amount of 21200
+	// msat including the fees for hop over channel 8. In the forward pass
+	// however, we subtract that fee again, resulting in the min HTLC
+	// amount. The forward pass doesn't check for a different policy that
+	// could me more applicable, which is why we don't get back the highest
+	// amount that could be delivered to the receiver of 21819 msat, using
+	// policy of channel 3.
+	hops = []route.Vertex{ctx.aliases["b"], ctx.aliases["z"]}
+	rt, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, fn.Some(payAddr), fn.None[[]byte](),
+	)
+	require.NoError(t, err)
+	checkHops(rt, []uint64{1, 8}, payAddr)
+	require.Equal(t, lnwire.MilliSatoshi(21200), rt.TotalAmount)
+	require.Equal(t, lnwire.MilliSatoshi(20000), rt.Hops[1].AmtToForward)
+
+	// Check that we compute a correct forwarding amount that involves
+	// inbound fees. We expect a similar amount as for the above case of
+	// b->c, but reduced by the inbound discount on the channel a->d.
+	// We get 106000 - 1000 (base in) - 0.001 * 106000 (rate in) = 104894.
+	hops = []route.Vertex{ctx.aliases["d"], ctx.aliases["f"]}
+	amt = lnwire.NewMSatFromSatoshis(100)
+	rt, err = ctx.router.BuildRoute(
+		fn.Some(amt), hops, nil, 40, fn.Some(payAddr),
+		fn.None[[]byte](),
+	)
+	require.NoError(t, err)
+	checkHops(rt, []uint64{9, 10}, payAddr)
+	require.EqualValues(t, 104894, rt.TotalAmount)
+
+	// Also check the min amount with inbound fees. The min amount bumps
+	// this to 20000 msat for the last hop. The outbound fee is 1200 msat,
+	// the inbound fee is -1021.2 msat (rounded down). This results in a
+	// total fee of 179 msat, giving a sender amount of 20179 msat. The
+	// determined receiver amount however reduces this to 20001 msat again
+	// due to rounding. This would not be compatible with the sender amount
+	// of 20179 msat, which results in underpayment of 1 msat in fee. There
+	// is a third pass through newRoute in which this gets corrected to end
+	hops = []route.Vertex{ctx.aliases["d"], ctx.aliases["f"]}
+	rt, err = ctx.router.BuildRoute(
+		noAmt, hops, nil, 40, fn.Some(payAddr), fn.None[[]byte](),
+	)
+	require.NoError(t, err)
+	checkHops(rt, []uint64{9, 10}, payAddr)
+	require.EqualValues(t, 20180, rt.TotalAmount, "%v", rt.TotalAmount)
 }
 
-// TestGetPathEdges tests that the getPathEdges function returns the expected
-// edges and amount when given a set of unifiers and does not panic.
-func TestGetPathEdges(t *testing.T) {
+// TestReceiverAmtForwardPass tests that the forward pass returns the expected
+// receiver amount when given a set of edges and does not panic.
+func TestReceiverAmtForwardPass(t *testing.T) {
 	t.Parallel()
 
-	const startingBlockHeight = 101
-	ctx := createTestCtxFromFile(t, startingBlockHeight, basicGraphFilePath)
-
 	testCases := []struct {
-		sourceNode     route.Vertex
-		amt            lnwire.MilliSatoshi
-		unifiers       []*edgeUnifier
-		bandwidthHints *bandwidthManager
-		hops           []route.Vertex
+		name         string
+		amt          lnwire.MilliSatoshi
+		unifiedEdges []*unifiedEdge
+		hops         []route.Vertex
 
-		expectedEdges []*models.CachedEdgePolicy
-		expectedAmt   lnwire.MilliSatoshi
-		expectedErr   string
-	}{{
-		sourceNode: ctx.aliases["roasbeef"],
-		unifiers: []*edgeUnifier{
-			{
-				edges:     []*unifiedEdge{},
-				localChan: true,
-			},
+		expectedAmt lnwire.MilliSatoshi
+		expectedErr string
+	}{
+		{
+			name:        "empty",
+			expectedErr: "no edges to forward through",
 		},
-		expectedErr: fmt.Sprintf("no matching outgoing channel "+
-			"available for node 0 (%v)", ctx.aliases["roasbeef"]),
-	}}
+		{
+			name: "single edge, no valid policy",
+			amt:  1000,
+			unifiedEdges: []*unifiedEdge{
+				{
+					policy: &models.CachedEdgePolicy{
+						MinHTLC: 1001,
+					},
+				},
+			},
+			expectedErr: fmt.Sprintf("no matching outgoing " +
+				"channel available for node index 0"),
+		},
+		{
+			name: "single edge",
+			amt:  1000,
+			unifiedEdges: []*unifiedEdge{
+				{
+					policy: &models.CachedEdgePolicy{
+						MinHTLC: 1000,
+					},
+				},
+			},
+			expectedAmt: 1000,
+		},
+		{
+			name: "outbound fee, no rounding",
+			amt:  1e9,
+			unifiedEdges: []*unifiedEdge{
+				{
+					// The first hop's outbound fee is
+					// irrelevant in fee calculation.
+					policy: &models.CachedEdgePolicy{
+						FeeBaseMSat:               1234,
+						FeeProportionalMillionths: 1234,
+					},
+				},
+				{
+					// No rounding is done here.
+					policy: &models.CachedEdgePolicy{
+						FeeBaseMSat:               1000,
+						FeeProportionalMillionths: 1000,
+					},
+				},
+			},
+			// From an outgoing amount of 999000000 msat, we get
+			// in = out + base + out * rate = 1000000000.0
+			//
+			// The inverse outgoing amount for this is
+			// out = (in - base) / (1 + rate) =
+			// (1e9 - 1000) / (1 + 1e-3) = 999000000.0000001,
+			// which is rounded down.
+			expectedAmt: 999000000,
+		},
+		{
+			name: "outbound fee, rounding",
+			amt:  1e9,
+			unifiedEdges: []*unifiedEdge{
+				{
+					// The first hop's outbound fee is
+					// irrelevant in fee calculation.
+					policy: &models.CachedEdgePolicy{
+						FeeBaseMSat:               1234,
+						FeeProportionalMillionths: 1234,
+					},
+				},
+				{
+					// This policy is chosen such that we
+					// round down.
+					policy: &models.CachedEdgePolicy{
+						FeeBaseMSat:               1000,
+						FeeProportionalMillionths: 999,
+					},
+				},
+			},
+			// The float amount for this is
+			// out = (in - base) / (1 + rate) =
+			// (1e9 - 1000) / (1 + 999e-6) = 999000998.002995,
+			// which is rounded up.
+			expectedAmt: 999000999,
+		},
+	}
 
 	for _, tc := range testCases {
-		pathEdges, amt, err := getPathEdges(
-			tc.sourceNode, tc.amt, tc.unifiers, tc.bandwidthHints,
-			tc.hops,
-		)
+		amt, err := receiverAmtForwardPass(tc.amt, tc.unifiedEdges)
 
 		if tc.expectedErr != "" {
 			require.Error(t, err)
@@ -1706,9 +1884,283 @@ func TestGetPathEdges(t *testing.T) {
 		}
 
 		require.NoError(t, err)
-		require.Equal(t, pathEdges, tc.expectedEdges)
 		require.Equal(t, amt, tc.expectedAmt)
 	}
+}
+
+// TestSenderAmtBackwardPass tests that the computation of the sender amount is
+// done correctly for route building.
+func TestSenderAmtBackwardPass(t *testing.T) {
+	bandwidthHints := bandwidthManager{
+		getLink: func(chanId lnwire.ShortChannelID) (
+			htlcswitch.ChannelLink, error) {
+
+			return nil, nil
+		},
+		localChans: make(map[lnwire.ShortChannelID]struct{}),
+	}
+
+	var (
+		capacity        btcutil.Amount      = 1_000_000
+		testReceiverAmt lnwire.MilliSatoshi = 1_000_000
+		minHTLC         lnwire.MilliSatoshi = 1_000
+	)
+
+	edgeUnifiers := []*edgeUnifier{
+		{
+			edges: []*unifiedEdge{
+				{
+					// This outbound fee doesn't have an
+					// effect (sender doesn't pay outbound).
+					policy: &models.CachedEdgePolicy{
+						FeeBaseMSat: 112,
+					},
+					inboundFees: models.InboundFee{
+						Base: 111,
+					},
+					capacity: capacity,
+				},
+			},
+		},
+		{
+			edges: []*unifiedEdge{
+				{
+					policy: &models.CachedEdgePolicy{
+						FeeBaseMSat: 222,
+					},
+					inboundFees: models.InboundFee{
+						Base: 222,
+					},
+					capacity: capacity,
+				},
+			},
+		},
+		{
+			edges: []*unifiedEdge{
+				{
+					policy: &models.CachedEdgePolicy{
+						FeeBaseMSat: 333,
+						MinHTLC:     minHTLC,
+					},
+					// In pathfinding, inbound fees are not
+					// populated for exit hops because the
+					// newNodeEdgeUnifier enforces this.
+					// This is important as otherwise we
+					// would not fail the min HTLC check in
+					// getEdge.
+					capacity: capacity,
+				},
+			},
+		},
+	}
+
+	// A search for an amount that is below the minimum HTLC amount should
+	// fail.
+	_, _, err := senderAmtBackwardPass(
+		edgeUnifiers, fn.Some(minHTLC-1), &bandwidthHints,
+	)
+	require.Error(t, err)
+
+	// Do a min amount search.
+	_, senderAmount, err := senderAmtBackwardPass(
+		edgeUnifiers, fn.None[lnwire.MilliSatoshi](), &bandwidthHints,
+	)
+	require.NoError(t, err)
+	require.Equal(t, minHTLC+333+222+222+111, senderAmount)
+
+	// Do a search for a specific amount.
+	unifiedEdges, senderAmount, err := senderAmtBackwardPass(
+		edgeUnifiers, fn.Some(testReceiverAmt), &bandwidthHints,
+	)
+	require.NoError(t, err)
+	require.Equal(t, testReceiverAmt+333+222+222+111, senderAmount)
+
+	// Check that we arrive at the same receiver amount by doing a forward
+	// pass.
+	receiverAmt, err := receiverAmtForwardPass(senderAmount, unifiedEdges)
+	require.NoError(t, err)
+	require.Equal(t, testReceiverAmt, receiverAmt)
+
+	// Insert a policy that leads to rounding.
+	edgeUnifiers[1] = &edgeUnifier{
+		edges: []*unifiedEdge{
+			{
+				policy: &models.CachedEdgePolicy{
+					FeeBaseMSat:               20,
+					FeeProportionalMillionths: 100,
+				},
+				inboundFees: models.InboundFee{
+					Base: -10,
+					Rate: -50,
+				},
+				capacity: capacity,
+			},
+		},
+	}
+
+	unifiedEdges, senderAmount, err = senderAmtBackwardPass(
+		edgeUnifiers, fn.Some(testReceiverAmt), &bandwidthHints,
+	)
+	require.NoError(t, err)
+
+	// For this route, we have some rounding errors, so we can't expect the
+	// exact amount, but it should be higher than the exact amount, to not
+	// end up below a min HTLC constraint.
+	receiverAmt, err = receiverAmtForwardPass(senderAmount, unifiedEdges)
+	require.NoError(t, err)
+	require.NotEqual(t, testReceiverAmt, receiverAmt)
+	require.InDelta(t, int64(testReceiverAmt), int64(receiverAmt), 1)
+	require.GreaterOrEqual(t, int64(receiverAmt), int64(testReceiverAmt))
+}
+
+// TestInboundOutbound tests the functions that computes the incoming and
+// outgoing amounts based on the fees of the incoming and outgoing channels.
+func TestInboundOutbound(t *testing.T) {
+	var outgoingAmt uint64 = 10_000_000
+
+	tests := []struct {
+		name         string
+		incomingBase int32
+		incomingRate int32
+		outgoingBase uint64
+		outgoingRate uint64
+	}{
+		{
+			name:         "only outbound fee",
+			incomingBase: 0,
+			incomingRate: 0,
+			outgoingBase: 20,
+			outgoingRate: 100,
+		},
+		{
+			name:         "positive inbound and outbound fee",
+			incomingBase: 20,
+			incomingRate: 100,
+			outgoingBase: 20,
+			outgoingRate: 100,
+		},
+		{
+			name:         "small negative inbound and outbound fee",
+			incomingBase: -10,
+			incomingRate: -50,
+			outgoingBase: 20,
+			outgoingRate: 100,
+		},
+		{
+			name:         "equal negative inbound and outbound fee",
+			incomingBase: -20,
+			incomingRate: -100,
+			outgoingBase: 20,
+			outgoingRate: 100,
+		},
+		{
+			name:         "large negative inbound and outbound fee",
+			incomingBase: -30,
+			incomingRate: -200,
+			outgoingBase: 20,
+			outgoingRate: 100,
+		},
+		{
+			name: "order of PPM negative inbound and " +
+				"outbound fee (m=0)",
+			incomingBase: -30,
+			incomingRate: -1_000_000,
+			outgoingBase: 20,
+			outgoingRate: 100,
+		},
+		{
+			name: "huge negative inbound and " +
+				"outbound fee (m<0)",
+			incomingBase: -30,
+			incomingRate: -2_000_000,
+			outgoingBase: 20,
+			outgoingRate: 100,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+
+		t.Run(tc.name, func(tt *testing.T) {
+			testInboundOutboundFee(
+				tt, outgoingAmt, tc.incomingBase,
+				tc.incomingRate, tc.outgoingBase,
+				tc.outgoingRate,
+			)
+		})
+	}
+}
+
+// testInboundOutboundFee is a helper function that tests the outgoing and
+// incoming amount relationship.
+func testInboundOutboundFee(t *testing.T, outgoingAmt uint64, inBase,
+	inRate int32, outBase, outRate uint64) {
+
+	debugStr := fmt.Sprintf(
+		"outAmt=%d, inBase=%d, inRate=%d, outBase=%d, outRate=%d",
+		outgoingAmt, inBase, inRate, outBase, outRate,
+	)
+
+	incomingEdge := &unifiedEdge{
+		policy: &models.CachedEdgePolicy{},
+		inboundFees: models.InboundFee{
+			Base: inBase,
+			Rate: inRate,
+		},
+	}
+
+	outgoingEdge := &unifiedEdge{
+		policy: &models.CachedEdgePolicy{
+			FeeBaseMSat: lnwire.MilliSatoshi(
+				outBase,
+			),
+			FeeProportionalMillionths: lnwire.MilliSatoshi(
+				outRate,
+			),
+		},
+	}
+
+	// We compute the incoming amount based on the outgoing amount, which
+	// mimicks the path finding process.
+	incomingAmt := incomingFromOutgoing(
+		lnwire.MilliSatoshi(outgoingAmt), incomingEdge,
+		outgoingEdge,
+	)
+
+	// We do the reverse and compute the outgoing amount based on the
+	// incoming amount.
+	outgoingAmtNew := outgoingFromIncoming(
+		incomingAmt, incomingEdge, outgoingEdge,
+	)
+
+	// We require that the incoming amount is always larger than or equal to
+	// the outgoing amount, because total fees (=incoming-outgoing) should
+	// not become negative.
+	require.GreaterOrEqual(
+		t, int64(incomingAmt), int64(outgoingAmtNew), debugStr,
+		"expected incomingAmt >= outgoingAmtNew",
+	)
+
+	// We check that up to rounding the amounts are equal.
+	require.InDelta(
+		t, int64(outgoingAmt), int64(outgoingAmtNew), 1.0, debugStr,
+		"expected |outgoingAmt - outgoingAmtNew | <= 1",
+	)
+
+	// If we round, the computed outgoing amount should be larger than the
+	// exact outgoing amount, to not hit any min HTLC limits.
+	require.GreaterOrEqual(
+		t, int64(outgoingAmtNew), int64(outgoingAmt), debugStr,
+		"expected outgoingAmtNew >= outgoingAmt",
+	)
+}
+
+// FuzzInboundOutbound tests the incoming and outgoing amount calculation
+// functions with fuzzing.
+func FuzzInboundOutboundFee(f *testing.F) {
+	f.Add(uint64(0), int32(0), int32(0), uint64(0), uint64(0))
+
+	f.Fuzz(testInboundOutboundFee)
 }
 
 // TestSendToRouteSkipTempErrSuccess validates a successful payment send.
@@ -1753,6 +2205,8 @@ func TestSendToRouteSkipTempErrSuccess(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Register mockers with the expected method calls.
@@ -1787,7 +2241,7 @@ func TestSendToRouteSkipTempErrSuccess(t *testing.T) {
 	payment.On("TerminalInfo").Return(nil, nil)
 
 	// Expect a successful send to route.
-	attempt, err := router.SendToRouteSkipTempErr(payHash, rt)
+	attempt, err := router.SendToRouteSkipTempErr(payHash, rt, nil)
 	require.NoError(t, err)
 	require.Equal(t, testAttempt, attempt)
 
@@ -1836,10 +2290,12 @@ func TestSendToRouteSkipTempErrNonMPP(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Expect an error to be returned.
-	attempt, err := router.SendToRouteSkipTempErr(payHash, rt)
+	attempt, err := router.SendToRouteSkipTempErr(payHash, rt, nil)
 	require.ErrorIs(t, ErrSkipTempErr, err)
 	require.Nil(t, attempt)
 
@@ -1890,6 +2346,8 @@ func TestSendToRouteSkipTempErrTempFailure(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Create the error to be returned.
@@ -1922,7 +2380,7 @@ func TestSendToRouteSkipTempErrTempFailure(t *testing.T) {
 	payment.On("TerminalInfo").Return(nil, nil)
 
 	// Expect a failed send to route.
-	attempt, err := router.SendToRouteSkipTempErr(payHash, rt)
+	attempt, err := router.SendToRouteSkipTempErr(payHash, rt, nil)
 	require.Equal(t, tempErr, err)
 	require.Equal(t, testAttempt, attempt)
 
@@ -1972,6 +2430,8 @@ func TestSendToRouteSkipTempErrPermanentFailure(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Create the error to be returned.
@@ -2008,7 +2468,7 @@ func TestSendToRouteSkipTempErrPermanentFailure(t *testing.T) {
 	payment.On("TerminalInfo").Return(nil, &failureReason)
 
 	// Expect a failed send to route.
-	attempt, err := router.SendToRouteSkipTempErr(payHash, rt)
+	attempt, err := router.SendToRouteSkipTempErr(payHash, rt, nil)
 	require.Equal(t, permErr, err)
 	require.Equal(t, testAttempt, attempt)
 
@@ -2058,6 +2518,8 @@ func TestSendToRouteTempFailure(t *testing.T) {
 		NextPaymentID: func() (uint64, error) {
 			return 0, nil
 		},
+		ClosedSCIDs:   mockClosedSCIDs,
+		TrafficShaper: fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
 	}}
 
 	// Create the error to be returned.
@@ -2092,7 +2554,7 @@ func TestSendToRouteTempFailure(t *testing.T) {
 	).Return(nil, nil)
 
 	// Expect a failed send to route.
-	attempt, err := router.SendToRoute(payHash, rt)
+	attempt, err := router.SendToRoute(payHash, rt, nil)
 	require.Equal(t, tempErr, err)
 	require.Equal(t, testAttempt, attempt)
 
@@ -2222,11 +2684,6 @@ func TestNewRouteRequest(t *testing.T) {
 			finalExpiry:    unblindedCltv,
 			err:            ErrExpiryAndBlinded,
 		},
-		{
-			name:           "invalid blinded payment",
-			blindedPayment: &BlindedPayment{},
-			err:            ErrNoBlindedPath,
-		},
 	}
 
 	for _, testCase := range testCases {
@@ -2235,9 +2692,27 @@ func TestNewRouteRequest(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
+			var (
+				blindedPathInfo *BlindedPaymentPathSet
+				expectedTarget  = testCase.expectedTarget
+				err             error
+			)
+			if testCase.blindedPayment != nil {
+				blindedPathInfo, err = NewBlindedPaymentPathSet(
+					[]*BlindedPayment{
+						testCase.blindedPayment,
+					},
+				)
+				require.NoError(t, err)
+
+				expectedTarget = route.NewVertex(
+					blindedPathInfo.TargetPubKey(),
+				)
+			}
+
 			req, err := NewRouteRequest(
 				source, testCase.target, 1000, 0, nil, nil,
-				testCase.routeHints, testCase.blindedPayment,
+				testCase.routeHints, blindedPathInfo,
 				testCase.finalExpiry,
 			)
 			require.ErrorIs(t, err, testCase.err)
@@ -2247,7 +2722,7 @@ func TestNewRouteRequest(t *testing.T) {
 				return
 			}
 
-			require.Equal(t, req.Target, testCase.expectedTarget)
+			require.Equal(t, req.Target, expectedTarget)
 			require.Equal(
 				t, req.FinalExpiry, testCase.expectedCltv,
 			)
@@ -2505,7 +2980,7 @@ func (m *mockGraphBuilder) setNextReject(reject bool) {
 	m.rejectUpdate = reject
 }
 
-func (m *mockGraphBuilder) ApplyChannelUpdate(msg *lnwire.ChannelUpdate) bool {
+func (m *mockGraphBuilder) ApplyChannelUpdate(msg *lnwire.ChannelUpdate1) bool {
 	if m.rejectUpdate {
 		return false
 	}
@@ -2588,4 +3063,237 @@ func createChannelEdge(bitcoinKey1, bitcoinKey2 []byte,
 	}
 
 	return fundingTx, &chanUtxo, chanID, nil
+}
+
+// TestFindBlindedPathsWithMC tests that the FindBlindedPaths method correctly
+// selects a set of blinded paths by using mission control data to select the
+// paths with the highest success probability.
+func TestFindBlindedPathsWithMC(t *testing.T) {
+	t.Parallel()
+
+	rbFeatureBits := []lnwire.FeatureBit{
+		lnwire.RouteBlindingOptional,
+	}
+
+	// Create the following graph and let all the nodes advertise support
+	// for blinded paths.
+	//
+	//			  C
+	//			/   \
+	//		       /     \
+	//		E -- A -- F -- D
+	//		       \     /
+	//			\   /
+	//		          B
+	//
+	featuresWithRouteBlinding := lnwire.NewFeatureVector(
+		lnwire.NewRawFeatureVector(rbFeatureBits...), lnwire.Features,
+	)
+
+	policyWithRouteBlinding := &testChannelPolicy{
+		Expiry:   144,
+		FeeRate:  400,
+		MinHTLC:  1,
+		MaxHTLC:  100000000,
+		Features: featuresWithRouteBlinding,
+	}
+
+	testChannels := []*testChannel{
+		symmetricTestChannel(
+			"eve", "alice", 100000, policyWithRouteBlinding, 1,
+		),
+		symmetricTestChannel(
+			"alice", "charlie", 100000, policyWithRouteBlinding, 2,
+		),
+		symmetricTestChannel(
+			"alice", "bob", 100000, policyWithRouteBlinding, 3,
+		),
+		symmetricTestChannel(
+			"charlie", "dave", 100000, policyWithRouteBlinding, 4,
+		),
+		symmetricTestChannel(
+			"bob", "dave", 100000, policyWithRouteBlinding, 5,
+		),
+		symmetricTestChannel(
+			"alice", "frank", 100000, policyWithRouteBlinding, 6,
+		),
+		symmetricTestChannel(
+			"frank", "dave", 100000, policyWithRouteBlinding, 7,
+		),
+	}
+
+	testGraph, err := createTestGraphFromChannels(
+		t, true, testChannels, "dave", rbFeatureBits...,
+	)
+	require.NoError(t, err)
+
+	ctx := createTestCtxFromGraphInstance(t, 101, testGraph)
+
+	var (
+		alice   = ctx.aliases["alice"]
+		bob     = ctx.aliases["bob"]
+		charlie = ctx.aliases["charlie"]
+		dave    = ctx.aliases["dave"]
+		eve     = ctx.aliases["eve"]
+		frank   = ctx.aliases["frank"]
+	)
+
+	// Create a mission control store which initially sets the success
+	// probability of each node pair to 1.
+	missionControl := map[route.Vertex]map[route.Vertex]float64{
+		eve: {alice: 1},
+		alice: {
+			charlie: 1,
+			bob:     1,
+			frank:   1,
+		},
+		charlie: {dave: 1},
+		bob:     {dave: 1},
+		frank:   {dave: 1},
+	}
+
+	// probabilitySrc is a helper that returns the mission control success
+	// probability of a forward between two vertices.
+	probabilitySrc := func(from route.Vertex, to route.Vertex,
+		amt lnwire.MilliSatoshi, capacity btcutil.Amount) float64 {
+
+		return missionControl[from][to]
+	}
+
+	// All the probabilities are set to 1. So if we restrict the path length
+	// to 2 and allow a max of 3 routes, then we expect three paths here.
+	routes, err := ctx.router.FindBlindedPaths(
+		dave, 1000, probabilitySrc, &BlindedPathRestrictions{
+			MinDistanceFromIntroNode: 2,
+			NumHops:                  2,
+			MaxNumPaths:              3,
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, routes, 3)
+
+	// assertPaths checks that the resulting set of paths is equal to the
+	// expected set and that the order of the paths is correct.
+	assertPaths := func(paths []*route.Route, expectedPaths []string) {
+		require.Len(t, paths, len(expectedPaths))
+
+		var actualPaths []string
+		for _, path := range paths {
+			label := getAliasFromPubKey(
+				path.SourcePubKey, ctx.aliases,
+			) + ","
+
+			for _, hop := range path.Hops {
+				label += getAliasFromPubKey(
+					hop.PubKeyBytes, ctx.aliases,
+				) + ","
+			}
+
+			actualPaths = append(
+				actualPaths, strings.TrimRight(label, ","),
+			)
+		}
+
+		for i, path := range expectedPaths {
+			require.Equal(t, path, actualPaths[i])
+		}
+	}
+
+	// Now, let's lower the MC probability of the B-D to 0.5 and F-D link to
+	// 0.25. We will leave the MaxNumPaths as 3 and so all paths should
+	// still be returned but the order should be:
+	// 1) A -> C -> D
+	// 2) A -> B -> D
+	// 3) A -> F -> D
+	missionControl[bob][dave] = 0.5
+	missionControl[frank][dave] = 0.25
+	routes, err = ctx.router.FindBlindedPaths(
+		dave, 1000, probabilitySrc, &BlindedPathRestrictions{
+			MinDistanceFromIntroNode: 2,
+			NumHops:                  2,
+			MaxNumPaths:              3,
+		},
+	)
+	require.NoError(t, err)
+	assertPaths(routes, []string{
+		"alice,charlie,dave",
+		"alice,bob,dave",
+		"alice,frank,dave",
+	})
+
+	// Just to show that the above result was not a fluke, let's change
+	// the C->D link to be the weak one.
+	missionControl[charlie][dave] = 0.125
+	routes, err = ctx.router.FindBlindedPaths(
+		dave, 1000, probabilitySrc, &BlindedPathRestrictions{
+			MinDistanceFromIntroNode: 2,
+			NumHops:                  2,
+			MaxNumPaths:              3,
+		},
+	)
+	require.NoError(t, err)
+	assertPaths(routes, []string{
+		"alice,bob,dave",
+		"alice,frank,dave",
+		"alice,charlie,dave",
+	})
+
+	// Change the MaxNumPaths to 1 to assert that only the best route is
+	// returned.
+	routes, err = ctx.router.FindBlindedPaths(
+		dave, 1000, probabilitySrc, &BlindedPathRestrictions{
+			MinDistanceFromIntroNode: 2,
+			NumHops:                  2,
+			MaxNumPaths:              1,
+		},
+	)
+	require.NoError(t, err)
+	assertPaths(routes, []string{
+		"alice,bob,dave",
+	})
+
+	// Test the edge case where Dave, the recipient, is also the
+	// introduction node.
+	routes, err = ctx.router.FindBlindedPaths(
+		dave, 1000, probabilitySrc, &BlindedPathRestrictions{
+			MinDistanceFromIntroNode: 0,
+			NumHops:                  0,
+			MaxNumPaths:              1,
+		},
+	)
+	require.NoError(t, err)
+	assertPaths(routes, []string{
+		"dave",
+	})
+
+	// Finally, we make one of the routes have a probability less than the
+	// minimum. This means we expect that route not to be chosen.
+	missionControl[charlie][dave] = DefaultMinRouteProbability
+	routes, err = ctx.router.FindBlindedPaths(
+		dave, 1000, probabilitySrc, &BlindedPathRestrictions{
+			MinDistanceFromIntroNode: 2,
+			NumHops:                  2,
+			MaxNumPaths:              3,
+		},
+	)
+	require.NoError(t, err)
+	assertPaths(routes, []string{
+		"alice,bob,dave",
+		"alice,frank,dave",
+	})
+
+	// Test that if the user explicitly indicates that we should ignore
+	// the Frank node during path selection, then this is done.
+	routes, err = ctx.router.FindBlindedPaths(
+		dave, 1000, probabilitySrc, &BlindedPathRestrictions{
+			MinDistanceFromIntroNode: 2,
+			NumHops:                  2,
+			MaxNumPaths:              3,
+			NodeOmissionSet:          fn.NewSet(frank),
+		},
+	)
+	require.NoError(t, err)
+	assertPaths(routes, []string{
+		"alice,bob,dave",
+	})
 }

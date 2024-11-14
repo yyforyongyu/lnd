@@ -16,6 +16,39 @@
     "application/json"
   ],
   "paths": {
+    "/v2/wallet/BumpForceCloseFee": {
+      "post": {
+        "summary": "lncli: `wallet bumpforceclosefee`\nBumpForceCloseFee is an endpoint that allows users to bump the fee of a\nchannel force close. This only works for channels with option_anchors.",
+        "operationId": "WalletKit_BumpForceCloseFee",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/walletrpcBumpForceCloseFeeResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/walletrpcBumpForceCloseFeeRequest"
+            }
+          }
+        ],
+        "tags": [
+          "WalletKit"
+        ]
+      }
+    },
     "/v2/wallet/accounts": {
       "get": {
         "summary": "lncli: `wallet accounts list`\nListAccounts retrieves all accounts belonging to the wallet by default. A\nname and key scope filter can be provided to filter through all of the\nwallet accounts and return only those matching.",
@@ -273,7 +306,7 @@
     },
     "/v2/wallet/estimatefee/{conf_target}": {
       "get": {
-        "summary": "EstimateFee attempts to query the internal fee estimator of the wallet to\ndetermine the fee (in sat/kw) to attach to a transaction in order to\nachieve the confirmation target.",
+        "summary": "lncli: `wallet estimatefeerate`\nEstimateFee attempts to query the internal fee estimator of the wallet to\ndetermine the fee (in sat/kw) to attach to a transaction in order to\nachieve the confirmation target.",
         "operationId": "WalletKit_EstimateFee",
         "responses": {
           "200": {
@@ -647,7 +680,7 @@
     },
     "/v2/wallet/sweeps/pending": {
       "get": {
-        "summary": "lncli: `pendingsweeps`\nPendingSweeps returns lists of on-chain outputs that lnd is currently\nattempting to sweep within its central batching engine. Outputs with similar\nfee rates are batched together in order to sweep them within a single\ntransaction.",
+        "summary": "lncli: `wallet pendingsweeps`\nPendingSweeps returns lists of on-chain outputs that lnd is currently\nattempting to sweep within its central batching engine. Outputs with similar\nfee rates are batched together in order to sweep them within a single\ntransaction.",
         "description": "NOTE: Some of the fields within PendingSweepsRequest are not guaranteed to\nremain supported. This is an advanced API that depends on the internals of\nthe UtxoSweeper, so things may change.",
         "operationId": "WalletKit_PendingSweeps",
         "responses": {
@@ -948,6 +981,25 @@
       "default": "WITNESS_PUBKEY_HASH",
       "description": "- `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)\n- `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)\n- `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)",
       "title": "`AddressType` has to be one of:"
+    },
+    "lnrpcChannelPoint": {
+      "type": "object",
+      "properties": {
+        "funding_txid_bytes": {
+          "type": "string",
+          "format": "byte",
+          "description": "Txid of the funding transaction. When using REST, this field must be\nencoded as base64."
+        },
+        "funding_txid_str": {
+          "type": "string",
+          "description": "Hex-encoded string representing the byte-reversed hash of the funding\ntransaction."
+        },
+        "output_index": {
+          "type": "integer",
+          "format": "int64",
+          "title": "The index of the output of the funding transaction"
+        }
+      }
     },
     "lnrpcCoinSelectionStrategy": {
       "type": "string",
@@ -1396,6 +1448,43 @@
         }
       }
     },
+    "walletrpcBumpForceCloseFeeRequest": {
+      "type": "object",
+      "properties": {
+        "chan_point": {
+          "$ref": "#/definitions/lnrpcChannelPoint",
+          "description": "The channel point which force close transaction we are attempting to\nbump the fee rate for."
+        },
+        "deadline_delta": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Optional. The deadline delta in number of blocks that the anchor output\nshould be spent within to bump the closing transaction."
+        },
+        "starting_feerate": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Optional. The starting fee rate, expressed in sat/vbyte. This value will be\nused by the sweeper's fee function as its starting fee rate. When not set,\nthe sweeper will use the estimated fee rate using the target_conf as the\nstarting fee rate."
+        },
+        "immediate": {
+          "type": "boolean",
+          "description": "Optional. Whether this cpfp transaction will be triggered immediately. When\nset to true, the sweeper will consider all currently registered sweeps and\ntrigger new batch transactions including the sweeping of the anchor output\nrelated to the selected force close transaction."
+        },
+        "budget": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Optional. The max amount in sats that can be used as the fees. For already\nregistered anchor outputs if not set explicitly the old value will be used.\nFor channel force closes which have no HTLCs in their commitment transaction\nthis value has to be set to an appropriate amount to pay for the cpfp\ntransaction of the force closed channel otherwise the fee bumping will fail."
+        }
+      }
+    },
+    "walletrpcBumpForceCloseFeeResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The status of the force close fee bump operation."
+        }
+      }
+    },
     "walletrpcChangeAddressType": {
       "type": "string",
       "enum": [
@@ -1412,6 +1501,11 @@
           "type": "string",
           "format": "int64",
           "description": "The amount of satoshis per kw that should be used in order to reach the\nconfirmation target in the request."
+        },
+        "min_relay_fee_sat_per_kw": {
+          "type": "string",
+          "format": "int64",
+          "description": "The current minimum relay fee based on our chain backend in sat/kw."
         }
       }
     },
@@ -1470,6 +1564,11 @@
           "format": "uint64",
           "description": "The fee rate, expressed in sat/vbyte, that should be used to spend the\ninput with."
         },
+        "sat_per_kw": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The fee rate, expressed in sat/kWU, that should be used to spend the\ninput with."
+        },
         "account": {
           "type": "string",
           "description": "The name of the account to fund the PSBT with. If empty, the default wallet\naccount is used."
@@ -1490,6 +1589,11 @@
         "coin_selection_strategy": {
           "$ref": "#/definitions/lnrpcCoinSelectionStrategy",
           "description": "The strategy to use for selecting coins during funding the PSBT."
+        },
+        "max_fee_ratio": {
+          "type": "number",
+          "format": "double",
+          "description": "The max fee to total output amount ratio that this psbt should adhere to."
         }
       }
     },
@@ -1588,7 +1692,13 @@
       }
     },
     "walletrpcImportPublicKeyResponse": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The status of the import operation."
+        }
+      }
     },
     "walletrpcImportTapscriptRequest": {
       "type": "object",
@@ -1660,7 +1770,13 @@
       }
     },
     "walletrpcLabelTransactionResponse": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The status of the label operation."
+        }
+      }
     },
     "walletrpcLeaseOutputRequest": {
       "type": "object",
@@ -1898,7 +2014,13 @@
       }
     },
     "walletrpcReleaseOutputResponse": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The status of the release operation."
+        }
+      }
     },
     "walletrpcRemoveTransactionResponse": {
       "type": "object",

@@ -10,9 +10,11 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 // ContractResolutions is a wrapper struct around the two forms of resolutions
@@ -1473,16 +1475,23 @@ func decodeBreachResolution(r io.Reader, b *BreachResolution) error {
 	return binary.Read(r, endian, &b.FundingOutPoint.Index)
 }
 
-func encodeHtlcSetKey(w io.Writer, h *HtlcSetKey) error {
-	err := binary.Write(w, endian, h.IsRemote)
+func encodeHtlcSetKey(w io.Writer, htlcSetKey HtlcSetKey) error {
+	err := binary.Write(w, endian, htlcSetKey.IsRemote)
 	if err != nil {
 		return err
 	}
-	return binary.Write(w, endian, h.IsPending)
+
+	return binary.Write(w, endian, htlcSetKey.IsPending)
 }
 
 func encodeCommitSet(w io.Writer, c *CommitSet) error {
-	if err := encodeHtlcSetKey(w, c.ConfCommitKey); err != nil {
+	confCommitKey, err := c.ConfCommitKey.UnwrapOrErr(
+		fmt.Errorf("HtlcSetKey is not set"),
+	)
+	if err != nil {
+		return err
+	}
+	if err := encodeHtlcSetKey(w, confCommitKey); err != nil {
 		return err
 	}
 
@@ -1492,8 +1501,7 @@ func encodeCommitSet(w io.Writer, c *CommitSet) error {
 	}
 
 	for htlcSetKey, htlcs := range c.HtlcSets {
-		htlcSetKey := htlcSetKey
-		if err := encodeHtlcSetKey(w, &htlcSetKey); err != nil {
+		if err := encodeHtlcSetKey(w, htlcSetKey); err != nil {
 			return err
 		}
 
@@ -1515,13 +1523,14 @@ func decodeHtlcSetKey(r io.Reader, h *HtlcSetKey) error {
 }
 
 func decodeCommitSet(r io.Reader) (*CommitSet, error) {
-	c := &CommitSet{
-		ConfCommitKey: &HtlcSetKey{},
-		HtlcSets:      make(map[HtlcSetKey][]channeldb.HTLC),
+	confCommitKey := HtlcSetKey{}
+	if err := decodeHtlcSetKey(r, &confCommitKey); err != nil {
+		return nil, err
 	}
 
-	if err := decodeHtlcSetKey(r, c.ConfCommitKey); err != nil {
-		return nil, err
+	c := &CommitSet{
+		ConfCommitKey: fn.Some(confCommitKey),
+		HtlcSets:      make(map[HtlcSetKey][]channeldb.HTLC),
 	}
 
 	var numSets uint8
@@ -1553,7 +1562,13 @@ func encodeTaprootAuxData(w io.Writer, c *ContractResolutions) error {
 		commitResolution := c.CommitResolution
 		commitSignDesc := commitResolution.SelfOutputSignDesc
 		//nolint:lll
-		tapCase.CtrlBlocks.CommitSweepCtrlBlock = commitSignDesc.ControlBlock
+		tapCase.CtrlBlocks.Val.CommitSweepCtrlBlock = commitSignDesc.ControlBlock
+
+		c.CommitResolution.ResolutionBlob.WhenSome(func(b []byte) {
+			tapCase.SettledCommitBlob = tlv.SomeRecordT(
+				tlv.NewPrimitiveRecord[tlv.TlvType2](b),
+			)
+		})
 	}
 
 	for _, htlc := range c.HtlcResolutions.IncomingHTLCs {
@@ -1571,7 +1586,7 @@ func encodeTaprootAuxData(w io.Writer, c *ContractResolutions) error {
 				htlc.SignedSuccessTx.TxIn[0].PreviousOutPoint,
 			)
 			//nolint:lll
-			tapCase.CtrlBlocks.SecondLevelCtrlBlocks[resID] = ctrlBlock
+			tapCase.CtrlBlocks.Val.SecondLevelCtrlBlocks[resID] = ctrlBlock
 
 			// For HTLCs we need to go to the second level for, we
 			// also need to store the control block needed to
@@ -1580,12 +1595,12 @@ func encodeTaprootAuxData(w io.Writer, c *ContractResolutions) error {
 				//nolint:lll
 				bridgeCtrlBlock := htlc.SignDetails.SignDesc.ControlBlock
 				//nolint:lll
-				tapCase.CtrlBlocks.IncomingHtlcCtrlBlocks[resID] = bridgeCtrlBlock
+				tapCase.CtrlBlocks.Val.IncomingHtlcCtrlBlocks[resID] = bridgeCtrlBlock
 			}
 		} else {
 			resID := newResolverID(htlc.ClaimOutpoint)
 			//nolint:lll
-			tapCase.CtrlBlocks.IncomingHtlcCtrlBlocks[resID] = ctrlBlock
+			tapCase.CtrlBlocks.Val.IncomingHtlcCtrlBlocks[resID] = ctrlBlock
 		}
 	}
 	for _, htlc := range c.HtlcResolutions.OutgoingHTLCs {
@@ -1603,7 +1618,7 @@ func encodeTaprootAuxData(w io.Writer, c *ContractResolutions) error {
 				htlc.SignedTimeoutTx.TxIn[0].PreviousOutPoint,
 			)
 			//nolint:lll
-			tapCase.CtrlBlocks.SecondLevelCtrlBlocks[resID] = ctrlBlock
+			tapCase.CtrlBlocks.Val.SecondLevelCtrlBlocks[resID] = ctrlBlock
 
 			// For HTLCs we need to go to the second level for, we
 			// also need to store the control block needed to
@@ -1614,18 +1629,18 @@ func encodeTaprootAuxData(w io.Writer, c *ContractResolutions) error {
 				//nolint:lll
 				bridgeCtrlBlock := htlc.SignDetails.SignDesc.ControlBlock
 				//nolint:lll
-				tapCase.CtrlBlocks.OutgoingHtlcCtrlBlocks[resID] = bridgeCtrlBlock
+				tapCase.CtrlBlocks.Val.OutgoingHtlcCtrlBlocks[resID] = bridgeCtrlBlock
 			}
 		} else {
 			resID := newResolverID(htlc.ClaimOutpoint)
 			//nolint:lll
-			tapCase.CtrlBlocks.OutgoingHtlcCtrlBlocks[resID] = ctrlBlock
+			tapCase.CtrlBlocks.Val.OutgoingHtlcCtrlBlocks[resID] = ctrlBlock
 		}
 	}
 
 	if c.AnchorResolution != nil {
 		anchorSignDesc := c.AnchorResolution.AnchorSignDescriptor
-		tapCase.TapTweaks.AnchorTweak = anchorSignDesc.TapTweak
+		tapCase.TapTweaks.Val.AnchorTweak = anchorSignDesc.TapTweak
 	}
 
 	return tapCase.Encode(w)
@@ -1639,7 +1654,11 @@ func decodeTapRootAuxData(r io.Reader, c *ContractResolutions) error {
 
 	if c.CommitResolution != nil {
 		c.CommitResolution.SelfOutputSignDesc.ControlBlock =
-			tapCase.CtrlBlocks.CommitSweepCtrlBlock
+			tapCase.CtrlBlocks.Val.CommitSweepCtrlBlock
+
+		tapCase.SettledCommitBlob.WhenSomeV(func(b []byte) {
+			c.CommitResolution.ResolutionBlob = fn.Some(b)
+		})
 	}
 
 	for i := range c.HtlcResolutions.IncomingHTLCs {
@@ -1652,19 +1671,19 @@ func decodeTapRootAuxData(r io.Reader, c *ContractResolutions) error {
 			)
 
 			//nolint:lll
-			ctrlBlock := tapCase.CtrlBlocks.SecondLevelCtrlBlocks[resID]
+			ctrlBlock := tapCase.CtrlBlocks.Val.SecondLevelCtrlBlocks[resID]
 			htlc.SweepSignDesc.ControlBlock = ctrlBlock
 
 			//nolint:lll
 			if htlc.SignDetails != nil {
-				bridgeCtrlBlock := tapCase.CtrlBlocks.IncomingHtlcCtrlBlocks[resID]
+				bridgeCtrlBlock := tapCase.CtrlBlocks.Val.IncomingHtlcCtrlBlocks[resID]
 				htlc.SignDetails.SignDesc.ControlBlock = bridgeCtrlBlock
 			}
 		} else {
 			resID = newResolverID(htlc.ClaimOutpoint)
 
 			//nolint:lll
-			ctrlBlock := tapCase.CtrlBlocks.IncomingHtlcCtrlBlocks[resID]
+			ctrlBlock := tapCase.CtrlBlocks.Val.IncomingHtlcCtrlBlocks[resID]
 			htlc.SweepSignDesc.ControlBlock = ctrlBlock
 		}
 
@@ -1680,19 +1699,19 @@ func decodeTapRootAuxData(r io.Reader, c *ContractResolutions) error {
 			)
 
 			//nolint:lll
-			ctrlBlock := tapCase.CtrlBlocks.SecondLevelCtrlBlocks[resID]
+			ctrlBlock := tapCase.CtrlBlocks.Val.SecondLevelCtrlBlocks[resID]
 			htlc.SweepSignDesc.ControlBlock = ctrlBlock
 
 			//nolint:lll
 			if htlc.SignDetails != nil {
-				bridgeCtrlBlock := tapCase.CtrlBlocks.OutgoingHtlcCtrlBlocks[resID]
+				bridgeCtrlBlock := tapCase.CtrlBlocks.Val.OutgoingHtlcCtrlBlocks[resID]
 				htlc.SignDetails.SignDesc.ControlBlock = bridgeCtrlBlock
 			}
 		} else {
 			resID = newResolverID(htlc.ClaimOutpoint)
 
 			//nolint:lll
-			ctrlBlock := tapCase.CtrlBlocks.OutgoingHtlcCtrlBlocks[resID]
+			ctrlBlock := tapCase.CtrlBlocks.Val.OutgoingHtlcCtrlBlocks[resID]
 			htlc.SweepSignDesc.ControlBlock = ctrlBlock
 		}
 
@@ -1701,7 +1720,7 @@ func decodeTapRootAuxData(r io.Reader, c *ContractResolutions) error {
 
 	if c.AnchorResolution != nil {
 		c.AnchorResolution.AnchorSignDescriptor.TapTweak =
-			tapCase.TapTweaks.AnchorTweak
+			tapCase.TapTweaks.Val.AnchorTweak
 	}
 
 	return nil

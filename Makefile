@@ -23,13 +23,19 @@ ANDROID_BUILD := $(ANDROID_BUILD_DIR)/Lndmobile.aar
 
 COMMIT := $(shell git describe --tags --dirty)
 
-GO_VERSION := $(shell go version | sed -nre 's/^[^0-9]*(([0-9]+\.)*[0-9]+).*/\1/p')
-GO_VERSION_MINOR := $(shell echo $(GO_VERSION) | cut -d. -f2)
+# Determine the minor version of the active Go installation.
+ACTIVE_GO_VERSION := $(shell go version | sed -nre 's/^[^0-9]*(([0-9]+\.)*[0-9]+).*/\1/p')
+ACTIVE_GO_VERSION_MINOR := $(shell echo $(ACTIVE_GO_VERSION) | cut -d. -f2)
 
 LOOPVARFIX :=
-ifeq ($(shell expr $(GO_VERSION_MINOR) \>= 21), 1)
+ifeq ($(shell expr $(ACTIVE_GO_VERSION_MINOR) \>= 21), 1)
 	LOOPVARFIX := GOEXPERIMENT=loopvar
 endif
+
+# GO_VERSION is the Go version used for the release build, docker files, and
+# GitHub Actions. This is the reference version for the project. All other Go
+# versions are checked against this version.
+GO_VERSION = 1.22.6
 
 GOBUILD := $(LOOPVARFIX) go build -v
 GOINSTALL := $(LOOPVARFIX) go install -v
@@ -156,7 +162,7 @@ release-install:
 release: clean-mobile
 	@$(call print, "Releasing lnd and lncli binaries.")
 	$(VERSION_CHECK)
-	./scripts/release.sh build-release "$(VERSION_TAG)" "$(BUILD_SYSTEM)" "$(RELEASE_TAGS)" "$(RELEASE_LDFLAGS)"
+	./scripts/release.sh build-release "$(VERSION_TAG)" "$(BUILD_SYSTEM)" "$(RELEASE_TAGS)" "$(RELEASE_LDFLAGS)" "$(GO_VERSION)"
 
 #? docker-release: Same as release but within a docker container to support reproducible builds on BSD/MacOS platforms
 docker-release:
@@ -202,7 +208,7 @@ endif
 itest-only: db-instance
 	@$(call print, "Running integration tests with ${backend} backend.")
 	rm -rf itest/*.log itest/.logs-*; date
-	EXEC_SUFFIX=$(EXEC_SUFFIX) scripts/itest_part.sh 0 1 $(TEST_FLAGS) $(ITEST_FLAGS)
+	EXEC_SUFFIX=$(EXEC_SUFFIX) scripts/itest_part.sh 0 1 $(TEST_FLAGS) $(ITEST_FLAGS) -test.v
 	$(COLLECT_ITEST_COVERAGE)
 
 #? itest: Build and run integration tests
@@ -297,10 +303,26 @@ fmt-check: fmt
 	@$(call print, "Checking fmt results.")
 	if test -n "$$(git status --porcelain)"; then echo "code not formatted correctly, please run `make fmt` again!"; git status; git diff; exit 1; fi
 
-#? lint: Run static code analysis
-lint: docker-tools
+#? check-go-version-yaml: Verify that the Go version is correct in all YAML files
+check-go-version-yaml:
+	@$(call print, "Checking for target Go version (v$(GO_VERSION)) in YAML files (*.yaml, *.yml)")
+	./scripts/check-go-version-yaml.sh $(GO_VERSION)
+
+#? check-go-version-dockerfile: Verify that the Go version is correct in all Dockerfile files
+check-go-version-dockerfile:
+	@$(call print, "Checking for target Go version (v$(GO_VERSION)) in Dockerfile files (*Dockerfile)")
+	./scripts/check-go-version-dockerfile.sh $(GO_VERSION)
+
+#? check-go-version: Verify that the Go version is correct in all project files
+check-go-version: check-go-version-dockerfile check-go-version-yaml
+
+#? lint-source: Run static code analysis
+lint-source: docker-tools
 	@$(call print, "Linting source.")
 	$(DOCKER_TOOLS) golangci-lint run -v $(LINT_WORKERS)
+
+#? lint: Run static code analysis
+lint: check-go-version lint-source
 
 #? protolint: Lint proto files using protolint
 protolint:

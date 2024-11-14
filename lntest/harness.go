@@ -16,6 +16,7 @@ import (
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/kvdb/etcd"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lntest/miner"
@@ -192,6 +193,9 @@ func (h *HarnessTest) Start(chain node.BackendConfig,
 
 	// Assemble the miner.
 	h.miner = miner
+
+	// Update block height.
+	h.updateCurrentHeight()
 }
 
 // ChainBackendName returns the chain backend name used in the test.
@@ -315,7 +319,7 @@ func (h *HarnessTest) SetupStandbyNodes() {
 
 	lndArgs := []string{
 		"--default-remote-max-htlcs=483",
-		"--dust-threshold=5000000",
+		"--channel-max-fee-exposure=5000000",
 	}
 
 	// Start the initial seeder nodes within the test network.
@@ -359,6 +363,8 @@ func (h *HarnessTest) Stop() {
 		return
 	}
 
+	h.shutdownAllNodes()
+
 	close(h.lndErrorChan)
 
 	// Stop the fee service.
@@ -399,6 +405,8 @@ func (h *HarnessTest) resetStandbyNodes(t *testing.T) {
 		// config for the coming test. This will also inherit the
 		// test's running context.
 		h.RestartNodeWithExtraArgs(hn, hn.Cfg.OriginalExtraArgs)
+
+		hn.AddToLogf("Finished test case %v", h.manager.currentTestCase)
 	}
 }
 
@@ -836,9 +844,10 @@ func (h *HarnessTest) NewNodeRemoteSigner(name string, extraArgs []string,
 	return hn
 }
 
-// KillNode kills the node (but won't wait for the node process to stop).
+// KillNode kills the node and waits for the node process to stop.
 func (h *HarnessTest) KillNode(hn *node.HarnessNode) {
-	require.NoErrorf(h, hn.Kill(), "%s: kill got error", hn.Name())
+	h.Logf("Manually killing the node %s", hn.Name())
+	require.NoErrorf(h, hn.KillAndWait(), "%s: kill got error", hn.Name())
 	delete(h.manager.activeNodes, hn.Cfg.NodeID)
 }
 
@@ -858,6 +867,12 @@ func (h *HarnessTest) SetFeeEstimateWithConf(
 	fee chainfee.SatPerKWeight, conf uint32) {
 
 	h.feeService.SetFeeRate(fee, conf)
+}
+
+// SetMinRelayFeerate sets a min relay fee rate to be returned from fee
+// estimator.
+func (h *HarnessTest) SetMinRelayFeerate(fee chainfee.SatPerKVByte) {
+	h.feeService.SetMinRelayFeerate(fee)
 }
 
 // validateNodeState checks that the node doesn't have any uncleaned states
@@ -898,18 +913,30 @@ func (h *HarnessTest) validateNodeState(hn *node.HarnessNode) error {
 			"delete all of them properly", hn.Name())
 	}
 
+	// The number of public edges should be zero.
+	if hn.State.Edge.Public != 0 {
+		return fmt.Errorf("%s: found active public egdes, please "+
+			"clean them properly", hn.Name())
+	}
+
+	// The number of edges should be zero.
+	if hn.State.Edge.Total != 0 {
+		return fmt.Errorf("%s: found active edges, please "+
+			"clean them properly", hn.Name())
+	}
+
 	return nil
 }
 
 // GetChanPointFundingTxid takes a channel point and converts it into a chain
 // hash.
 func (h *HarnessTest) GetChanPointFundingTxid(
-	cp *lnrpc.ChannelPoint) *chainhash.Hash {
+	cp *lnrpc.ChannelPoint) chainhash.Hash {
 
 	txid, err := lnrpc.GetChanPointFundingTxid(cp)
 	require.NoError(h, err, "unable to get txid")
 
-	return txid
+	return *txid
 }
 
 // OutPointFromChannelPoint creates an outpoint from a given channel point.
@@ -918,7 +945,7 @@ func (h *HarnessTest) OutPointFromChannelPoint(
 
 	txid := h.GetChanPointFundingTxid(cp)
 	return wire.OutPoint{
-		Hash:  *txid,
+		Hash:  txid,
 		Index: cp.OutputIndex,
 	}
 }
@@ -1196,8 +1223,8 @@ func (h *HarnessTest) openChannel(alice, bob *node.HarnessNode,
 
 	// Check that both alice and bob have seen the channel from their
 	// network topology.
-	h.AssertTopologyChannelOpen(alice, fundingChanPoint)
-	h.AssertTopologyChannelOpen(bob, fundingChanPoint)
+	h.AssertChannelInGraph(alice, fundingChanPoint)
+	h.AssertChannelInGraph(bob, fundingChanPoint)
 
 	// Check that the channel can be seen in their ListChannels.
 	h.AssertChannelExists(alice, fundingChanPoint)
@@ -1218,8 +1245,8 @@ func (h *HarnessTest) openChannelZeroConf(alice, bob *node.HarnessNode,
 
 	// Check that both alice and bob have seen the channel from their
 	// network topology.
-	h.AssertTopologyChannelOpen(alice, fundingChanPoint)
-	h.AssertTopologyChannelOpen(bob, fundingChanPoint)
+	h.AssertChannelInGraph(alice, fundingChanPoint)
+	h.AssertChannelInGraph(bob, fundingChanPoint)
 
 	// Finally, check that the channel can be seen in their ListChannels.
 	h.AssertChannelExists(alice, fundingChanPoint)
@@ -1254,7 +1281,7 @@ func (h *HarnessTest) OpenChannelAssertErr(srcNode, destNode *node.HarnessNode,
 // mempool.
 func (h *HarnessTest) CloseChannelAssertPending(hn *node.HarnessNode,
 	cp *lnrpc.ChannelPoint,
-	force bool) (rpc.CloseChanClient, *chainhash.Hash) {
+	force bool) (rpc.CloseChanClient, chainhash.Hash) {
 
 	// Calls the rpc to close the channel.
 	closeReq := &lnrpc.CloseChannelRequest{
@@ -1297,9 +1324,9 @@ func (h *HarnessTest) CloseChannelAssertPending(hn *node.HarnessNode,
 		pendingClose.ClosePending.Txid)
 
 	// Assert the closing tx is in the mempool.
-	h.miner.AssertTxInMempool(closeTxid)
+	h.miner.AssertTxInMempool(*closeTxid)
 
-	return stream, closeTxid
+	return stream, *closeTxid
 }
 
 // CloseChannel attempts to coop close a non-anchored channel identified by the
@@ -1312,7 +1339,7 @@ func (h *HarnessTest) CloseChannelAssertPending(hn *node.HarnessNode,
 //  5. the node reports zero waiting close channels.
 //  6. the node receives a topology update regarding the channel close.
 func (h *HarnessTest) CloseChannel(hn *node.HarnessNode,
-	cp *lnrpc.ChannelPoint) *chainhash.Hash {
+	cp *lnrpc.ChannelPoint) chainhash.Hash {
 
 	stream, _ := h.CloseChannelAssertPending(hn, cp, false)
 
@@ -1331,7 +1358,7 @@ func (h *HarnessTest) CloseChannel(hn *node.HarnessNode,
 //  7. mine DefaultCSV-1 blocks.
 //  8. the node reports zero pending force close channels.
 func (h *HarnessTest) ForceCloseChannel(hn *node.HarnessNode,
-	cp *lnrpc.ChannelPoint) *chainhash.Hash {
+	cp *lnrpc.ChannelPoint) chainhash.Hash {
 
 	stream, _ := h.CloseChannelAssertPending(hn, cp, true)
 
@@ -1618,30 +1645,13 @@ func (h *HarnessTest) OpenChannelPsbt(srcNode, destNode *node.HarnessNode,
 	return respStream, upd.PsbtFund.Psbt
 }
 
-// CleanupForceClose mines a force close commitment found in the mempool and
-// the following sweep transaction from the force closing node.
+// CleanupForceClose mines blocks to clean up the force close process. This is
+// used for tests that are not asserting the expected behavior is found during
+// the force close process, e.g., num of sweeps, etc. Instead, it provides a
+// shortcut to move the test forward with a clean mempool.
 func (h *HarnessTest) CleanupForceClose(hn *node.HarnessNode) {
 	// Wait for the channel to be marked pending force close.
 	h.AssertNumPendingForceClose(hn, 1)
-
-	// Mine enough blocks for the node to sweep its funds from the force
-	// closed channel. The commit sweep resolver is able to offer the input
-	// to the sweeper at defaulCSV-1, and broadcast the sweep tx once one
-	// more block is mined.
-	//
-	// NOTE: we might empty blocks here as we don't know the exact number
-	// of blocks to mine. This may end up mining more blocks than needed.
-	h.MineEmptyBlocks(node.DefaultCSV - 1)
-
-	// Assert there is one pending sweep.
-	h.AssertNumPendingSweeps(hn, 1)
-
-	// Mine a block to trigger the sweep.
-	h.MineEmptyBlocks(1)
-
-	// The node should now sweep the funds, clean up by mining the sweeping
-	// tx.
-	h.MineBlocksAndAssertNumTxes(1, 1)
 
 	// Mine blocks to get any second level HTLC resolved. If there are no
 	// HTLCs, this will behave like h.AssertNumPendingCloseChannels.
@@ -1765,6 +1775,14 @@ func (h *HarnessTest) SendPaymentAssertSettled(hn *node.HarnessNode,
 	return h.SendPaymentAndAssertStatus(hn, req, lnrpc.Payment_SUCCEEDED)
 }
 
+// SendPaymentAssertInflight sends a payment from the passed node and asserts
+// the payment is inflight.
+func (h *HarnessTest) SendPaymentAssertInflight(hn *node.HarnessNode,
+	req *routerrpc.SendPaymentRequest) *lnrpc.Payment {
+
+	return h.SendPaymentAndAssertStatus(hn, req, lnrpc.Payment_IN_FLIGHT)
+}
+
 // OpenChannelRequest is used to open a channel using the method
 // OpenMultiChannelsAsync.
 type OpenChannelRequest struct {
@@ -1812,8 +1830,8 @@ func (h *HarnessTest) OpenMultiChannelsAsync(
 		if !req.Param.Private {
 			// Check that both alice and bob have seen the channel
 			// from their channel watch request.
-			h.AssertTopologyChannelOpen(req.Local, cp)
-			h.AssertTopologyChannelOpen(req.Remote, cp)
+			h.AssertChannelInGraph(req.Local, cp)
+			h.AssertChannelInGraph(req.Remote, cp)
 		}
 
 		// Finally, check that the channel can be seen in their
@@ -1902,7 +1920,7 @@ func (h *HarnessTest) CalculateTxFee(tx *wire.MsgTx) btcutil.Amount {
 	var balance btcutil.Amount
 	for _, in := range tx.TxIn {
 		parentHash := in.PreviousOutPoint.Hash
-		rawTx := h.miner.GetRawTransaction(&parentHash)
+		rawTx := h.miner.GetRawTransaction(parentHash)
 		parent := rawTx.MsgTx()
 		value := parent.TxOut[in.PreviousOutPoint.Index].Value
 
@@ -2072,8 +2090,42 @@ func (h *HarnessTest) ReceiveHtlcInterceptor(
 		require.Fail(h, "timeout", "timeout intercepting htlc")
 
 	case err := <-errChan:
-		require.Failf(h, "err from stream",
-			"received err from stream: %v", err)
+		require.Failf(h, "err from HTLC interceptor stream",
+			"received err from HTLC interceptor stream: %v", err)
+
+	case updateMsg := <-chanMsg:
+		return updateMsg
+	}
+
+	return nil
+}
+
+// ReceiveInvoiceHtlcModification waits until a message is received on the
+// invoice HTLC modifier stream or the timeout is reached.
+func (h *HarnessTest) ReceiveInvoiceHtlcModification(
+	stream rpc.InvoiceHtlcModifierClient) *invoicesrpc.HtlcModifyRequest {
+
+	chanMsg := make(chan *invoicesrpc.HtlcModifyRequest)
+	errChan := make(chan error)
+	go func() {
+		// Consume one message. This will block until the message is
+		// received.
+		resp, err := stream.Recv()
+		if err != nil {
+			errChan <- err
+			return
+		}
+		chanMsg <- resp
+	}()
+
+	select {
+	case <-time.After(DefaultTimeout):
+		require.Fail(h, "timeout", "timeout invoice HTLC modifier")
+
+	case err := <-errChan:
+		require.Failf(h, "err from invoice HTLC modifier stream",
+			"received err from invoice HTLC modifier stream: %v",
+			err)
 
 	case updateMsg := <-chanMsg:
 		return updateMsg
@@ -2117,7 +2169,7 @@ func (h *HarnessTest) ReceiveChannelEvent(
 
 // GetOutputIndex returns the output index of the given address in the given
 // transaction.
-func (h *HarnessTest) GetOutputIndex(txid *chainhash.Hash, addr string) int {
+func (h *HarnessTest) GetOutputIndex(txid chainhash.Hash, addr string) int {
 	// We'll then extract the raw transaction from the mempool in order to
 	// determine the index of the p2tr output.
 	tx := h.miner.GetRawTransaction(txid)
@@ -2160,4 +2212,155 @@ func (h *HarnessTest) SendCoins(a, b *node.HarnessNode,
 	tx := h.GetNumTxsFromMempool(1)[0]
 
 	return tx
+}
+
+// CreateSimpleNetwork creates the number of nodes specified by the number of
+// configs and makes a topology of `node1 -> node2 -> node3...`. Each node is
+// created using the specified config, the neighbors are connected, and the
+// channels are opened. Each node will be funded with a single UTXO of 1 BTC
+// except the last one.
+//
+// For instance, to create a network with 2 nodes that share the same node
+// config,
+//
+//	cfg := []string{"--protocol.anchors"}
+//	cfgs := [][]string{cfg, cfg}
+//	params := OpenChannelParams{...}
+//	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, params)
+//
+// This will create two nodes and open an anchor channel between them.
+func (h *HarnessTest) CreateSimpleNetwork(nodeCfgs [][]string,
+	p OpenChannelParams) ([]*lnrpc.ChannelPoint, []*node.HarnessNode) {
+
+	// Create new nodes.
+	nodes := h.createNodes(nodeCfgs)
+
+	var resp []*lnrpc.ChannelPoint
+
+	// Open zero-conf channels if specified.
+	if p.ZeroConf {
+		resp = h.openZeroConfChannelsForNodes(nodes, p)
+	} else {
+		// Open channels between the nodes.
+		resp = h.openChannelsForNodes(nodes, p)
+	}
+
+	return resp, nodes
+}
+
+// acceptChannel is used to accept a single channel that comes across. This
+// should be run in a goroutine and is used to test nodes with the zero-conf
+// feature bit.
+func acceptChannel(t *testing.T, zeroConf bool, stream rpc.AcceptorClient) {
+	req, err := stream.Recv()
+	require.NoError(t, err)
+
+	resp := &lnrpc.ChannelAcceptResponse{
+		Accept:        true,
+		PendingChanId: req.PendingChanId,
+		ZeroConf:      zeroConf,
+	}
+	err = stream.Send(resp)
+	require.NoError(t, err)
+}
+
+// createNodes creates the number of nodes specified by the number of configs.
+// Each node is created using the specified config, the neighbors are
+// connected.
+func (h *HarnessTest) createNodes(nodeCfgs [][]string) []*node.HarnessNode {
+	// Get the number of nodes.
+	numNodes := len(nodeCfgs)
+
+	// Make a slice of nodes.
+	nodes := make([]*node.HarnessNode, numNodes)
+
+	// Create new nodes.
+	for i, nodeCfg := range nodeCfgs {
+		nodeName := fmt.Sprintf("Node%q", string(rune('A'+i)))
+		n := h.NewNode(nodeName, nodeCfg)
+		nodes[i] = n
+	}
+
+	// Connect the nodes in a chain.
+	for i := 1; i < len(nodes); i++ {
+		nodeA := nodes[i-1]
+		nodeB := nodes[i]
+		h.EnsureConnected(nodeA, nodeB)
+	}
+
+	// Fund all the nodes expect the last one.
+	for i := 0; i < len(nodes)-1; i++ {
+		node := nodes[i]
+		h.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, node)
+	}
+
+	// Mine 1 block to get the above coins confirmed.
+	h.MineBlocksAndAssertNumTxes(1, numNodes-1)
+
+	return nodes
+}
+
+// openChannelsForNodes takes a list of nodes and makes a topology of `node1 ->
+// node2 -> node3...`.
+func (h *HarnessTest) openChannelsForNodes(nodes []*node.HarnessNode,
+	p OpenChannelParams) []*lnrpc.ChannelPoint {
+
+	// Sanity check the params.
+	require.Greater(h, len(nodes), 1, "need at least 2 nodes")
+
+	// Open channels in batch to save blocks mined.
+	reqs := make([]*OpenChannelRequest, 0, len(nodes)-1)
+	for i := 0; i < len(nodes)-1; i++ {
+		nodeA := nodes[i]
+		nodeB := nodes[i+1]
+
+		req := &OpenChannelRequest{
+			Local:  nodeA,
+			Remote: nodeB,
+			Param:  p,
+		}
+		reqs = append(reqs, req)
+	}
+	resp := h.OpenMultiChannelsAsync(reqs)
+
+	// Make sure the nodes know each other's channels if they are public.
+	if !p.Private {
+		for _, node := range nodes {
+			for _, chanPoint := range resp {
+				h.AssertChannelInGraph(node, chanPoint)
+			}
+		}
+	}
+
+	return resp
+}
+
+// openZeroConfChannelsForNodes takes a list of nodes and makes a topology of
+// `node1 -> node2 -> node3...` with zero-conf channels.
+func (h *HarnessTest) openZeroConfChannelsForNodes(nodes []*node.HarnessNode,
+	p OpenChannelParams) []*lnrpc.ChannelPoint {
+
+	// Sanity check the params.
+	require.True(h, p.ZeroConf, "zero-conf channels must be enabled")
+	require.Greater(h, len(nodes), 1, "need at least 2 nodes")
+
+	// We are opening numNodes-1 channels.
+	cancels := make([]context.CancelFunc, 0, len(nodes)-1)
+
+	// Create the channel acceptors.
+	for _, node := range nodes[1:] {
+		acceptor, cancel := node.RPC.ChannelAcceptor()
+		go acceptChannel(h.T, true, acceptor)
+
+		cancels = append(cancels, cancel)
+	}
+
+	// Open channels between the nodes.
+	resp := h.openChannelsForNodes(nodes, p)
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+
+	return resp
 }

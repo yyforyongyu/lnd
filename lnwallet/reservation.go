@@ -2,6 +2,7 @@ package lnwallet
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -25,7 +27,7 @@ type CommitmentType int
 const (
 	// CommitmentTypeLegacy is the legacy commitment format with a tweaked
 	// to_remote key.
-	CommitmentTypeLegacy = iota
+	CommitmentTypeLegacy CommitmentType = iota
 
 	// CommitmentTypeTweakless is a newer commitment format where the
 	// to_remote key is static.
@@ -49,6 +51,11 @@ const (
 	// channels that use a musig2 funding output and the tapscript tree
 	// where relevant for the commitment transaction pk scripts.
 	CommitmentTypeSimpleTaproot
+
+	// CommitmentTypeSimpleTaprootOverlay builds on the existing
+	// CommitmentTypeSimpleTaproot type but layers on a special overlay
+	// protocol.
+	CommitmentTypeSimpleTaprootOverlay
 )
 
 // HasStaticRemoteKey returns whether the commitment type supports remote
@@ -58,8 +65,11 @@ func (c CommitmentType) HasStaticRemoteKey() bool {
 	case CommitmentTypeTweakless,
 		CommitmentTypeAnchorsZeroFeeHtlcTx,
 		CommitmentTypeScriptEnforcedLease,
-		CommitmentTypeSimpleTaproot:
+		CommitmentTypeSimpleTaproot,
+		CommitmentTypeSimpleTaprootOverlay:
+
 		return true
+
 	default:
 		return false
 	}
@@ -70,8 +80,11 @@ func (c CommitmentType) HasAnchors() bool {
 	switch c {
 	case CommitmentTypeAnchorsZeroFeeHtlcTx,
 		CommitmentTypeScriptEnforcedLease,
-		CommitmentTypeSimpleTaproot:
+		CommitmentTypeSimpleTaproot,
+		CommitmentTypeSimpleTaprootOverlay:
+
 		return true
+
 	default:
 		return false
 	}
@@ -79,7 +92,8 @@ func (c CommitmentType) HasAnchors() bool {
 
 // IsTaproot returns true if the channel type is a taproot channel.
 func (c CommitmentType) IsTaproot() bool {
-	return c == CommitmentTypeSimpleTaproot
+	return c == CommitmentTypeSimpleTaproot ||
+		c == CommitmentTypeSimpleTaprootOverlay
 }
 
 // String returns the name of the CommitmentType.
@@ -95,10 +109,34 @@ func (c CommitmentType) String() string {
 		return "script-enforced-lease"
 	case CommitmentTypeSimpleTaproot:
 		return "simple-taproot"
+	case CommitmentTypeSimpleTaprootOverlay:
+		return "simple-taproot-overlay"
 	default:
 		return "invalid"
 	}
 }
+
+// ReservationState is a type that represents the current state of a channel
+// reservation within the funding workflow.
+type ReservationState int
+
+const (
+	// WaitingToSend is the state either the funder/fundee is in after
+	// creating a reservation, but hasn't sent a message yet.
+	WaitingToSend ReservationState = iota
+
+	// SentOpenChannel is the state the funder is in after sending the
+	// OpenChannel message.
+	SentOpenChannel
+
+	// SentAcceptChannel is the state the fundee is in after sending the
+	// AcceptChannel message.
+	SentAcceptChannel
+
+	// SentFundingCreated is the state the funder is in after sending the
+	// FundingCreated message.
+	SentFundingCreated
+)
 
 // ChannelContribution is the primary constituent of the funding workflow
 // within lnwallet. Each side first exchanges their respective contributions
@@ -223,6 +261,8 @@ type ChannelReservation struct {
 	nextRevocationKeyLoc keychain.KeyLocator
 
 	musigSessions *MusigPairSession
+
+	state ReservationState
 }
 
 // NewChannelReservation creates a new channel reservation. This function is
@@ -261,7 +301,7 @@ func NewChannelReservation(capacity, localFundingAmt btcutil.Amount,
 	// addition to the two anchor outputs.
 	feeMSat := lnwire.NewMSatFromSatoshis(commitFee)
 	if req.CommitType.HasAnchors() {
-		feeMSat += 2 * lnwire.NewMSatFromSatoshis(anchorSize)
+		feeMSat += 2 * lnwire.NewMSatFromSatoshis(AnchorSize)
 	}
 
 	// Used to cut down on verbosity.
@@ -399,7 +439,7 @@ func NewChannelReservation(capacity, localFundingAmt btcutil.Amount,
 		chanType |= channeldb.FrozenBit
 	}
 
-	if req.CommitType == CommitmentTypeSimpleTaproot {
+	if req.CommitType.IsTaproot() {
 		chanType |= channeldb.SimpleTaprootFeatureBit
 	}
 
@@ -413,6 +453,18 @@ func NewChannelReservation(capacity, localFundingAmt btcutil.Amount,
 
 	if req.ScidAliasFeature {
 		chanType |= channeldb.ScidAliasFeatureBit
+	}
+
+	taprootOverlay := req.CommitType == CommitmentTypeSimpleTaprootOverlay
+	switch {
+	case taprootOverlay && req.TapscriptRoot.IsNone():
+		fallthrough
+	case !taprootOverlay && req.TapscriptRoot.IsSome():
+		return nil, fmt.Errorf("taproot overlay chans must be set " +
+			"with tapscript root")
+
+	case taprootOverlay && req.TapscriptRoot.IsSome():
+		chanType |= channeldb.TapscriptRootBit
 	}
 
 	return &ChannelReservation{
@@ -448,12 +500,14 @@ func NewChannelReservation(capacity, localFundingAmt btcutil.Amount,
 			InitialLocalBalance:  ourBalance,
 			InitialRemoteBalance: theirBalance,
 			Memo:                 req.Memo,
+			TapscriptRoot:        req.TapscriptRoot,
 		},
 		pushMSat:      req.PushMSat,
 		pendingChanID: req.PendingChanID,
 		reservationID: id,
 		wallet:        wallet,
 		chanFunder:    req.ChanFunder,
+		state:         WaitingToSend,
 	}, nil
 }
 
@@ -463,6 +517,22 @@ func (r *ChannelReservation) AddAlias(scid lnwire.ShortChannelID) {
 	defer r.Unlock()
 
 	r.partialState.ShortChannelID = scid
+}
+
+// SetState sets the ReservationState.
+func (r *ChannelReservation) SetState(state ReservationState) {
+	r.Lock()
+	defer r.Unlock()
+
+	r.state = state
+}
+
+// State returns the current ReservationState.
+func (r *ChannelReservation) State() ReservationState {
+	r.RLock()
+	defer r.RUnlock()
+
+	return r.state
 }
 
 // SetNumConfsRequired sets the number of confirmations that are required for
@@ -501,29 +571,34 @@ func (r *ChannelReservation) IsTaproot() bool {
 // of satoshis that can be transferred in a single commitment. This function
 // will also attempt to verify the constraints for sanity, returning an error
 // if the parameters are seemed unsound.
-func (r *ChannelReservation) CommitConstraints(c *channeldb.ChannelConstraints,
-	maxLocalCSVDelay uint16, responder bool) error {
+func (r *ChannelReservation) CommitConstraints(
+	bounds *channeldb.ChannelStateBounds,
+	commitParams *channeldb.CommitmentParams,
+	maxLocalCSVDelay uint16,
+	responder bool) error {
 
 	r.Lock()
 	defer r.Unlock()
 
 	// First, verify the sanity of the channel constraints.
-	err := VerifyConstraints(c, maxLocalCSVDelay, r.partialState.Capacity)
+	err := VerifyConstraints(
+		bounds, commitParams, maxLocalCSVDelay, r.partialState.Capacity,
+	)
 	if err != nil {
 		return err
 	}
 
 	// Our dust limit should always be less than or equal to our proposed
 	// channel reserve.
-	if responder && r.ourContribution.DustLimit > c.ChanReserve {
-		r.ourContribution.DustLimit = c.ChanReserve
+	if responder && r.ourContribution.DustLimit > bounds.ChanReserve {
+		r.ourContribution.DustLimit = bounds.ChanReserve
 	}
 
-	r.ourContribution.ChanReserve = c.ChanReserve
-	r.ourContribution.MaxPendingAmount = c.MaxPendingAmount
-	r.ourContribution.MinHTLC = c.MinHTLC
-	r.ourContribution.MaxAcceptedHtlcs = c.MaxAcceptedHtlcs
-	r.ourContribution.CsvDelay = c.CsvDelay
+	r.ourContribution.ChanReserve = bounds.ChanReserve
+	r.ourContribution.MaxPendingAmount = bounds.MaxPendingAmount
+	r.ourContribution.MinHTLC = bounds.MinHTLC
+	r.ourContribution.MaxAcceptedHtlcs = bounds.MaxAcceptedHtlcs
+	r.ourContribution.CsvDelay = commitParams.CsvDelay
 
 	return nil
 }
@@ -600,12 +675,15 @@ func (r *ChannelReservation) IsCannedShim() bool {
 }
 
 // ProcessPsbt continues a previously paused funding flow that involves PSBT to
-// construct the funding transaction. This method can be called once the PSBT is
-// finalized and the signed transaction is available.
-func (r *ChannelReservation) ProcessPsbt() error {
+// construct the funding transaction. This method can be called once the PSBT
+// is finalized and the signed transaction is available.
+func (r *ChannelReservation) ProcessPsbt(
+	auxFundingDesc fn.Option[AuxFundingDesc]) error {
+
 	errChan := make(chan error, 1)
 
 	r.wallet.msgChan <- &continueContributionMsg{
+		auxFundingDesc:   auxFundingDesc,
 		pendingFundingID: r.reservationID,
 		err:              errChan,
 	}
@@ -707,8 +785,10 @@ func (r *ChannelReservation) CompleteReservation(fundingInputScripts []*input.Sc
 // available via the .OurSignatures() method. As this method should only be
 // called as a response to a single funder channel, only a commitment signature
 // will be populated.
-func (r *ChannelReservation) CompleteReservationSingle(fundingPoint *wire.OutPoint,
-	commitSig input.Signature) (*channeldb.OpenChannel, error) {
+func (r *ChannelReservation) CompleteReservationSingle(
+	fundingPoint *wire.OutPoint, commitSig input.Signature,
+	auxFundingDesc fn.Option[AuxFundingDesc]) (*channeldb.OpenChannel,
+	error) {
 
 	errChan := make(chan error, 1)
 	completeChan := make(chan *channeldb.OpenChannel, 1)
@@ -718,6 +798,7 @@ func (r *ChannelReservation) CompleteReservationSingle(fundingPoint *wire.OutPoi
 		fundingOutpoint:    fundingPoint,
 		theirCommitmentSig: commitSig,
 		completeChan:       completeChan,
+		auxFundingDesc:     auxFundingDesc,
 		err:                errChan,
 	}
 
@@ -803,64 +884,113 @@ func (r *ChannelReservation) Cancel() error {
 	return <-errChan
 }
 
+// ChanState the current open channel state.
+func (r *ChannelReservation) ChanState() *channeldb.OpenChannel {
+	r.RLock()
+	defer r.RUnlock()
+
+	return r.partialState
+}
+
+// CommitmentKeyRings returns the local+remote key ring used for the very first
+// commitment transaction both parties.
+//
+//nolint:lll
+func (r *ChannelReservation) CommitmentKeyRings() lntypes.Dual[CommitmentKeyRing] {
+	r.RLock()
+	defer r.RUnlock()
+
+	chanType := r.partialState.ChanType
+	ourChanCfg := r.ourContribution.ChannelConfig
+	theirChanCfg := r.theirContribution.ChannelConfig
+
+	localKeys := DeriveCommitmentKeys(
+		r.ourContribution.FirstCommitmentPoint, lntypes.Local, chanType,
+		ourChanCfg, theirChanCfg,
+	)
+
+	remoteKeys := DeriveCommitmentKeys(
+		r.theirContribution.FirstCommitmentPoint, lntypes.Remote,
+		chanType, ourChanCfg, theirChanCfg,
+	)
+
+	return lntypes.Dual[CommitmentKeyRing]{
+		Local:  *localKeys,
+		Remote: *remoteKeys,
+	}
+}
+
 // VerifyConstraints is a helper function that can be used to check the sanity
 // of various channel constraints.
-func VerifyConstraints(c *channeldb.ChannelConstraints,
-	maxLocalCSVDelay uint16, channelCapacity btcutil.Amount) error {
+func VerifyConstraints(bounds *channeldb.ChannelStateBounds,
+	commitParams *channeldb.CommitmentParams, maxLocalCSVDelay uint16,
+	channelCapacity btcutil.Amount) error {
 
 	// Fail if the csv delay for our funds exceeds our maximum.
-	if c.CsvDelay > maxLocalCSVDelay {
-		return ErrCsvDelayTooLarge(c.CsvDelay, maxLocalCSVDelay)
+	if commitParams.CsvDelay > maxLocalCSVDelay {
+		return ErrCsvDelayTooLarge(
+			commitParams.CsvDelay, maxLocalCSVDelay,
+		)
 	}
 
 	// The channel reserve should always be greater or equal to the dust
 	// limit. The reservation request should be denied if otherwise.
-	if c.DustLimit > c.ChanReserve {
-		return ErrChanReserveTooSmall(c.ChanReserve, c.DustLimit)
+	if commitParams.DustLimit > bounds.ChanReserve {
+		return ErrChanReserveTooSmall(
+			bounds.ChanReserve, commitParams.DustLimit,
+		)
 	}
 
 	// Validate against the maximum-sized witness script dust limit, and
 	// also ensure that the DustLimit is not too large.
 	maxWitnessLimit := DustLimitForSize(input.UnknownWitnessSize)
-	if c.DustLimit < maxWitnessLimit || c.DustLimit > 3*maxWitnessLimit {
-		return ErrInvalidDustLimit(c.DustLimit)
+	if commitParams.DustLimit < maxWitnessLimit ||
+		commitParams.DustLimit > 3*maxWitnessLimit {
+
+		return ErrInvalidDustLimit(commitParams.DustLimit)
 	}
 
 	// Fail if we consider the channel reserve to be too large.  We
 	// currently fail if it is greater than 20% of the channel capacity.
 	maxChanReserve := channelCapacity / 5
-	if c.ChanReserve > maxChanReserve {
-		return ErrChanReserveTooLarge(c.ChanReserve, maxChanReserve)
+	if bounds.ChanReserve > maxChanReserve {
+		return ErrChanReserveTooLarge(
+			bounds.ChanReserve, maxChanReserve,
+		)
 	}
 
 	// Fail if the minimum HTLC value is too large. If this is too large,
 	// the channel won't be useful for sending small payments. This limit
 	// is currently set to maxValueInFlight, effectively letting the remote
 	// setting this as large as it wants.
-	if c.MinHTLC > c.MaxPendingAmount {
-		return ErrMinHtlcTooLarge(c.MinHTLC, c.MaxPendingAmount)
+	if bounds.MinHTLC > bounds.MaxPendingAmount {
+		return ErrMinHtlcTooLarge(
+			bounds.MinHTLC, bounds.MaxPendingAmount,
+		)
 	}
 
 	// Fail if maxHtlcs is above the maximum allowed number of 483.  This
 	// number is specified in BOLT-02.
-	if c.MaxAcceptedHtlcs > uint16(input.MaxHTLCNumber/2) {
+	if bounds.MaxAcceptedHtlcs > uint16(input.MaxHTLCNumber/2) {
 		return ErrMaxHtlcNumTooLarge(
-			c.MaxAcceptedHtlcs, uint16(input.MaxHTLCNumber/2),
+			bounds.MaxAcceptedHtlcs, uint16(input.MaxHTLCNumber/2),
 		)
 	}
 
 	// Fail if we consider maxHtlcs too small. If this is too small we
 	// cannot offer many HTLCs to the remote.
 	const minNumHtlc = 5
-	if c.MaxAcceptedHtlcs < minNumHtlc {
-		return ErrMaxHtlcNumTooSmall(c.MaxAcceptedHtlcs, minNumHtlc)
+	if bounds.MaxAcceptedHtlcs < minNumHtlc {
+		return ErrMaxHtlcNumTooSmall(
+			bounds.MaxAcceptedHtlcs, minNumHtlc,
+		)
 	}
 
 	// Fail if we consider maxValueInFlight too small. We currently require
 	// the remote to at least allow minNumHtlc * minHtlc in flight.
-	if c.MaxPendingAmount < minNumHtlc*c.MinHTLC {
+	if bounds.MaxPendingAmount < minNumHtlc*bounds.MinHTLC {
 		return ErrMaxValueInFlightTooSmall(
-			c.MaxPendingAmount, minNumHtlc*c.MinHTLC,
+			bounds.MaxPendingAmount, minNumHtlc*bounds.MinHTLC,
 		)
 	}
 

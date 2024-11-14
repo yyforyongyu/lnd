@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -136,6 +137,7 @@ func genTaskTest(
 		if chanType.IsTaproot() {
 			scriptTree, _ := input.NewLocalCommitScriptTree(
 				csvDelay, toLocalPK, revPK,
+				fn.None[txscript.TapLeaf](),
 			)
 
 			pkScript, _ := input.PayToTaprootScript(
@@ -189,7 +191,7 @@ func genTaskTest(
 
 		if chanType.IsTaproot() {
 			scriptTree, _ := input.NewRemoteCommitScriptTree(
-				toRemotePK,
+				toRemotePK, fn.None[txscript.TapLeaf](),
 			)
 
 			pkScript, _ := input.PayToTaprootScript(
@@ -650,7 +652,7 @@ func testBackupTask(t *testing.T, test backupTaskTest) {
 	hint, encBlob, err := task.craftSessionPayload(test.signer)
 	require.NoError(t, err, "unable to craft session payload")
 
-	// Verify that the breach hint matches the breach txid's prefix.
+	// Verify that the breach hint matches the prefix of SHA256(txid).
 	breachTxID := test.breachInfo.BreachTxHash
 	expHint := blob.NewBreachHintFromHash(&breachTxID)
 	require.Equal(t, expHint, hint)

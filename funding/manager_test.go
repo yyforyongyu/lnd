@@ -28,6 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/channelnotifier"
 	"github.com/lightningnetwork/lnd/discovery"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lncfg"
@@ -161,7 +162,7 @@ func (m *mockAliasMgr) GetPeerAlias(lnwire.ChannelID) (lnwire.ShortChannelID,
 }
 
 func (m *mockAliasMgr) AddLocalAlias(lnwire.ShortChannelID,
-	lnwire.ShortChannelID, bool) error {
+	lnwire.ShortChannelID, bool, bool) error {
 
 	return nil
 }
@@ -282,6 +283,8 @@ type testNode struct {
 }
 
 var _ lnpeer.Peer = (*testNode)(nil)
+
+func (n *testNode) Disconnect(err error) {}
 
 func (n *testNode) IdentityKey() *btcec.PublicKey {
 	return n.addr.IdentityKey
@@ -561,6 +564,12 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 		IsSweeperOutpoint: func(wire.OutPoint) bool {
 			return false
 		},
+		AuxLeafStore: fn.Some[lnwallet.AuxLeafStore](
+			&lnwallet.MockAuxLeafStore{},
+		),
+		AuxSigner: fn.Some[lnwallet.AuxSigner](
+			lnwallet.NewAuxSignerMock(lnwallet.EmptyMockJobHandler),
+		),
 	}
 
 	for _, op := range options {
@@ -670,6 +679,8 @@ func recreateAliceFundingManager(t *testing.T, alice *testNode) {
 		OpenChannelPredicate:  chainedAcceptor,
 		DeleteAliasEdge:       oldCfg.DeleteAliasEdge,
 		AliasManager:          oldCfg.AliasManager,
+		AuxLeafStore:          oldCfg.AuxLeafStore,
+		AuxSigner:             oldCfg.AuxSigner,
 	})
 	require.NoError(t, err, "failed recreating aliceFundingManager")
 
@@ -1201,9 +1212,9 @@ func assertChannelAnnouncements(t *testing.T, alice, bob *testNode,
 		gotChannelUpdate := false
 		for _, msg := range announcements {
 			switch m := msg.(type) {
-			case *lnwire.ChannelAnnouncement:
+			case *lnwire.ChannelAnnouncement1:
 				gotChannelAnnouncement = true
-			case *lnwire.ChannelUpdate:
+			case *lnwire.ChannelUpdate1:
 
 				// The channel update sent by the node should
 				// advertise the MinHTLC value required by the
@@ -1290,7 +1301,7 @@ func assertAnnouncementSignatures(t *testing.T, alice, bob *testNode) {
 		gotNodeAnnouncement := false
 		for _, msg := range announcements {
 			switch msg.(type) {
-			case *lnwire.AnnounceSignatures:
+			case *lnwire.AnnounceSignatures1:
 				gotAnnounceSignatures = true
 			case *lnwire.NodeAnnouncement:
 				gotNodeAnnouncement = true
@@ -4642,8 +4653,8 @@ func testZeroConf(t *testing.T, chanType *lnwire.ChannelType) {
 // opening behavior with a specified fundmax flag. To give a hypothetical
 // example, if ANCHOR types had been introduced after the fundmax flag had been
 // activated, the developer would have had to code for the anchor reserve in the
-// funding manager in the context of public and private channels. Otherwise
-// inconsistent bahvior would have resulted when specifying fundmax for
+// funding manager in the context of public and private channels. Otherwise,
+// inconsistent behavior would have resulted when specifying fundmax for
 // different types of channel openings.
 // To ensure consistency this test compares a map of locally defined channel
 // commitment types to the list of channel types that are defined in the proto
@@ -4659,6 +4670,7 @@ func TestCommitmentTypeFundmaxSanityCheck(t *testing.T) {
 		"ANCHORS":                 3,
 		"SCRIPT_ENFORCED_LEASE":   4,
 		"SIMPLE_TAPROOT":          5,
+		"SIMPLE_TAPROOT_OVERLAY":  6,
 	}
 
 	for commitmentType := range lnrpc.CommitmentType_value {

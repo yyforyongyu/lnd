@@ -1,11 +1,15 @@
 package routing
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 // Instantiate variables to allow taking a reference from the failure reason.
@@ -76,66 +80,73 @@ type interpretedResult struct {
 
 // interpretResult interprets a payment outcome and returns an object that
 // contains information required to update mission control.
-func interpretResult(rt *route.Route, success bool, failureSrcIdx *int,
-	failure lnwire.FailureMessage) *interpretedResult {
+func interpretResult(rt *mcRoute,
+	failure fn.Option[paymentFailure]) *interpretedResult {
 
 	i := &interpretedResult{
 		pairResults: make(map[DirectedNodePair]pairResult),
 	}
 
-	if success {
+	return fn.ElimOption(failure, func() *interpretedResult {
 		i.processSuccess(rt)
-	} else {
-		i.processFail(rt, failureSrcIdx, failure)
-	}
-	return i
+
+		return i
+	}, func(info paymentFailure) *interpretedResult {
+		i.processFail(rt, info)
+
+		return i
+	})
 }
 
 // processSuccess processes a successful payment attempt.
-func (i *interpretedResult) processSuccess(route *route.Route) {
+func (i *interpretedResult) processSuccess(route *mcRoute) {
 	// For successes, all nodes must have acted in the right way. Therefore
 	// we mark all of them with a success result.
-	i.successPairRange(route, 0, len(route.Hops)-1)
+	i.successPairRange(route, 0, len(route.hops.Val)-1)
 }
 
 // processFail processes a failed payment attempt.
-func (i *interpretedResult) processFail(
-	rt *route.Route, errSourceIdx *int,
-	failure lnwire.FailureMessage) {
-
-	if errSourceIdx == nil {
+func (i *interpretedResult) processFail(rt *mcRoute, failure paymentFailure) {
+	if failure.info.IsNone() {
 		i.processPaymentOutcomeUnknown(rt)
 		return
 	}
+
+	var (
+		idx     int
+		failMsg lnwire.FailureMessage
+	)
+
+	failure.info.WhenSome(
+		func(r tlv.RecordT[tlv.TlvType0, paymentFailureInfo]) {
+			idx = int(r.Val.sourceIdx.Val)
+			failMsg = r.Val.msg.Val.FailureMessage
+		},
+	)
 
 	// If the payment was to a blinded route and we received an error from
 	// after the introduction point, handle this error separately - there
 	// has been a protocol violation from the introduction node. This
 	// penalty applies regardless of the error code that is returned.
 	introIdx, isBlinded := introductionPointIndex(rt)
-	if isBlinded && introIdx < *errSourceIdx {
-		i.processPaymentOutcomeBadIntro(rt, introIdx, *errSourceIdx)
+	if isBlinded && introIdx < idx {
+		i.processPaymentOutcomeBadIntro(rt, introIdx, idx)
 		return
 	}
 
-	switch *errSourceIdx {
-
+	switch idx {
 	// We are the source of the failure.
 	case 0:
-		i.processPaymentOutcomeSelf(rt, failure)
+		i.processPaymentOutcomeSelf(rt, failMsg)
 
 	// A failure from the final hop was received.
-	case len(rt.Hops):
-		i.processPaymentOutcomeFinal(
-			rt, failure,
-		)
+	case len(rt.hops.Val):
+		i.processPaymentOutcomeFinal(rt, failMsg)
 
 	// An intermediate hop failed. Interpret the outcome, update reputation
 	// and try again.
 	default:
-		i.processPaymentOutcomeIntermediate(
-			rt, *errSourceIdx, failure,
-		)
+		i.processPaymentOutcomeIntermediate(rt, idx, failMsg)
 	}
 }
 
@@ -144,7 +155,7 @@ func (i *interpretedResult) processFail(
 // node. This indicates that the introduction node is not obeying the route
 // blinding specification, as we expect all errors from the introduction node
 // to be source from it.
-func (i *interpretedResult) processPaymentOutcomeBadIntro(route *route.Route,
+func (i *interpretedResult) processPaymentOutcomeBadIntro(route *mcRoute,
 	introIdx, errSourceIdx int) {
 
 	// We fail the introduction node for not obeying the specification.
@@ -161,14 +172,14 @@ func (i *interpretedResult) processPaymentOutcomeBadIntro(route *route.Route,
 	// a final failure reason because the recipient can't process the
 	// payment (independent of the introduction failing to convert the
 	// error, we can't complete the payment if the last hop fails).
-	if errSourceIdx == len(route.Hops) {
+	if errSourceIdx == len(route.hops.Val) {
 		i.finalFailureReason = &reasonError
 	}
 }
 
 // processPaymentOutcomeSelf handles failures sent by ourselves.
-func (i *interpretedResult) processPaymentOutcomeSelf(
-	rt *route.Route, failure lnwire.FailureMessage) {
+func (i *interpretedResult) processPaymentOutcomeSelf(rt *mcRoute,
+	failure lnwire.FailureMessage) {
 
 	switch failure.(type) {
 
@@ -181,7 +192,7 @@ func (i *interpretedResult) processPaymentOutcomeSelf(
 		i.failNode(rt, 1)
 
 		// If this was a payment to a direct peer, we can stop trying.
-		if len(rt.Hops) == 1 {
+		if len(rt.hops.Val) == 1 {
 			i.finalFailureReason = &reasonError
 		}
 
@@ -191,15 +202,15 @@ func (i *interpretedResult) processPaymentOutcomeSelf(
 	// available in the link has been updated.
 	default:
 		log.Warnf("Routing failure for local channel %v occurred",
-			rt.Hops[0].ChannelID)
+			rt.hops.Val[0].channelID)
 	}
 }
 
 // processPaymentOutcomeFinal handles failures sent by the final hop.
-func (i *interpretedResult) processPaymentOutcomeFinal(
-	route *route.Route, failure lnwire.FailureMessage) {
+func (i *interpretedResult) processPaymentOutcomeFinal(route *mcRoute,
+	failure lnwire.FailureMessage) {
 
-	n := len(route.Hops)
+	n := len(route.hops.Val)
 
 	failNode := func() {
 		i.failNode(route, n)
@@ -292,9 +303,10 @@ func (i *interpretedResult) processPaymentOutcomeFinal(
 
 // processPaymentOutcomeIntermediate handles failures sent by an intermediate
 // hop.
-func (i *interpretedResult) processPaymentOutcomeIntermediate(
-	route *route.Route, errorSourceIdx int,
-	failure lnwire.FailureMessage) {
+//
+//nolint:funlen
+func (i *interpretedResult) processPaymentOutcomeIntermediate(route *mcRoute,
+	errorSourceIdx int, failure lnwire.FailureMessage) {
 
 	reportOutgoing := func() {
 		i.failPair(
@@ -398,8 +410,8 @@ func (i *interpretedResult) processPaymentOutcomeIntermediate(
 		// Set the node pair for which a channel update may be out of
 		// date. The second chance logic uses the policyFailure field.
 		i.policyFailure = &DirectedNodePair{
-			From: route.Hops[errorSourceIdx-1].PubKeyBytes,
-			To:   route.Hops[errorSourceIdx].PubKeyBytes,
+			From: route.hops.Val[errorSourceIdx-1].pubKeyBytes.Val,
+			To:   route.hops.Val[errorSourceIdx].pubKeyBytes.Val,
 		}
 
 		reportOutgoing()
@@ -427,8 +439,8 @@ func (i *interpretedResult) processPaymentOutcomeIntermediate(
 		// Set the node pair for which a channel update may be out of
 		// date. The second chance logic uses the policyFailure field.
 		i.policyFailure = &DirectedNodePair{
-			From: route.Hops[errorSourceIdx-1].PubKeyBytes,
-			To:   route.Hops[errorSourceIdx].PubKeyBytes,
+			From: route.hops.Val[errorSourceIdx-1].pubKeyBytes.Val,
+			To:   route.hops.Val[errorSourceIdx].pubKeyBytes.Val,
 		}
 
 		// We report incoming channel. If a second pair is granted in
@@ -502,16 +514,14 @@ func (i *interpretedResult) processPaymentOutcomeIntermediate(
 		// Note that if LND is extended to support multiple blinded
 		// routes, this will terminate the payment without re-trying
 		// the other routes.
-		if introIdx == len(route.Hops)-1 {
+		if introIdx == len(route.hops.Val)-1 {
 			i.finalFailureReason = &reasonError
 		} else {
 			// If there are other hops between the recipient and
 			// introduction node, then we just penalize the last
 			// hop in the blinded route to minimize the storage of
 			// results for ephemeral keys.
-			i.failPairBalance(
-				route, len(route.Hops)-1,
-			)
+			i.failPairBalance(route, len(route.hops.Val)-1)
 		}
 
 	// In all other cases, we penalize the reporting node. These are all
@@ -525,9 +535,9 @@ func (i *interpretedResult) processPaymentOutcomeIntermediate(
 // route, using the same indexing in the route that we use for errorSourceIdx
 // (i.e., that we consider our own node to be at index zero). A boolean is
 // returned to indicate whether the route contains a blinded portion at all.
-func introductionPointIndex(route *route.Route) (int, bool) {
-	for i, hop := range route.Hops {
-		if hop.BlindingPoint != nil {
+func introductionPointIndex(route *mcRoute) (int, bool) {
+	for i, hop := range route.hops.Val {
+		if hop.hasBlindingPoint.IsSome() {
 			return i + 1, true
 		}
 	}
@@ -537,8 +547,8 @@ func introductionPointIndex(route *route.Route) (int, bool) {
 
 // processPaymentOutcomeUnknown processes a payment outcome for which no failure
 // message or source is available.
-func (i *interpretedResult) processPaymentOutcomeUnknown(route *route.Route) {
-	n := len(route.Hops)
+func (i *interpretedResult) processPaymentOutcomeUnknown(route *mcRoute) {
+	n := len(route.hops.Val)
 
 	// If this is a direct payment, the destination must be at fault.
 	if n == 1 {
@@ -553,12 +563,214 @@ func (i *interpretedResult) processPaymentOutcomeUnknown(route *route.Route) {
 	i.failPairRange(route, 0, n-1)
 }
 
+// extractMCRoute extracts the fields required by MC from the Route struct to
+// create the more minimal mcRoute struct.
+func extractMCRoute(r *route.Route) *mcRoute {
+	return &mcRoute{
+		sourcePubKey: tlv.NewRecordT[tlv.TlvType0](r.SourcePubKey),
+		totalAmount:  tlv.NewRecordT[tlv.TlvType1](r.TotalAmount),
+		hops: tlv.NewRecordT[tlv.TlvType2](
+			extractMCHops(r.Hops),
+		),
+	}
+}
+
+// extractMCHops extracts the Hop fields that MC actually uses from a slice of
+// Hops.
+func extractMCHops(hops []*route.Hop) mcHops {
+	return fn.Map(extractMCHop, hops)
+}
+
+// extractMCHop extracts the Hop fields that MC actually uses from a Hop.
+func extractMCHop(hop *route.Hop) *mcHop {
+	h := mcHop{
+		channelID: tlv.NewPrimitiveRecord[tlv.TlvType0](
+			hop.ChannelID,
+		),
+		pubKeyBytes: tlv.NewRecordT[tlv.TlvType1](hop.PubKeyBytes),
+		amtToFwd:    tlv.NewRecordT[tlv.TlvType2](hop.AmtToForward),
+	}
+
+	if hop.BlindingPoint != nil {
+		h.hasBlindingPoint = tlv.SomeRecordT(
+			tlv.NewRecordT[tlv.TlvType3](lnwire.TrueBoolean{}),
+		)
+	}
+
+	if hop.CustomRecords != nil {
+		h.hasCustomRecords = tlv.SomeRecordT(
+			tlv.NewRecordT[tlv.TlvType4](lnwire.TrueBoolean{}),
+		)
+	}
+
+	return &h
+}
+
+// mcRoute holds the bare minimum info about a payment attempt route that MC
+// requires.
+type mcRoute struct {
+	sourcePubKey tlv.RecordT[tlv.TlvType0, route.Vertex]
+	totalAmount  tlv.RecordT[tlv.TlvType1, lnwire.MilliSatoshi]
+	hops         tlv.RecordT[tlv.TlvType2, mcHops]
+}
+
+// Record returns a TLV record that can be used to encode/decode an mcRoute
+// to/from a TLV stream.
+func (r *mcRoute) Record() tlv.Record {
+	recordSize := func() uint64 {
+		var (
+			b   bytes.Buffer
+			buf [8]byte
+		)
+		if err := encodeMCRoute(&b, r, &buf); err != nil {
+			panic(err)
+		}
+
+		return uint64(len(b.Bytes()))
+	}
+
+	return tlv.MakeDynamicRecord(
+		0, r, recordSize, encodeMCRoute, decodeMCRoute,
+	)
+}
+
+func encodeMCRoute(w io.Writer, val interface{}, _ *[8]byte) error {
+	if v, ok := val.(*mcRoute); ok {
+		return serializeRoute(w, v)
+	}
+
+	return tlv.NewTypeForEncodingErr(val, "routing.mcRoute")
+}
+
+func decodeMCRoute(r io.Reader, val interface{}, _ *[8]byte, l uint64) error {
+	if v, ok := val.(*mcRoute); ok {
+		route, err := deserializeRoute(io.LimitReader(r, int64(l)))
+		if err != nil {
+			return err
+		}
+
+		*v = *route
+
+		return nil
+	}
+
+	return tlv.NewTypeForDecodingErr(val, "routing.mcRoute", l, l)
+}
+
+// mcHops is a list of mcHop records.
+type mcHops []*mcHop
+
+// Record returns a TLV record that can be used to encode/decode a list of
+// mcHop to/from a TLV stream.
+func (h *mcHops) Record() tlv.Record {
+	recordSize := func() uint64 {
+		var (
+			b   bytes.Buffer
+			buf [8]byte
+		)
+		if err := encodeMCHops(&b, h, &buf); err != nil {
+			panic(err)
+		}
+
+		return uint64(len(b.Bytes()))
+	}
+
+	return tlv.MakeDynamicRecord(
+		0, h, recordSize, encodeMCHops, decodeMCHops,
+	)
+}
+
+func encodeMCHops(w io.Writer, val interface{}, buf *[8]byte) error {
+	if v, ok := val.(*mcHops); ok {
+		// Encode the number of hops as a var int.
+		if err := tlv.WriteVarInt(w, uint64(len(*v)), buf); err != nil {
+			return err
+		}
+
+		// With that written out, we'll now encode the entries
+		// themselves as a sub-TLV record, which includes its _own_
+		// inner length prefix.
+		for _, hop := range *v {
+			var hopBytes bytes.Buffer
+			if err := serializeHop(&hopBytes, hop); err != nil {
+				return err
+			}
+
+			// We encode the record with a varint length followed by
+			// the _raw_ TLV bytes.
+			tlvLen := uint64(len(hopBytes.Bytes()))
+			if err := tlv.WriteVarInt(w, tlvLen, buf); err != nil {
+				return err
+			}
+
+			if _, err := w.Write(hopBytes.Bytes()); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	return tlv.NewTypeForEncodingErr(val, "routing.mcHops")
+}
+
+func decodeMCHops(r io.Reader, val interface{}, buf *[8]byte, l uint64) error {
+	if v, ok := val.(*mcHops); ok {
+		// First, we'll decode the varint that encodes how many hops
+		// are encoded in the stream.
+		numHops, err := tlv.ReadVarInt(r, buf)
+		if err != nil {
+			return err
+		}
+
+		// Now that we know how many records we'll need to read, we can
+		// iterate and read them all out in series.
+		for i := uint64(0); i < numHops; i++ {
+			// Read out the varint that encodes the size of this
+			// inner TLV record.
+			hopSize, err := tlv.ReadVarInt(r, buf)
+			if err != nil {
+				return err
+			}
+
+			// Using this information, we'll create a new limited
+			// reader that'll return an EOF once the end has been
+			// reached so the stream stops consuming bytes.
+			innerTlvReader := &io.LimitedReader{
+				R: r,
+				N: int64(hopSize),
+			}
+
+			hop, err := deserializeHop(innerTlvReader)
+			if err != nil {
+				return err
+			}
+
+			*v = append(*v, hop)
+		}
+
+		return nil
+	}
+
+	return tlv.NewTypeForDecodingErr(val, "routing.mcHops", l, l)
+}
+
+// mcHop holds the bare minimum info about a payment attempt route hop that MC
+// requires.
+type mcHop struct {
+	channelID        tlv.RecordT[tlv.TlvType0, uint64]
+	pubKeyBytes      tlv.RecordT[tlv.TlvType1, route.Vertex]
+	amtToFwd         tlv.RecordT[tlv.TlvType2, lnwire.MilliSatoshi]
+	hasBlindingPoint tlv.OptionalRecordT[tlv.TlvType3, lnwire.TrueBoolean]
+	hasCustomRecords tlv.OptionalRecordT[tlv.TlvType4, lnwire.TrueBoolean]
+}
+
 // failNode marks the node indicated by idx in the route as failed. It also
 // marks the incoming and outgoing channels of the node as failed. This function
 // intentionally panics when the self node is failed.
-func (i *interpretedResult) failNode(rt *route.Route, idx int) {
+func (i *interpretedResult) failNode(rt *mcRoute, idx int) {
 	// Mark the node as failing.
-	i.nodeFailure = &rt.Hops[idx-1].PubKeyBytes
+	i.nodeFailure = &rt.hops.Val[idx-1].pubKeyBytes.Val
 
 	// Mark the incoming connection as failed for the node. We intent to
 	// penalize as much as we can for a node level failure, including future
@@ -574,7 +786,7 @@ func (i *interpretedResult) failNode(rt *route.Route, idx int) {
 
 	// If not the ultimate node, mark the outgoing connection as failed for
 	// the node.
-	if idx < len(rt.Hops) {
+	if idx < len(rt.hops.Val) {
 		outgoingChannelIdx := idx
 		outPair, _ := getPair(rt, outgoingChannelIdx)
 		i.pairResults[outPair] = failPairResult(0)
@@ -584,18 +796,14 @@ func (i *interpretedResult) failNode(rt *route.Route, idx int) {
 
 // failPairRange marks the node pairs from node fromIdx to node toIdx as failed
 // in both direction.
-func (i *interpretedResult) failPairRange(
-	rt *route.Route, fromIdx, toIdx int) {
-
+func (i *interpretedResult) failPairRange(rt *mcRoute, fromIdx, toIdx int) {
 	for idx := fromIdx; idx <= toIdx; idx++ {
 		i.failPair(rt, idx)
 	}
 }
 
 // failPair marks a pair as failed in both directions.
-func (i *interpretedResult) failPair(
-	rt *route.Route, idx int) {
-
+func (i *interpretedResult) failPair(rt *mcRoute, idx int) {
 	pair, _ := getPair(rt, idx)
 
 	// Report pair in both directions without a minimum penalization amount.
@@ -604,9 +812,7 @@ func (i *interpretedResult) failPair(
 }
 
 // failPairBalance marks a pair as failed with a minimum penalization amount.
-func (i *interpretedResult) failPairBalance(
-	rt *route.Route, channelIdx int) {
-
+func (i *interpretedResult) failPairBalance(rt *mcRoute, channelIdx int) {
 	pair, amt := getPair(rt, channelIdx)
 
 	i.pairResults[pair] = failPairResult(amt)
@@ -614,9 +820,7 @@ func (i *interpretedResult) failPairBalance(
 
 // successPairRange marks the node pairs from node fromIdx to node toIdx as
 // succeeded.
-func (i *interpretedResult) successPairRange(
-	rt *route.Route, fromIdx, toIdx int) {
-
+func (i *interpretedResult) successPairRange(rt *mcRoute, fromIdx, toIdx int) {
 	for idx := fromIdx; idx <= toIdx; idx++ {
 		pair, amt := getPair(rt, idx)
 
@@ -626,21 +830,21 @@ func (i *interpretedResult) successPairRange(
 
 // getPair returns a node pair from the route and the amount passed between that
 // pair.
-func getPair(rt *route.Route, channelIdx int) (DirectedNodePair,
+func getPair(rt *mcRoute, channelIdx int) (DirectedNodePair,
 	lnwire.MilliSatoshi) {
 
-	nodeTo := rt.Hops[channelIdx].PubKeyBytes
+	nodeTo := rt.hops.Val[channelIdx].pubKeyBytes.Val
 	var (
 		nodeFrom route.Vertex
 		amt      lnwire.MilliSatoshi
 	)
 
 	if channelIdx == 0 {
-		nodeFrom = rt.SourcePubKey
-		amt = rt.TotalAmount
+		nodeFrom = rt.sourcePubKey.Val
+		amt = rt.totalAmount.Val
 	} else {
-		nodeFrom = rt.Hops[channelIdx-1].PubKeyBytes
-		amt = rt.Hops[channelIdx-1].AmtToForward
+		nodeFrom = rt.hops.Val[channelIdx-1].pubKeyBytes.Val
+		amt = rt.hops.Val[channelIdx-1].amtToFwd.Val
 	}
 
 	pair := NewDirectedNodePair(nodeFrom, nodeTo)

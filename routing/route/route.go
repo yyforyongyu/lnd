@@ -94,6 +94,32 @@ func (v Vertex) String() string {
 	return fmt.Sprintf("%x", v[:])
 }
 
+// Record returns a TLV record that can be used to encode/decode a Vertex
+// to/from a TLV stream.
+func (v *Vertex) Record() tlv.Record {
+	return tlv.MakeStaticRecord(
+		0, v, VertexSize, encodeVertex, decodeVertex,
+	)
+}
+
+func encodeVertex(w io.Writer, val interface{}, _ *[8]byte) error {
+	if b, ok := val.(*Vertex); ok {
+		_, err := w.Write(b[:])
+		return err
+	}
+
+	return tlv.NewTypeForEncodingErr(val, "Vertex")
+}
+
+func decodeVertex(r io.Reader, val interface{}, _ *[8]byte, l uint64) error {
+	if b, ok := val.(*Vertex); ok {
+		_, err := io.ReadFull(r, b[:])
+		return err
+	}
+
+	return tlv.NewTypeForDecodingErr(val, "Vertex", l, VertexSize)
+}
+
 // Hop represents an intermediate or final node of the route. This naming
 // is in line with the definition given in BOLT #4: Onion Routing Protocol.
 // The struct houses the channel along which this hop can be reached and
@@ -488,6 +514,26 @@ type Route struct {
 	// Hops contains details concerning the specific forwarding details at
 	// each hop.
 	Hops []*Hop
+
+	// FirstHopAmount is the amount that should actually be sent to the
+	// first hop in the route. This is only different from TotalAmount above
+	// for custom channels where the on-chain amount doesn't necessarily
+	// reflect all the value of an outgoing payment.
+	FirstHopAmount tlv.RecordT[
+		tlv.TlvType0, tlv.BigSizeT[lnwire.MilliSatoshi],
+	]
+
+	// FirstHopWireCustomRecords is a set of custom records that should be
+	// included in the wire message sent to the first hop. This is only set
+	// on custom channels and is used to include additional information
+	// about the actual value of the payment.
+	//
+	// NOTE: Since these records already represent TLV records, and we
+	// enforce them to be in the custom range (e.g. >= 65536), we don't use
+	// another parent record type here. Instead, when serializing the Route
+	// we merge the TLV records together with the custom records and encode
+	// everything as a single TLV stream.
+	FirstHopWireCustomRecords lnwire.CustomRecords
 }
 
 // Copy returns a deep copy of the Route.

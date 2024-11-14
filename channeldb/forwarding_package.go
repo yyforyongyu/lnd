@@ -211,6 +211,11 @@ func (f *PkgFilter) Decode(r io.Reader) error {
 	return err
 }
 
+// String returns a human-readable string.
+func (f *PkgFilter) String() string {
+	return fmt.Sprintf("count=%v, filter=%v", f.count, f.filter)
+}
+
 // FwdPkg records all adds, settles, and fails that were locked in as a result
 // of the remote peer sending us a revocation. Each package is identified by
 // the short chanid and remote commitment height corresponding to the revocation
@@ -278,6 +283,27 @@ func NewFwdPkg(source lnwire.ShortChannelID, height uint64,
 		AckFilter:        NewPkgFilter(nAddUpdates),
 		SettleFails:      settleFailUpdates,
 		SettleFailFilter: NewPkgFilter(nSettleFailUpdates),
+	}
+}
+
+// SourceRef is a convenience method that returns an AddRef to this forwarding
+// package for the index in the argument. It is the caller's responsibility
+// to ensure that the index is in bounds.
+func (f *FwdPkg) SourceRef(i uint16) AddRef {
+	return AddRef{
+		Height: f.Height,
+		Index:  i,
+	}
+}
+
+// DestRef is a convenience method that returns a SettleFailRef to this
+// forwarding package for the index in the argument. It is the caller's
+// responsibility to ensure that the index is in bounds.
+func (f *FwdPkg) DestRef(i uint16) SettleFailRef {
+	return SettleFailRef{
+		Source: f.Source,
+		Height: f.Height,
+		Index:  i,
 	}
 }
 

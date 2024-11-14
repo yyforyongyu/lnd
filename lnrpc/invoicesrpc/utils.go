@@ -123,6 +123,16 @@ func CreateRPCInvoice(invoice *invoices.Invoice,
 			MppTotalAmtMsat: uint64(htlc.MppTotalAmt),
 		}
 
+		// The custom channel data is currently just the raw bytes of
+		// the encoded custom records.
+		customData, err := lnwire.CustomRecords(
+			htlc.CustomRecords,
+		).Serialize()
+		if err != nil {
+			return nil, err
+		}
+		rpcHtlc.CustomChannelData = customData
+
 		// Populate any fields relevant to AMP payments.
 		if htlc.AMP != nil {
 			rootShare := htlc.AMP.Record.RootShare()
@@ -176,6 +186,7 @@ func CreateRPCInvoice(invoice *invoices.Invoice,
 		IsKeysend:       invoice.IsKeysend(),
 		PaymentAddr:     invoice.Terms.PaymentAddr[:],
 		IsAmp:           invoice.IsAMP(),
+		IsBlinded:       invoice.IsBlinded(),
 	}
 
 	rpcInvoice.AmpInvoiceState = make(map[string]*lnrpc.AMPInvoiceState)

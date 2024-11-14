@@ -1,7 +1,7 @@
 package chancloser
 
 import (
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightningnetwork/lnd/build"
 )
 
@@ -22,20 +22,4 @@ func DisableLog() {
 // UseLogger uses a specified Logger to output package logging info.
 func UseLogger(logger btclog.Logger) {
 	chancloserLog = logger
-}
-
-// logClosure is used to provide a closure over expensive logging operations
-// so they aren't performed when the logging level doesn't warrant it.
-type logClosure func() string
-
-// String invokes the underlying function and returns the result.
-func (c logClosure) String() string {
-	return c()
-}
-
-// newLogClosure returns a new closure over a function that returns a string
-// which itself provides a Stringer interface so that it can be used with the
-// logging system.
-func newLogClosure(c func() string) logClosure {
-	return logClosure(c)
 }

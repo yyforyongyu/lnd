@@ -73,9 +73,11 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 	htlcBudget := htlcValue.MulF64(contractcourt.DefaultBudgetRatio)
 
 	// cpfpBudget is the budget used to sweep the CPFP anchor.
+	// In addition to the htlc amount to protect we also need to include
+	// the anchor amount itself for the budget.
 	cpfpBudget := (htlcValue - htlcBudget).MulF64(
 		contractcourt.DefaultBudgetRatio,
-	)
+	) + contractcourt.AnchorOutputValue
 
 	// Create a preimage, that will be held by Carol.
 	var preimage lntypes.Preimage
@@ -96,12 +98,14 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 		// swept so we can focus on testing HTLCs.
 		fmt.Sprintf("--bitcoin.defaultremotedelay=%v", cltvDelta*10),
 	}
+	cfgs := [][]string{cfg, cfg, cfg}
+
 	openChannelParams := lntest.OpenChannelParams{
 		Amt: invoiceAmt * 10,
 	}
 
 	// Create a three hop network: Alice -> Bob -> Carol.
-	chanPoints, nodes := createSimpleNetwork(ht, cfg, 3, openChannelParams)
+	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, openChannelParams)
 
 	// Unwrap the results.
 	abChanPoint, bcChanPoint := chanPoints[0], chanPoints[1]
@@ -212,7 +216,7 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 	txns := ht.GetNumTxsFromMempool(2)
 
 	// Find the sweeping tx.
-	sweepTx := ht.FindSweepingTxns(txns, 1, *closeTxid)[0]
+	sweepTx := ht.FindSweepingTxns(txns, 1, closeTxid)[0]
 
 	// Get the weight for Bob's anchor sweeping tx.
 	txWeight := ht.CalculateTxWeight(sweepTx)
@@ -279,7 +283,7 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 		txns = ht.GetNumTxsFromMempool(2)
 
 		// Find the sweeping tx.
-		sweepTx = ht.FindSweepingTxns(txns, 1, *closeTxid)[0]
+		sweepTx = ht.FindSweepingTxns(txns, 1, closeTxid)[0]
 
 		// Calculate the fee rate of Bob's new sweeping tx.
 		feeRate = uint64(ht.CalculateTxFeeRate(sweepTx))
@@ -318,7 +322,7 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 	txns = ht.GetNumTxsFromMempool(2)
 
 	// Find the sweeping tx.
-	sweepTx = ht.FindSweepingTxns(txns, 1, *closeTxid)[0]
+	sweepTx = ht.FindSweepingTxns(txns, 1, closeTxid)[0]
 
 	// Calculate the fee of Bob's new sweeping tx.
 	fee = uint64(ht.CalculateTxFee(sweepTx))
@@ -339,7 +343,7 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 	txns = ht.GetNumTxsFromMempool(2)
 
 	// Find the sweeping tx.
-	currentSweepTx := ht.FindSweepingTxns(txns, 1, *closeTxid)[0]
+	currentSweepTx := ht.FindSweepingTxns(txns, 1, closeTxid)[0]
 
 	// Assert the anchor sweep tx stays unchanged.
 	require.Equal(ht, sweepTx.TxHash(), currentSweepTx.TxHash())
@@ -424,12 +428,14 @@ func testSweepCPFPAnchorIncomingTimeout(ht *lntest.HarnessTest) {
 		// swept so we can focus on testing HTLCs.
 		fmt.Sprintf("--bitcoin.defaultremotedelay=%v", cltvDelta*10),
 	}
+	cfgs := [][]string{cfg, cfg, cfg}
+
 	openChannelParams := lntest.OpenChannelParams{
 		Amt: invoiceAmt * 10,
 	}
 
 	// Create a three hop network: Alice -> Bob -> Carol.
-	chanPoints, nodes := createSimpleNetwork(ht, cfg, 3, openChannelParams)
+	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, openChannelParams)
 
 	// Unwrap the results.
 	abChanPoint, bcChanPoint := chanPoints[0], chanPoints[1]
@@ -488,9 +494,11 @@ func testSweepCPFPAnchorIncomingTimeout(ht *lntest.HarnessTest) {
 	htlcBudget := htlcValue.MulF64(contractcourt.DefaultBudgetRatio)
 
 	// cpfpBudget is the budget used to sweep the CPFP anchor.
+	// In addition to the htlc amount to protect we also need to include
+	// the anchor amount itself for the budget.
 	cpfpBudget := (htlcValue - htlcBudget).MulF64(
 		contractcourt.DefaultBudgetRatio,
-	)
+	) + contractcourt.AnchorOutputValue
 
 	// Carol should have one incoming HTLC on channel Bob -> Carol.
 	ht.AssertIncomingHTLCActive(carol, bcChanPoint, payHash[:])
@@ -549,7 +557,7 @@ func testSweepCPFPAnchorIncomingTimeout(ht *lntest.HarnessTest) {
 	txns := ht.GetNumTxsFromMempool(2)
 
 	// Find the sweeping tx.
-	sweepTx := ht.FindSweepingTxns(txns, 1, *closeTxid)[0]
+	sweepTx := ht.FindSweepingTxns(txns, 1, closeTxid)[0]
 
 	// Get the weight for Bob's anchor sweeping tx.
 	txWeight := ht.CalculateTxWeight(sweepTx)
@@ -616,7 +624,7 @@ func testSweepCPFPAnchorIncomingTimeout(ht *lntest.HarnessTest) {
 		txns = ht.GetNumTxsFromMempool(2)
 
 		// Find the sweeping tx.
-		sweepTx = ht.FindSweepingTxns(txns, 1, *closeTxid)[0]
+		sweepTx = ht.FindSweepingTxns(txns, 1, closeTxid)[0]
 
 		// Calculate the fee rate of Bob's new sweeping tx.
 		feeRate = uint64(ht.CalculateTxFeeRate(sweepTx))
@@ -655,7 +663,7 @@ func testSweepCPFPAnchorIncomingTimeout(ht *lntest.HarnessTest) {
 	txns = ht.GetNumTxsFromMempool(2)
 
 	// Find the sweeping tx.
-	sweepTx = ht.FindSweepingTxns(txns, 1, *closeTxid)[0]
+	sweepTx = ht.FindSweepingTxns(txns, 1, closeTxid)[0]
 
 	// Calculate the fee of Bob's new sweeping tx.
 	fee = uint64(ht.CalculateTxFee(sweepTx))
@@ -676,7 +684,7 @@ func testSweepCPFPAnchorIncomingTimeout(ht *lntest.HarnessTest) {
 	txns = ht.GetNumTxsFromMempool(2)
 
 	// Find the sweeping tx.
-	currentSweepTx := ht.FindSweepingTxns(txns, 1, *closeTxid)[0]
+	currentSweepTx := ht.FindSweepingTxns(txns, 1, closeTxid)[0]
 
 	// Assert the anchor sweep tx stays unchanged.
 	require.Equal(ht, sweepTx.TxHash(), currentSweepTx.TxHash())
@@ -767,12 +775,14 @@ func testSweepHTLCs(ht *lntest.HarnessTest) {
 		// swept so we can focus on testing HTLCs.
 		fmt.Sprintf("--bitcoin.defaultremotedelay=%v", cltvDelta*10),
 	}
+	cfgs := [][]string{cfg, cfg, cfg}
+
 	openChannelParams := lntest.OpenChannelParams{
 		Amt: invoiceAmt * 10,
 	}
 
 	// Create a three hop network: Alice -> Bob -> Carol.
-	chanPoints, nodes := createSimpleNetwork(ht, cfg, 3, openChannelParams)
+	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, openChannelParams)
 
 	// Unwrap the results.
 	abChanPoint, bcChanPoint := chanPoints[0], chanPoints[1]
@@ -1294,13 +1304,15 @@ func testSweepCommitOutputAndAnchor(ht *lntest.HarnessTest) {
 		fmt.Sprintf("--sweeper.nodeadlineconftarget=%v", deadline),
 		fmt.Sprintf("--bitcoin.defaultremotedelay=%v", toLocalCSV),
 	}
+	cfgs := [][]string{cfg, cfg}
+
 	openChannelParams := lntest.OpenChannelParams{
 		Amt:     fundAmt,
 		PushAmt: bobBalance,
 	}
 
 	// Create a two hop network: Alice -> Bob.
-	chanPoints, nodes := createSimpleNetwork(ht, cfg, 2, openChannelParams)
+	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, openChannelParams)
 
 	// Unwrap the results.
 	chanPoint := chanPoints[0]
@@ -1342,9 +1354,13 @@ func testSweepCommitOutputAndAnchor(ht *lntest.HarnessTest) {
 	// PendingChannels RPC under the waiting close section.
 	ht.AssertChannelWaitingClose(alice, chanPoint)
 
-	// We should see neither Alice or Bob has any pending sweeps as there
-	// are no time-sensitive HTLCs.
-	ht.AssertNumPendingSweeps(alice, 0)
+	// Alice should see 2 anchor sweeps for the local and remote commitment.
+	// Even without HTLCs at stake the anchors are registered with the
+	// sweeper subsytem.
+	ht.AssertNumPendingSweeps(alice, 2)
+
+	// Bob did not force close the channel therefore he should have no
+	// pending sweeps.
 	ht.AssertNumPendingSweeps(bob, 0)
 
 	// Mine a block to confirm Alice's force closing tx. Once it's
@@ -1772,67 +1788,6 @@ func testSweepCommitOutputAndAnchor(ht *lntest.HarnessTest) {
 	ht.MineBlocksAndAssertNumTxes(1, 2)
 }
 
-// createSimpleNetwork creates the specified number of nodes and makes a
-// topology of `node1 -> node2 -> node3...`. Each node is created using the
-// specified config, the neighbors are connected, and the channels are opened.
-// Each node will be funded with a single UTXO of 1 BTC except the last one.
-func createSimpleNetwork(ht *lntest.HarnessTest, nodeCfg []string,
-	numNodes int, p lntest.OpenChannelParams) ([]*lnrpc.ChannelPoint,
-	[]*node.HarnessNode) {
-
-	// Make a slice of nodes.
-	nodes := make([]*node.HarnessNode, numNodes)
-
-	// Create new nodes.
-	for i := range nodes {
-		nodeName := fmt.Sprintf("Node%q", string(rune('A'+i)))
-		n := ht.NewNode(nodeName, nodeCfg)
-		nodes[i] = n
-	}
-
-	// Connect the nodes in a chain.
-	for i := 1; i < len(nodes); i++ {
-		nodeA := nodes[i-1]
-		nodeB := nodes[i]
-		ht.EnsureConnected(nodeA, nodeB)
-	}
-
-	// Fund all the nodes expect the last one.
-	for i := 0; i < len(nodes)-1; i++ {
-		node := nodes[i]
-		ht.FundCoinsUnconfirmed(btcutil.SatoshiPerBitcoin, node)
-	}
-
-	// Mine 1 block to get the above coins confirmed.
-	ht.MineBlocksAndAssertNumTxes(1, numNodes-1)
-
-	// Open channels in batch to save blocks mined.
-	reqs := make([]*lntest.OpenChannelRequest, 0, len(nodes)-1)
-	for i := 0; i < len(nodes)-1; i++ {
-		nodeA := nodes[i]
-		nodeB := nodes[i+1]
-
-		req := &lntest.OpenChannelRequest{
-			Local:  nodeA,
-			Remote: nodeB,
-			Param:  p,
-		}
-		reqs = append(reqs, req)
-	}
-	resp := ht.OpenMultiChannelsAsync(reqs)
-
-	// Make sure the nodes know each other's channels if they are public.
-	if !p.Private {
-		for _, node := range nodes {
-			for _, chanPoint := range resp {
-				ht.AssertTopologyChannelOpen(node, chanPoint)
-			}
-		}
-	}
-
-	return resp, nodes
-}
-
 // testBumpFee checks that when a new input is requested, it's first bumped via
 // CPFP, then RBF. Along the way, we check the `BumpFee` can properly update
 // the fee function used by supplying new params.
@@ -2144,5 +2099,160 @@ func runBumpFee(ht *lntest.HarnessTest, alice *node.HarnessNode) {
 	assertFeeRateGreater(testFeeRate)
 
 	// Clean up the mempol.
+	ht.MineBlocksAndAssertNumTxes(1, 2)
+}
+
+// testBumpForceCloseFee tests that when a force close transaction, in
+// particular a commitment which has no HTLCs at stake, can be bumped via the
+// rpc endpoint `BumpForceCloseFee`.
+//
+// NOTE: This test does not check for a specific fee rate because channel force
+// closures should be bumped taking a budget into account not a specific
+// fee rate.
+func testBumpForceCloseFee(ht *lntest.HarnessTest) {
+	// Skip this test for neutrino, as it's not aware of mempool
+	// transactions.
+	if ht.IsNeutrinoBackend() {
+		ht.Skipf("skipping BumpForceCloseFee test for neutrino backend")
+	}
+	// fundAmt is the funding amount.
+	fundAmt := btcutil.Amount(1_000_000)
+
+	// We add a push amount because otherwise no anchor for the counter
+	// party will be created which influences the commitment fee
+	// calculation.
+	pushAmt := btcutil.Amount(50_000)
+
+	openChannelParams := lntest.OpenChannelParams{
+		Amt:     fundAmt,
+		PushAmt: pushAmt,
+	}
+
+	// Bumping the close fee rate is only possible for anchor channels.
+	cfg := []string{
+		"--protocol.anchors",
+	}
+	cfgs := [][]string{cfg, cfg}
+
+	// Create a two hop network: Alice -> Bob.
+	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, openChannelParams)
+
+	// Unwrap the results.
+	chanPoint := chanPoints[0]
+	alice := nodes[0]
+
+	// We need to fund alice with 2 wallet inputs so that we can test to
+	// increase the fee rate of the anchor cpfp via two subsequent calls of
+	// the`BumpForceCloseFee` rpc cmd.
+	//
+	// TODO (ziggie): Make sure we use enough wallet inputs so that both
+	// anchor transactions (local, remote commitment tx) can be created and
+	// broadcasted. Not sure if we really need this, because we can be sure
+	// as soon as one anchor transactions makes it into the mempool that the
+	// others will fail anyways?
+	ht.FundCoinsP2TR(btcutil.SatoshiPerBitcoin, alice)
+
+	// Alice force closes the channel which has no HTLCs at stake.
+	_, closingTxID := ht.CloseChannelAssertPending(alice, chanPoint, true)
+	require.NotNil(ht, closingTxID)
+
+	// Alice should see one waiting close channel.
+	ht.AssertNumWaitingClose(alice, 1)
+
+	// Alice should have 2 registered sweep inputs. The anchor of the local
+	// commitment tx and the anchor of the remote commitment tx.
+	ht.AssertNumPendingSweeps(alice, 2)
+
+	// Calculate the commitment tx fee rate.
+	closingTx := ht.AssertTxInMempool(closingTxID)
+	require.NotNil(ht, closingTx)
+
+	// The default commitment fee for anchor channels is capped at 2500
+	// sat/kw but there might be some inaccuracies because of the witness
+	// signature length therefore we calculate the exact value here.
+	closingFeeRate := ht.CalculateTxFeeRate(closingTx)
+
+	// We increase the fee rate of the fee function by 100% to make sure
+	// we trigger a cpfp-transaction.
+	newFeeRate := closingFeeRate * 2
+
+	// We need to make sure that the budget can cover the fees for bumping.
+	// However we also want to make sure that the budget is not too large
+	// so that the delta of the fee function does not increase the feerate
+	// by a single sat hence NOT rbfing the anchor sweep every time a new
+	// block is found and a new sweep broadcast is triggered.
+	//
+	// NOTE:
+	// We expect an anchor sweep with 2 inputs (anchor input + a wallet
+	// input) and 1 p2tr output. This transaction has a weight of approx.
+	// 725 wu. This info helps us to calculate the delta of the fee
+	// function.
+	// EndFeeRate: 100_000 sats/725 wu * 1000 = 137931 sat/kw
+	// StartingFeeRate: 5000 sat/kw
+	// delta = (137931-5000)/1008 = 132 sat/kw (which is lower than
+	// 250 sat/kw) => hence we are violating BIP 125 Rule 4, which is
+	// exactly what we want here to test the subsequent calling of the
+	// bumpclosefee rpc.
+	cpfpBudget := 100_000
+
+	bumpFeeReq := &walletrpc.BumpForceCloseFeeRequest{
+		ChanPoint:       chanPoint,
+		StartingFeerate: uint64(newFeeRate.FeePerVByte()),
+		Budget:          uint64(cpfpBudget),
+		// We use a force param to create the sweeping tx immediately.
+		Immediate: true,
+	}
+	alice.RPC.BumpForceCloseFee(bumpFeeReq)
+
+	// We expect the initial closing transaction and the local anchor cpfp
+	// transaction because alice force closed the channel.
+	//
+	// NOTE: We don't compare a feerate but only make sure that a cpfp
+	// transaction was triggered. The sweeper increases the fee rate
+	// periodically with every new incoming block and the selected fee
+	// function.
+	ht.AssertNumTxsInMempool(2)
+
+	// Identify the cpfp anchor sweep.
+	txns := ht.GetNumTxsFromMempool(2)
+	cpfpSweep1 := ht.FindSweepingTxns(txns, 1, closingTx.TxHash())[0]
+
+	// Mine an empty block and make sure the anchor cpfp is still in the
+	// mempool hence the new block did not let the sweeper subsystem rbf
+	// this anchor sweep transaction (because of the small fee delta).
+	ht.MineEmptyBlocks(1)
+	cpfpHash1 := cpfpSweep1.TxHash()
+	ht.AssertTxInMempool(cpfpHash1)
+
+	// Now Bump the fee rate again with a bigger starting fee rate of the
+	// fee function.
+	newFeeRate = closingFeeRate * 3
+
+	bumpFeeReq = &walletrpc.BumpForceCloseFeeRequest{
+		ChanPoint:       chanPoint,
+		StartingFeerate: uint64(newFeeRate.FeePerVByte()),
+		// The budget needs to be high enough to pay for the fee because
+		// the anchor does not have an output value high enough to pay
+		// for itself.
+		Budget: uint64(cpfpBudget),
+		// We use a force param to create the sweeping tx immediately.
+		Immediate: true,
+	}
+	alice.RPC.BumpForceCloseFee(bumpFeeReq)
+
+	// Make sure the old sweep is not in the mempool anymore, which proofs
+	// that a new cpfp transaction replaced the old one paying higher fees.
+	ht.AssertTxNotInMempool(cpfpHash1)
+
+	// Identify the new cpfp transaction.
+	// Both anchor sweeps result from the same closing tx (the local
+	// commitment) hence proofing that the remote commitment transaction
+	// and its cpfp transaction is invalid and not accepted into the
+	// mempool.
+	txns = ht.GetNumTxsFromMempool(2)
+	ht.FindSweepingTxns(txns, 1, closingTx.TxHash())
+
+	// Mine both transactions, the closing tx and the anchor cpfp tx.
+	// This is needed to clean up the mempool.
 	ht.MineBlocksAndAssertNumTxes(1, 2)
 }

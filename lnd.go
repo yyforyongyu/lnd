@@ -24,6 +24,7 @@ import (
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/chanacceptor"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/cluster"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -56,6 +57,14 @@ const (
 	// admin macaroon unless the administrator explicitly allowed it. Thus
 	// there's no harm allowing group read.
 	adminMacaroonFilePermissions = 0640
+
+	// leaderResignTimeout is the timeout used when resigning from the
+	// leader role. This is kept short so LND can shut down quickly in case
+	// of a system failure or network partition making the cluster
+	// unresponsive. The cluster itself should ensure that the leader is not
+	// elected again until the previous leader has resigned or the leader
+	// election timeout has passed.
+	leaderResignTimeout = 5 * time.Second
 )
 
 // AdminAuthOptions returns a list of DialOptions that can be used to
@@ -140,7 +149,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 
 	defer func() {
 		ltndLog.Info("Shutdown complete\n")
-		err := cfg.LogWriter.Close()
+		err := cfg.LogRotator.Close()
 		if err != nil {
 			ltndLog.Errorf("Could not close log rotator: %v", err)
 		}
@@ -184,7 +193,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	defer cancel()
 
 	// Enable http profiling server if requested.
-	if cfg.Profile != "" {
+	if cfg.Pprof.Profile != "" {
 		// Create the http handler.
 		pprofMux := http.NewServeMux()
 		pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -193,11 +202,11 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
-		if cfg.BlockingProfile != 0 {
-			runtime.SetBlockProfileRate(cfg.BlockingProfile)
+		if cfg.Pprof.BlockingProfile != 0 {
+			runtime.SetBlockProfileRate(cfg.Pprof.BlockingProfile)
 		}
-		if cfg.MutexProfile != 0 {
-			runtime.SetMutexProfileFraction(cfg.MutexProfile)
+		if cfg.Pprof.MutexProfile != 0 {
+			runtime.SetMutexProfileFraction(cfg.Pprof.MutexProfile)
 		}
 
 		// Redirect all requests to the pprof handler, thus visiting
@@ -207,11 +216,11 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 			"/debug/pprof/", http.StatusSeeOther,
 		))
 
-		ltndLog.Infof("Pprof listening on %v", cfg.Profile)
+		ltndLog.Infof("Pprof listening on %v", cfg.Pprof.Profile)
 
 		// Create the pprof server.
 		pprofServer := &http.Server{
-			Addr:              cfg.Profile,
+			Addr:              cfg.Pprof.Profile,
 			Handler:           pprofMux,
 			ReadHeaderTimeout: cfg.HTTPHeaderTimeout,
 		}
@@ -236,8 +245,8 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	}
 
 	// Write cpu profile if requested.
-	if cfg.CPUProfile != "" {
-		f, err := os.Create(cfg.CPUProfile)
+	if cfg.Pprof.CPUProfile != "" {
+		f, err := os.Create(cfg.Pprof.CPUProfile)
 		if err != nil {
 			return mkErr("unable to create CPU profile: %v", err)
 		}
@@ -381,6 +390,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	// blocked until this instance is elected as the current leader or
 	// shutting down.
 	elected := false
+	var leaderElector cluster.LeaderElector
 	if cfg.Cluster.EnableLeaderElection {
 		electionCtx, cancelElection := context.WithCancel(ctx)
 
@@ -392,7 +402,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		ltndLog.Infof("Using %v leader elector",
 			cfg.Cluster.LeaderElector)
 
-		leaderElector, err := cfg.Cluster.MakeLeaderElector(
+		leaderElector, err = cfg.Cluster.MakeLeaderElector(
 			electionCtx, cfg.DB,
 		)
 		if err != nil {
@@ -407,7 +417,17 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 			ltndLog.Infof("Attempting to resign from leader role "+
 				"(%v)", cfg.Cluster.ID)
 
-			if err := leaderElector.Resign(); err != nil {
+			// Ensure that we don't block the shutdown process if
+			// the leader resigning process takes too long. The
+			// cluster will ensure that the leader is not elected
+			// again until the previous leader has resigned or the
+			// leader election timeout has passed.
+			timeoutCtx, cancel := context.WithTimeout(
+				ctx, leaderResignTimeout,
+			)
+			defer cancel()
+
+			if err := leaderElector.Resign(timeoutCtx); err != nil {
 				ltndLog.Errorf("Leader elector failed to "+
 					"resign: %v", err)
 			}
@@ -436,7 +456,8 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	defer cleanUp()
 
 	partialChainControl, walletConfig, cleanUp, err := implCfg.BuildWalletConfig(
-		ctx, dbs, interceptorChain, grpcListeners,
+		ctx, dbs, &implCfg.AuxComponents, interceptorChain,
+		grpcListeners,
 	)
 	if err != nil {
 		return mkErr("error creating wallet config: %v", err)
@@ -579,7 +600,8 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	server, err := newServer(
 		cfg, cfg.Listeners, dbs, activeChainControl, &idKeyDesc,
 		activeChainControl.Cfg.WalletUnlockParams.ChansToRestore,
-		multiAcceptor, torController, tlsManager,
+		multiAcceptor, torController, tlsManager, leaderElector,
+		implCfg,
 	)
 	if err != nil {
 		return mkErr("unable to create server: %v", err)
@@ -616,6 +638,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	err = rpcServer.addDeps(
 		server, interceptorChain.MacaroonService(), cfg.SubRPCServers,
 		atplManager, server.invoices, tower, multiAcceptor,
+		server.invoiceHtlcModifier,
 	)
 	if err != nil {
 		return mkErr("unable to add deps to RPC server: %v", err)
@@ -644,25 +667,54 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	ltndLog.Infof("Waiting for chain backend to finish sync, "+
 		"start_height=%v", bestHeight)
 
+	type syncResult struct {
+		synced        bool
+		bestBlockTime int64
+		err           error
+	}
+
+	var syncedResChan = make(chan syncResult, 1)
+
 	for {
-		if !interceptor.Alive() {
+		// We check if the wallet is synced in a separate goroutine as
+		// the call is blocking, and we want to be able to interrupt it
+		// if the daemon is shutting down.
+		go func() {
+			synced, bestBlockTime, err := activeChainControl.Wallet.
+				IsSynced()
+			syncedResChan <- syncResult{synced, bestBlockTime, err}
+		}()
+
+		select {
+		case <-interceptor.ShutdownChannel():
 			return nil
+
+		case res := <-syncedResChan:
+			if res.err != nil {
+				return mkErr("unable to determine if wallet "+
+					"is synced: %v", res.err)
+			}
+
+			ltndLog.Debugf("Syncing to block timestamp: %v, is "+
+				"synced=%v", time.Unix(res.bestBlockTime, 0),
+				res.synced)
+
+			if res.synced {
+				break
+			}
+
+			// If we're not yet synced, we'll wait for a second
+			// before checking again.
+			select {
+			case <-interceptor.ShutdownChannel():
+				return nil
+
+			case <-time.After(time.Second):
+				continue
+			}
 		}
 
-		synced, ts, err := activeChainControl.Wallet.IsSynced()
-		if err != nil {
-			return mkErr("unable to determine if wallet is "+
-				"synced: %v", err)
-		}
-
-		ltndLog.Debugf("Syncing to block timestamp: %v, is synced=%v",
-			time.Unix(ts, 0), synced)
-
-		if synced {
-			break
-		}
-
-		time.Sleep(time.Second * 1)
+		break
 	}
 
 	_, bestHeight, err = activeChainControl.ChainIO.GetBestBlock()
@@ -674,11 +726,33 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		bestHeight)
 
 	// With all the relevant chains initialized, we can finally start the
-	// server itself.
-	if err := server.Start(); err != nil {
+	// server itself. We start the server in an asynchronous goroutine so
+	// that we are able to interrupt and shutdown the daemon gracefully in
+	// case the startup of the subservers do not behave as expected.
+	errChan := make(chan error)
+	go func() {
+		errChan <- server.Start()
+	}()
+
+	defer func() {
+		err := server.Stop()
+		if err != nil {
+			ltndLog.Warnf("Stopping the server including all "+
+				"its subsystems failed with %v", err)
+		}
+	}()
+
+	select {
+	case err := <-errChan:
+		if err == nil {
+			break
+		}
+
 		return mkErr("unable to start server: %v", err)
+
+	case <-interceptor.ShutdownChannel():
+		return nil
 	}
-	defer server.Stop()
 
 	// We transition the server state to Active, as the server is up.
 	interceptorChain.SetServerActive()

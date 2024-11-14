@@ -82,9 +82,52 @@
         ]
       }
     },
+    "/v2/invoices/htlcmodifier": {
+      "post": {
+        "summary": "HtlcModifier is a bidirectional streaming RPC that allows a client to\nintercept and modify the HTLCs that attempt to settle the given invoice. The\nserver will send HTLCs of invoices to the client and the client can modify\nsome aspects of the HTLC in order to pass the invoice acceptance tests.",
+        "operationId": "Invoices_HtlcModifier",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/invoicesrpcHtlcModifyRequest"
+                },
+                "error": {
+                  "$ref": "#/definitions/rpcStatus"
+                }
+              },
+              "title": "Stream result of invoicesrpcHtlcModifyRequest"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": " (streaming inputs)",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/invoicesrpcHtlcModifyResponse"
+            }
+          }
+        ],
+        "tags": [
+          "Invoices"
+        ]
+      }
+    },
     "/v2/invoices/lookup": {
       "get": {
-        "summary": "LookupInvoiceV2 attempts to look up at invoice. An invoice can be refrenced\nusing either its payment hash, payment address, or set ID.",
+        "summary": "LookupInvoiceV2 attempts to look up at invoice. An invoice can be referenced\nusing either its payment hash, payment address, or set ID.",
         "operationId": "Invoices_LookupInvoiceV2",
         "responses": {
           "200": {
@@ -317,6 +360,76 @@
     "invoicesrpcCancelInvoiceResp": {
       "type": "object"
     },
+    "invoicesrpcCircuitKey": {
+      "type": "object",
+      "properties": {
+        "chan_id": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The id of the channel that the is part of this circuit."
+        },
+        "htlc_id": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The index of the incoming htlc in the incoming channel."
+        }
+      },
+      "description": "CircuitKey is a unique identifier for an HTLC."
+    },
+    "invoicesrpcHtlcModifyRequest": {
+      "type": "object",
+      "properties": {
+        "invoice": {
+          "$ref": "#/definitions/lnrpcInvoice",
+          "description": "The invoice the intercepted HTLC is attempting to settle. The HTLCs in\nthe invoice are only HTLCs that have already been accepted or settled,\nnot including the current intercepted HTLC."
+        },
+        "exit_htlc_circuit_key": {
+          "$ref": "#/definitions/invoicesrpcCircuitKey",
+          "description": "The unique identifier of the HTLC of this intercepted HTLC."
+        },
+        "exit_htlc_amt": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The amount in milli-satoshi that the exit HTLC is attempting to pay."
+        },
+        "exit_htlc_expiry": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The absolute expiry height of the exit HTLC."
+        },
+        "current_height": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The current block height."
+        },
+        "exit_htlc_wire_custom_records": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "format": "byte"
+          },
+          "description": "The wire message custom records of the exit HTLC."
+        }
+      }
+    },
+    "invoicesrpcHtlcModifyResponse": {
+      "type": "object",
+      "properties": {
+        "circuit_key": {
+          "$ref": "#/definitions/invoicesrpcCircuitKey",
+          "description": "The circuit key of the HTLC that the client wants to modify."
+        },
+        "amt_paid": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The modified amount in milli-satoshi that the exit HTLC is paying. This\nvalue can be different from the actual on-chain HTLC amount, in case the\nHTLC carries other valuable items, as can be the case with custom channel\ntypes."
+        },
+        "cancel_set": {
+          "type": "boolean",
+          "description": "This flag indicates whether the HTLCs associated with the invoices should\nbe cancelled. The interceptor client may set this field if some\nunexpected behavior is encountered. Setting this will ignore the amt_paid\nfield."
+        }
+      }
+    },
     "invoicesrpcLookupModifier": {
       "type": "string",
       "enum": [
@@ -392,6 +505,34 @@
           "type": "string",
           "format": "int64",
           "description": "The total amount paid for the sub-invoice expressed in milli satoshis."
+        }
+      }
+    },
+    "lnrpcBlindedPathConfig": {
+      "type": "object",
+      "properties": {
+        "min_num_real_hops": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The minimum number of real hops to include in a blinded path. This doesn't\ninclude our node, so if the minimum is 1, then the path will contain at\nminimum our node along with an introduction node hop. If it is zero then\nthe shortest path will use our node as an introduction node."
+        },
+        "num_hops": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The number of hops to include in a blinded path. This doesn't include our\nnode, so if it is 1, then the path will contain our node along with an\nintroduction node or dummy node hop. If paths shorter than NumHops is\nfound, then they will be padded using dummy hops."
+        },
+        "max_num_paths": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The maximum number of blinded paths to select and add to an invoice."
+        },
+        "node_omission_list": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "byte"
+          },
+          "description": "A list of node IDs of nodes that should not be used in any of our generated\nblinded paths."
         }
       }
     },
@@ -578,6 +719,14 @@
           },
           "description": "Maps a 32-byte hex-encoded set ID to the sub-invoice AMP state for the\ngiven set ID. This field is always populated for AMP invoices, and can be\nused along side LookupInvoice to obtain the HTLC information related to a\ngiven sub-invoice.\nNote: Output only, don't specify for creating an invoice.",
           "title": "[EXPERIMENTAL]:"
+        },
+        "is_blinded": {
+          "type": "boolean",
+          "description": "Signals that the invoice should include blinded paths to hide the true\nidentity of the recipient."
+        },
+        "blinded_path_config": {
+          "$ref": "#/definitions/lnrpcBlindedPathConfig",
+          "description": "Config values to use when creating blinded paths for this invoice. These\ncan be used to override the defaults config values provided in by the\nglobal config. This field is only used if is_blinded is true."
         }
       }
     },
@@ -639,6 +788,11 @@
         "amp": {
           "$ref": "#/definitions/lnrpcAMP",
           "description": "Details relevant to AMP HTLCs, only populated if this is an AMP HTLC."
+        },
+        "custom_channel_data": {
+          "type": "string",
+          "format": "byte",
+          "description": "Custom channel data that might be populated in custom channels."
         }
       },
       "title": "Details of an HTLC that paid to an invoice"

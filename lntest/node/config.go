@@ -215,7 +215,6 @@ func (cfg *BaseNodeConfig) GenArgs() []string {
 		fmt.Sprintf("--readonlymacaroonpath=%v", cfg.ReadMacPath),
 		fmt.Sprintf("--invoicemacaroonpath=%v", cfg.InvoiceMacPath),
 		fmt.Sprintf("--trickledelay=%v", trickleDelay),
-		fmt.Sprintf("--profile=%d", cfg.ProfilePort),
 
 		// Use a small batch delay so we can broadcast the
 		// announcements quickly in the tests.
@@ -315,6 +314,9 @@ func ExtraArgsEtcd(etcdCfg *etcd.Config, name string, cluster bool,
 				leaderSessionTTL),
 		}
 		extraArgs = append(extraArgs, clusterArgs...)
+		extraArgs = append(
+			extraArgs, "--healthcheck.leader.interval=10s",
+		)
 	}
 
 	return extraArgs

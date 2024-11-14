@@ -394,7 +394,6 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 		// we will call the specialized coin selection function for
 		// that.
 		case r.FundUpToMaxAmt != 0 && r.MinFundAmt != 0:
-
 			// We need to ensure that manually selected coins, which
 			// are spent entirely on the channel funding, leave
 			// enough funds in the wallet to cover for a reserve.
@@ -437,6 +436,7 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 				reserve, w.cfg.DustLimit, coins,
 				w.cfg.CoinSelectionStrategy,
 				fundingOutputWeight, changeType,
+				DefaultMaxFeeRatio,
 			)
 			if err != nil {
 				return err
@@ -472,6 +472,7 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 				r.FeeRate, r.LocalAmt, dustLimit, coins,
 				w.cfg.CoinSelectionStrategy,
 				fundingOutputWeight, changeType,
+				DefaultMaxFeeRatio,
 			)
 			if err != nil {
 				return err
@@ -486,6 +487,7 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 				r.FeeRate, r.LocalAmt, dustLimit, coins,
 				w.cfg.CoinSelectionStrategy,
 				fundingOutputWeight, changeType,
+				DefaultMaxFeeRatio,
 			)
 			if err != nil {
 				return err
@@ -525,7 +527,7 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 		for _, coin := range selectedCoins {
 			outpoint := coin.OutPoint
 
-			_, _, _, err = w.cfg.CoinLeaser.LeaseOutput(
+			_, err = w.cfg.CoinLeaser.LeaseOutput(
 				LndInternalLockID, outpoint,
 				DefaultReservationTimeout,
 			)
@@ -539,6 +541,7 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 				localFundingAmt:  localContributionAmt,
 				remoteFundingAmt: r.RemoteAmt,
 				musig2:           r.Musig2,
+				tapscriptRoot:    r.TapscriptRoot,
 			},
 			InputCoins: selectedCoins,
 			coinLeaser: w.cfg.CoinLeaser,

@@ -23,6 +23,7 @@ import (
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	switchhop "github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/kvdb"
@@ -514,7 +515,8 @@ func (g *testGraphInstance) getLink(chanID lnwire.ShortChannelID) (
 // not required and derived from the channel data. The goal is to keep
 // instantiating a test channel graph as light weight as possible.
 func createTestGraphFromChannels(t *testing.T, useCache bool,
-	testChannels []*testChannel, source string) (*testGraphInstance, error) {
+	testChannels []*testChannel, source string,
+	sourceFeatureBits ...lnwire.FeatureBit) (*testGraphInstance, error) {
 
 	// We'll use this fake address for the IP address of all the nodes in
 	// our tests. This value isn't needed for path finding so it doesn't
@@ -578,10 +580,13 @@ func createTestGraphFromChannels(t *testing.T, useCache bool,
 	}
 
 	// Add the source node.
-	dbNode, err := addNodeWithAlias(source, lnwire.EmptyFeatureVector())
-	if err != nil {
-		return nil, err
-	}
+	dbNode, err := addNodeWithAlias(
+		source, lnwire.NewFeatureVector(
+			lnwire.NewRawFeatureVector(sourceFeatureBits...),
+			lnwire.Features,
+		),
+	)
+	require.NoError(t, err)
 
 	if err = graph.SetSourceNode(dbNode); err != nil {
 		return nil, err
@@ -1362,7 +1367,7 @@ func TestNewRoute(t *testing.T) {
 		// overwrite the final hop's feature vector in the graph.
 		destFeatures *lnwire.FeatureVector
 
-		paymentAddr *[32]byte
+		paymentAddr fn.Option[[32]byte]
 
 		// metadata is the payment metadata to attach to the route.
 		metadata []byte
@@ -1441,7 +1446,7 @@ func TestNewRoute(t *testing.T) {
 			// a fee to receive the payment.
 			name:          "two hop single shot mpp",
 			destFeatures:  tlvPayAddrFeatures,
-			paymentAddr:   &testPaymentAddr,
+			paymentAddr:   fn.Some(testPaymentAddr),
 			paymentAmount: 100000,
 			hops: []*models.CachedEdgePolicy{
 				createHop(0, 1000, 1000000, 10),
@@ -1906,7 +1911,7 @@ func runDestPaymentAddr(t *testing.T, useCache bool) {
 	luoji := ctx.keyFromAlias("luoji")
 
 	// Add payment address w/o any invoice features.
-	ctx.restrictParams.PaymentAddr = &[32]byte{1}
+	ctx.restrictParams.PaymentAddr = fn.Some([32]byte{1})
 
 	// Add empty destination features. This should cause us to fail, since
 	// this overrides anything in the graph.
@@ -2950,7 +2955,7 @@ func runInboundFees(t *testing.T, useCache bool) {
 	ctx := newPathFindingTestContext(t, useCache, testChannels, "a")
 
 	payAddr := [32]byte{1}
-	ctx.restrictParams.PaymentAddr = &payAddr
+	ctx.restrictParams.PaymentAddr = fn.Some(payAddr)
 	ctx.restrictParams.DestFeatures = tlvPayAddrFeatures
 
 	const (
@@ -2969,7 +2974,7 @@ func runInboundFees(t *testing.T, useCache bool) {
 			amt:         paymentAmt,
 			cltvDelta:   finalHopCLTV,
 			records:     nil,
-			paymentAddr: &payAddr,
+			paymentAddr: fn.Some(payAddr),
 			totalAmt:    paymentAmt,
 		},
 		nil,
@@ -3031,10 +3036,11 @@ type pathFindingTestContext struct {
 }
 
 func newPathFindingTestContext(t *testing.T, useCache bool,
-	testChannels []*testChannel, source string) *pathFindingTestContext {
+	testChannels []*testChannel, source string,
+	sourceFeatureBits ...lnwire.FeatureBit) *pathFindingTestContext {
 
 	testGraphInstance, err := createTestGraphFromChannels(
-		t, useCache, testChannels, source,
+		t, useCache, testChannels, source, sourceFeatureBits...,
 	)
 	require.NoError(t, err, "unable to create graph")
 
@@ -3075,6 +3081,12 @@ func (c *pathFindingTestContext) findPath(target route.Vertex,
 		c.graph, nil, c.bandwidthHints, &c.restrictParams,
 		&c.pathFindingConfig, c.source, target, amt, c.timePref, 0,
 	)
+}
+
+func (c *pathFindingTestContext) findBlindedPaths(
+	restrictions *blindedPathRestrictions) ([][]blindedHop, error) {
+
+	return dbFindBlindedPaths(c.graph, restrictions)
 }
 
 func (c *pathFindingTestContext) assertPath(path []*unifiedEdge,
@@ -3132,6 +3144,22 @@ func dbFindPath(graph *channeldb.ChannelGraph,
 	)
 
 	return route, err
+}
+
+// dbFindBlindedPaths calls findBlindedPaths after getting a db transaction from
+// the database graph.
+func dbFindBlindedPaths(graph *channeldb.ChannelGraph,
+	restrictions *blindedPathRestrictions) ([][]blindedHop, error) {
+
+	sourceNode, err := graph.SourceNode()
+	if err != nil {
+		return nil, err
+	}
+
+	return findBlindedPaths(
+		newMockGraphSessionChanDB(graph), sourceNode.PubKeyBytes,
+		restrictions,
+	)
 }
 
 // TestBlindedRouteConstruction tests creation of a blinded route with the
@@ -3250,21 +3278,39 @@ func TestBlindedRouteConstruction(t *testing.T) {
 
 	require.NoError(t, blindedPayment.Validate())
 
+	blindedPathSet, err := NewBlindedPaymentPathSet(
+		[]*BlindedPayment{blindedPayment},
+	)
+	require.NoError(t, err)
+
 	// Generate route hints from our blinded payment and a set of edges
 	// that make up the graph we'll give to route construction. The hints
 	// map is keyed by source node, so we can retrieve our blinded edges
 	// accordingly.
-	blindedEdges, err := blindedPayment.toRouteHints()
+	blindedEdges, err := blindedPayment.toRouteHints(
+		fn.None[*btcec.PublicKey](),
+	)
 	require.NoError(t, err)
 
 	carolDaveEdge := blindedEdges[carolVertex][0]
 	daveEveEdge := blindedEdges[daveBlindedVertex][0]
 
 	edges := []*unifiedEdge{
-		{policy: aliceBobEdge},
-		{policy: bobCarolEdge},
-		{policy: carolDaveEdge.EdgePolicy()},
-		{policy: daveEveEdge.EdgePolicy()},
+		{
+			policy: aliceBobEdge,
+		},
+		{
+			policy:         bobCarolEdge,
+			blindedPayment: blindedPayment,
+		},
+		{
+			policy:         carolDaveEdge.EdgePolicy(),
+			blindedPayment: blindedPayment,
+		},
+		{
+			policy:         daveEveEdge.EdgePolicy(),
+			blindedPayment: blindedPayment,
+		},
 	}
 
 	// Total timelock for the route should include:
@@ -3355,7 +3401,7 @@ func TestBlindedRouteConstruction(t *testing.T) {
 
 	route, err := newRoute(
 		sourceVertex, edges, currentHeight, finalHopParams,
-		blindedPath,
+		blindedPathSet,
 	)
 	require.NoError(t, err)
 	require.Equal(t, expectedRoute, route)
@@ -3382,30 +3428,37 @@ func TestLastHopPayloadSize(t *testing.T) {
 		amtToForward          = lnwire.MilliSatoshi(10000)
 		finalHopExpiry  int32 = 144
 
-		oneHopBlindedPayment = &BlindedPayment{
-			BlindedPath: &sphinx.BlindedPath{
-				BlindedHops: []*sphinx.BlindedHopInfo{
-					{
-						CipherText: encrypedData,
-					},
+		oneHopPath = &sphinx.BlindedPath{
+			BlindedHops: []*sphinx.BlindedHopInfo{
+				{
+					CipherText: encrypedData,
 				},
-				BlindingPoint: blindedPoint,
 			},
+			BlindingPoint: blindedPoint,
 		}
-		twoHopBlindedPayment = &BlindedPayment{
-			BlindedPath: &sphinx.BlindedPath{
-				BlindedHops: []*sphinx.BlindedHopInfo{
-					{
-						CipherText: encrypedData,
-					},
-					{
-						CipherText: encrypedData,
-					},
+
+		twoHopPath = &sphinx.BlindedPath{
+			BlindedHops: []*sphinx.BlindedHopInfo{
+				{
+					CipherText: encrypedData,
 				},
-				BlindingPoint: blindedPoint,
+				{
+					CipherText: encrypedData,
+				},
 			},
+			BlindingPoint: blindedPoint,
 		}
 	)
+
+	oneHopBlindedPayment, err := NewBlindedPaymentPathSet(
+		[]*BlindedPayment{{BlindedPath: oneHopPath}},
+	)
+	require.NoError(t, err)
+
+	twoHopBlindedPayment, err := NewBlindedPaymentPathSet(
+		[]*BlindedPayment{{BlindedPath: twoHopPath}},
+	)
+	require.NoError(t, err)
 
 	testCases := []struct {
 		name           string
@@ -3416,7 +3469,7 @@ func TestLastHopPayloadSize(t *testing.T) {
 		{
 			name: "Non blinded final hop",
 			restrictions: &RestrictParams{
-				PaymentAddr:       paymentAddr,
+				PaymentAddr:       fn.Some(*paymentAddr),
 				DestCustomRecords: customRecords,
 				Metadata:          metadata,
 				Amp:               ampOptions,
@@ -3427,7 +3480,7 @@ func TestLastHopPayloadSize(t *testing.T) {
 		{
 			name: "Blinded final hop introduction point",
 			restrictions: &RestrictParams{
-				BlindedPayment: oneHopBlindedPayment,
+				BlindedPaymentPathSet: oneHopBlindedPayment,
 			},
 			amount:         amtToForward,
 			finalHopExpiry: finalHopExpiry,
@@ -3435,7 +3488,7 @@ func TestLastHopPayloadSize(t *testing.T) {
 		{
 			name: "Blinded final hop of a two hop payment",
 			restrictions: &RestrictParams{
-				BlindedPayment: twoHopBlindedPayment,
+				BlindedPaymentPathSet: twoHopBlindedPayment,
 			},
 			amount:         amtToForward,
 			finalHopExpiry: finalHopExpiry,
@@ -3448,12 +3501,10 @@ func TestLastHopPayloadSize(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			var mpp *record.MPP
-			if tc.restrictions.PaymentAddr != nil {
-				mpp = record.NewMPP(
-					tc.amount, *tc.restrictions.PaymentAddr,
-				)
-			}
+			mpp := fn.MapOptionZ(tc.restrictions.PaymentAddr,
+				func(addr [32]byte) *record.MPP {
+					return record.NewMPP(tc.amount, addr)
+				})
 
 			// In case it's an AMP payment we use the max AMP record
 			// size to estimate the final hop size.
@@ -3463,12 +3514,11 @@ func TestLastHopPayloadSize(t *testing.T) {
 			}
 
 			var finalHop route.Hop
-			if tc.restrictions.BlindedPayment != nil {
-				blindedPath := tc.restrictions.BlindedPayment.
-					BlindedPath.BlindedHops
-
-				blindedPoint := tc.restrictions.BlindedPayment.
-					BlindedPath.BlindingPoint
+			if tc.restrictions.BlindedPaymentPathSet != nil {
+				path := tc.restrictions.BlindedPaymentPathSet.
+					LargestLastHopPayloadPath()
+				blindedPath := path.BlindedPath.BlindedHops
+				blindedPoint := path.BlindedPath.BlindingPoint
 
 				//nolint:lll
 				finalHop = route.Hop{
@@ -3505,4 +3555,182 @@ func TestLastHopPayloadSize(t *testing.T) {
 			)
 		})
 	}
+}
+
+// TestFindBlindedPaths tests that the findBlindedPaths function correctly
+// selects a set of blinded paths to a destination node given various
+// restrictions.
+func TestFindBlindedPaths(t *testing.T) {
+	featuresWithRouteBlinding := lnwire.NewFeatureVector(
+		lnwire.NewRawFeatureVector(lnwire.RouteBlindingOptional),
+		lnwire.Features,
+	)
+
+	policyWithRouteBlinding := &testChannelPolicy{
+		Expiry:   144,
+		FeeRate:  400,
+		MinHTLC:  1,
+		MaxHTLC:  100000000,
+		Features: featuresWithRouteBlinding,
+	}
+
+	policyWithoutRouteBlinding := &testChannelPolicy{
+		Expiry:  144,
+		FeeRate: 400,
+		MinHTLC: 1,
+		MaxHTLC: 100000000,
+	}
+
+	// Set up the following graph where Dave will be our destination node.
+	// All the nodes except for A will signal the Route Blinding feature
+	// bit.
+	//
+	// 	      A --- F
+	// 	      |	    |
+	//	G --- D --- B --- E
+	// 	      |		  |
+	// 	      C-----------/
+	//
+	testChannels := []*testChannel{
+		symmetricTestChannel(
+			"dave", "alice", 100000, policyWithoutRouteBlinding, 1,
+		),
+		symmetricTestChannel(
+			"dave", "bob", 100000, policyWithRouteBlinding, 2,
+		),
+		symmetricTestChannel(
+			"dave", "charlie", 100000, policyWithRouteBlinding, 3,
+		),
+		symmetricTestChannel(
+			"alice", "frank", 100000, policyWithRouteBlinding, 4,
+		),
+		symmetricTestChannel(
+			"bob", "frank", 100000, policyWithRouteBlinding, 5,
+		),
+		symmetricTestChannel(
+			"eve", "charlie", 100000, policyWithRouteBlinding, 6,
+		),
+		symmetricTestChannel(
+			"bob", "eve", 100000, policyWithRouteBlinding, 7,
+		),
+		symmetricTestChannel(
+			"dave", "george", 100000, policyWithRouteBlinding, 8,
+		),
+	}
+
+	ctx := newPathFindingTestContext(
+		t, true, testChannels, "dave", lnwire.RouteBlindingOptional,
+	)
+
+	// assertPaths checks that the set of selected paths contains all the
+	// expected paths.
+	assertPaths := func(paths [][]blindedHop, expectedPaths []string) {
+		require.Len(t, paths, len(expectedPaths))
+
+		actualPaths := make(map[string]bool)
+
+		for _, path := range paths {
+			var label string
+			for _, hop := range path {
+				label += ctx.aliasFromKey(hop.vertex) + ","
+			}
+
+			actualPaths[strings.TrimRight(label, ",")] = true
+		}
+
+		for _, path := range expectedPaths {
+			require.True(t, actualPaths[path])
+		}
+	}
+
+	// 1) Restrict the min & max path length such that we only include paths
+	// with one hop other than the destination hop.
+	paths, err := ctx.findBlindedPaths(&blindedPathRestrictions{
+		minNumHops: 1,
+		maxNumHops: 1,
+	})
+	require.NoError(t, err)
+
+	// We expect the B->D and C->D paths to be chosen.
+	// The A->D path is not chosen since A does not advertise the route
+	// blinding feature bit. The G->D path is not chosen since G does not
+	// have any other known channels.
+	assertPaths(paths, []string{
+		"bob,dave",
+		"charlie,dave",
+	})
+
+	// 2) Extend the search to include 2 hops other than the destination.
+	paths, err = ctx.findBlindedPaths(&blindedPathRestrictions{
+		minNumHops: 1,
+		maxNumHops: 2,
+	})
+	require.NoError(t, err)
+
+	// We expect the following paths:
+	// 	- B, D
+	//	- F, B, D
+	// 	- E, B, D
+	// 	- C, D
+	// 	- E, C, D
+	assertPaths(paths, []string{
+		"bob,dave",
+		"frank,bob,dave",
+		"eve,bob,dave",
+		"charlie,dave",
+		"eve,charlie,dave",
+	})
+
+	// 3) Extend the search even further and also increase the minimum path
+	// length.
+	paths, err = ctx.findBlindedPaths(&blindedPathRestrictions{
+		minNumHops: 2,
+		maxNumHops: 3,
+	})
+	require.NoError(t, err)
+
+	// We expect the following paths:
+	//	- F, B, D
+	// 	- E, B, D
+	// 	- E, C, D
+	// 	- B, E, C, D
+	// 	- C, E, B, D
+	assertPaths(paths, []string{
+		"frank,bob,dave",
+		"eve,bob,dave",
+		"eve,charlie,dave",
+		"bob,eve,charlie,dave",
+		"charlie,eve,bob,dave",
+	})
+
+	// 4) Repeat the above test but instruct the function to never use
+	// charlie.
+	paths, err = ctx.findBlindedPaths(&blindedPathRestrictions{
+		minNumHops: 2,
+		maxNumHops: 3,
+		nodeOmissionSet: fn.NewSet[route.Vertex](
+			ctx.keyFromAlias("charlie"),
+		),
+	})
+	require.NoError(t, err)
+
+	// We expect the following paths:
+	//	- F, B, D
+	// 	- E, B, D
+	assertPaths(paths, []string{
+		"frank,bob,dave",
+		"eve,bob,dave",
+	})
+
+	// 5) Finally, we will test the special case where the destination node
+	// is also the recipient.
+	paths, err = ctx.findBlindedPaths(&blindedPathRestrictions{
+		minNumHops: 0,
+		maxNumHops: 0,
+	})
+	require.NoError(t, err)
+
+	assertPaths(paths, []string{
+		"dave",
+	})
 }

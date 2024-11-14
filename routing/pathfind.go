@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
@@ -13,6 +14,8 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
 	"github.com/lightningnetwork/lnd/feature"
+	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/routing/route"
@@ -108,7 +111,7 @@ type finalHopParams struct {
 	cltvDelta uint16
 
 	records     record.CustomSet
-	paymentAddr *[32]byte
+	paymentAddr fn.Option[[32]byte]
 
 	// metadata is additional data that is sent along with the payment to
 	// the payee.
@@ -134,9 +137,8 @@ type finalHopParams struct {
 // NOTE: If a non-nil blinded path is provided it is assumed to have been
 // validated by the caller.
 func newRoute(sourceVertex route.Vertex,
-	pathEdges []*unifiedEdge, currentHeight uint32,
-	finalHop finalHopParams, blindedPath *sphinx.BlindedPath) (
-	*route.Route, error) {
+	pathEdges []*unifiedEdge, currentHeight uint32, finalHop finalHopParams,
+	blindedPathSet *BlindedPaymentPathSet) (*route.Route, error) {
 
 	var (
 		hops []*route.Hop
@@ -151,6 +153,8 @@ func newRoute(sourceVertex route.Vertex,
 		// backwards below, this next hop gets closer and closer to the
 		// sender of the payment.
 		nextIncomingAmount lnwire.MilliSatoshi
+
+		blindedPayment *BlindedPayment
 	)
 
 	pathLength := len(pathEdges)
@@ -158,6 +162,15 @@ func newRoute(sourceVertex route.Vertex,
 		// Now we'll start to calculate the items within the per-hop
 		// payload for the hop this edge is leading to.
 		edge := pathEdges[i].policy
+
+		// If this is an edge from a blinded path and the
+		// blindedPayment variable has not been set yet, then set it now
+		// by extracting the corresponding blinded payment from the
+		// edge.
+		isBlindedEdge := pathEdges[i].blindedPayment != nil
+		if isBlindedEdge && blindedPayment == nil {
+			blindedPayment = pathEdges[i].blindedPayment
+		}
 
 		// We'll calculate the amounts, timelocks, and fees for each hop
 		// in the route. The base case is the final hop which includes
@@ -198,20 +211,12 @@ func newRoute(sourceVertex route.Vertex,
 			// reporting through RPC. Set to zero for the final hop.
 			fee = 0
 
-			// Only include the final hop CLTV delta in the total
-			// time lock value if this is not a route to a blinded
-			// path. For blinded paths, the total time-lock from the
-			// whole path will be deduced from the introduction
-			// node's CLTV delta. The exception is for the case
-			// where the final hop is the blinded path introduction
-			// node.
-			if blindedPath == nil ||
-				len(blindedPath.BlindedHops) == 1 {
-
-				// As this is the last hop, we'll use the
-				// specified final CLTV delta value instead of
-				// the value from the last link in the route.
+			if blindedPathSet == nil {
 				totalTimeLock += uint32(finalHop.cltvDelta)
+			} else {
+				totalTimeLock += uint32(
+					blindedPathSet.FinalCLTVDelta(),
+				)
 			}
 			outgoingTimeLock = totalTimeLock
 
@@ -221,7 +226,7 @@ func newRoute(sourceVertex route.Vertex,
 			// If we're attaching a payment addr but the receiver
 			// doesn't support both TLV and payment addrs, fail.
 			payAddr := supports(lnwire.PaymentAddrOptional)
-			if !payAddr && finalHop.paymentAddr != nil {
+			if !payAddr && finalHop.paymentAddr.IsSome() {
 				return nil, errors.New("cannot attach " +
 					"payment addr")
 			}
@@ -229,16 +234,13 @@ func newRoute(sourceVertex route.Vertex,
 			// Otherwise attach the mpp record if it exists.
 			// TODO(halseth): move this to payment life cycle,
 			// where AMP options are set.
-			if finalHop.paymentAddr != nil {
-				mpp = record.NewMPP(
-					finalHop.totalAmt,
-					*finalHop.paymentAddr,
-				)
-			}
+			finalHop.paymentAddr.WhenSome(func(addr [32]byte) {
+				mpp = record.NewMPP(finalHop.totalAmt, addr)
+			})
 
 			metadata = finalHop.metadata
 
-			if blindedPath != nil {
+			if blindedPathSet != nil {
 				totalAmtMsatBlinded = finalHop.totalAmt
 			}
 		} else {
@@ -298,10 +300,28 @@ func newRoute(sourceVertex route.Vertex,
 	// If we are creating a route to a blinded path, we need to add some
 	// additional data to the route that is required for blinded forwarding.
 	// We do another pass on our edges to append this data.
-	if blindedPath != nil {
+	if blindedPathSet != nil {
+		// If the passed in BlindedPaymentPathSet is non-nil but no
+		// edge had a BlindedPayment attached, it means that the path
+		// chosen was an introduction-node-only path. So in this case,
+		// we can assume the relevant payment is the only one in the
+		// payment set.
+		if blindedPayment == nil {
+			var err error
+			blindedPayment, err = blindedPathSet.IntroNodeOnlyPath()
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		var (
 			inBlindedRoute bool
 			dataIndex      = 0
+
+			blindedPath = blindedPayment.BlindedPath
+			numHops     = len(blindedPath.BlindedHops)
+			realFinal   = blindedPath.BlindedHops[numHops-1].
+					BlindedNodePub
 
 			introVertex = route.NewVertex(
 				blindedPath.IntroductionPoint,
@@ -330,6 +350,11 @@ func newRoute(sourceVertex route.Vertex,
 			if i != len(hops)-1 {
 				hop.AmtToForward = 0
 				hop.OutgoingTimeLock = 0
+			} else {
+				// For the final hop, we swap out the pub key
+				// bytes to the original destination node pub
+				// key for that payment path.
+				hop.PubKeyBytes = route.NewVertex(realFinal)
 			}
 
 			dataIndex++
@@ -424,7 +449,7 @@ type RestrictParams struct {
 	// PaymentAddr is a random 32-byte value generated by the receiver to
 	// mitigate probing vectors and payment sniping attacks on overpaid
 	// invoices.
-	PaymentAddr *[32]byte
+	PaymentAddr fn.Option[[32]byte]
 
 	// Amp signals to the pathfinder that this payment is an AMP payment
 	// and therefore it needs to account for additional AMP data in the
@@ -435,9 +460,13 @@ type RestrictParams struct {
 	// the payee.
 	Metadata []byte
 
-	// BlindedPayment is necessary to determine the hop size of the
+	// BlindedPaymentPathSet is necessary to determine the hop size of the
 	// last/exit hop.
-	BlindedPayment *BlindedPayment
+	BlindedPaymentPathSet *BlindedPaymentPathSet
+
+	// FirstHopCustomRecords includes any records that should be included in
+	// the update_add_htlc message towards our peer.
+	FirstHopCustomRecords lnwire.CustomRecords
 }
 
 // PathFindingConfig defines global parameters that control the trade-off in
@@ -496,7 +525,16 @@ func getOutgoingBalance(node route.Vertex, outgoingChans map[uint64]struct{},
 			max = bandwidth
 		}
 
-		total += bandwidth
+		var overflow bool
+		total, overflow = overflowSafeAdd(total, bandwidth)
+		if overflow {
+			// If the current total and the bandwidth would
+			// overflow the maximum value, we set the total to the
+			// maximum value. Which is more milli-satoshis than are
+			// in existence anyway, so the actual value is
+			// irrelevant.
+			total = lnwire.MilliSatoshi(math.MaxUint64)
+		}
 
 		return nil
 	}
@@ -567,7 +605,7 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 	// checking that it supports the features we need. If the caller has a
 	// payment address to attach, check that our destination feature vector
 	// supports them.
-	if r.PaymentAddr != nil &&
+	if r.PaymentAddr.IsSome() &&
 		!features.HasFeature(lnwire.PaymentAddrOptional) {
 
 		return nil, 0, errNoPaymentAddr
@@ -695,7 +733,6 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 	// processEdge is a helper closure that will be used to make sure edges
 	// satisfy our specific requirements.
 	processEdge := func(fromVertex route.Vertex,
-		fromFeatures *lnwire.FeatureVector,
 		edge *unifiedEdge, toNodeDist *nodeWithDist) {
 
 		edgesExpanded++
@@ -722,13 +759,31 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 		amountToSend := toNodeDist.netAmountReceived +
 			lnwire.MilliSatoshi(inboundFee)
 
+		// Check if accumulated fees would exceed fee limit when this
+		// node would be added to the path.
+		totalFee := int64(amountToSend) - int64(amt)
+
+		log.Trace(lnutils.NewLogClosure(func() string {
+			return fmt.Sprintf(
+				"Checking fromVertex (%v) with "+
+					"minInboundFee=%v, inboundFee=%v, "+
+					"amountToSend=%v, amt=%v, totalFee=%v",
+				fromVertex, minInboundFee, inboundFee,
+				amountToSend, amt, totalFee,
+			)
+		}))
+
+		if totalFee > 0 && lnwire.MilliSatoshi(totalFee) > r.FeeLimit {
+			return
+		}
+
 		// Request the success probability for this edge.
 		edgeProbability := r.ProbabilitySource(
 			fromVertex, toNodeDist.node, amountToSend,
 			edge.capacity,
 		)
 
-		log.Trace(newLogClosure(func() string {
+		log.Trace(lnutils.NewLogClosure(func() string {
 			return fmt.Sprintf("path finding probability: fromnode=%v,"+
 				" tonode=%v, amt=%v, cap=%v, probability=%v",
 				fromVertex, toNodeDist.node, amountToSend,
@@ -778,13 +833,6 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 		netAmountToReceive := amountToSend +
 			lnwire.MilliSatoshi(outboundFee)
 
-		// Check if accumulated fees would exceed fee limit when this
-		// node would be added to the path.
-		totalFee := int64(netAmountToReceive) - int64(amt)
-		if totalFee > 0 && lnwire.MilliSatoshi(totalFee) > r.FeeLimit {
-			return
-		}
-
 		// Calculate total probability of successfully reaching target
 		// by multiplying the probabilities. Both this edge and the rest
 		// of the route must succeed.
@@ -811,7 +859,7 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 		// weight composed of the fee that this node will charge and
 		// the amount that will be locked for timeLockDelta blocks in
 		// the HTLC that is handed out to fromVertex.
-		weight := edgeWeight(netAmountToReceive, fee, timeLockDelta)
+		weight := edgeWeight(amountToSend, fee, timeLockDelta)
 
 		// Compute the tentative weight to this new channel/edge
 		// which is the weight from our toNode to the target node
@@ -1033,7 +1081,7 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 
 			// Check if this candidate node is better than what we
 			// already have.
-			processEdge(fromNode, fromFeatures, edge, partialPath)
+			processEdge(fromNode, edge, partialPath)
 		}
 
 		if nodeHeap.Len() == 0 {
@@ -1099,6 +1147,209 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 	return pathEdges, distance[source].probability, nil
 }
 
+// blindedPathRestrictions are a set of constraints to adhere to when
+// choosing a set of blinded paths to this node.
+type blindedPathRestrictions struct {
+	// minNumHops is the minimum number of hops to include in a blinded
+	// path. This doesn't include our node, so if the minimum is 1, then
+	// the path will contain at minimum our node along with an introduction
+	// node hop. A minimum of 0 will include paths where this node is the
+	// introduction node and so should be used with caution.
+	minNumHops uint8
+
+	// maxNumHops is the maximum number of hops to include in a blinded
+	// path. This doesn't include our node, so if the maximum is 1, then
+	// the path will contain our node along with an introduction node hop.
+	maxNumHops uint8
+
+	// nodeOmissionSet holds a set of node IDs of nodes that we should
+	// ignore during blinded path selection.
+	nodeOmissionSet fn.Set[route.Vertex]
+}
+
+// blindedHop holds the information about a hop we have selected for a blinded
+// path.
+type blindedHop struct {
+	vertex       route.Vertex
+	channelID    uint64
+	edgeCapacity btcutil.Amount
+}
+
+// findBlindedPaths does a depth first search from the target node to find a set
+// of blinded paths to the target node given the set of restrictions. This
+// function will select and return any candidate path. A candidate path is a
+// path to the target node with a size determined by the given hop number
+// constraints where all the nodes on the path signal the route blinding feature
+// _and_ the introduction node for the path has more than one public channel.
+// Any filtering of paths based on payment value or success probabilities is
+// left to the caller.
+func findBlindedPaths(g Graph, target route.Vertex,
+	restrictions *blindedPathRestrictions) ([][]blindedHop, error) {
+
+	// Sanity check the restrictions.
+	if restrictions.minNumHops > restrictions.maxNumHops {
+		return nil, fmt.Errorf("maximum number of blinded path hops "+
+			"(%d) must be greater than or equal to the minimum "+
+			"number of hops (%d)", restrictions.maxNumHops,
+			restrictions.minNumHops)
+	}
+
+	// If the node is not the destination node, then it is required that the
+	// node advertise the route blinding feature-bit in order for it to be
+	// chosen as a node on the blinded path.
+	supportsRouteBlinding := func(node route.Vertex) (bool, error) {
+		if node == target {
+			return true, nil
+		}
+
+		features, err := g.FetchNodeFeatures(node)
+		if err != nil {
+			return false, err
+		}
+
+		return features.HasFeature(lnwire.RouteBlindingOptional), nil
+	}
+
+	// This function will have some recursion. We will spin out from the
+	// target node & append edges to the paths until we reach various exit
+	// conditions such as: The maxHops number being reached or reaching
+	// a node that doesn't have any other edges - in that final case, the
+	// whole path should be ignored.
+	paths, _, err := processNodeForBlindedPath(
+		g, target, supportsRouteBlinding, nil, restrictions,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reverse each path so that the order is correct (from introduction
+	// node to last hop node) and then append this node on as the
+	// destination of each path.
+	orderedPaths := make([][]blindedHop, len(paths))
+	for i, path := range paths {
+		sort.Slice(path, func(i, j int) bool {
+			return j < i
+		})
+
+		orderedPaths[i] = append(path, blindedHop{vertex: target})
+	}
+
+	// Handle the special case that allows a blinded path with the
+	// introduction node as the destination node.
+	if restrictions.minNumHops == 0 {
+		singleHopPath := [][]blindedHop{{{vertex: target}}}
+
+		//nolint:makezero
+		orderedPaths = append(
+			orderedPaths, singleHopPath...,
+		)
+	}
+
+	return orderedPaths, err
+}
+
+// processNodeForBlindedPath is a recursive function that traverses the graph
+// in a depth first manner searching for a set of blinded paths to the given
+// node.
+func processNodeForBlindedPath(g Graph, node route.Vertex,
+	supportsRouteBlinding func(vertex route.Vertex) (bool, error),
+	alreadyVisited map[route.Vertex]bool,
+	restrictions *blindedPathRestrictions) ([][]blindedHop, bool, error) {
+
+	// If we have already visited the maximum number of hops, then this path
+	// is complete and we can exit now.
+	if len(alreadyVisited) > int(restrictions.maxNumHops) {
+		return nil, false, nil
+	}
+
+	// If we have already visited this peer on this path, then we skip
+	// processing it again.
+	if alreadyVisited[node] {
+		return nil, false, nil
+	}
+
+	// If we have explicitly been told to ignore this node for blinded paths
+	// then we skip it too.
+	if restrictions.nodeOmissionSet.Contains(node) {
+		return nil, false, nil
+	}
+
+	supports, err := supportsRouteBlinding(node)
+	if err != nil {
+		return nil, false, err
+	}
+	if !supports {
+		return nil, false, nil
+	}
+
+	// At this point, copy the alreadyVisited map.
+	visited := make(map[route.Vertex]bool, len(alreadyVisited))
+	for r := range alreadyVisited {
+		visited[r] = true
+	}
+
+	// Add this node the visited set.
+	visited[node] = true
+
+	var (
+		hopSets   [][]blindedHop
+		chanCount int
+	)
+
+	// Now, iterate over the node's channels in search for paths to this
+	// node that can be used for blinded paths
+	err = g.ForEachNodeChannel(node,
+		func(channel *channeldb.DirectedChannel) error {
+			// Keep track of how many incoming channels this node
+			// has. We only use a node as an introduction node if it
+			// has channels other than the one that lead us to it.
+			chanCount++
+
+			// Process each channel peer to gather any paths that
+			// lead to the peer.
+			nextPaths, hasMoreChans, err := processNodeForBlindedPath( //nolint:lll
+				g, channel.OtherNode, supportsRouteBlinding,
+				visited, restrictions,
+			)
+			if err != nil {
+				return err
+			}
+
+			hop := blindedHop{
+				vertex:       channel.OtherNode,
+				channelID:    channel.ChannelID,
+				edgeCapacity: channel.Capacity,
+			}
+
+			// For each of the paths returned, unwrap them and
+			// append this hop to them.
+			for _, path := range nextPaths {
+				hopSets = append(
+					hopSets,
+					append([]blindedHop{hop}, path...),
+				)
+			}
+
+			// If this node does have channels other than the one
+			// that lead to it, and if the hop count up to this node
+			// meets the minHop requirement, then we also add a
+			// path that starts at this node.
+			if hasMoreChans &&
+				len(visited) >= int(restrictions.minNumHops) {
+
+				hopSets = append(hopSets, []blindedHop{hop})
+			}
+
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return hopSets, chanCount > 1, nil
+}
+
 // getProbabilityBasedDist converts a weight into a distance that takes into
 // account the success probability and the (virtual) cost of a failed payment
 // attempt.
@@ -1160,9 +1411,11 @@ func getProbabilityBasedDist(weight int64, probability float64,
 func lastHopPayloadSize(r *RestrictParams, finalHtlcExpiry int32,
 	amount lnwire.MilliSatoshi) uint64 {
 
-	if r.BlindedPayment != nil {
-		blindedPath := r.BlindedPayment.BlindedPath.BlindedHops
-		blindedPoint := r.BlindedPayment.BlindedPath.BlindingPoint
+	if r.BlindedPaymentPathSet != nil {
+		paymentPath := r.BlindedPaymentPathSet.
+			LargestLastHopPayloadPath()
+		blindedPath := paymentPath.BlindedPath.BlindedHops
+		blindedPoint := paymentPath.BlindedPath.BlindingPoint
 
 		encryptedData := blindedPath[len(blindedPath)-1].CipherText
 		finalHop := route.Hop{
@@ -1179,9 +1432,9 @@ func lastHopPayloadSize(r *RestrictParams, finalHtlcExpiry int32,
 	}
 
 	var mpp *record.MPP
-	if r.PaymentAddr != nil {
-		mpp = record.NewMPP(amount, *r.PaymentAddr)
-	}
+	r.PaymentAddr.WhenSome(func(addr [32]byte) {
+		mpp = record.NewMPP(amount, addr)
+	})
 
 	var amp *record.AMP
 	if r.Amp != nil {
@@ -1202,4 +1455,16 @@ func lastHopPayloadSize(r *RestrictParams, finalHtlcExpiry int32,
 
 	// The final hop does not have a short chanID set.
 	return finalHop.PayloadSize(0)
+}
+
+// overflowSafeAdd adds two MilliSatoshi values and returns the result. If an
+// overflow could occur, zero is returned instead and the boolean is set to
+// true.
+func overflowSafeAdd(x, y lnwire.MilliSatoshi) (lnwire.MilliSatoshi, bool) {
+	if y > math.MaxUint64-x {
+		// Overflow would occur, return 0 and set overflow flag.
+		return 0, true
+	}
+
+	return x + y, false
 }

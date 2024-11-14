@@ -9,12 +9,14 @@ import (
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/routing/shards"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -60,6 +62,12 @@ func (m *mockPaymentAttemptDispatcherOld) SendHTLC(
 	return nil
 }
 
+func (m *mockPaymentAttemptDispatcherOld) HasAttemptResult(
+	attemptID uint64) (bool, error) {
+
+	return false, nil
+}
+
 func (m *mockPaymentAttemptDispatcherOld) GetAttemptResult(paymentID uint64,
 	_ lntypes.Hash, _ htlcswitch.ErrorDecrypter) (
 	<-chan *htlcswitch.PaymentResult, error) {
@@ -98,7 +106,8 @@ type mockPaymentSessionSourceOld struct {
 var _ PaymentSessionSource = (*mockPaymentSessionSourceOld)(nil)
 
 func (m *mockPaymentSessionSourceOld) NewPaymentSession(
-	_ *LightningPayment) (PaymentSession, error) {
+	_ *LightningPayment, _ fn.Option[tlv.Blob],
+	_ fn.Option[TlvTrafficShaper]) (PaymentSession, error) {
 
 	return &mockPaymentSessionOld{
 		routes:  m.routes,
@@ -116,10 +125,10 @@ func (m *mockPaymentSessionSourceOld) NewPaymentSessionEmpty() PaymentSession {
 }
 
 type mockMissionControlOld struct {
-	MissionControl
+	MissionController
 }
 
-var _ MissionController = (*mockMissionControlOld)(nil)
+var _ MissionControlQuerier = (*mockMissionControlOld)(nil)
 
 func (m *mockMissionControlOld) ReportPaymentFail(
 	paymentID uint64, rt *route.Route,
@@ -160,7 +169,8 @@ type mockPaymentSessionOld struct {
 var _ PaymentSession = (*mockPaymentSessionOld)(nil)
 
 func (m *mockPaymentSessionOld) RequestRoute(_, _ lnwire.MilliSatoshi,
-	_, height uint32) (*route.Route, error) {
+	_, height uint32, _ lnwire.CustomRecords) (*route.Route,
+	error) {
 
 	if m.release != nil {
 		m.release <- struct{}{}
@@ -176,7 +186,7 @@ func (m *mockPaymentSessionOld) RequestRoute(_, _ lnwire.MilliSatoshi,
 	return r, nil
 }
 
-func (m *mockPaymentSessionOld) UpdateAdditionalEdge(_ *lnwire.ChannelUpdate,
+func (m *mockPaymentSessionOld) UpdateAdditionalEdge(_ *lnwire.ChannelUpdate1,
 	_ *btcec.PublicKey, _ *models.CachedEdgePolicy) bool {
 
 	return false
@@ -207,6 +217,10 @@ func (m *mockPayerOld) SendHTLC(_ lnwire.ShortChannelID,
 		return fmt.Errorf("test quitting")
 	}
 
+}
+
+func (m *mockPayerOld) HasAttemptResult(attemptID uint64) (bool, error) {
+	return false, nil
 }
 
 func (m *mockPayerOld) GetAttemptResult(paymentID uint64, _ lntypes.Hash,
@@ -494,7 +508,7 @@ func (m *mockControlTowerOld) FailPayment(phash lntypes.Hash,
 }
 
 func (m *mockControlTowerOld) FetchPayment(phash lntypes.Hash) (
-	dbMPPayment, error) {
+	DBMPPayment, error) {
 
 	m.Lock()
 	defer m.Unlock()
@@ -585,6 +599,13 @@ func (m *mockPaymentAttemptDispatcher) SendHTLC(firstHop lnwire.ShortChannelID,
 	return args.Error(0)
 }
 
+func (m *mockPaymentAttemptDispatcher) HasAttemptResult(
+	attemptID uint64) (bool, error) {
+
+	args := m.Called(attemptID)
+	return args.Bool(0), args.Error(1)
+}
+
 func (m *mockPaymentAttemptDispatcher) GetAttemptResult(attemptID uint64,
 	paymentHash lntypes.Hash, deobfuscator htlcswitch.ErrorDecrypter) (
 	<-chan *htlcswitch.PaymentResult, error) {
@@ -613,9 +634,10 @@ type mockPaymentSessionSource struct {
 var _ PaymentSessionSource = (*mockPaymentSessionSource)(nil)
 
 func (m *mockPaymentSessionSource) NewPaymentSession(
-	payment *LightningPayment) (PaymentSession, error) {
+	payment *LightningPayment, firstHopBlob fn.Option[tlv.Blob],
+	tlvShaper fn.Option[TlvTrafficShaper]) (PaymentSession, error) {
 
-	args := m.Called(payment)
+	args := m.Called(payment, firstHopBlob, tlvShaper)
 	return args.Get(0).(PaymentSession), args.Error(1)
 }
 
@@ -635,7 +657,7 @@ type mockMissionControl struct {
 	mock.Mock
 }
 
-var _ MissionController = (*mockMissionControl)(nil)
+var _ MissionControlQuerier = (*mockMissionControl)(nil)
 
 func (m *mockMissionControl) ReportPaymentFail(
 	paymentID uint64, rt *route.Route,
@@ -673,9 +695,12 @@ type mockPaymentSession struct {
 var _ PaymentSession = (*mockPaymentSession)(nil)
 
 func (m *mockPaymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
-	activeShards, height uint32) (*route.Route, error) {
+	activeShards, height uint32,
+	firstHopCustomRecords lnwire.CustomRecords) (*route.Route, error) {
 
-	args := m.Called(maxAmt, feeLimit, activeShards, height)
+	args := m.Called(
+		maxAmt, feeLimit, activeShards, height, firstHopCustomRecords,
+	)
 
 	// Type assertion on nil will fail, so we check and return here.
 	if args.Get(0) == nil {
@@ -685,7 +710,7 @@ func (m *mockPaymentSession) RequestRoute(maxAmt, feeLimit lnwire.MilliSatoshi,
 	return args.Get(0).(*route.Route), args.Error(1)
 }
 
-func (m *mockPaymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate,
+func (m *mockPaymentSession) UpdateAdditionalEdge(msg *lnwire.ChannelUpdate1,
 	pubKey *btcec.PublicKey, policy *models.CachedEdgePolicy) bool {
 
 	args := m.Called(msg, pubKey, policy)
@@ -759,7 +784,7 @@ func (m *mockControlTower) FailPayment(phash lntypes.Hash,
 }
 
 func (m *mockControlTower) FetchPayment(phash lntypes.Hash) (
-	dbMPPayment, error) {
+	DBMPPayment, error) {
 
 	args := m.Called(phash)
 
@@ -797,7 +822,7 @@ type mockMPPayment struct {
 	mock.Mock
 }
 
-var _ dbMPPayment = (*mockMPPayment)(nil)
+var _ DBMPPayment = (*mockMPPayment)(nil)
 
 func (m *mockMPPayment) GetState() *channeldb.MPPaymentState {
 	args := m.Called()
@@ -878,6 +903,14 @@ func (m *mockLink) EligibleToForward() bool {
 // MayAddOutgoingHtlc returns the error configured in our mock.
 func (m *mockLink) MayAddOutgoingHtlc(_ lnwire.MilliSatoshi) error {
 	return m.mayAddOutgoingErr
+}
+
+func (m *mockLink) FundingCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
+}
+
+func (m *mockLink) CommitmentCustomBlob() fn.Option[tlv.Blob] {
+	return fn.None[tlv.Blob]()
 }
 
 type mockShardTracker struct {

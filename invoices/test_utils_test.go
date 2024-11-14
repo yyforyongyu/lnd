@@ -30,6 +30,8 @@ type mockPayload struct {
 	amp           *record.AMP
 	customRecords record.CustomSet
 	metadata      []byte
+	pathID        *chainhash.Hash
+	totalAmtMsat  lnwire.MilliSatoshi
 }
 
 func (p *mockPayload) MultiPath() *record.MPP {
@@ -38,6 +40,14 @@ func (p *mockPayload) MultiPath() *record.MPP {
 
 func (p *mockPayload) AMPRecord() *record.AMP {
 	return p.amp
+}
+
+func (p *mockPayload) PathID() *chainhash.Hash {
+	return p.pathID
+}
+
+func (p *mockPayload) TotalAmtMsat() lnwire.MilliSatoshi {
+	return p.totalAmtMsat
 }
 
 func (p *mockPayload) CustomRecords() record.CustomSet {
@@ -112,12 +122,8 @@ var (
 	testMessageSigner = zpay32.MessageSigner{
 		SignCompact: func(msg []byte) ([]byte, error) {
 			hash := chainhash.HashB(msg)
-			sig, err := ecdsa.SignCompact(testPrivKey, hash, true)
-			if err != nil {
-				return nil, fmt.Errorf("can't sign the "+
-					"message: %v", err)
-			}
-			return sig, nil
+
+			return ecdsa.SignCompact(testPrivKey, hash, true), nil
 		},
 	}
 
@@ -143,6 +149,7 @@ func defaultRegistryConfig() invpkg.RegistryConfig {
 	return invpkg.RegistryConfig{
 		FinalCltvRejectDelta: testFinalCltvRejectDelta,
 		HtlcHoldDuration:     30 * time.Second,
+		HtlcInterceptor:      &invpkg.MockHtlcModifier{},
 	}
 }
 

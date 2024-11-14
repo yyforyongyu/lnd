@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	sphinx "github.com/lightningnetwork/lightning-onion"
@@ -13,15 +12,6 @@ import (
 )
 
 const (
-	// relayInfoSize is the number of bytes that the relay info of a blinded
-	// payment will occupy.
-	// 	base fee: 4 bytes
-	//	prop fee: 4 bytes
-	//	cltv delta: 2 bytes
-	//	min htlc: 8 bytes
-	//	max htlc: 8 bytes
-	relayInfoSize = 26
-
 	// maxNumHopsPerPath is the maximum number of blinded path hops that can
 	// be included in a single encoded blinded path. This is calculated
 	// based on the `data_length` limit of 638 bytes for any tagged field in
@@ -30,6 +20,18 @@ const (
 	// proposal](https://github.com/lightning/blips/pull/39) for a detailed
 	// calculation.
 	maxNumHopsPerPath = 7
+
+	// maxCipherTextLength defines the largest cipher text size allowed.
+	// This is derived by using the `data_length` upper bound of 639 bytes
+	// and then assuming the case of a path with only a single hop (meaning
+	// the cipher text may be as large as possible).
+	maxCipherTextLength = 535
+)
+
+var (
+	// byteOrder defines the endian-ness we use for encoding to and from
+	// buffers.
+	byteOrder = binary.BigEndian
 )
 
 // BlindedPaymentPath holds all the information a payer needs to know about a
@@ -69,24 +71,30 @@ type BlindedPaymentPath struct {
 // DecodeBlindedPayment attempts to parse a BlindedPaymentPath from the passed
 // reader.
 func DecodeBlindedPayment(r io.Reader) (*BlindedPaymentPath, error) {
-	var relayInfo [relayInfoSize]byte
-	n, err := r.Read(relayInfo[:])
+	var payment BlindedPaymentPath
+
+	if err := binary.Read(r, byteOrder, &payment.FeeBaseMsat); err != nil {
+		return nil, err
+	}
+
+	if err := binary.Read(r, byteOrder, &payment.FeeRate); err != nil {
+		return nil, err
+	}
+
+	err := binary.Read(r, byteOrder, &payment.CltvExpiryDelta)
 	if err != nil {
 		return nil, err
 	}
-	if n != relayInfoSize {
-		return nil, fmt.Errorf("unable to read %d relay info bytes "+
-			"off of the given stream: %w", relayInfoSize, err)
+
+	err = binary.Read(r, byteOrder, &payment.HTLCMinMsat)
+	if err != nil {
+		return nil, err
 	}
 
-	var payment BlindedPaymentPath
-
-	// Parse the relay info fields.
-	payment.FeeBaseMsat = binary.BigEndian.Uint32(relayInfo[:4])
-	payment.FeeRate = binary.BigEndian.Uint32(relayInfo[4:8])
-	payment.CltvExpiryDelta = binary.BigEndian.Uint16(relayInfo[8:10])
-	payment.HTLCMinMsat = binary.BigEndian.Uint64(relayInfo[10:18])
-	payment.HTLCMaxMsat = binary.BigEndian.Uint64(relayInfo[18:])
+	err = binary.Read(r, byteOrder, &payment.HTLCMaxMsat)
+	if err != nil {
+		return nil, err
+	}
 
 	// Parse the feature bit vector.
 	f := lnwire.EmptyFeatureVector()
@@ -146,24 +154,31 @@ func DecodeBlindedPayment(r io.Reader) (*BlindedPaymentPath, error) {
 // 5) Number of hops: 1 byte.
 // 6) Encoded BlindedHops.
 func (p *BlindedPaymentPath) Encode(w io.Writer) error {
-	var relayInfo [26]byte
-	binary.BigEndian.PutUint32(relayInfo[:4], p.FeeBaseMsat)
-	binary.BigEndian.PutUint32(relayInfo[4:8], p.FeeRate)
-	binary.BigEndian.PutUint16(relayInfo[8:10], p.CltvExpiryDelta)
-	binary.BigEndian.PutUint64(relayInfo[10:18], p.HTLCMinMsat)
-	binary.BigEndian.PutUint64(relayInfo[18:], p.HTLCMaxMsat)
-
-	_, err := w.Write(relayInfo[:])
-	if err != nil {
+	if err := binary.Write(w, byteOrder, p.FeeBaseMsat); err != nil {
 		return err
 	}
 
-	err = p.Features.Encode(w)
-	if err != nil {
+	if err := binary.Write(w, byteOrder, p.FeeRate); err != nil {
 		return err
 	}
 
-	_, err = w.Write(p.FirstEphemeralBlindingPoint.SerializeCompressed())
+	if err := binary.Write(w, byteOrder, p.CltvExpiryDelta); err != nil {
+		return err
+	}
+
+	if err := binary.Write(w, byteOrder, p.HTLCMinMsat); err != nil {
+		return err
+	}
+
+	if err := binary.Write(w, byteOrder, p.HTLCMaxMsat); err != nil {
+		return err
+	}
+
+	if err := p.Features.Encode(w); err != nil {
+		return err
+	}
+
+	_, err := w.Write(p.FirstEphemeralBlindingPoint.SerializeCompressed())
 	if err != nil {
 		return err
 	}
@@ -174,14 +189,12 @@ func (p *BlindedPaymentPath) Encode(w io.Writer) error {
 			"maximum of %d", numHops, maxNumHopsPerPath)
 	}
 
-	_, err = w.Write([]byte{byte(numHops)})
-	if err != nil {
+	if _, err := w.Write([]byte{byte(numHops)}); err != nil {
 		return err
 	}
 
 	for _, hop := range p.Hops {
-		err = EncodeBlindedHop(w, hop)
-		if err != nil {
+		if err := EncodeBlindedHop(w, hop); err != nil {
 			return err
 		}
 	}
@@ -207,6 +220,12 @@ func DecodeBlindedHop(r io.Reader) (*sphinx.BlindedHopInfo, error) {
 		return nil, err
 	}
 
+	if dataLen > maxCipherTextLength {
+		return nil, fmt.Errorf("a blinded hop cipher text blob may "+
+			"not exceed the maximum of %d bytes",
+			maxCipherTextLength)
+	}
+
 	encryptedData := make([]byte, dataLen)
 	_, err = r.Read(encryptedData)
 	if err != nil {
@@ -230,9 +249,9 @@ func EncodeBlindedHop(w io.Writer, hop *sphinx.BlindedHopInfo) error {
 		return err
 	}
 
-	if len(hop.CipherText) > math.MaxUint16 {
+	if len(hop.CipherText) > maxCipherTextLength {
 		return fmt.Errorf("encrypted recipient data can not exceed a "+
-			"length of %d bytes", math.MaxUint16)
+			"length of %d bytes", maxCipherTextLength)
 	}
 
 	err = tlv.WriteVarInt(w, uint64(len(hop.CipherText)), &[8]byte{})

@@ -43,6 +43,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// maxInflightHtlcs specifies the max number of inflight HTLCs. This number is
+// chosen to be smaller than the default 483 so the test can run faster.
+const maxInflightHtlcs = 50
+
 var (
 	alicePrivKey = []byte("alice priv key")
 	bobPrivKey   = []byte("bob priv key")
@@ -91,8 +95,10 @@ func genIDs() (lnwire.ChannelID, lnwire.ChannelID, lnwire.ShortChannelID,
 
 // mockGetChanUpdateMessage helper function which returns topology update of
 // the channel
-func mockGetChanUpdateMessage(cid lnwire.ShortChannelID) (*lnwire.ChannelUpdate, error) {
-	return &lnwire.ChannelUpdate{
+func mockGetChanUpdateMessage(_ lnwire.ShortChannelID) (*lnwire.ChannelUpdate1,
+	error) {
+
+	return &lnwire.ChannelUpdate1{
 		Signature: wireSig,
 	}, nil
 }
@@ -138,24 +144,28 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 	csvTimeoutBob := uint32(4)
 	isAliceInitiator := true
 
-	aliceConstraints := &channeldb.ChannelConstraints{
-		DustLimit: btcutil.Amount(200),
+	aliceBounds := channeldb.ChannelStateBounds{
 		MaxPendingAmount: lnwire.NewMSatFromSatoshis(
 			channelCapacity),
 		ChanReserve:      aliceReserve,
 		MinHTLC:          0,
-		MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-		CsvDelay:         uint16(csvTimeoutAlice),
+		MaxAcceptedHtlcs: maxInflightHtlcs,
+	}
+	aliceCommitParams := channeldb.CommitmentParams{
+		DustLimit: btcutil.Amount(200),
+		CsvDelay:  uint16(csvTimeoutAlice),
 	}
 
-	bobConstraints := &channeldb.ChannelConstraints{
-		DustLimit: btcutil.Amount(800),
+	bobBounds := channeldb.ChannelStateBounds{
 		MaxPendingAmount: lnwire.NewMSatFromSatoshis(
 			channelCapacity),
 		ChanReserve:      bobReserve,
 		MinHTLC:          0,
-		MaxAcceptedHtlcs: input.MaxHTLCNumber / 2,
-		CsvDelay:         uint16(csvTimeoutBob),
+		MaxAcceptedHtlcs: maxInflightHtlcs,
+	}
+	bobCommitParams := channeldb.CommitmentParams{
+		DustLimit: btcutil.Amount(800),
+		CsvDelay:  uint16(csvTimeoutBob),
 	}
 
 	var hash [sha256.Size]byte
@@ -172,7 +182,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 	fundingTxIn := wire.NewTxIn(prevOut, nil, nil)
 
 	aliceCfg := channeldb.ChannelConfig{
-		ChannelConstraints: *aliceConstraints,
+		ChannelStateBounds: aliceBounds,
+		CommitmentParams:   aliceCommitParams,
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: aliceKeyPub,
 		},
@@ -190,7 +201,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 		},
 	}
 	bobCfg := channeldb.ChannelConfig{
-		ChannelConstraints: *bobConstraints,
+		ChannelStateBounds: bobBounds,
+		CommitmentParams:   bobCommitParams,
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: bobKeyPub,
 		},
@@ -345,8 +357,11 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 	)
 
 	alicePool := lnwallet.NewSigPool(runtime.NumCPU(), aliceSigner)
+	signerMock := lnwallet.NewDefaultAuxSignerMock(t)
 	channelAlice, err := lnwallet.NewLightningChannel(
 		aliceSigner, aliceChannelState, alicePool,
+		lnwallet.WithLeafStore(&lnwallet.MockAuxLeafStore{}),
+		lnwallet.WithAuxSigner(signerMock),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -356,6 +371,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 	bobPool := lnwallet.NewSigPool(runtime.NumCPU(), bobSigner)
 	channelBob, err := lnwallet.NewLightningChannel(
 		bobSigner, bobChannelState, bobPool,
+		lnwallet.WithLeafStore(&lnwallet.MockAuxLeafStore{}),
+		lnwallet.WithAuxSigner(signerMock),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -417,6 +434,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 
 		newAliceChannel, err := lnwallet.NewLightningChannel(
 			aliceSigner, aliceStoredChannel, alicePool,
+			lnwallet.WithLeafStore(&lnwallet.MockAuxLeafStore{}),
+			lnwallet.WithAuxSigner(signerMock),
 		)
 		if err != nil {
 			return nil, errors.Errorf("unable to create new channel: %v",
@@ -463,6 +482,8 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 
 		newBobChannel, err := lnwallet.NewLightningChannel(
 			bobSigner, bobStoredChannel, bobPool,
+			lnwallet.WithLeafStore(&lnwallet.MockAuxLeafStore{}),
+			lnwallet.WithAuxSigner(signerMock),
 		)
 		if err != nil {
 			return nil, errors.Errorf("unable to create new channel: %v",
@@ -1053,17 +1074,17 @@ func serverOptionRejectHtlc(alice, bob, carol bool) serverOption {
 	}
 }
 
-// createTwoClusterChannels creates lightning channels which are needed for
-// a 2 hop network cluster to be initialized.
-func createTwoClusterChannels(t *testing.T, aliceToBob,
-	bobToCarol btcutil.Amount) (*testLightningChannel,
+// createMirroredChannel creates two LightningChannel objects which represent
+// the state machines on either side of a single channel between alice and bob.
+func createMirroredChannel(t *testing.T, aliceToBob,
+	bobToAlice btcutil.Amount) (*testLightningChannel,
 	*testLightningChannel, error) {
 
 	_, _, firstChanID, _ := genIDs()
 
-	// Create lightning channels between Alice<->Bob and Bob<->Carol
+	// Create lightning channels between Alice<->Bob for Alice and Bob
 	alice, bob, err := createTestChannel(t, alicePrivKey, bobPrivKey,
-		aliceToBob, aliceToBob, 0, 0, firstChanID,
+		aliceToBob, bobToAlice, 0, 0, firstChanID,
 	)
 	if err != nil {
 		return nil, nil, errors.Errorf("unable to create "+
@@ -1127,15 +1148,19 @@ func (h *hopNetwork) createChannelLink(server, peer *mockServer,
 		return nil
 	}
 
+	forwardPackets := func(linkQuit <-chan struct{}, _ bool,
+		packets ...*htlcPacket) error {
+
+		return server.htlcSwitch.ForwardPackets(linkQuit, packets...)
+	}
+
 	link := NewChannelLink(
 		ChannelLinkConfig{
-			BestHeight:    server.htlcSwitch.BestHeight,
-			FwrdingPolicy: h.globalPolicy,
-			Peer:          peer,
-			Circuits:      server.htlcSwitch.CircuitModifier(),
-			ForwardPackets: func(linkQuit chan struct{}, _ bool, packets ...*htlcPacket) error {
-				return server.htlcSwitch.ForwardPackets(linkQuit, packets...)
-			},
+			BestHeight:         server.htlcSwitch.BestHeight,
+			FwrdingPolicy:      h.globalPolicy,
+			Peer:               peer,
+			Circuits:           server.htlcSwitch.CircuitModifier(),
+			ForwardPackets:     forwardPackets,
 			DecodeHopIterators: decoder.DecodeHopIterators,
 			ExtractErrorEncrypter: func(*btcec.PublicKey) (
 				hop.ErrorEncrypter, lnwire.FailCode) {
@@ -1176,12 +1201,14 @@ func (h *hopNetwork) createChannelLink(server, peer *mockServer,
 	}
 
 	go func() {
-		for {
-			select {
-			case <-notifyUpdateChan:
-			case <-link.(*channelLink).quit:
-				close(doneChan)
-				return
+		if chanLink, ok := link.(*channelLink); ok {
+			for {
+				select {
+				case <-notifyUpdateChan:
+				case <-chanLink.Quit:
+					close(doneChan)
+					return
+				}
 			}
 		}
 	}()

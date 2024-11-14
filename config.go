@@ -71,8 +71,6 @@ const (
 	defaultChanEnableTimeout             = 19 * time.Minute
 	defaultChanDisableTimeout            = 20 * time.Minute
 	defaultHeightHintCacheQueryDisable   = false
-	defaultMaxLogFiles                   = 3
-	defaultMaxLogFileSize                = 10
 	defaultMinBackoff                    = time.Second
 	defaultMaxBackoff                    = time.Hour
 	defaultLetsEncryptDirname            = "letsencrypt"
@@ -168,6 +166,17 @@ const (
 	defaultRSTimeout  = time.Second * 1
 	defaultRSBackoff  = time.Second * 30
 	defaultRSAttempts = 1
+
+	// Set defaults for a health check which ensures that the leader
+	// election is functioning correctly. Although this check is off by
+	// default (as etcd leader election is only used in a clustered setup),
+	// we still set the default values so that the health check can be
+	// easily enabled with sane defaults. Note that by default we only run
+	// this check once, as it is critical for the node's operation.
+	defaultLeaderCheckInterval = time.Minute
+	defaultLeaderCheckTimeout  = time.Second * 5
+	defaultLeaderCheckBackoff  = time.Second * 5
+	defaultLeaderCheckAttempts = 1
 
 	// defaultRemoteMaxHtlcs specifies the default limit for maximum
 	// concurrent HTLCs the remote party may add to commitment transactions.
@@ -304,8 +313,8 @@ type Config struct {
 	ReadMacPath     string        `long:"readonlymacaroonpath" description:"Path to write the read-only macaroon for lnd's RPC and REST services if it doesn't exist"`
 	InvoiceMacPath  string        `long:"invoicemacaroonpath" description:"Path to the invoice-only macaroon for lnd's RPC and REST services if it doesn't exist"`
 	LogDir          string        `long:"logdir" description:"Directory to log output."`
-	MaxLogFiles     int           `long:"maxlogfiles" description:"Maximum logfiles to keep (0 for no rotation)"`
-	MaxLogFileSize  int           `long:"maxlogfilesize" description:"Maximum logfile size in MB"`
+	MaxLogFiles     int           `long:"maxlogfiles" description:"Maximum logfiles to keep (0 for no rotation). DEPRECATED: use --logging.file.max-files instead" hidden:"true"`
+	MaxLogFileSize  int           `long:"maxlogfilesize" description:"Maximum logfile size in MB. DEPRECATED: use --logging.file.max-file-size instead" hidden:"true"`
 	AcceptorTimeout time.Duration `long:"acceptortimeout" description:"Time after which an RPCAcceptor will time out and return false if it hasn't yet received a response"`
 
 	LetsEncryptDir    string `long:"letsencryptdir" description:"The directory to store Let's Encrypt certificates within"`
@@ -339,12 +348,12 @@ type Config struct {
 
 	DebugLevel string `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <global-level>,<subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
 
-	CPUProfile string `long:"cpuprofile" description:"Write CPU profile to the specified file"`
+	CPUProfile      string `long:"cpuprofile" description:"DEPRECATED: Use 'pprof.cpuprofile' option. Write CPU profile to the specified file" hidden:"true"`
+	Profile         string `long:"profile" description:"DEPRECATED: Use 'pprof.profile' option. Enable HTTP profiling on either a port or host:port" hidden:"true"`
+	BlockingProfile int    `long:"blockingprofile" description:"DEPRECATED: Use 'pprof.blockingprofile' option. Used to enable a blocking profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every blocking event, and 0 including no events." hidden:"true"`
+	MutexProfile    int    `long:"mutexprofile" description:"DEPRECATED: Use 'pprof.mutexprofile' option. Used to Enable a mutex profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every mutex event, and 0 including no events." hidden:"true"`
 
-	Profile string `long:"profile" description:"Enable HTTP profiling on either a port or host:port"`
-
-	BlockingProfile int `long:"blockingprofile" description:"Used to enable a blocking profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every blocking event, and 0 including no events."`
-	MutexProfile    int `long:"mutexprofile" description:"Used to Enable a mutex profile to be served on the profiling port. This takes a value from 0 to 1, with 1 including every mutex event, and 0 including no events."`
+	Pprof *lncfg.Pprof `group:"Pprof" namespace:"pprof"`
 
 	UnsafeDisconnect   bool   `long:"unsafe-disconnect" description:"DEPRECATED: Allows the rpcserver to intentionally disconnect from peers with open channels. THIS FLAG WILL BE REMOVED IN 0.10.0" hidden:"true"`
 	UnsafeReplay       bool   `long:"unsafe-replay" description:"Causes a link to replay the adds on its commitment txn after starting up, this enables testing of the sphinx replay logic."`
@@ -441,7 +450,9 @@ type Config struct {
 
 	GcCanceledInvoicesOnTheFly bool `long:"gc-canceled-invoices-on-the-fly" description:"If true, we'll delete newly canceled invoices on the fly."`
 
-	DustThreshold uint64 `long:"dust-threshold" description:"Sets the dust sum threshold in satoshis for a channel after which dust HTLC's will be failed."`
+	DustThreshold uint64 `long:"dust-threshold" description:"DEPRECATED: Sets the max fee exposure in satoshis for a channel after which HTLC's will be failed." hidden:"true"`
+
+	MaxFeeExposure uint64 `long:"channel-max-fee-exposure" description:" Limits the maximum fee exposure in satoshis of a channel. This value is enforced for all channels and is independent of the channel initiator."`
 
 	Fee *lncfg.Fee `group:"fee" namespace:"fee"`
 
@@ -481,9 +492,11 @@ type Config struct {
 
 	GRPC *GRPCConfig `group:"grpc" namespace:"grpc"`
 
-	// LogWriter is the root logger that all of the daemon's subloggers are
+	// SubLogMgr is the root logger that all the daemon's subloggers are
 	// hooked up to.
-	LogWriter *build.RotatingLogWriter
+	SubLogMgr  *build.SubLoggerManager
+	LogRotator *build.RotatingLogWriter
+	LogConfig  *build.LogConfig `group:"logging" namespace:"logging"`
 
 	// networkDir is the path to the directory of the currently active
 	// network. This path will hold the files related to each different
@@ -549,8 +562,8 @@ func DefaultConfig() Config {
 		LetsEncryptDir:    defaultLetsEncryptDir,
 		LetsEncryptListen: defaultLetsEncryptListen,
 		LogDir:            defaultLogDir,
-		MaxLogFiles:       defaultMaxLogFiles,
-		MaxLogFileSize:    defaultMaxLogFileSize,
+		MaxLogFiles:       build.DefaultMaxLogFiles,
+		MaxLogFileSize:    build.DefaultMaxLogFileSize,
 		AcceptorTimeout:   defaultAcceptorTimeout,
 		WSPingInterval:    lnrpc.DefaultPingInterval,
 		WSPongWait:        lnrpc.DefaultPongWait,
@@ -672,6 +685,12 @@ func DefaultConfig() Config {
 				Attempts: defaultRSAttempts,
 				Backoff:  defaultRSBackoff,
 			},
+			LeaderCheck: &lncfg.CheckConfig{
+				Interval: defaultLeaderCheckInterval,
+				Timeout:  defaultLeaderCheckTimeout,
+				Attempts: defaultLeaderCheckAttempts,
+				Backoff:  defaultLeaderCheckBackoff,
+			},
 		},
 		Gossip: &lncfg.Gossip{
 			MaxChannelUpdateBurst: discovery.DefaultMaxChannelUpdateBurst,
@@ -681,11 +700,19 @@ func DefaultConfig() Config {
 		Invoices: &lncfg.Invoices{
 			HoldExpiryDelta: lncfg.DefaultHoldInvoiceExpiryDelta,
 		},
+		Routing: &lncfg.Routing{
+			BlindedPaths: lncfg.BlindedPaths{
+				MinNumRealHops:           lncfg.DefaultMinNumRealBlindedPathHops,
+				NumHops:                  lncfg.DefaultNumBlindedPathHops,
+				MaxNumPaths:              lncfg.DefaultMaxNumBlindedPaths,
+				PolicyIncreaseMultiplier: lncfg.DefaultBlindedPathPolicyIncreaseMultiplier,
+				PolicyDecreaseMultiplier: lncfg.DefaultBlindedPathPolicyDecreaseMultiplier,
+			},
+		},
 		MaxOutgoingCltvExpiry:     htlcswitch.DefaultMaxOutgoingCltvExpiry,
 		MaxChannelFeeAllocation:   htlcswitch.DefaultMaxLinkFeeAllocation,
 		MaxCommitFeeRateAnchors:   lnwallet.DefaultAnchorsCommitMaxFeeRateSatPerVByte,
-		DustThreshold:             uint64(htlcswitch.DefaultDustThreshold.ToSatoshis()),
-		LogWriter:                 build.NewRotatingLogWriter(),
+		LogRotator:                build.NewRotatingLogWriter(),
 		DB:                        lncfg.DefaultDB(),
 		Cluster:                   lncfg.DefaultCluster(),
 		RPCMiddleware:             lncfg.DefaultRPCMiddleware(),
@@ -707,6 +734,7 @@ func DefaultConfig() Config {
 			ServerPingTimeout: defaultGrpcServerPingTimeout,
 			ClientPingMinWait: defaultGrpcClientPingMinWait,
 		},
+		LogConfig:         build.DefaultLogConfig(),
 		WtClient:          lncfg.DefaultWtClientCfg(),
 		HTTPHeaderTimeout: DefaultHTTPHeaderTimeout,
 	}
@@ -792,7 +820,8 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 	cleanCfg, err := ValidateConfig(
 		cfg, interceptor, fileParser, flagParser,
 	)
-	if usageErr, ok := err.(*usageError); ok {
+	var usageErr *lncfg.UsageError
+	if errors.As(err, &usageErr) {
 		// The logging system might not yet be initialized, so we also
 		// write to stderr to make sure the error appears somewhere.
 		_, _ = fmt.Fprintln(os.Stderr, usageMessage)
@@ -801,9 +830,9 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 		// The log subsystem might not yet be initialized. But we still
 		// try to log the error there since some packaging solutions
 		// might only look at the log and not stdout/stderr.
-		ltndLog.Warnf("Error validating config: %v", usageErr.err)
+		ltndLog.Warnf("Error validating config: %v", err)
 
-		return nil, usageErr.err
+		return nil, err
 	}
 	if err != nil {
 		// The log subsystem might not yet be initialized. But we still
@@ -825,18 +854,6 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, error) {
 	logWarningsForDeprecation(*cleanCfg)
 
 	return cleanCfg, nil
-}
-
-// usageError is an error type that signals a problem with the supplied flags.
-type usageError struct {
-	err error
-}
-
-// Error returns the error string.
-//
-// NOTE: This is part of the error interface.
-func (u *usageError) Error() string {
-	return u.err.Error()
 }
 
 // ValidateConfig check the given configuration to be sane. This makes sure no
@@ -1318,31 +1335,6 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		cfg.Autopilot.MaxChannelSize = int64(MaxFundingAmount)
 	}
 
-	// Validate profile port or host:port.
-	if cfg.Profile != "" {
-		str := "%s: The profile port must be between 1024 and 65535"
-
-		// Try to parse Profile as a host:port.
-		_, hostPort, err := net.SplitHostPort(cfg.Profile)
-		if err == nil {
-			// Determine if the port is valid.
-			profilePort, err := strconv.Atoi(hostPort)
-			if err != nil || profilePort < 1024 || profilePort > 65535 {
-				return nil, &usageError{mkErr(str)}
-			}
-		} else {
-			// Try to parse Profile as a port.
-			profilePort, err := strconv.Atoi(cfg.Profile)
-			if err != nil || profilePort < 1024 || profilePort > 65535 {
-				return nil, &usageError{mkErr(str)}
-			}
-
-			// Since the user just set a port, we will serve debugging
-			// information over localhost.
-			cfg.Profile = net.JoinHostPort("127.0.0.1", cfg.Profile)
-		}
-	}
-
 	// We'll now construct the network directory which will be where we
 	// store all the data specific to this chain/network.
 	cfg.networkDir = filepath.Join(
@@ -1407,24 +1399,48 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		lncfg.NormalizeNetwork(cfg.ActiveNetParams.Name),
 	)
 
-	// A log writer must be passed in, otherwise we can't function and would
-	// run into a panic later on.
-	if cfg.LogWriter == nil {
-		return nil, mkErr("log writer missing in config")
+	if err := cfg.LogConfig.Validate(); err != nil {
+		return nil, mkErr("error validating logging config: %w", err)
 	}
+
+	cfg.SubLogMgr = build.NewSubLoggerManager(build.NewDefaultLogHandlers(
+		cfg.LogConfig, cfg.LogRotator,
+	)...)
+
+	// Initialize logging at the default logging level.
+	SetupLoggers(cfg.SubLogMgr, interceptor)
 
 	// Special show command to list supported subsystems and exit.
 	if cfg.DebugLevel == "show" {
 		fmt.Println("Supported subsystems",
-			cfg.LogWriter.SupportedSubsystems())
+			cfg.SubLogMgr.SupportedSubsystems())
 		os.Exit(0)
 	}
 
-	// Initialize logging at the default logging level.
-	SetupLoggers(cfg.LogWriter, interceptor)
-	err = cfg.LogWriter.InitLogRotator(
+	if cfg.MaxLogFiles != build.DefaultMaxLogFiles {
+		if cfg.LogConfig.File.MaxLogFiles !=
+			build.DefaultMaxLogFiles {
+
+			return nil, mkErr("cannot set both maxlogfiles and "+
+				"logging.file.max-files", err)
+		}
+
+		cfg.LogConfig.File.MaxLogFiles = cfg.MaxLogFiles
+	}
+	if cfg.MaxLogFileSize != build.DefaultMaxLogFileSize {
+		if cfg.LogConfig.File.MaxLogFileSize !=
+			build.DefaultMaxLogFileSize {
+
+			return nil, mkErr("cannot set both maxlogfilesize and "+
+				"logging.file.max-file-size", err)
+		}
+
+		cfg.LogConfig.File.MaxLogFileSize = cfg.MaxLogFileSize
+	}
+
+	err = cfg.LogRotator.InitLogRotator(
+		cfg.LogConfig.File,
 		filepath.Join(cfg.LogDir, defaultLogFilename),
-		cfg.MaxLogFileSize, cfg.MaxLogFiles,
 	)
 	if err != nil {
 		str := "log rotation setup failed: %v"
@@ -1432,10 +1448,10 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 	}
 
 	// Parse, validate, and set debug log level(s).
-	err = build.ParseAndSetDebugLevels(cfg.DebugLevel, cfg.LogWriter)
+	err = build.ParseAndSetDebugLevels(cfg.DebugLevel, cfg.SubLogMgr)
 	if err != nil {
 		str := "error parsing debug level: %v"
-		return nil, &usageError{mkErr(str, err)}
+		return nil, &lncfg.UsageError{Err: mkErr(str, err)}
 	}
 
 	// At least one RPCListener is required. So listen on localhost per
@@ -1656,18 +1672,6 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		return nil, mkErr("error parsing gossip syncer: %v", err)
 	}
 
-	// Log a warning if our expiry delta is not greater than our incoming
-	// broadcast delta. We do not fail here because this value may be set
-	// to zero to intentionally keep lnd's behavior unchanged from when we
-	// didn't auto-cancel these invoices.
-	if cfg.Invoices.HoldExpiryDelta <= lncfg.DefaultIncomingBroadcastDelta {
-		ltndLog.Warnf("Invoice hold expiry delta: %v <= incoming "+
-			"delta: %v, accepted hold invoices will force close "+
-			"channels if they are not canceled manually",
-			cfg.Invoices.HoldExpiryDelta,
-			lncfg.DefaultIncomingBroadcastDelta)
-	}
-
 	// If the experimental protocol options specify any protocol messages
 	// that we want to handle as custom messages, set them now.
 	customMsg := cfg.ProtocolOptions.CustomMessageOverrides()
@@ -1676,6 +1680,60 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 	// startup is blocked on config parsing.
 	if err := lnwire.SetCustomOverrides(customMsg); err != nil {
 		return nil, mkErr("custom-message: %v", err)
+	}
+
+	// Map old pprof flags to new pprof group flags.
+	//
+	// NOTE: This is a temporary measure to ensure compatibility with old
+	// flags.
+	if cfg.CPUProfile != "" {
+		if cfg.Pprof.CPUProfile != "" {
+			return nil, mkErr("cpuprofile and pprof.cpuprofile " +
+				"are mutually exclusive")
+		}
+		cfg.Pprof.CPUProfile = cfg.CPUProfile
+	}
+	if cfg.Profile != "" {
+		if cfg.Pprof.Profile != "" {
+			return nil, mkErr("profile and pprof.profile " +
+				"are mutually exclusive")
+		}
+		cfg.Pprof.Profile = cfg.Profile
+	}
+	if cfg.BlockingProfile != 0 {
+		if cfg.Pprof.BlockingProfile != 0 {
+			return nil, mkErr("blockingprofile and " +
+				"pprof.blockingprofile are mutually exclusive")
+		}
+		cfg.Pprof.BlockingProfile = cfg.BlockingProfile
+	}
+	if cfg.MutexProfile != 0 {
+		if cfg.Pprof.MutexProfile != 0 {
+			return nil, mkErr("mutexprofile and " +
+				"pprof.mutexprofile are mutually exclusive")
+		}
+		cfg.Pprof.MutexProfile = cfg.MutexProfile
+	}
+
+	// Don't allow both the old dust-threshold and the new
+	// channel-max-fee-exposure to be set.
+	if cfg.DustThreshold != 0 && cfg.MaxFeeExposure != 0 {
+		return nil, mkErr("cannot set both dust-threshold and " +
+			"channel-max-fee-exposure")
+	}
+
+	switch {
+	// Use the old dust-threshold as the max fee exposure if it is set and
+	// the new option is not.
+	case cfg.DustThreshold != 0:
+		cfg.MaxFeeExposure = cfg.DustThreshold
+
+	// Use the default max fee exposure if the new option is not set and
+	// the old one is not set either.
+	case cfg.MaxFeeExposure == 0:
+		cfg.MaxFeeExposure = uint64(
+			htlcswitch.DefaultMaxFeeExposure.ToSatoshis(),
+		)
 	}
 
 	// Validate the subconfigs for workers, caches, and the tower client.
@@ -1690,6 +1748,9 @@ func ValidateConfig(cfg Config, interceptor signal.Interceptor, fileParser,
 		cfg.RemoteSigner,
 		cfg.Sweeper,
 		cfg.Htlcswitch,
+		cfg.Invoices,
+		cfg.Routing,
+		cfg.Pprof,
 	)
 	if err != nil {
 		return nil, err

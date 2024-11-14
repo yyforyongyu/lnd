@@ -12,6 +12,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainreg"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/funding"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/labels"
@@ -19,6 +20,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/stretchr/testify/require"
 )
@@ -872,7 +874,7 @@ func testChannelFundingPersistence(ht *lntest.HarnessTest) {
 	// channel has been opened. The funding transaction should be found
 	// within the newly mined block.
 	block := ht.MineBlocksAndAssertNumTxes(1, 1)[0]
-	ht.AssertTxInBlock(block, fundingTxID)
+	ht.AssertTxInBlock(block, *fundingTxID)
 
 	// Get the height that our transaction confirmed at.
 	height := int32(ht.CurrentHeight())
@@ -925,8 +927,8 @@ func testChannelFundingPersistence(ht *lntest.HarnessTest) {
 
 	// Make sure Alice and Carol have seen the channel in their network
 	// topology.
-	ht.AssertTopologyChannelOpen(alice, chanPoint)
-	ht.AssertTopologyChannelOpen(carol, chanPoint)
+	ht.AssertChannelInGraph(alice, chanPoint)
+	ht.AssertChannelInGraph(carol, chanPoint)
 
 	// Create an additional check for our channel assertion that will
 	// check that our label is as expected.
@@ -968,11 +970,16 @@ func testBatchChanFunding(ht *lntest.HarnessTest) {
 	ht.EnsureConnected(alice, dave)
 	ht.EnsureConnected(alice, eve)
 
+	expectedFeeRate := chainfee.SatPerKWeight(2500)
+
+	// We verify that the channel opening uses the correct fee rate.
+	ht.SetFeeEstimateWithConf(expectedFeeRate, 3)
+
 	// Let's create our batch TX request. This first one should fail as we
 	// open a channel to Carol that is too small for her min chan size.
 	batchReq := &lnrpc.BatchOpenChannelRequest{
-		SatPerVbyte: 12,
-		MinConfs:    1,
+		TargetConf: 3,
+		MinConfs:   1,
 		Channels: []*lnrpc.BatchOpenChannel{{
 			NodePubkey:         bob.PubKey[:],
 			LocalFundingAmount: 100_000,
@@ -1048,7 +1055,7 @@ func testBatchChanFunding(ht *lntest.HarnessTest) {
 
 	// Ensure that Alice can send funds to Eve via the zero-conf channel
 	// before the batch transaction was mined.
-	ht.AssertTopologyChannelOpen(alice, chanPoint4)
+	ht.AssertChannelInGraph(alice, chanPoint4)
 	eveInvoiceParams := &lnrpc.Invoice{
 		Value:   int64(10_000),
 		Private: true,
@@ -1060,14 +1067,20 @@ func testBatchChanFunding(ht *lntest.HarnessTest) {
 
 	// Mine the batch transaction and check the network topology.
 	block := ht.MineBlocksAndAssertNumTxes(6, 1)[0]
-	ht.AssertTxInBlock(block, txHash)
-	ht.AssertTopologyChannelOpen(alice, chanPoint1)
-	ht.AssertTopologyChannelOpen(alice, chanPoint2)
-	ht.AssertTopologyChannelOpen(alice, chanPoint3)
+	ht.AssertTxInBlock(block, *txHash)
+	ht.AssertChannelInGraph(alice, chanPoint1)
+	ht.AssertChannelInGraph(alice, chanPoint2)
+	ht.AssertChannelInGraph(alice, chanPoint3)
 
 	// Check if the change type from the batch_open_channel funding is P2TR.
-	rawTx := ht.GetRawTransaction(txHash)
+	rawTx := ht.GetRawTransaction(*txHash)
 	require.Len(ht, rawTx.MsgTx().TxOut, 5)
+
+	// Check the fee rate of the batch-opening transaction. We expect slight
+	// inaccuracies because of the DER signature fee estimation.
+	openingFeeRate := ht.CalculateTxFeeRate(rawTx.MsgTx())
+	require.InEpsilonf(ht, uint64(expectedFeeRate), uint64(openingFeeRate),
+		0.01, "want %v, got %v", expectedFeeRate, openingFeeRate)
 
 	// For calculating the change output index we use the formula for the
 	// sum of consecutive of integers (n(n+1)/2). All the channel point
@@ -1180,6 +1193,7 @@ func deriveFundingShim(ht *lntest.HarnessTest, carol, dave *node.HarnessNode,
 
 		_, fundingOutput, err = input.GenTaprootFundingScript(
 			carolKey, daveKey, int64(chanSize),
+			fn.None[chainhash.Hash](),
 		)
 		require.NoError(ht, err)
 

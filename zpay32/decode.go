@@ -14,13 +14,57 @@ import (
 	"github.com/btcsuite/btcd/btcutil/bech32"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
+// DecodeOption is a type that can be used to supply functional options to the
+// Decode function.
+type DecodeOption func(*decodeOptions)
+
+// WithKnownFeatureBits is a functional option that overwrites the set of
+// known feature bits. If not set, then LND's lnwire.Features variable will be
+// used by default.
+func WithKnownFeatureBits(features map[lnwire.FeatureBit]string) DecodeOption {
+	return func(options *decodeOptions) {
+		options.knownFeatureBits = features
+	}
+}
+
+// WithErrorOnUnknownFeatureBit is a functional option that will cause the
+// Decode function to return an error if the decoded invoice contains an unknown
+// feature bit.
+func WithErrorOnUnknownFeatureBit() DecodeOption {
+	return func(options *decodeOptions) {
+		options.errorOnUnknownFeature = true
+	}
+}
+
+// decodeOptions holds the set of Decode options.
+type decodeOptions struct {
+	knownFeatureBits      map[lnwire.FeatureBit]string
+	errorOnUnknownFeature bool
+}
+
+// newDecodeOptions constructs the default decodeOptions struct.
+func newDecodeOptions() *decodeOptions {
+	return &decodeOptions{
+		knownFeatureBits:      lnwire.Features,
+		errorOnUnknownFeature: false,
+	}
+}
+
 // Decode parses the provided encoded invoice and returns a decoded Invoice if
 // it is valid by BOLT-0011 and matches the provided active network.
-func Decode(invoice string, net *chaincfg.Params) (*Invoice, error) {
-	decodedInvoice := Invoice{}
+func Decode(invoice string, net *chaincfg.Params, opts ...DecodeOption) (
+	*Invoice, error) {
+
+	options := newDecodeOptions()
+	for _, o := range opts {
+		o(options)
+	}
+
+	var decodedInvoice Invoice
 
 	// Before bech32 decoding the invoice, make sure that it is not too large.
 	// This is done as an anti-DoS measure since bech32 decoding is expensive.
@@ -134,7 +178,7 @@ func Decode(invoice string, net *chaincfg.Params) (*Invoice, error) {
 	// If no feature vector was decoded, populate an empty one.
 	if decodedInvoice.Features == nil {
 		decodedInvoice.Features = lnwire.NewFeatureVector(
-			nil, lnwire.Features,
+			nil, options.knownFeatureBits,
 		)
 	}
 
@@ -142,6 +186,24 @@ func Decode(invoice string, net *chaincfg.Params) (*Invoice, error) {
 	// fields set.
 	if err := validateInvoice(&decodedInvoice); err != nil {
 		return nil, err
+	}
+
+	if options.errorOnUnknownFeature {
+		// Make sure that we understand all the required feature bits
+		// in the invoice.
+		unknownFeatureBits := decodedInvoice.Features.
+			UnknownRequiredFeatures()
+
+		if len(unknownFeatureBits) > 0 {
+			errStr := fmt.Sprintf("invoice contains " +
+				"unknown feature bits:")
+
+			for _, bit := range unknownFeatureBits {
+				errStr += fmt.Sprintf(" %d,", bit)
+			}
+
+			return nil, errors.New(strings.TrimRight(errStr, ","))
+		}
 	}
 
 	return &decodedInvoice, nil
@@ -217,13 +279,19 @@ func parseTaggedFields(invoice *Invoice, fields []byte, net *chaincfg.Params) er
 			invoice.PaymentHash, err = parse32Bytes(base32Data)
 
 		case fieldTypeS:
-			if invoice.PaymentAddr != nil {
+			if invoice.PaymentAddr.IsSome() {
 				// We skip the field if we have already seen a
 				// supported one.
 				continue
 			}
 
-			invoice.PaymentAddr, err = parse32Bytes(base32Data)
+			addr, err := parse32Bytes(base32Data)
+			if err != nil {
+				return err
+			}
+			if addr != nil {
+				invoice.PaymentAddr = fn.Some(*addr)
+			}
 
 		case fieldTypeD:
 			if invoice.Description != nil {

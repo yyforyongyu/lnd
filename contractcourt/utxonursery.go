@@ -18,8 +18,10 @@ import (
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/labels"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/sweep"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 //                          SUMMARY OF OUTPUT STATES
@@ -947,10 +949,7 @@ func (u *UtxoNursery) waitForSweepConf(classHeight uint32,
 func (u *UtxoNursery) sweepCribOutput(classHeight uint32, baby *babyOutput) error {
 	utxnLog.Infof("Publishing CLTV-delayed HTLC output using timeout tx "+
 		"(txid=%v): %v", baby.timeoutTx.TxHash(),
-		newLogClosure(func() string {
-			return spew.Sdump(baby.timeoutTx)
-		}),
-	)
+		lnutils.SpewLogClosure(baby.timeoutTx))
 
 	// We'll now broadcast the HTLC transaction, then wait for it to be
 	// confirmed before transitioning it to kindergarten.
@@ -1425,6 +1424,7 @@ func makeKidOutput(outpoint, originChanPoint *wire.OutPoint,
 	return kidOutput{
 		breachedOutput: makeBreachedOutput(
 			outpoint, witnessType, nil, signDescriptor, heightHint,
+			fn.None[tlv.Blob](),
 		),
 		isHtlc:           isHtlc,
 		originChanPoint:  *originChanPoint,

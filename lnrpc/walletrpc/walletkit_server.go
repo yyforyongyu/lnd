@@ -29,6 +29,7 @@ import (
 	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/input"
@@ -42,6 +43,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/sweep"
+	"golang.org/x/exp/maps"
 	"google.golang.org/grpc"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 )
@@ -103,6 +105,10 @@ var (
 			Action: "read",
 		}},
 		"/walletrpc.WalletKit/BumpFee": {{
+			Entity: "onchain",
+			Action: "write",
+		}},
+		"/walletrpc.WalletKit/BumpForceCloseFee": {{
 			Entity: "onchain",
 			Action: "write",
 		}},
@@ -490,7 +496,7 @@ func (w *WalletKit) LeaseOutput(ctx context.Context,
 	// other concurrent processes attempting to lease the same UTXO.
 	var expiration time.Time
 	err = w.cfg.CoinSelectionLocker.WithCoinSelectLock(func() error {
-		expiration, _, _, err = w.cfg.Wallet.LeaseOutput(
+		expiration, err = w.cfg.Wallet.LeaseOutput(
 			lockID, *op, duration,
 		)
 		return err
@@ -530,7 +536,9 @@ func (w *WalletKit) ReleaseOutput(ctx context.Context,
 		return nil, err
 	}
 
-	return &ReleaseOutputResponse{}, nil
+	return &ReleaseOutputResponse{
+		Status: fmt.Sprintf("output %v released", op.String()),
+	}, nil
 }
 
 // ListLeases returns a list of all currently locked utxos.
@@ -811,8 +819,8 @@ func (w *WalletKit) SendOutputs(ctx context.Context,
 	// requirement, we can request that the wallet attempts to create this
 	// transaction.
 	tx, err := w.cfg.Wallet.SendOutputs(
-		outputsToCreate, chainfee.SatPerKWeight(req.SatPerKw), minConfs,
-		label, coinSelectionStrategy,
+		nil, outputsToCreate, chainfee.SatPerKWeight(req.SatPerKw),
+		minConfs, label, coinSelectionStrategy,
 	)
 	if err != nil {
 		return nil, err
@@ -849,8 +857,11 @@ func (w *WalletKit) EstimateFee(ctx context.Context,
 		return nil, err
 	}
 
+	relayFeePerKw := w.cfg.FeeEstimator.RelayFeePerKW()
+
 	return &EstimateFeeResponse{
-		SatPerKw: int64(satPerKw),
+		SatPerKw:            int64(satPerKw),
+		MinRelayFeeSatPerKw: int64(relayFeePerKw),
 	}, nil
 }
 
@@ -1122,6 +1133,163 @@ func (w *WalletKit) BumpFee(ctx context.Context,
 	}, nil
 }
 
+// getWaitingCloseChannel returns the waiting close channel in case it does
+// exist in the underlying channel state database.
+func (w *WalletKit) getWaitingCloseChannel(
+	chanPoint wire.OutPoint) (*channeldb.OpenChannel, error) {
+
+	// Fetch all channels, which still have their commitment transaction not
+	// confirmed (waiting close channels).
+	chans, err := w.cfg.ChanStateDB.FetchWaitingCloseChannels()
+	if err != nil {
+		return nil, err
+	}
+
+	channel := fn.Find(func(c *channeldb.OpenChannel) bool {
+		return c.FundingOutpoint == chanPoint
+	}, chans)
+
+	return channel.UnwrapOrErr(errors.New("channel not found"))
+}
+
+// BumpForceCloseFee bumps the fee rate of an unconfirmed anchor channel. It
+// updates the new fee rate parameters with the sweeper subsystem. Additionally
+// it will try to create anchor cpfp transactions for all possible commitment
+// transactions (local, remote, remote-dangling) so depending on which
+// commitment is in the local mempool only one of them will succeed in being
+// broadcasted.
+func (w *WalletKit) BumpForceCloseFee(_ context.Context,
+	in *BumpForceCloseFeeRequest) (*BumpForceCloseFeeResponse, error) {
+
+	if in.ChanPoint == nil {
+		return nil, fmt.Errorf("no chan_point provided")
+	}
+
+	lnrpcOutpoint, err := lnrpc.GetChannelOutPoint(in.ChanPoint)
+	if err != nil {
+		return nil, err
+	}
+
+	outPoint, err := UnmarshallOutPoint(lnrpcOutpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the relevant channel if it is in the waiting close state.
+	channel, err := w.getWaitingCloseChannel(*outPoint)
+	if err != nil {
+		return nil, err
+	}
+
+	if !channel.ChanType.HasAnchors() {
+		return nil, fmt.Errorf("not able to bump the fee of a " +
+			"non-anchor channel")
+	}
+
+	// Match pending sweeps with commitments of the channel for which a bump
+	// is requested. Depending on the commitment state when force closing
+	// the channel we might have up to 3 commitments to consider when
+	// bumping the fee.
+	commitSet := fn.NewSet[chainhash.Hash]()
+
+	if channel.LocalCommitment.CommitTx != nil {
+		localTxID := channel.LocalCommitment.CommitTx.TxHash()
+		commitSet.Add(localTxID)
+	}
+
+	if channel.RemoteCommitment.CommitTx != nil {
+		remoteTxID := channel.RemoteCommitment.CommitTx.TxHash()
+		commitSet.Add(remoteTxID)
+	}
+
+	// Check whether there was a dangling commitment at the time the channel
+	// was force closed.
+	remoteCommitDiff, err := channel.RemoteCommitChainTip()
+	if err != nil && !errors.Is(err, channeldb.ErrNoPendingCommit) {
+		return nil, err
+	}
+
+	if remoteCommitDiff != nil {
+		hash := remoteCommitDiff.Commitment.CommitTx.TxHash()
+		commitSet.Add(hash)
+	}
+
+	// Retrieve all of the outputs the UtxoSweeper is currently trying to
+	// sweep.
+	inputsMap, err := w.cfg.Sweeper.PendingInputs()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the current height so we can calculate the deadline height.
+	_, currentHeight, err := w.cfg.Chain.GetBestBlock()
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve current height: %w",
+			err)
+	}
+
+	pendingSweeps := maps.Values(inputsMap)
+
+	// Discard everything except for the anchor sweeps.
+	anchors := fn.Filter(func(sweep *sweep.PendingInputResponse) bool {
+		// Only filter for anchor inputs because these are the only
+		// inputs which can be used to bump a closed unconfirmed
+		// commitment transaction.
+		if sweep.WitnessType != input.CommitmentAnchor &&
+			sweep.WitnessType != input.TaprootAnchorSweepSpend {
+
+			return false
+		}
+
+		return commitSet.Contains(sweep.OutPoint.Hash)
+	}, pendingSweeps)
+
+	if len(anchors) == 0 {
+		return nil, fmt.Errorf("unable to find pending anchor outputs")
+	}
+
+	// Filter all relevant anchor sweeps and update the sweep request.
+	for _, anchor := range anchors {
+		// Anchor cpfp bump request are predictable because they are
+		// swept separately hence not batched with other sweeps (they
+		// are marked with the exclusive group flag). Bumping the fee
+		// rate does not create any conflicting fee bump conditions.
+		// Either the rbf requirements are met or the bump is rejected
+		// by the mempool rules.
+		params, existing, err := w.prepareSweepParams(
+			&BumpFeeRequest{
+				Outpoint:    lnrpcOutpoint,
+				TargetConf:  in.DeadlineDelta,
+				SatPerVbyte: in.StartingFeerate,
+				Immediate:   in.Immediate,
+				Budget:      in.Budget,
+			}, anchor.OutPoint, currentHeight,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// There might be the case when an anchor sweep is confirmed
+		// between fetching the pending sweeps and preparing the sweep
+		// params. We log this case and proceed.
+		if !existing {
+			log.Errorf("Sweep anchor input(%v) not known to the " +
+				"sweeper subsystem")
+			continue
+		}
+
+		_, err = w.cfg.Sweeper.UpdateParams(anchor.OutPoint, params)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &BumpForceCloseFeeResponse{
+		Status: "Successfully registered anchor-cpfp transaction to" +
+			"bump channel force close transaction",
+	}, nil
+}
+
 // sweepNewInput handles the case where an input is seen the first time by the
 // sweeper. It will fetch the output from the wallet and construct an input and
 // offer it to the sweeper.
@@ -1139,7 +1307,7 @@ func (w *WalletKit) sweepNewInput(op *wire.OutPoint, currentHeight uint32,
 	//
 	// We'll gather all of the information required by the UtxoSweeper in
 	// order to sweep the output.
-	utxo, err := w.cfg.Wallet.FetchInputInfo(op)
+	utxo, err := w.cfg.Wallet.FetchOutpointInfo(op)
 	if err != nil {
 		return err
 	}
@@ -1277,7 +1445,10 @@ func (w *WalletKit) LabelTransaction(ctx context.Context,
 	}
 
 	err = w.cfg.Wallet.LabelTransaction(*hash, req.Label, req.Overwrite)
-	return &LabelTransactionResponse{}, err
+
+	return &LabelTransactionResponse{
+		Status: fmt.Sprintf("transaction label '%s' added", req.Label),
+	}, err
 }
 
 // FundPsbt creates a fully populated PSBT that contains enough inputs to fund
@@ -1345,9 +1516,13 @@ func (w *WalletKit) FundPsbt(_ context.Context,
 			req.GetSatPerVbyte() * 1000,
 		).FeePerKWeight()
 
+	case req.GetSatPerKw() != 0:
+		feeSatPerKW = chainfee.SatPerKWeight(req.GetSatPerKw())
+
 	default:
 		return nil, fmt.Errorf("fee definition missing, need to " +
-			"specify either target_conf or sat_per_vbyte")
+			"specify either target_conf, sat_per_vbyte or " +
+			"sat_per_kw")
 	}
 
 	// Then, we'll extract the minimum number of confirmations that each
@@ -1456,11 +1631,17 @@ func (w *WalletKit) FundPsbt(_ context.Context,
 			return nil, fmt.Errorf("unknown change output type")
 		}
 
+		maxFeeRatio := chanfunding.DefaultMaxFeeRatio
+
+		if req.MaxFeeRatio != 0 {
+			maxFeeRatio = req.MaxFeeRatio
+		}
+
 		// Run the actual funding process now, using the channel funding
 		// coin selection algorithm.
 		return w.fundPsbtCoinSelect(
 			account, changeIndex, packet, minConfs, changeType,
-			feeSatPerKW, coinSelectionStrategy,
+			feeSatPerKW, coinSelectionStrategy, maxFeeRatio,
 		)
 
 	// The template is specified as a RPC message. We need to create a new
@@ -1663,8 +1844,8 @@ func (w *WalletKit) fundPsbtInternalWallet(account string,
 func (w *WalletKit) fundPsbtCoinSelect(account string, changeIndex int32,
 	packet *psbt.Packet, minConfs int32,
 	changeType chanfunding.ChangeAddressType,
-	feeRate chainfee.SatPerKWeight, strategy base.CoinSelectionStrategy) (
-	*FundPsbtResponse, error) {
+	feeRate chainfee.SatPerKWeight, strategy base.CoinSelectionStrategy,
+	maxFeeRatio float64) (*FundPsbtResponse, error) {
 
 	// We want to make sure we don't select any inputs that are already
 	// specified in the template. To do that, we require those inputs to
@@ -1752,6 +1933,7 @@ func (w *WalletKit) fundPsbtCoinSelect(account string, changeIndex int32,
 		changeAmt, needMore, err := chanfunding.CalculateChangeAmount(
 			inputSum, outputSum, packetFeeNoChange,
 			packetFeeWithChange, changeDustLimit, changeType,
+			maxFeeRatio,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("error calculating change "+
@@ -1808,7 +1990,7 @@ func (w *WalletKit) fundPsbtCoinSelect(account string, changeIndex int32,
 
 		selectedCoins, changeAmount, err := chanfunding.CoinSelect(
 			feeRate, fundingAmount, changeDustLimit, coins,
-			strategy, estimator, changeType,
+			strategy, estimator, changeType, maxFeeRatio,
 		)
 		if err != nil {
 			return fmt.Errorf("error selecting coins: %w", err)
@@ -2490,10 +2672,7 @@ func (w *WalletKit) SignMessageWithAddr(_ context.Context,
 			"fetched from wallet database: %w", err)
 	}
 
-	sigBytes, err := ecdsa.SignCompact(privKey, digest, pubKey.Compressed())
-	if err != nil {
-		return nil, fmt.Errorf("failed to create signature: %w", err)
-	}
+	sigBytes := ecdsa.SignCompact(privKey, digest, pubKey.Compressed())
 
 	// Bitcoin signatures are base64 encoded (being compatible with
 	// bitcoin-core and btcd).
@@ -2722,7 +2901,10 @@ func (w *WalletKit) ImportPublicKey(_ context.Context,
 		return nil, err
 	}
 
-	return &ImportPublicKeyResponse{}, nil
+	return &ImportPublicKeyResponse{
+		Status: fmt.Sprintf("public key %x imported",
+			pubKey.SerializeCompressed()),
+	}, nil
 }
 
 // ImportTapscript imports a Taproot script and internal key and adds the

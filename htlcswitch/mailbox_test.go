@@ -109,7 +109,7 @@ func TestMailBoxCouriers(t *testing.T) {
 		t.Fatalf("recvd packets mismatched: expected %v, got %v",
 			spew.Sdump(sentPackets), spew.Sdump(recvdPackets))
 	}
-	if !reflect.DeepEqual(recvdMessages, recvdMessages) {
+	if !reflect.DeepEqual(sentMessages, recvdMessages) {
 		t.Fatalf("recvd messages mismatched: expected %v, got %v",
 			spew.Sdump(sentMessages), spew.Sdump(recvdMessages))
 	}
@@ -250,7 +250,7 @@ func newMailboxContext(t *testing.T, startTime time.Time,
 	return ctx
 }
 
-func (c *mailboxContext) forward(_ chan struct{},
+func (c *mailboxContext) forward(_ <-chan struct{},
 	pkts ...*htlcPacket) error {
 
 	for _, pkt := range pkts {
@@ -706,7 +706,7 @@ func TestMailOrchestrator(t *testing.T) {
 	// First, we'll create a new instance of our orchestrator.
 	mo := newMailOrchestrator(&mailOrchConfig{
 		failMailboxUpdate: failMailboxUpdate,
-		forwardPackets: func(_ chan struct{},
+		forwardPackets: func(_ <-chan struct{},
 			pkts ...*htlcPacket) error {
 
 			return nil

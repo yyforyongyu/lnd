@@ -74,6 +74,10 @@ type RegistryConfig struct {
 	// KeysendHoldTime indicates for how long we want to accept and hold
 	// spontaneous keysend payments.
 	KeysendHoldTime time.Duration
+
+	// HtlcInterceptor is an interface that allows the invoice registry to
+	// let clients intercept invoices before they are settled.
+	HtlcInterceptor HtlcInterceptor
 }
 
 // htlcReleaseEvent describes an htlc auto-release event. It is used to release
@@ -101,6 +105,9 @@ func (r *htlcReleaseEvent) Less(other queue.PriorityQueueItem) bool {
 // created by the daemon. The registry is a thin wrapper around a map in order
 // to ensure that all updates/reads are thread safe.
 type InvoiceRegistry struct {
+	started atomic.Bool
+	stopped atomic.Bool
+
 	sync.RWMutex
 
 	nextClientID uint32 // must be used atomically
@@ -213,42 +220,66 @@ func (i *InvoiceRegistry) scanInvoicesOnStart(ctx context.Context) error {
 
 // Start starts the registry and all goroutines it needs to carry out its task.
 func (i *InvoiceRegistry) Start() error {
-	// Start InvoiceExpiryWatcher and prepopulate it with existing active
-	// invoices.
-	err := i.expiryWatcher.Start(func(hash lntypes.Hash, force bool) error {
-		return i.cancelInvoiceImpl(context.Background(), hash, force)
-	})
+	var err error
+
+	log.Info("InvoiceRegistry starting...")
+
+	if i.started.Swap(true) {
+		return fmt.Errorf("InvoiceRegistry started more than once")
+	}
+	// Start InvoiceExpiryWatcher and prepopulate it with existing
+	// active invoices.
+	err = i.expiryWatcher.Start(
+		func(hash lntypes.Hash, force bool) error {
+			return i.cancelInvoiceImpl(
+				context.Background(), hash, force,
+			)
+		})
 	if err != nil {
 		return err
 	}
-
-	log.Info("InvoiceRegistry starting")
 
 	i.wg.Add(1)
 	go i.invoiceEventLoop()
 
-	// Now scan all pending and removable invoices to the expiry watcher or
-	// delete them.
+	// Now scan all pending and removable invoices to the expiry
+	// watcher or delete them.
 	err = i.scanInvoicesOnStart(context.Background())
 	if err != nil {
 		_ = i.Stop()
-		return err
 	}
 
-	return nil
+	log.Debug("InvoiceRegistry started")
+
+	return err
 }
 
 // Stop signals the registry for a graceful shutdown.
 func (i *InvoiceRegistry) Stop() error {
 	log.Info("InvoiceRegistry shutting down...")
+
+	if i.stopped.Swap(true) {
+		return fmt.Errorf("InvoiceRegistry stopped more than once")
+	}
+
+	log.Info("InvoiceRegistry shutting down...")
 	defer log.Debug("InvoiceRegistry shutdown complete")
 
-	i.expiryWatcher.Stop()
+	var err error
+	if i.expiryWatcher == nil {
+		err = fmt.Errorf("InvoiceRegistry expiryWatcher is not " +
+			"initialized")
+	} else {
+		i.expiryWatcher.Stop()
+	}
 
 	close(i.quit)
 
 	i.wg.Wait()
-	return nil
+
+	log.Debug("InvoiceRegistry shutdown complete")
+
+	return err
 }
 
 // invoiceEvent represents a new event that has modified on invoice on disk.
@@ -887,6 +918,7 @@ func (i *InvoiceRegistry) processAMP(ctx invoiceUpdateCtx) error {
 func (i *InvoiceRegistry) NotifyExitHopHtlc(rHash lntypes.Hash,
 	amtPaid lnwire.MilliSatoshi, expiry uint32, currentHeight int32,
 	circuitKey CircuitKey, hodlChan chan<- interface{},
+	wireCustomRecords lnwire.CustomRecords,
 	payload Payload) (HtlcResolution, error) {
 
 	// Create the update context containing the relevant details of the
@@ -898,10 +930,13 @@ func (i *InvoiceRegistry) NotifyExitHopHtlc(rHash lntypes.Hash,
 		expiry:               expiry,
 		currentHeight:        currentHeight,
 		finalCltvRejectDelta: i.cfg.FinalCltvRejectDelta,
+		wireCustomRecords:    wireCustomRecords,
 		customRecords:        payload.CustomRecords(),
 		mpp:                  payload.MultiPath(),
 		amp:                  payload.AMPRecord(),
 		metadata:             payload.Metadata(),
+		pathID:               payload.PathID(),
+		totalAmtMsat:         payload.TotalAmtMsat(),
 	}
 
 	switch {
@@ -990,13 +1025,66 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 	ctx *invoiceUpdateCtx, hodlChan chan<- interface{}) (
 	HtlcResolution, invoiceExpiry, error) {
 
+	invoiceRef := ctx.invoiceRef()
+	setID := (*SetID)(ctx.setID())
+
+	// We need to look up the current state of the invoice in order to send
+	// the previously accepted/settled HTLCs to the interceptor.
+	existingInvoice, err := i.idb.LookupInvoice(
+		context.Background(), invoiceRef,
+	)
+	switch {
+	case errors.Is(err, ErrInvoiceNotFound) ||
+		errors.Is(err, ErrNoInvoicesCreated):
+
+		// If the invoice was not found, return a failure resolution
+		// with an invoice not found result.
+		return NewFailResolution(
+			ctx.circuitKey, ctx.currentHeight,
+			ResultInvoiceNotFound,
+		), nil, nil
+
+	case err != nil:
+		ctx.log(err.Error())
+		return nil, nil, err
+	}
+
+	var cancelSet bool
+
+	// Provide the invoice to the settlement interceptor to allow
+	// the interceptor's client an opportunity to manipulate the
+	// settlement process.
+	err = i.cfg.HtlcInterceptor.Intercept(HtlcModifyRequest{
+		WireCustomRecords:  ctx.wireCustomRecords,
+		ExitHtlcCircuitKey: ctx.circuitKey,
+		ExitHtlcAmt:        ctx.amtPaid,
+		ExitHtlcExpiry:     ctx.expiry,
+		CurrentHeight:      uint32(ctx.currentHeight),
+		Invoice:            existingInvoice,
+	}, func(resp HtlcModifyResponse) {
+		log.Debugf("Received invoice HTLC interceptor response: %v",
+			resp)
+
+		if resp.AmountPaid != 0 {
+			ctx.amtPaid = resp.AmountPaid
+		}
+
+		cancelSet = resp.CancelSet
+	})
+	if err != nil {
+		err := fmt.Errorf("error during invoice HTLC interception: %w",
+			err)
+		ctx.log(err.Error())
+
+		return nil, nil, err
+	}
+
 	// We'll attempt to settle an invoice matching this rHash on disk (if
 	// one exists). The callback will update the invoice state and/or htlcs.
 	var (
 		resolution        HtlcResolution
 		updateSubscribers bool
 	)
-
 	callback := func(inv *Invoice) (*InvoiceUpdateDesc, error) {
 		updateDesc, res, err := updateInvoice(ctx, inv)
 		if err != nil {
@@ -1008,13 +1096,22 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 			updateDesc.State != nil
 
 		// Assign resolution to outer scope variable.
-		resolution = res
+		if cancelSet {
+			// If a cancel signal was set for the htlc set, we set
+			// the resolution as a failure with an underpayment
+			// indication. Something was wrong with this htlc, so
+			// we probably can't settle the invoice at all.
+			resolution = NewFailResolution(
+				ctx.circuitKey, ctx.currentHeight,
+				ResultAmountTooLow,
+			)
+		} else {
+			resolution = res
+		}
 
 		return updateDesc, nil
 	}
 
-	invoiceRef := ctx.invoiceRef()
-	setID := (*SetID)(ctx.setID())
 	invoice, err := i.idb.UpdateInvoice(
 		context.Background(), invoiceRef, setID, callback,
 	)
@@ -1027,8 +1124,8 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 		), nil, nil
 	}
 
-	switch err {
-	case ErrInvoiceNotFound:
+	switch {
+	case errors.Is(err, ErrInvoiceNotFound):
 		// If the invoice was not found, return a failure resolution
 		// with an invoice not found result.
 		return NewFailResolution(
@@ -1036,13 +1133,13 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 			ResultInvoiceNotFound,
 		), nil, nil
 
-	case ErrInvRefEquivocation:
+	case errors.Is(err, ErrInvRefEquivocation):
 		return NewFailResolution(
 			ctx.circuitKey, ctx.currentHeight,
 			ResultInvoiceNotFound,
 		), nil, nil
 
-	case nil:
+	case err == nil:
 
 	default:
 		ctx.log(err.Error())
@@ -1050,6 +1147,8 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 	}
 
 	var invoiceToExpire invoiceExpiry
+
+	log.Tracef("Settlement resolution: %T %v", resolution, resolution)
 
 	switch res := resolution.(type) {
 	case *HtlcFailResolution:
@@ -1183,7 +1282,7 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 	}
 
 	// Now that the links have been notified of any state changes to their
-	// HTLCs, we'll go ahead and notify any clients wiaiting on the invoice
+	// HTLCs, we'll go ahead and notify any clients waiting on the invoice
 	// state changes.
 	if updateSubscribers {
 		// We'll add a setID onto the notification, but only if this is
