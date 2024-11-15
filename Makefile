@@ -200,7 +200,7 @@ ifeq ($(dbbackend),postgres)
 	# specifically for integration testing and are not fit for running
 	# production nodes.
 	docker run --name lnd-postgres -e POSTGRES_PASSWORD=postgres -p 6432:5432 -d postgres:13-alpine -N 500 -c max_pred_locks_per_transaction=1024 -c max_locks_per_transaction=128 -c jit=off -c work_mem=8MB -c checkpoint_timeout=10min -c enable_seqscan=off
-	docker logs -f lnd-postgres &
+	docker logs -f lnd-postgres >itest/postgres-log 2>&1 &
 
 	# Wait for the instance to be started.
 	sleep $(POSTGRES_START_DELAY)
