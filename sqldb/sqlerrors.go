@@ -21,6 +21,7 @@ var (
 	postgresErrMsgs = []string{
 		"could not serialize access",
 		"current transaction is aborted",
+		"deadlock detected",
 	}
 )
 
@@ -114,6 +115,13 @@ func parsePostgresError(pqErr *pgconn.PgError) error {
 	// In failed SQL transaction because we didn't catch a previous
 	// serialization error, so return this one as a serialization error.
 	case pgerrcode.InFailedSQLTransaction:
+		return &ErrSerializationError{
+			DBError: pqErr,
+		}
+
+	// Deadlock detedted because of a serialization error, so return this
+	// one as a serialization error.
+	case pgerrcode.DeadlockDetected:
 		return &ErrSerializationError{
 			DBError: pqErr,
 		}
