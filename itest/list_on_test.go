@@ -549,8 +549,12 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testCustomFeatures,
 	},
 	{
-		Name:     "update pending open channels",
-		TestFunc: testUpdateOnPendingOpenChannels,
+		Name:     "update pending open channels on funder side",
+		TestFunc: testUpdateOnFunderPendingOpenChannels,
+	},
+	{
+		Name:     "update pending open channels on fundee side",
+		TestFunc: testUpdateOnFundeePendingOpenChannels,
 	},
 	{
 		Name:     "blinded payment htlc re-forward",
