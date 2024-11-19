@@ -1083,7 +1083,7 @@ func (c *ChannelGraph) addChannelEdge(tx kvdb.RwTx,
 		err := addLightningNode(tx, &node1Shell)
 		if err != nil {
 			return fmt.Errorf("unable to create shell node "+
-				"for: %x", edge.NodeKey1Bytes)
+				"for: %x: %w", edge.NodeKey1Bytes, err)
 		}
 	case node1Err != nil:
 		return err
@@ -1099,7 +1099,7 @@ func (c *ChannelGraph) addChannelEdge(tx kvdb.RwTx,
 		err := addLightningNode(tx, &node2Shell)
 		if err != nil {
 			return fmt.Errorf("unable to create shell node "+
-				"for: %x", edge.NodeKey2Bytes)
+				"for: %x: %w", edge.NodeKey2Bytes, err)
 		}
 	case node2Err != nil:
 		return err
