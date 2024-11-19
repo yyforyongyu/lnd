@@ -21,6 +21,7 @@ var (
 	postgresErrMsgs = []string{
 		"could not serialize access",
 		"current transaction is aborted",
+		"not enough elements in RWConflictPool",
 		"deadlock detected",
 	}
 )
