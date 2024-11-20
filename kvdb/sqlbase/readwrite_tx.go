@@ -5,6 +5,7 @@ package sqlbase
 import (
 	"context"
 	"database/sql"
+	"sync"
 
 	"github.com/btcsuite/btcwallet/walletdb"
 )
@@ -19,6 +20,14 @@ type readWriteTx struct {
 
 	// active is true if the transaction hasn't been committed yet.
 	active bool
+
+	// err is an error set by calls that don't return errors. If it's set,
+	// the transaction must be rolled back and, if a serialization error,
+	// possibly retried.
+	err error
+
+	// errMu is a mutex for reading/updating the error.
+	errMu sync.RWMutex
 }
 
 // newReadWriteTx creates an rw transaction using a connection from the
@@ -46,6 +55,22 @@ func newReadWriteTx(db *db, readOnly bool) (*readWriteTx, error) {
 	}, nil
 }
 
+// checkError returns an error if the transaction has already errored.
+func (tx *readWriteTx) checkError() error {
+	tx.errMu.RLock()
+	defer tx.errMu.RUnlock()
+
+	return tx.err
+}
+
+// setError sets the error for the transaction.
+func (tx *readWriteTx) setError(err error) {
+	tx.errMu.Lock()
+	defer tx.errMu.Unlock()
+
+	tx.err = err
+}
+
 // ReadBucket opens the root bucket for read only access.  If the bucket
 // described by the key does not exist, nil is returned.
 func (tx *readWriteTx) ReadBucket(key []byte) walletdb.ReadBucket {
@@ -54,11 +79,23 @@ func (tx *readWriteTx) ReadBucket(key []byte) walletdb.ReadBucket {
 
 // ForEachBucket iterates through all top level buckets.
 func (tx *readWriteTx) ForEachBucket(fn func(key []byte) error) error {
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	// Fetch binary top level buckets.
 	bucket := newReadWriteBucket(tx, nil)
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	err := bucket.ForEach(func(k, _ []byte) error {
 		return fn(k)
 	})
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	return err
 }
 
@@ -93,6 +130,10 @@ func (tx *readWriteTx) ReadWriteBucket(key []byte) walletdb.ReadWriteBucket {
 func (tx *readWriteTx) CreateTopLevelBucket(key []byte) (
 	walletdb.ReadWriteBucket, error) {
 
+	if err := tx.checkError(); err != nil {
+		return nil, err
+	}
+
 	if len(key) == 0 {
 		return nil, walletdb.ErrBucketNameRequired
 	}
@@ -105,6 +146,10 @@ func (tx *readWriteTx) CreateTopLevelBucket(key []byte) (
 // errors if the bucket can not be found or the key keys a single value
 // instead of a bucket.
 func (tx *readWriteTx) DeleteTopLevelBucket(key []byte) error {
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	// Execute a cascading delete on the key.
 	result, err := tx.Exec(
 		"DELETE FROM "+tx.db.table+" WHERE key=$1 "+
@@ -128,6 +173,10 @@ func (tx *readWriteTx) DeleteTopLevelBucket(key []byte) error {
 
 // Commit commits the transaction if not already committed.
 func (tx *readWriteTx) Commit() error {
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	// Commit will fail if the transaction is already committed.
 	if !tx.active {
 		return walletdb.ErrTxClosed
