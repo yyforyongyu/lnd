@@ -227,6 +227,12 @@ func newRoute(sourceVertex route.Vertex,
 			// doesn't support both TLV and payment addrs, fail.
 			payAddr := supports(lnwire.PaymentAddrOptional)
 			if !payAddr && finalHop.paymentAddr.IsSome() {
+				log.Debugf("Destination doesn't support "+
+					"payment addr: edge=%v, payAddr=%v, "+
+					"finalHopPayAddr=%v",
+					lnutils.SpewLogClosure(edge), payAddr,
+					finalHop.paymentAddr.IsSome())
+
 				return nil, errors.New("cannot attach " +
 					"payment addr")
 			}
