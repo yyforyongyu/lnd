@@ -3,6 +3,7 @@ package sweep
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -1662,11 +1663,22 @@ func (s *UtxoSweeper) monitorFeeBumpResult(set InputSet,
 			}
 
 		case <-s.quit:
-			log.Debugf("Sweeper shutting down, exit fee " +
-				"bump handler")
+			log.Debugf("Sweeper shutting down, exit fee "+
+				"bump handler: %s", stack())
 
 			return
 		}
+	}
+}
+
+func stack() []byte {
+	buf := make([]byte, 1024)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return buf[:n]
+		}
+		buf = make([]byte, 2*len(buf))
 	}
 }
 
