@@ -4,20 +4,24 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb/etcd"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lntest/miner"
 	"github.com/lightningnetwork/lnd/lntest/node"
@@ -26,6 +30,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/routing"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,6 +54,9 @@ const (
 	// maxBlocksAllowed specifies the max allowed value to be used when
 	// mining blocks.
 	maxBlocksAllowed = 100
+
+	finalCltvDelta  = routing.MinCLTVDelta // 18.
+	thawHeightDelta = finalCltvDelta * 2   // 36.
 )
 
 // TestCase defines a test case that's been used in the integration test.
@@ -60,23 +68,11 @@ type TestCase struct {
 	TestFunc func(t *HarnessTest)
 }
 
-// standbyNodes are a list of nodes which are created during the initialization
-// of the test and used across all test cases.
-type standbyNodes struct {
-	// Alice and Bob are the initial seeder nodes that are automatically
-	// created to be the initial participants of the test network.
-	Alice *node.HarnessNode
-	Bob   *node.HarnessNode
-}
-
 // HarnessTest builds on top of a testing.T with enhanced error detection. It
 // is responsible for managing the interactions among different nodes, and
 // providing easy-to-use assertions.
 type HarnessTest struct {
 	*testing.T
-
-	// Embed the standbyNodes so we can easily access them via `ht.Alice`.
-	standbyNodes
 
 	// miner is a reference to a running full node that can be used to
 	// create new blocks on the network.
@@ -264,97 +260,6 @@ func (h *HarnessTest) createAndSendOutput(target *node.HarnessNode,
 	h.miner.SendOutput(output, defaultMinerFeeRate)
 }
 
-// SetupRemoteSigningStandbyNodes starts the initial seeder nodes within the
-// test harness in a remote signing configuration. The initial node's wallets
-// will be funded wallets with 100x1 BTC outputs each.
-func (h *HarnessTest) SetupRemoteSigningStandbyNodes() {
-	h.Log("Setting up standby nodes Alice and Bob with remote " +
-		"signing configurations...")
-	defer h.Log("Finished the setup, now running tests...")
-
-	password := []byte("itestpassword")
-
-	// Setup remote signing nodes for Alice and Bob.
-	signerAlice := h.NewNode("SignerAlice", nil)
-	signerBob := h.NewNode("SignerBob", nil)
-
-	// Setup watch-only nodes for Alice and Bob, each configured with their
-	// own remote signing instance.
-	h.Alice = h.setupWatchOnlyNode("Alice", signerAlice, password)
-	h.Bob = h.setupWatchOnlyNode("Bob", signerBob, password)
-
-	// Fund each node with 100 BTC (using 100 separate transactions).
-	const fundAmount = 1 * btcutil.SatoshiPerBitcoin
-	const numOutputs = 100
-	const totalAmount = fundAmount * numOutputs
-	for _, node := range []*node.HarnessNode{h.Alice, h.Bob} {
-		h.manager.standbyNodes[node.Cfg.NodeID] = node
-		for i := 0; i < numOutputs; i++ {
-			h.createAndSendOutput(
-				node, fundAmount,
-				lnrpc.AddressType_WITNESS_PUBKEY_HASH,
-			)
-		}
-	}
-
-	// We generate several blocks in order to give the outputs created
-	// above a good number of confirmations.
-	const totalTxes = 200
-	h.MineBlocksAndAssertNumTxes(numBlocksSendOutput, totalTxes)
-
-	// Now we want to wait for the nodes to catch up.
-	h.WaitForBlockchainSync(h.Alice)
-	h.WaitForBlockchainSync(h.Bob)
-
-	// Now block until both wallets have fully synced up.
-	h.WaitForBalanceConfirmed(h.Alice, totalAmount)
-	h.WaitForBalanceConfirmed(h.Bob, totalAmount)
-}
-
-// SetUp starts the initial seeder nodes within the test harness. The initial
-// node's wallets will be funded wallets with 10x10 BTC outputs each.
-func (h *HarnessTest) SetupStandbyNodes() {
-	h.Log("Setting up standby nodes Alice and Bob...")
-	defer h.Log("Finished the setup, now running tests...")
-
-	lndArgs := []string{
-		"--default-remote-max-htlcs=483",
-		"--channel-max-fee-exposure=5000000",
-	}
-
-	// Start the initial seeder nodes within the test network.
-	h.Alice = h.NewNode("Alice", lndArgs)
-	h.Bob = h.NewNode("Bob", lndArgs)
-
-	// Load up the wallets of the seeder nodes with 100 outputs of 1 BTC
-	// each.
-	const fundAmount = 1 * btcutil.SatoshiPerBitcoin
-	const numOutputs = 100
-	const totalAmount = fundAmount * numOutputs
-	for _, node := range []*node.HarnessNode{h.Alice, h.Bob} {
-		h.manager.standbyNodes[node.Cfg.NodeID] = node
-		for i := 0; i < numOutputs; i++ {
-			h.createAndSendOutput(
-				node, fundAmount,
-				lnrpc.AddressType_WITNESS_PUBKEY_HASH,
-			)
-		}
-	}
-
-	// We generate several blocks in order to give the outputs created
-	// above a good number of confirmations.
-	const totalTxes = 200
-	h.MineBlocksAndAssertNumTxes(numBlocksSendOutput, totalTxes)
-
-	// Now we want to wait for the nodes to catch up.
-	h.WaitForBlockchainSync(h.Alice)
-	h.WaitForBlockchainSync(h.Bob)
-
-	// Now block until both wallets have fully synced up.
-	h.WaitForBalanceConfirmed(h.Alice, totalAmount)
-	h.WaitForBalanceConfirmed(h.Bob, totalAmount)
-}
-
 // Stop stops the test harness.
 func (h *HarnessTest) Stop() {
 	// Do nothing if it's not started.
@@ -392,24 +297,6 @@ func (h *HarnessTest) RunTestCase(testCase *TestCase) {
 	testCase.TestFunc(h)
 }
 
-// resetStandbyNodes resets all standby nodes by attaching the new testing.T
-// and restarting them with the original config.
-func (h *HarnessTest) resetStandbyNodes(t *testing.T) {
-	t.Helper()
-
-	for _, hn := range h.manager.standbyNodes {
-		// Inherit the testing.T.
-		h.T = t
-
-		// Reset the config so the node will be using the default
-		// config for the coming test. This will also inherit the
-		// test's running context.
-		h.RestartNodeWithExtraArgs(hn, hn.Cfg.OriginalExtraArgs)
-
-		hn.AddToLogf("Finished test case %v", h.manager.currentTestCase)
-	}
-}
-
 // Subtest creates a child HarnessTest, which inherits the harness net and
 // stand by nodes created by the parent test. It will return a cleanup function
 // which resets  all the standby nodes' configs back to its original state and
@@ -421,7 +308,6 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 		T:            t,
 		manager:      h.manager,
 		miner:        h.miner,
-		standbyNodes: h.standbyNodes,
 		feeService:   h.feeService,
 		lndErrorChan: make(chan error, lndErrorChanSize),
 	}
@@ -431,9 +317,6 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 
 	// Inherit the subtest for the miner.
 	st.miner.T = st.T
-
-	// Reset the standby nodes.
-	st.resetStandbyNodes(t)
 
 	// Reset fee estimator.
 	st.feeService.Reset()
@@ -447,6 +330,9 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 
 		st.Logf("finished test: %s, start height=%d, end height=%d, "+
 			"mined blocks=%d", st.manager.currentTestCase,
+			startHeight, endHeight, endHeight-startHeight)
+
+		fmt.Printf("finished test: %s, %d, %d, %d\n", st.manager.currentTestCase,
 			startHeight, endHeight, endHeight-startHeight)
 
 		// Don't bother run the cleanups if the test is failed.
@@ -464,14 +350,8 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 			return
 		}
 
-		// When we finish the test, reset the nodes' configs and take a
-		// snapshot of each of the nodes' internal states.
-		for _, node := range st.manager.standbyNodes {
-			st.cleanupStandbyNode(node)
-		}
-
 		// If found running nodes, shut them down.
-		st.shutdownNonStandbyNodes()
+		st.shutdownAllNodes()
 
 		// We require the mempool to be cleaned from the test.
 		require.Empty(st, st.miner.GetRawMempool(), "mempool not "+
@@ -491,26 +371,9 @@ func (h *HarnessTest) Subtest(t *testing.T) *HarnessTest {
 	return st
 }
 
-// shutdownNonStandbyNodes will shutdown any non-standby nodes.
-func (h *HarnessTest) shutdownNonStandbyNodes() {
-	h.shutdownNodes(true)
-}
-
 // shutdownAllNodes will shutdown all running nodes.
 func (h *HarnessTest) shutdownAllNodes() {
-	h.shutdownNodes(false)
-}
-
-// shutdownNodes will shutdown any non-standby nodes. If skipStandby is false,
-// all the standby nodes will be shutdown too.
-func (h *HarnessTest) shutdownNodes(skipStandby bool) {
-	for nid, node := range h.manager.activeNodes {
-		// If it's a standby node, skip.
-		_, ok := h.manager.standbyNodes[nid]
-		if ok && skipStandby {
-			continue
-		}
-
+	for _, node := range h.manager.activeNodes {
 		// The process may not be in a state to always shutdown
 		// immediately, so we'll retry up to a hard limit to ensure we
 		// eventually shutdown.
@@ -559,26 +422,14 @@ func (h *HarnessTest) cleanupStandbyNode(hn *node.HarnessNode) {
 func (h *HarnessTest) removeConnectionns(hn *node.HarnessNode) {
 	resp := hn.RPC.ListPeers()
 	for _, peer := range resp.Peers {
-		// Skip disconnecting Alice and Bob.
-		switch peer.PubKey {
-		case h.Alice.PubKeyStr:
-			continue
-		case h.Bob.PubKeyStr:
-			continue
-		}
-
 		hn.RPC.DisconnectPeer(peer.PubKey)
 	}
 }
 
 // SetTestName set the test case name.
 func (h *HarnessTest) SetTestName(name string) {
-	h.manager.currentTestCase = name
-
-	// Overwrite the old log filename so we can create new log files.
-	for _, node := range h.manager.standbyNodes {
-		node.Cfg.LogFilenamePrefix = name
-	}
+	cleanTestCaseName := strings.ReplaceAll(name, " ", "_")
+	h.manager.currentTestCase = cleanTestCaseName
 }
 
 // NewNode creates a new node and asserts its creation. The node is guaranteed
@@ -592,6 +443,42 @@ func (h *HarnessTest) NewNode(name string,
 	// Start the node.
 	err = node.Start(h.runCtx)
 	require.NoError(h, err, "failed to start node %s", node.Name())
+
+	return node
+}
+
+// NewNodeWithCoins creates a new node and asserts its creation. The node is
+// guaranteed to have finished its initialization and all its subservers are
+// started. In addition, 5 UTXO of 1 BTC each are sent to the node.
+func (h *HarnessTest) NewNodeWithCoins(name string,
+	extraArgs []string) *node.HarnessNode {
+
+	node, err := h.manager.newNode(h.T, name, extraArgs, nil, false)
+	require.NoErrorf(h, err, "unable to create new node for %s", name)
+
+	// Start the node.
+	err = node.Start(h.runCtx)
+	require.NoError(h, err, "failed to start node %s", node.Name())
+
+	// Load up the wallets of the node with 5 outputs of 1 BTC each.
+	const (
+		numOutputs  = 5
+		fundAmount  = 1 * btcutil.SatoshiPerBitcoin
+		totalAmount = fundAmount * numOutputs
+	)
+
+	for i := 0; i < numOutputs; i++ {
+		h.createAndSendOutput(
+			node, fundAmount,
+			lnrpc.AddressType_WITNESS_PUBKEY_HASH,
+		)
+	}
+
+	// Mine a block to confirm the transactions.
+	h.MineBlocksAndAssertNumTxes(1, numOutputs)
+
+	// Now block until the wallet have fully synced up.
+	h.WaitForBalanceConfirmed(node, totalAmount)
 
 	return node
 }
@@ -1464,7 +1351,7 @@ func (h *HarnessTest) fundCoins(amt btcutil.Amount, target *node.HarnessNode,
 }
 
 // FundCoins attempts to send amt satoshis from the internal mining node to the
-// targeted lightning node using a P2WKH address. 2 blocks are mined after in
+// targeted lightning node using a P2WKH address. 1 blocks are mined after in
 // order to confirm the transaction.
 func (h *HarnessTest) FundCoins(amt btcutil.Amount, hn *node.HarnessNode) {
 	h.fundCoins(amt, hn, lnrpc.AddressType_WITNESS_PUBKEY_HASH, true)
@@ -1653,6 +1540,22 @@ func (h *HarnessTest) CleanupForceClose(hn *node.HarnessNode) {
 	// Wait for the channel to be marked pending force close.
 	h.AssertNumPendingForceClose(hn, 1)
 
+	// Mine enough blocks for the node to sweep its funds from the force
+	// closed channel. The commit sweep resolver is offers the input to the
+	// sweeper when it's force closed, and broadcast the sweep tx at
+	// defaulCSV-1.
+	//
+	// NOTE: we might empty blocks here as we don't know the exact number
+	// of blocks to mine. This may end up mining more blocks than needed.
+	h.MineEmptyBlocks(node.DefaultCSV - 1)
+
+	// Assert there is one pending sweep.
+	h.AssertNumPendingSweeps(hn, 1)
+
+	// The node should now sweep the funds, clean up by mining the sweeping
+	// tx.
+	h.MineBlocksAndAssertNumTxes(1, 1)
+
 	// Mine blocks to get any second level HTLC resolved. If there are no
 	// HTLCs, this will behave like h.AssertNumPendingCloseChannels.
 	h.mineTillForceCloseResolved(hn)
@@ -1724,9 +1627,9 @@ func (h *HarnessTest) RestartNodeAndRestoreDB(hn *node.HarnessNode) {
 // closures as the caller doesn't need to mine all the blocks to make sure the
 // mempool is empty.
 func (h *HarnessTest) CleanShutDown() {
-	// First, shutdown all non-standby nodes to prevent new transactions
-	// being created and fed into the mempool.
-	h.shutdownNonStandbyNodes()
+	// First, shutdown all nodes to prevent new transactions being created
+	// and fed into the mempool.
+	h.shutdownAllNodes()
 
 	// Now mine blocks till the mempool is empty.
 	h.cleanMempool()
@@ -1994,7 +1897,8 @@ func (h *HarnessTest) AssertSweepFound(hn *node.HarnessNode,
 			return nil
 		}
 
-		return fmt.Errorf("sweep tx %v not found", sweep)
+		return fmt.Errorf("sweep tx %v not found in resp %v", sweep,
+			sweepResp)
 	}, wait.DefaultTimeout)
 	require.NoError(h, err, "%s: timeout checking sweep tx", hn.Name())
 }
@@ -2264,6 +2168,10 @@ func acceptChannel(t *testing.T, zeroConf bool, stream rpc.AcceptorClient) {
 	require.NoError(t, err)
 }
 
+var nodeNames = []string{
+	"Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Heidi",
+}
+
 // createNodes creates the number of nodes specified by the number of configs.
 // Each node is created using the specified config, the neighbors are
 // connected.
@@ -2276,7 +2184,7 @@ func (h *HarnessTest) createNodes(nodeCfgs [][]string) []*node.HarnessNode {
 
 	// Create new nodes.
 	for i, nodeCfg := range nodeCfgs {
-		nodeName := fmt.Sprintf("Node%q", string(rune('A'+i)))
+		nodeName := nodeNames[i]
 		n := h.NewNode(nodeName, nodeCfg)
 		nodes[i] = n
 	}
@@ -2308,11 +2216,38 @@ func (h *HarnessTest) openChannelsForNodes(nodes []*node.HarnessNode,
 	// Sanity check the params.
 	require.Greater(h, len(nodes), 1, "need at least 2 nodes")
 
+	// attachFundingShim is a helper closure that optionally attaches a
+	// funding shim to the open channel params and returns it.
+	attachFundingShim := func(
+		nodeA, nodeB *node.HarnessNode) OpenChannelParams {
+
+		// If this channel is not a script enforced lease channel,
+		// we'll do nothing and return the params.
+		leasedType := lnrpc.CommitmentType_SCRIPT_ENFORCED_LEASE
+		if p.CommitmentType != leasedType {
+			return p
+		}
+
+		// Otherwise derive the funding shim, attach it to the original
+		// open channel params and return it.
+		minerHeight := h.CurrentHeight()
+		thawHeight := minerHeight + thawHeightDelta
+		fundingShim, _ := h.deriveFundingShim(
+			nodeA, nodeB, p.Amt, thawHeight, true, leasedType,
+		)
+
+		p.FundingShim = fundingShim
+		return p
+	}
+
 	// Open channels in batch to save blocks mined.
 	reqs := make([]*OpenChannelRequest, 0, len(nodes)-1)
 	for i := 0; i < len(nodes)-1; i++ {
 		nodeA := nodes[i]
 		nodeB := nodes[i+1]
+
+		// Optionally attach a funding shim to the open channel params.
+		p = attachFundingShim(nodeA, nodeB)
 
 		req := &OpenChannelRequest{
 			Local:  nodeA,
@@ -2363,4 +2298,120 @@ func (h *HarnessTest) openZeroConfChannelsForNodes(nodes []*node.HarnessNode,
 	}
 
 	return resp
+}
+
+// deriveFundingShim creates a channel funding shim by deriving the necessary
+// keys on both sides.
+func (h *HarnessTest) deriveFundingShim(alice, bob *node.HarnessNode,
+	chanSize btcutil.Amount, thawHeight uint32, publish bool,
+	commitType lnrpc.CommitmentType) (*lnrpc.FundingShim,
+	*lnrpc.ChannelPoint) {
+
+	keyLoc := &signrpc.KeyLocator{KeyFamily: 9999}
+	carolFundingKey := alice.RPC.DeriveKey(keyLoc)
+	daveFundingKey := bob.RPC.DeriveKey(keyLoc)
+
+	// Now that we have the multi-sig keys for each party, we can manually
+	// construct the funding transaction. We'll instruct the backend to
+	// immediately create and broadcast a transaction paying out an exact
+	// amount. Normally this would reside in the mempool, but we just
+	// confirm it now for simplicity.
+	var (
+		fundingOutput *wire.TxOut
+		musig2        bool
+		err           error
+	)
+	if commitType == lnrpc.CommitmentType_SIMPLE_TAPROOT {
+		var carolKey, daveKey *btcec.PublicKey
+		carolKey, err = btcec.ParsePubKey(carolFundingKey.RawKeyBytes)
+		require.NoError(h, err)
+		daveKey, err = btcec.ParsePubKey(daveFundingKey.RawKeyBytes)
+		require.NoError(h, err)
+
+		_, fundingOutput, err = input.GenTaprootFundingScript(
+			carolKey, daveKey, int64(chanSize),
+			fn.None[chainhash.Hash](),
+		)
+		require.NoError(h, err)
+
+		musig2 = true
+	} else {
+		_, fundingOutput, err = input.GenFundingPkScript(
+			carolFundingKey.RawKeyBytes, daveFundingKey.RawKeyBytes,
+			int64(chanSize),
+		)
+		require.NoError(h, err)
+	}
+
+	var txid *chainhash.Hash
+	targetOutputs := []*wire.TxOut{fundingOutput}
+	if publish {
+		txid = h.SendOutputsWithoutChange(targetOutputs, 5)
+	} else {
+		tx := h.CreateTransaction(targetOutputs, 5)
+
+		txHash := tx.TxHash()
+		txid = &txHash
+	}
+
+	// At this point, we can being our external channel funding workflow.
+	// We'll start by generating a pending channel ID externally that will
+	// be used to track this new funding type.
+	pendingChanID := h.Random32Bytes()
+
+	// Now that we have the pending channel ID, Dave (our responder) will
+	// register the intent to receive a new channel funding workflow using
+	// the pending channel ID.
+	chanPoint := &lnrpc.ChannelPoint{
+		FundingTxid: &lnrpc.ChannelPoint_FundingTxidBytes{
+			FundingTxidBytes: txid[:],
+		},
+	}
+	chanPointShim := &lnrpc.ChanPointShim{
+		Amt:       int64(chanSize),
+		ChanPoint: chanPoint,
+		LocalKey: &lnrpc.KeyDescriptor{
+			RawKeyBytes: daveFundingKey.RawKeyBytes,
+			KeyLoc: &lnrpc.KeyLocator{
+				KeyFamily: daveFundingKey.KeyLoc.KeyFamily,
+				KeyIndex:  daveFundingKey.KeyLoc.KeyIndex,
+			},
+		},
+		RemoteKey:     carolFundingKey.RawKeyBytes,
+		PendingChanId: pendingChanID,
+		ThawHeight:    thawHeight,
+		Musig2:        musig2,
+	}
+	fundingShim := &lnrpc.FundingShim{
+		Shim: &lnrpc.FundingShim_ChanPointShim{
+			ChanPointShim: chanPointShim,
+		},
+	}
+	bob.RPC.FundingStateStep(&lnrpc.FundingTransitionMsg{
+		Trigger: &lnrpc.FundingTransitionMsg_ShimRegister{
+			ShimRegister: fundingShim,
+		},
+	})
+
+	// If we attempt to register the same shim (has the same pending chan
+	// ID), then we should get an error.
+	bob.RPC.FundingStateStepAssertErr(&lnrpc.FundingTransitionMsg{
+		Trigger: &lnrpc.FundingTransitionMsg_ShimRegister{
+			ShimRegister: fundingShim,
+		},
+	})
+
+	// We'll take the chan point shim we just registered for Dave (the
+	// responder), and swap the local/remote keys before we feed it in as
+	// Carol's funding shim as the initiator.
+	fundingShim.GetChanPointShim().LocalKey = &lnrpc.KeyDescriptor{
+		RawKeyBytes: carolFundingKey.RawKeyBytes,
+		KeyLoc: &lnrpc.KeyLocator{
+			KeyFamily: carolFundingKey.KeyLoc.KeyFamily,
+			KeyIndex:  carolFundingKey.KeyLoc.KeyIndex,
+		},
+	}
+	fundingShim.GetChanPointShim().RemoteKey = daveFundingKey.RawKeyBytes
+
+	return fundingShim, chanPoint
 }

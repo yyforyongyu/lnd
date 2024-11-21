@@ -135,21 +135,31 @@ func testPaymentSucceededHTLCRemoteSwept(ht *lntest.HarnessTest) {
 	// direct preimage spend.
 	ht.AssertNumPendingSweeps(bob, 1)
 
-	// Mine a block to trigger the sweep.
-	//
-	// TODO(yy): remove it once `blockbeat` is implemented.
-	ht.MineEmptyBlocks(1)
-
-	// Mine Bob's sweeping tx.
-	ht.MineBlocksAndAssertNumTxes(1, 1)
-
 	// Let Alice come back up. Since the channel is now closed, we expect
 	// different behaviors based on whether the HTLC is a dust.
 	// - For dust payment, it should be failed now as the HTLC won't go
 	//   onchain.
 	// - For non-dust payment, it should be marked as succeeded since her
 	//   outgoing htlc is swept by Bob.
+	//
+	// TODO(yy): move the restart after Bob's sweeping tx being confirmed
+	// once the blockbeat starts remembering its last processed block and
+	// can handle looking for spends in the past blocks.
 	require.NoError(ht, restartAlice())
+
+	// Alice should have a pending force close channel.
+	ht.AssertNumPendingForceClose(alice, 1)
+
+	// Mine a block to trigger the sweep. This is needed because the
+	// preimage extraction logic from the link is not managed by the
+	// blockbeat, which means the preimage may be sent to the contest
+	// resolver after it's launched.
+	//
+	// TODO(yy): Expose blockbeat to the link layer.
+	ht.MineEmptyBlocks(1)
+
+	// Mine Bob's sweeping tx.
+	ht.MineBlocksAndAssertNumTxes(1, 1)
 
 	// Since Alice is restarted, we need to track the payments again.
 	payStream := alice.RPC.TrackPaymentV2(payHash[:])
@@ -169,21 +179,19 @@ func testPaymentSucceededHTLCRemoteSwept(ht *lntest.HarnessTest) {
 // out and claimed onchain via the timeout path, the payment will be marked as
 // failed. This test creates a topology from Alice -> Bob, and let Alice send
 // payments to Bob. Bob then goes offline, such that Alice's outgoing HTLC will
-// time out. Alice will also be restarted to make sure resumed payments are
-// also marked as failed.
+// time out.
 func testPaymentFailedHTLCLocalSwept(ht *lntest.HarnessTest) {
-	success := ht.Run("fail payment", func(t *testing.T) {
-		st := ht.Subtest(t)
-		runTestPaymentHTLCTimeout(st, false)
-	})
-	if !success {
-		return
-	}
+	runTestPaymentHTLCTimeout(ht, false)
+}
 
-	ht.Run("fail resumed payment", func(t *testing.T) {
-		st := ht.Subtest(t)
-		runTestPaymentHTLCTimeout(st, true)
-	})
+// testPaymentFailedHTLCLocalSweptResumed checks that when an outgoing HTLC is
+// timed out and claimed onchain via the timeout path, the payment will be
+// marked as failed. This test creates a topology from Alice -> Bob, and let
+// Alice send payments to Bob. Bob then goes offline, such that Alice's
+// outgoing HTLC will time out. Alice will be restarted to make sure resumed
+// payments are also marked as failed.
+func testPaymentFailedHTLCLocalSweptResumed(ht *lntest.HarnessTest) {
+	runTestPaymentHTLCTimeout(ht, true)
 }
 
 // runTestPaymentHTLCTimeout is the helper function that actually runs the
@@ -325,9 +333,6 @@ func runTestPaymentHTLCTimeout(ht *lntest.HarnessTest, restartAlice bool) {
 	// sweep her outgoing HTLC in next block.
 	ht.MineBlocksAndAssertNumTxes(1, 1)
 
-	// Cleanup the channel.
-	ht.CleanupForceClose(alice)
-
 	// We expect the non-dust payment to marked as failed in Alice's
 	// database and also from her stream.
 	ht.AssertPaymentStatus(alice, preimage, lnrpc.Payment_FAILED)
@@ -339,7 +344,8 @@ func runTestPaymentHTLCTimeout(ht *lntest.HarnessTest, restartAlice bool) {
 // to return floor fee rate(1 sat/vb).
 func testSendDirectPayment(ht *lntest.HarnessTest) {
 	// Grab Alice and Bob's nodes for convenience.
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNodeWithCoins("Bob", nil)
 
 	// Create a list of commitment types we want to test.
 	commitmentTypes := []lnrpc.CommitmentType{
@@ -441,6 +447,9 @@ func testSendDirectPayment(ht *lntest.HarnessTest) {
 			// Make sure they are connected.
 			st.EnsureConnected(alice, bob)
 
+			// TODO(yy): remove this line to fix the ListCoins bug.
+			st.FundCoins(btcutil.SatoshiPerBitcoin, alice)
+
 			// Open a channel with 100k satoshis between Alice and
 			// Bob with Alice being the sole funder of the channel.
 			params := lntest.OpenChannelParams{
@@ -459,7 +468,9 @@ func testSendDirectPayment(ht *lntest.HarnessTest) {
 }
 
 func testListPayments(ht *lntest.HarnessTest) {
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	// Check that there are no payments before test.
 	ht.AssertNumPayments(alice, 0)
@@ -467,9 +478,7 @@ func testListPayments(ht *lntest.HarnessTest) {
 	// Open a channel with 100k satoshis between Alice and Bob with Alice
 	// being the sole funder of the channel.
 	chanAmt := btcutil.Amount(100000)
-	chanPoint := ht.OpenChannel(
-		alice, bob, lntest.OpenChannelParams{Amt: chanAmt},
-	)
+	ht.OpenChannel(alice, bob, lntest.OpenChannelParams{Amt: chanAmt})
 
 	// Now that the channel is open, create an invoice for Bob which
 	// expects a payment of 1000 satoshis from Alice paid via a particular
@@ -628,17 +637,6 @@ func testListPayments(ht *lntest.HarnessTest) {
 
 	// Check that there are no payments after test.
 	ht.AssertNumPayments(alice, 0)
-
-	// TODO(yy): remove the sleep once the following bug is fixed.
-	// When the invoice is reported settled, the commitment dance is not
-	// yet finished, which can cause an error when closing the channel,
-	// saying there's active HTLCs. We need to investigate this issue and
-	// reverse the order to, first finish the commitment dance, then report
-	// the invoice as settled.
-	time.Sleep(2 * time.Second)
-
-	// Close the channel.
-	ht.CloseChannel(alice, chanPoint)
 }
 
 // testPaymentFollowingChannelOpen tests that the channel transition from
@@ -651,7 +649,10 @@ func testPaymentFollowingChannelOpen(ht *lntest.HarnessTest) {
 	channelCapacity := paymentAmt * 1000
 
 	// We first establish a channel between Alice and Bob.
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
+	ht.EnsureConnected(alice, bob)
+
 	p := lntest.OpenChannelParams{
 		Amt: channelCapacity,
 	}
@@ -685,19 +686,6 @@ func testPaymentFollowingChannelOpen(ht *lntest.HarnessTest) {
 	// Send payment to Bob so that a channel update to disk will be
 	// executed.
 	ht.CompletePaymentRequests(alice, []string{bobPayReqs[0]})
-
-	// TODO(yy): remove the sleep once the following bug is fixed.
-	// When the invoice is reported settled, the commitment dance is not
-	// yet finished, which can cause an error when closing the channel,
-	// saying there's active HTLCs. We need to investigate this issue and
-	// reverse the order to, first finish the commitment dance, then report
-	// the invoice as settled.
-	time.Sleep(2 * time.Second)
-
-	// Finally, immediately close the channel. This function will also
-	// block until the channel is closed and will additionally assert the
-	// relevant channel closing post conditions.
-	ht.CloseChannel(alice, chanPoint)
 }
 
 // testAsyncPayments tests the performance of the async payments.
@@ -805,11 +793,6 @@ func runAsyncPayments(ht *lntest.HarnessTest, alice, bob *node.HarnessNode,
 	ht.Log("\tBenchmark info: Elapsed time: ", timeTaken)
 	ht.Log("\tBenchmark info: TPS: ",
 		float64(numInvoices)/timeTaken.Seconds())
-
-	// Finally, immediately close the channel. This function will also
-	// block until the channel is closed and will additionally assert the
-	// relevant channel closing post conditions.
-	ht.CloseChannel(alice, chanPoint)
 }
 
 // testBidirectionalAsyncPayments tests that nodes are able to send the
@@ -917,17 +900,14 @@ func testBidirectionalAsyncPayments(ht *lntest.HarnessTest) {
 	// Next query for Bob's and Alice's channel states, in order to confirm
 	// that all payment have been successfully transmitted.
 	assertChannelState(ht, bob, chanPoint, bobAmt, aliceAmt)
-
-	// Finally, immediately close the channel. This function will also
-	// block until the channel is closed and will additionally assert the
-	// relevant channel closing post conditions.
-	ht.CloseChannel(alice, chanPoint)
 }
 
 func testInvoiceSubscriptions(ht *lntest.HarnessTest) {
 	const chanAmt = btcutil.Amount(500000)
 
-	alice, bob := ht.Alice, ht.Bob
+	alice := ht.NewNodeWithCoins("Alice", nil)
+	bob := ht.NewNode("Bob", nil)
+	ht.EnsureConnected(alice, bob)
 
 	// Create a new invoice subscription client for Bob, the notification
 	// should be dispatched shortly below.
@@ -936,9 +916,7 @@ func testInvoiceSubscriptions(ht *lntest.HarnessTest) {
 
 	// Open a channel with 500k satoshis between Alice and Bob with Alice
 	// being the sole funder of the channel.
-	chanPoint := ht.OpenChannel(
-		alice, bob, lntest.OpenChannelParams{Amt: chanAmt},
-	)
+	ht.OpenChannel(alice, bob, lntest.OpenChannelParams{Amt: chanAmt})
 
 	// Next create a new invoice for Bob requesting 1k satoshis.
 	const paymentAmt = 1000
@@ -1040,16 +1018,6 @@ func testInvoiceSubscriptions(ht *lntest.HarnessTest) {
 
 	// At this point, all the invoices should be fully settled.
 	require.Empty(ht, settledInvoices, "not all invoices settled")
-
-	// TODO(yy): remove the sleep once the following bug is fixed.
-	// When the invoice is reported settled, the commitment dance is not
-	// yet finished, which can cause an error when closing the channel,
-	// saying there's active HTLCs. We need to investigate this issue and
-	// reverse the order to, first finish the commitment dance, then report
-	// the invoice as settled.
-	time.Sleep(2 * time.Second)
-
-	ht.CloseChannel(alice, chanPoint)
 }
 
 // assertChannelState asserts the channel state by checking the values in
@@ -1097,23 +1065,16 @@ func assertChannelState(ht *lntest.HarnessTest, hn *node.HarnessNode,
 // 5.) Alice observes a failed OR succeeded payment with failure reason
 // FAILURE_REASON_CANCELED which suppresses further payment attempts.
 func testPaymentFailureReasonCanceled(ht *lntest.HarnessTest) {
-	// Initialize the test context with 3 connected nodes.
-	ts := newInterceptorTestScenario(ht)
-
-	alice, bob, carol := ts.alice, ts.bob, ts.carol
-
-	// Open and wait for channels.
 	const chanAmt = btcutil.Amount(300000)
 	p := lntest.OpenChannelParams{Amt: chanAmt}
-	reqs := []*lntest.OpenChannelRequest{
-		{Local: alice, Remote: bob, Param: p},
-		{Local: bob, Remote: carol, Param: p},
-	}
-	resp := ht.OpenMultiChannelsAsync(reqs)
-	cpAB, cpBC := resp[0], resp[1]
 
-	// Make sure Alice is aware of channel Bob=>Carol.
-	ht.AssertChannelInGraph(alice, cpBC)
+	// Initialize the test context with 3 connected nodes.
+	cfgs := [][]string{nil, nil, nil}
+
+	// Open and wait for channels.
+	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, p)
+	alice, bob, carol := nodes[0], nodes[1], nodes[2]
+	cpAB := chanPoints[0]
 
 	// Connect the interceptor.
 	interceptor, cancelInterceptor := bob.RPC.HtlcInterceptor()
@@ -1123,7 +1084,8 @@ func testPaymentFailureReasonCanceled(ht *lntest.HarnessTest) {
 	// htlc even though the payment context was canceled before invoice
 	// settlement.
 	sendPaymentInterceptAndCancel(
-		ht, ts, cpAB, routerrpc.ResolveHoldForwardAction_RESUME,
+		ht, alice, bob, carol, cpAB,
+		routerrpc.ResolveHoldForwardAction_RESUME,
 		lnrpc.Payment_SUCCEEDED, interceptor,
 	)
 
@@ -1133,23 +1095,17 @@ func testPaymentFailureReasonCanceled(ht *lntest.HarnessTest) {
 	// Note that we'd have to reset Alice's mission control if we tested the
 	// htlc fail case before the htlc resume case.
 	sendPaymentInterceptAndCancel(
-		ht, ts, cpAB, routerrpc.ResolveHoldForwardAction_FAIL,
+		ht, alice, bob, carol, cpAB,
+		routerrpc.ResolveHoldForwardAction_FAIL,
 		lnrpc.Payment_FAILED, interceptor,
 	)
-
-	// Finally, close channels.
-	ht.CloseChannel(alice, cpAB)
-	ht.CloseChannel(bob, cpBC)
 }
 
 func sendPaymentInterceptAndCancel(ht *lntest.HarnessTest,
-	ts *interceptorTestScenario, cpAB *lnrpc.ChannelPoint,
+	alice, bob, carol *node.HarnessNode, cpAB *lnrpc.ChannelPoint,
 	interceptorAction routerrpc.ResolveHoldForwardAction,
 	expectedPaymentStatus lnrpc.Payment_PaymentStatus,
 	interceptor rpc.InterceptorClient) {
-
-	// Prepare the test cases.
-	alice, bob, carol := ts.alice, ts.bob, ts.carol
 
 	// Prepare the test cases.
 	addResponse := carol.RPC.AddInvoice(&lnrpc.Invoice{
@@ -1220,21 +1176,21 @@ func sendPaymentInterceptAndCancel(ht *lntest.HarnessTest,
 // out and claimed onchain via the timeout path, the payment will be marked as
 // failed. This test creates a topology from Alice -> Bob, and let Alice send
 // payments to Bob. Bob then goes offline, such that Alice's outgoing HTLC will
-// time out. Alice will also be restarted to make sure resumed payments are
-// also marked as failed.
+// time out.
 func testSendToRouteFailHTLCTimeout(ht *lntest.HarnessTest) {
-	success := ht.Run("fail payment", func(t *testing.T) {
-		st := ht.Subtest(t)
-		runSendToRouteFailHTLCTimeout(st, false)
-	})
-	if !success {
-		return
-	}
+	runSendToRouteFailHTLCTimeout(ht, false)
+}
 
-	ht.Run("fail resumed payment", func(t *testing.T) {
-		st := ht.Subtest(t)
-		runTestPaymentHTLCTimeout(st, true)
-	})
+// testSendToRouteFailHTLCTimeout is similar to
+// testPaymentFailedHTLCLocalSwept. The only difference is the `SendPayment` is
+// replaced with `SendToRouteV2`. It checks that when an outgoing HTLC is timed
+// out and claimed onchain via the timeout path, the payment will be marked as
+// failed. This test creates a topology from Alice -> Bob, and let Alice send
+// payments to Bob. Bob then goes offline, such that Alice's outgoing HTLC will
+// time out. Alice will be restarted to make sure resumed payments are also
+// marked as failed.
+func testSendToRouteFailHTLCTimeoutResumed(ht *lntest.HarnessTest) {
+	runTestPaymentHTLCTimeout(ht, true)
 }
 
 // runSendToRouteFailHTLCTimeout is the helper function that actually runs the
