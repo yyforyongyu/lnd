@@ -38,7 +38,7 @@ const (
 	SqliteBackend              = "sqlite"
 	DefaultBatchCommitInterval = 500 * time.Millisecond
 
-	defaultPostgresMaxConnections = 50
+	defaultPostgresMaxConnections = 20
 	defaultSqliteMaxConnections   = 2
 
 	defaultSqliteBusyTimeout = 5 * time.Second

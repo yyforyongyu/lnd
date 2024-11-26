@@ -26,6 +26,10 @@ func newReadWriteCursor(b *readWriteBucket) *readWriteCursor {
 // First positions the cursor at the first key/value pair and returns
 // the pair.
 func (c *readWriteCursor) First() ([]byte, []byte) {
+	if err := c.bucket.tx.checkError(); err != nil {
+		return nil, nil
+	}
+
 	var (
 		key   []byte
 		value []byte
@@ -43,7 +47,9 @@ func (c *readWriteCursor) First() ([]byte, []byte) {
 		return nil, nil
 
 	case err != nil:
-		panic(err)
+		c.bucket.tx.setError(err)
+
+		return nil, nil
 	}
 
 	// Copy current key to prevent modification by the caller.
@@ -56,6 +62,10 @@ func (c *readWriteCursor) First() ([]byte, []byte) {
 // Last positions the cursor at the last key/value pair and returns the
 // pair.
 func (c *readWriteCursor) Last() ([]byte, []byte) {
+	if err := c.bucket.tx.checkError(); err != nil {
+		return nil, nil
+	}
+
 	var (
 		key   []byte
 		value []byte
@@ -73,7 +83,9 @@ func (c *readWriteCursor) Last() ([]byte, []byte) {
 		return nil, nil
 
 	case err != nil:
-		panic(err)
+		c.bucket.tx.setError(err)
+
+		return nil, nil
 	}
 
 	// Copy current key to prevent modification by the caller.
@@ -86,6 +98,10 @@ func (c *readWriteCursor) Last() ([]byte, []byte) {
 // Next moves the cursor one key/value pair forward and returns the new
 // pair.
 func (c *readWriteCursor) Next() ([]byte, []byte) {
+	if err := c.bucket.tx.checkError(); err != nil {
+		return nil, nil
+	}
+
 	var (
 		key   []byte
 		value []byte
@@ -104,7 +120,9 @@ func (c *readWriteCursor) Next() ([]byte, []byte) {
 		return nil, nil
 
 	case err != nil:
-		panic(err)
+		c.bucket.tx.setError(err)
+
+		return nil, nil
 	}
 
 	// Copy current key to prevent modification by the caller.
@@ -117,6 +135,10 @@ func (c *readWriteCursor) Next() ([]byte, []byte) {
 // Prev moves the cursor one key/value pair backward and returns the new
 // pair.
 func (c *readWriteCursor) Prev() ([]byte, []byte) {
+	if err := c.bucket.tx.checkError(); err != nil {
+		return nil, nil
+	}
+
 	var (
 		key   []byte
 		value []byte
@@ -135,7 +157,9 @@ func (c *readWriteCursor) Prev() ([]byte, []byte) {
 		return nil, nil
 
 	case err != nil:
-		panic(err)
+		c.bucket.tx.setError(err)
+
+		return nil, nil
 	}
 
 	// Copy current key to prevent modification by the caller.
@@ -149,6 +173,10 @@ func (c *readWriteCursor) Prev() ([]byte, []byte) {
 // not exist, the cursor is moved to the next key after seek.  Returns
 // the new pair.
 func (c *readWriteCursor) Seek(seek []byte) ([]byte, []byte) {
+	if err := c.bucket.tx.checkError(); err != nil {
+		return nil, nil
+	}
+
 	// Convert nil to empty slice, otherwise sql mapping won't be correct
 	// and no keys are found.
 	if seek == nil {
@@ -173,7 +201,9 @@ func (c *readWriteCursor) Seek(seek []byte) ([]byte, []byte) {
 		return nil, nil
 
 	case err != nil:
-		panic(err)
+		c.bucket.tx.setError(err)
+
+		return nil, nil
 	}
 
 	// Copy current key to prevent modification by the caller.
@@ -187,6 +217,10 @@ func (c *readWriteCursor) Seek(seek []byte) ([]byte, []byte) {
 // invalidating the cursor.  Returns ErrIncompatibleValue if attempted
 // when the cursor points to a nested bucket.
 func (c *readWriteCursor) Delete() error {
+	if err := c.bucket.tx.checkError(); err != nil {
+		return err
+	}
+
 	// Get first record at or after cursor.
 	var key []byte
 	row, cancel := c.bucket.tx.QueryRow(
@@ -203,7 +237,7 @@ func (c *readWriteCursor) Delete() error {
 		return nil
 
 	case err != nil:
-		panic(err)
+		return err
 	}
 
 	// Delete record.
@@ -214,7 +248,7 @@ func (c *readWriteCursor) Delete() error {
 		key,
 	)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	rows, err := result.RowsAffected()

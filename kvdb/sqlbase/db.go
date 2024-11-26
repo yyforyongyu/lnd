@@ -55,10 +55,6 @@ type Config struct {
 	// commands. Note that the sqlite keywords to be replaced are
 	// case-sensitive.
 	SQLiteCmdReplacements SQLiteCmdReplacements
-
-	// WithTxLevelLock when set will ensure that there is a transaction
-	// level lock.
-	WithTxLevelLock bool
 }
 
 // db holds a reference to the sql db connection.
@@ -78,10 +74,6 @@ type db struct {
 
 	// db is the underlying database connection instance.
 	db *sql.DB
-
-	// lock is the global write lock that ensures single writer. This is
-	// only used if cfg.WithTxLevelLock is set.
-	lock sync.RWMutex
 
 	// table is the name of the table that contains the data for all
 	// top-level buckets that have keys that cannot be mapped to a distinct
@@ -165,38 +157,6 @@ func (db *db) getPrefixedTableName(table string) string {
 	return fmt.Sprintf("%s_%s", db.prefix, table)
 }
 
-// catchPanic executes the specified function. If a panic occurs, it is returned
-// as an error value.
-func catchPanic(f func() error) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			switch data := r.(type) {
-			case error:
-				err = data
-
-			default:
-				err = errors.New(fmt.Sprintf("%v", data))
-			}
-
-			// Before we issue a critical log which'll cause the
-			// daemon to shut down, we'll first check if this is a
-			// DB serialization error. If so, then we don't need to
-			// log as we can retry safely and avoid tearing
-			// everything down.
-			if sqldb.IsSerializationError(sqldb.MapSQLError(err)) {
-				log.Tracef("Detected db serialization error "+
-					"via panic: %v", err)
-			} else {
-				log.Criticalf("Caught unhandled error: %v", r)
-			}
-		}
-	}()
-
-	err = f()
-
-	return
-}
-
 // View opens a database read transaction and executes the function f with the
 // transaction passed as a parameter. After f exits, the transaction is rolled
 // back. If f errors, its error is returned, not a rollback error (if any
@@ -242,7 +202,19 @@ func (db *db) executeTransaction(f func(tx walletdb.ReadWriteTx) error,
 		}
 
 		reset()
-		return catchPanic(func() error { return f(kvTx) })
+
+		err := f(kvTx)
+		// Return the internal error first in case we need to retry and
+		// the error returned by the function is only a symptom of the
+		// underlying serialization error we already have.
+		if intErr := kvTx.checkError(); intErr != nil {
+			return intErr
+		}
+		if err != nil {
+			return err
+		}
+
+		return nil
 	}
 
 	onBackoff := func(retry int, delay time.Duration) {

@@ -21,27 +21,18 @@ type readWriteTx struct {
 	// active is true if the transaction hasn't been committed yet.
 	active bool
 
-	// locker is a pointer to the global db lock.
-	locker sync.Locker
+	// err is an error set by calls that don't return errors. If it's set,
+	// the transaction must be rolled back and, if a serialization error,
+	// possibly retried.
+	err error
+
+	// errMu is a mutex for reading/updating the error.
+	errMu sync.RWMutex
 }
 
 // newReadWriteTx creates an rw transaction using a connection from the
 // specified pool.
 func newReadWriteTx(db *db, readOnly bool) (*readWriteTx, error) {
-	locker := newNoopLocker()
-	if db.cfg.WithTxLevelLock {
-		// Obtain the global lock instance. An alternative here is to
-		// obtain a database lock from Postgres. Unfortunately there is
-		// no database-level lock in Postgres, meaning that each table
-		// would need to be locked individually. Perhaps an advisory
-		// lock could perform this function too.
-		locker = &db.lock
-		if readOnly {
-			locker = db.lock.RLocker()
-		}
-	}
-	locker.Lock()
-
 	// Start the transaction. Don't use the timeout context because it would
 	// be applied to the transaction as a whole. If possible, mark the
 	// transaction as read-only to make sure that potential programming
@@ -54,7 +45,6 @@ func newReadWriteTx(db *db, readOnly bool) (*readWriteTx, error) {
 		},
 	)
 	if err != nil {
-		locker.Unlock()
 		return nil, err
 	}
 
@@ -62,8 +52,23 @@ func newReadWriteTx(db *db, readOnly bool) (*readWriteTx, error) {
 		db:     db,
 		tx:     tx,
 		active: true,
-		locker: locker,
 	}, nil
+}
+
+// checkError returns an error if the transaction has already errored.
+func (tx *readWriteTx) checkError() error {
+	tx.errMu.RLock()
+	defer tx.errMu.RUnlock()
+
+	return tx.err
+}
+
+// setError sets the error for the transaction.
+func (tx *readWriteTx) setError(err error) {
+	tx.errMu.Lock()
+	defer tx.errMu.Unlock()
+
+	tx.err = err
 }
 
 // ReadBucket opens the root bucket for read only access.  If the bucket
@@ -74,11 +79,23 @@ func (tx *readWriteTx) ReadBucket(key []byte) walletdb.ReadBucket {
 
 // ForEachBucket iterates through all top level buckets.
 func (tx *readWriteTx) ForEachBucket(fn func(key []byte) error) error {
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	// Fetch binary top level buckets.
 	bucket := newReadWriteBucket(tx, nil)
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	err := bucket.ForEach(func(k, _ []byte) error {
 		return fn(k)
 	})
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	return err
 }
 
@@ -94,7 +111,6 @@ func (tx *readWriteTx) Rollback() error {
 
 	// Unlock the transaction regardless of the error result.
 	tx.active = false
-	tx.locker.Unlock()
 	return err
 }
 
@@ -114,6 +130,10 @@ func (tx *readWriteTx) ReadWriteBucket(key []byte) walletdb.ReadWriteBucket {
 func (tx *readWriteTx) CreateTopLevelBucket(key []byte) (
 	walletdb.ReadWriteBucket, error) {
 
+	if err := tx.checkError(); err != nil {
+		return nil, err
+	}
+
 	if len(key) == 0 {
 		return nil, walletdb.ErrBucketNameRequired
 	}
@@ -126,6 +146,10 @@ func (tx *readWriteTx) CreateTopLevelBucket(key []byte) (
 // errors if the bucket can not be found or the key keys a single value
 // instead of a bucket.
 func (tx *readWriteTx) DeleteTopLevelBucket(key []byte) error {
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	// Execute a cascading delete on the key.
 	result, err := tx.Exec(
 		"DELETE FROM "+tx.db.table+" WHERE key=$1 "+
@@ -149,6 +173,10 @@ func (tx *readWriteTx) DeleteTopLevelBucket(key []byte) error {
 
 // Commit commits the transaction if not already committed.
 func (tx *readWriteTx) Commit() error {
+	if err := tx.checkError(); err != nil {
+		return err
+	}
+
 	// Commit will fail if the transaction is already committed.
 	if !tx.active {
 		return walletdb.ErrTxClosed
@@ -162,7 +190,6 @@ func (tx *readWriteTx) Commit() error {
 
 	// Unlock the transaction regardless of the error result.
 	tx.active = false
-	tx.locker.Unlock()
 
 	return err
 }
@@ -204,25 +231,3 @@ func (tx *readWriteTx) Exec(query string, args ...interface{}) (sql.Result,
 
 	return tx.tx.ExecContext(ctx, query, args...)
 }
-
-// noopLocker is an implementation of a no-op sync.Locker.
-type noopLocker struct{}
-
-// newNoopLocker creates a new noopLocker.
-func newNoopLocker() sync.Locker {
-	return &noopLocker{}
-}
-
-// Lock is a noop.
-//
-// NOTE: this is part of the sync.Locker interface.
-func (n *noopLocker) Lock() {
-}
-
-// Unlock is a noop.
-//
-// NOTE: this is part of the sync.Locker interface.
-func (n *noopLocker) Unlock() {
-}
-
-var _ sync.Locker = (*noopLocker)(nil)

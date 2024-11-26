@@ -50,9 +50,20 @@ func parentSelector(id *int64) string {
 // is nil, but it does not include the key/value pairs within those
 // nested buckets.
 func (b *readWriteBucket) ForEach(cb func(k, v []byte) error) error {
+	if err := b.tx.checkError(); err != nil {
+		return err
+	}
+
 	cursor := b.ReadWriteCursor()
+	if err := b.tx.checkError(); err != nil {
+		return err
+	}
 
 	k, v := cursor.First()
+	if err := b.tx.checkError(); err != nil {
+		return err
+	}
+
 	for k != nil {
 		err := cb(k, v)
 		if err != nil {
@@ -60,6 +71,10 @@ func (b *readWriteBucket) ForEach(cb func(k, v []byte) error) error {
 		}
 
 		k, v = cursor.Next()
+		if err := b.tx.checkError(); err != nil {
+			return err
+		}
+
 	}
 
 	return nil
@@ -68,6 +83,10 @@ func (b *readWriteBucket) ForEach(cb func(k, v []byte) error) error {
 // Get returns the value for the given key. Returns nil if the key does
 // not exist in this bucket.
 func (b *readWriteBucket) Get(key []byte) []byte {
+	if err := b.tx.checkError(); err != nil {
+		return nil
+	}
+
 	// Return nil if the key is empty.
 	if len(key) == 0 {
 		return nil
@@ -86,7 +105,9 @@ func (b *readWriteBucket) Get(key []byte) []byte {
 		return nil
 
 	case err != nil:
-		panic(err)
+		b.tx.setError(err)
+
+		return nil
 	}
 
 	// When an empty byte array is stored as the value, Sqlite will decode
@@ -128,7 +149,7 @@ func (b *readWriteBucket) NestedReadWriteBucket(
 		return nil
 
 	case err != nil:
-		panic(err)
+		b.tx.setError(err)
 	}
 
 	return newReadWriteBucket(b.tx, &id)
@@ -141,6 +162,10 @@ func (b *readWriteBucket) NestedReadWriteBucket(
 // possible depending on the implementation.
 func (b *readWriteBucket) CreateBucket(key []byte) (
 	walletdb.ReadWriteBucket, error) {
+
+	if err := b.tx.checkError(); err != nil {
+		return nil, err
+	}
 
 	if len(key) == 0 {
 		return nil, walletdb.ErrBucketNameRequired
@@ -194,6 +219,10 @@ func (b *readWriteBucket) CreateBucket(key []byte) (
 func (b *readWriteBucket) CreateBucketIfNotExists(key []byte) (
 	walletdb.ReadWriteBucket, error) {
 
+	if err := b.tx.checkError(); err != nil {
+		return nil, err
+	}
+
 	if len(key) == 0 {
 		return nil, walletdb.ErrBucketNameRequired
 	}
@@ -238,6 +267,10 @@ func (b *readWriteBucket) CreateBucketIfNotExists(key []byte) (
 // pointed to by the passed key. All values in the bucket and sub-buckets
 // will be deleted as well.
 func (b *readWriteBucket) DeleteNestedBucket(key []byte) error {
+	if err := b.tx.checkError(); err != nil {
+		return err
+	}
+
 	if len(key) == 0 {
 		return walletdb.ErrIncompatibleValue
 	}
@@ -265,6 +298,10 @@ func (b *readWriteBucket) DeleteNestedBucket(key []byte) error {
 // Put updates the value for the passed key.
 // Returns ErrKeyRequired if te passed key is empty.
 func (b *readWriteBucket) Put(key, value []byte) error {
+	if err := b.tx.checkError(); err != nil {
+		return err
+	}
+
 	if len(key) == 0 {
 		return walletdb.ErrKeyRequired
 	}
@@ -326,6 +363,10 @@ func (b *readWriteBucket) Put(key, value []byte) error {
 // Delete deletes the key/value pointed to by the passed key.
 // Returns ErrKeyRequired if the passed key is empty.
 func (b *readWriteBucket) Delete(key []byte) error {
+	if err := b.tx.checkError(); err != nil {
+		return err
+	}
+
 	if key == nil {
 		return nil
 	}
@@ -379,6 +420,10 @@ func (b *readWriteBucket) Tx() walletdb.ReadWriteTx {
 // Note that this is not a thread safe function and as such it must not be used
 // for synchronization.
 func (b *readWriteBucket) NextSequence() (uint64, error) {
+	if err := b.tx.checkError(); err != nil {
+		return 0, err
+	}
+
 	seq := b.Sequence() + 1
 
 	return seq, b.SetSequence(seq)
@@ -386,8 +431,12 @@ func (b *readWriteBucket) NextSequence() (uint64, error) {
 
 // SetSequence updates the sequence number for the bucket.
 func (b *readWriteBucket) SetSequence(v uint64) error {
+	if err := b.tx.checkError(); err != nil {
+		return err
+	}
+
 	if b.id == nil {
-		panic("sequence not supported on top level bucket")
+		return errors.New("sequence not supported on top level bucket")
 	}
 
 	result, err := b.tx.Exec(
@@ -412,8 +461,17 @@ func (b *readWriteBucket) SetSequence(v uint64) error {
 // Sequence returns the current sequence number for this bucket without
 // incrementing it.
 func (b *readWriteBucket) Sequence() uint64 {
+	if err := b.tx.checkError(); err != nil {
+		return 0
+	}
+
 	if b.id == nil {
-		panic("sequence not supported on top level bucket")
+
+		b.tx.setError(errors.New(
+			"sequence not supported on top level bucket",
+		))
+
+		return 0
 	}
 
 	var seq int64
@@ -430,7 +488,9 @@ func (b *readWriteBucket) Sequence() uint64 {
 		return 0
 
 	case err != nil:
-		panic(err)
+		b.tx.setError(err)
+
+		return 0
 	}
 
 	return uint64(seq)
@@ -443,6 +503,10 @@ func (b *readWriteBucket) Prefetch(paths ...[]string) {}
 // ForAll is an optimized version of ForEach with the limitation that no
 // additional queries can be executed within the callback.
 func (b *readWriteBucket) ForAll(cb func(k, v []byte) error) error {
+	if err := b.tx.checkError(); err != nil {
+		return err
+	}
+
 	rows, cancel, err := b.tx.Query(
 		"SELECT key, value FROM " + b.table + " WHERE " +
 			parentSelector(b.id) + " ORDER BY key",
