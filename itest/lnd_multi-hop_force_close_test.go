@@ -357,8 +357,11 @@ func runLocalClaimOutgoingHTLC(ht *lntest.HarnessTest,
 	// We'll create two random payment hashes unknown to carol, then send
 	// each of them by manually specifying the HTLC details.
 	carolPubKey := carol.PubKey[:]
-	dustPayHash := ht.Random32Bytes()
-	payHash := ht.Random32Bytes()
+
+	preimageDust := ht.RandomPreimage()
+	preimage := ht.RandomPreimage()
+	dustPayHash := preimageDust.Hash()
+	payHash := preimage.Hash()
 
 	// If this is a taproot channel, then we'll need to make some manual
 	// route hints so Alice can actually find a route.
@@ -370,7 +373,7 @@ func runLocalClaimOutgoingHTLC(ht *lntest.HarnessTest,
 	req := &routerrpc.SendPaymentRequest{
 		Dest:           carolPubKey,
 		Amt:            int64(dustHtlcAmt),
-		PaymentHash:    dustPayHash,
+		PaymentHash:    dustPayHash[:],
 		FinalCltvDelta: finalCltvDelta,
 		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
@@ -381,7 +384,7 @@ func runLocalClaimOutgoingHTLC(ht *lntest.HarnessTest,
 	req = &routerrpc.SendPaymentRequest{
 		Dest:           carolPubKey,
 		Amt:            int64(htlcAmt),
-		PaymentHash:    payHash,
+		PaymentHash:    payHash[:],
 		FinalCltvDelta: finalCltvDelta,
 		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
@@ -532,6 +535,10 @@ func runLocalClaimOutgoingHTLC(ht *lntest.HarnessTest,
 	// Once this transaction has been confirmed, Bob should detect that he
 	// no longer has any pending channels.
 	ht.AssertNumPendingForceClose(bob, 0)
+
+	expectedReason := lnrpc.PaymentFailureReason_FAILURE_REASON_ERROR
+	ht.AssertPaymentFailureReason(alice, preimage, expectedReason)
+	ht.AssertPaymentFailureReason(alice, preimageDust, expectedReason)
 }
 
 // testMultiHopReceiverPreimageClaimAnchor tests

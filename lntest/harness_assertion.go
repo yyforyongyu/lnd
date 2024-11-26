@@ -1615,7 +1615,8 @@ func (h *HarnessTest) AssertPaymentFailureReason(hn *node.HarnessNode,
 		}
 
 		return fmt.Errorf("payment: %v failure reason not match, "+
-			"want %s got %s", payHash, reason, p.Status)
+			"want %s(%d) got %s(%d)", payHash, reason, reason,
+			p.Status, p.Status)
 	}, DefaultTimeout)
 	require.NoError(h, err, "timeout checking payment failure reason")
 }
