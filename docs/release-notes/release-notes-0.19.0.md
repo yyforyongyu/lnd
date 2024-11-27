@@ -238,6 +238,11 @@ The underlying functionality between those two options remain the same.
   `channeldb` package](https://github.com/lightningnetwork/lnd/pull/9236) and 
   into the `graph/db` package.
 
+* [Remove global application level lock for
+  Postgres](https://github.com/lightningnetwork/lnd/pull/9313) so multiple DB
+  transactions can run at once, increasing efficiency. Includes several bugfixes
+  to allow this to work properly.
+
 ## Tooling and Documentation
 
 * [Improved `lncli create` command help text](https://github.com/lightningnetwork/lnd/pull/9077)
