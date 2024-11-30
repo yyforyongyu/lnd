@@ -13,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channeldb/models"
@@ -226,6 +227,15 @@ func (c *chanArbTestCtx) CleanUp() {
 	}
 }
 
+// receiveBlockbeat mocks the behavior of a blockbeat being sent by the
+// BlockbeatDispatcher, which essentially mocks the method `ProcessBlock`.
+func (c *chanArbTestCtx) receiveBlockbeat(height int) {
+	go func() {
+		beat := newBeatFromHeight(int32(height))
+		c.chanArb.BlockbeatChan <- beat
+	}()
+}
+
 // AssertStateTransitions asserts that the state machine steps through the
 // passed states in order.
 func (c *chanArbTestCtx) AssertStateTransitions(expectedStates ...ArbitratorState) {
@@ -285,7 +295,8 @@ func (c *chanArbTestCtx) Restart(restartClosure func(*chanArbTestCtx)) (*chanArb
 		restartClosure(newCtx)
 	}
 
-	if err := newCtx.chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := newCtx.chanArb.Start(nil, beat); err != nil {
 		return nil, err
 	}
 
@@ -512,7 +523,8 @@ func TestChannelArbitratorCooperativeClose(t *testing.T) {
 	chanArbCtx, err := createTestChannelArbitrator(t, log)
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 
-	if err := chanArbCtx.chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArbCtx.chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	t.Cleanup(func() {
@@ -570,7 +582,8 @@ func TestChannelArbitratorRemoteForceClose(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb := chanArbCtx.chanArb
 
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	defer chanArb.Stop()
@@ -623,7 +636,8 @@ func TestChannelArbitratorLocalForceClose(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb := chanArbCtx.chanArb
 
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	defer chanArb.Stop()
@@ -735,7 +749,8 @@ func TestChannelArbitratorBreachClose(t *testing.T) {
 	chanArb.cfg.PreimageDB = newMockWitnessBeacon()
 	chanArb.cfg.Registry = &mockRegistry{}
 
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	t.Cleanup(func() {
@@ -862,7 +877,8 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	chanArb.cfg.PreimageDB = newMockWitnessBeacon()
 	chanArb.cfg.Registry = &mockRegistry{}
 
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	defer chanArb.Stop()
@@ -1036,7 +1052,7 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	}
 	require.Equal(t, expectedFinalHtlcs, chanArbCtx.finalHtlcs)
 
-	// We'll no re-create the resolver, notice that we use the existing
+	// We'll now re-create the resolver, notice that we use the existing
 	// arbLog so it carries over the same on-disk state.
 	chanArbCtxNew, err := chanArbCtx.Restart(nil)
 	require.NoError(t, err, "unable to create ChannelArbitrator")
@@ -1074,7 +1090,12 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	}
 
 	// Send a notification that the expiry height has been reached.
+	//
+	// TODO(yy): remove the EpochChan and use the blockbeat below once
+	// resolvers are hooked with the blockbeat.
 	oldNotifier.EpochChan <- &chainntnfs.BlockEpoch{Height: 10}
+	// beat := chainio.NewBlockbeatFromHeight(10)
+	// chanArb.BlockbeatChan <- beat
 
 	// htlcOutgoingContestResolver is now transforming into a
 	// htlcTimeoutResolver and should send the contract off for incubation.
@@ -1138,7 +1159,8 @@ func TestChannelArbitratorLocalForceCloseRemoteConfirmed(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb := chanArbCtx.chanArb
 
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	defer chanArb.Stop()
@@ -1245,7 +1267,8 @@ func TestChannelArbitratorLocalForceDoubleSpend(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb := chanArbCtx.chanArb
 
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	defer chanArb.Stop()
@@ -1351,7 +1374,8 @@ func TestChannelArbitratorPersistence(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 
 	chanArb := chanArbCtx.chanArb
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 
@@ -1469,7 +1493,8 @@ func TestChannelArbitratorForceCloseBreachedChannel(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 
 	chanArb := chanArbCtx.chanArb
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 
@@ -1656,7 +1681,8 @@ func TestChannelArbitratorCommitFailure(t *testing.T) {
 		}
 
 		chanArb := chanArbCtx.chanArb
-		if err := chanArb.Start(nil); err != nil {
+		beat := newBeatFromHeight(0)
+		if err := chanArb.Start(nil, beat); err != nil {
 			t.Fatalf("unable to start ChannelArbitrator: %v", err)
 		}
 
@@ -1740,7 +1766,8 @@ func TestChannelArbitratorEmptyResolutions(t *testing.T) {
 	chanArb.cfg.ClosingHeight = 100
 	chanArb.cfg.CloseType = channeldb.RemoteForceClose
 
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(100)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 
@@ -1770,7 +1797,8 @@ func TestChannelArbitratorAlreadyForceClosed(t *testing.T) {
 	chanArbCtx, err := createTestChannelArbitrator(t, log)
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb := chanArbCtx.chanArb
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	defer chanArb.Stop()
@@ -1868,9 +1896,10 @@ func TestChannelArbitratorDanglingCommitForceClose(t *testing.T) {
 				t.Fatalf("unable to create ChannelArbitrator: %v", err)
 			}
 			chanArb := chanArbCtx.chanArb
-			if err := chanArb.Start(nil); err != nil {
-				t.Fatalf("unable to start ChannelArbitrator: %v", err)
-			}
+			beat := newBeatFromHeight(0)
+			err = chanArb.Start(nil, beat)
+			require.NoError(t, err)
+
 			defer chanArb.Stop()
 
 			// Now that our channel arb has started, we'll set up
@@ -1914,7 +1943,8 @@ func TestChannelArbitratorDanglingCommitForceClose(t *testing.T) {
 			// now mine a block (height 5), which is 5 blocks away
 			// (our grace delta) from the expiry of that HTLC.
 			case testCase.htlcExpired:
-				chanArbCtx.chanArb.blocks <- 5
+				beat := newBeatFromHeight(5)
+				chanArbCtx.chanArb.BlockbeatChan <- beat
 
 			// Otherwise, we'll just trigger a regular force close
 			// request.
@@ -2026,8 +2056,7 @@ func TestChannelArbitratorDanglingCommitForceClose(t *testing.T) {
 			// so instead, we'll mine another block which'll cause
 			// it to re-examine its state and realize there're no
 			// more HTLCs.
-			chanArbCtx.chanArb.blocks <- 6
-			chanArbCtx.AssertStateTransitions(StateFullyResolved)
+			chanArbCtx.receiveBlockbeat(6)
 		})
 	}
 }
@@ -2064,7 +2093,8 @@ func TestChannelArbitratorPendingExpiredHTLC(t *testing.T) {
 		return false
 	}
 
-	if err := chanArb.Start(nil); err != nil {
+	beat := newBeatFromHeight(0)
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	t.Cleanup(func() {
@@ -2098,13 +2128,15 @@ func TestChannelArbitratorPendingExpiredHTLC(t *testing.T) {
 	// We will advance the uptime to 10 seconds which should be still within
 	// the grace period and should not trigger going to chain.
 	testClock.SetTime(startTime.Add(time.Second * 10))
-	chanArbCtx.chanArb.blocks <- 5
+	beat = newBeatFromHeight(5)
+	chanArbCtx.chanArb.BlockbeatChan <- beat
 	chanArbCtx.AssertState(StateDefault)
 
 	// We will advance the uptime to 16 seconds which should trigger going
 	// to chain.
 	testClock.SetTime(startTime.Add(time.Second * 16))
-	chanArbCtx.chanArb.blocks <- 6
+	beat = newBeatFromHeight(6)
+	chanArbCtx.chanArb.BlockbeatChan <- beat
 	chanArbCtx.AssertStateTransitions(
 		StateBroadcastCommit,
 		StateCommitmentBroadcasted,
@@ -2217,8 +2249,8 @@ func TestRemoteCloseInitiator(t *testing.T) {
 					"ChannelArbitrator: %v", err)
 			}
 			chanArb := chanArbCtx.chanArb
-
-			if err := chanArb.Start(nil); err != nil {
+			beat := newBeatFromHeight(0)
+			if err := chanArb.Start(nil, beat); err != nil {
 				t.Fatalf("unable to start "+
 					"ChannelArbitrator: %v", err)
 			}
@@ -2472,7 +2504,7 @@ func TestSweepAnchors(t *testing.T) {
 
 	// Set current block height.
 	heightHint := uint32(1000)
-	chanArbCtx.chanArb.blocks <- int32(heightHint)
+	chanArbCtx.receiveBlockbeat(int(heightHint))
 
 	htlcIndexBase := uint64(99)
 	deadlineDelta := uint32(10)
@@ -2635,7 +2667,7 @@ func TestSweepLocalAnchor(t *testing.T) {
 
 	// Set current block height.
 	heightHint := uint32(1000)
-	chanArbCtx.chanArb.blocks <- int32(heightHint)
+	chanArbCtx.receiveBlockbeat(int(heightHint))
 
 	htlcIndex := uint64(99)
 	deadlineDelta := uint32(10)
@@ -2769,7 +2801,9 @@ func TestChannelArbitratorAnchors(t *testing.T) {
 			},
 		}
 
-	if err := chanArb.Start(nil); err != nil {
+	heightHint := uint32(1000)
+	beat := newBeatFromHeight(int32(heightHint))
+	if err := chanArb.Start(nil, beat); err != nil {
 		t.Fatalf("unable to start ChannelArbitrator: %v", err)
 	}
 	t.Cleanup(func() {
@@ -2782,8 +2816,8 @@ func TestChannelArbitratorAnchors(t *testing.T) {
 	chanArb.UpdateContractSignals(signals)
 
 	// Set current block height.
-	heightHint := uint32(1000)
-	chanArbCtx.chanArb.blocks <- int32(heightHint)
+	beat = newBeatFromHeight(int32(heightHint))
+	chanArbCtx.chanArb.BlockbeatChan <- beat
 
 	htlcAmt := lnwire.MilliSatoshi(1_000_000)
 
@@ -2951,9 +2985,13 @@ func TestChannelArbitratorAnchors(t *testing.T) {
 	require.Equal(t, 2, len(chanArbCtx.sweeper.deadlines))
 	require.EqualValues(t,
 		heightHint+deadlinePreimageDelta/2,
+		chanArbCtx.sweeper.deadlines[0], "want %d, got %d",
+		heightHint+deadlinePreimageDelta/2,
 		chanArbCtx.sweeper.deadlines[0],
 	)
 	require.EqualValues(t,
+		heightHint+deadlinePreimageDelta/2,
+		chanArbCtx.sweeper.deadlines[1], "want %d, got %d",
 		heightHint+deadlinePreimageDelta/2,
 		chanArbCtx.sweeper.deadlines[1],
 	)
@@ -3054,7 +3092,8 @@ func TestChannelArbitratorStartForceCloseFail(t *testing.T) {
 				return test.broadcastErr
 			}
 
-			err = chanArb.Start(nil)
+			beat := newBeatFromHeight(0)
+			err = chanArb.Start(nil, beat)
 
 			if !test.expectedStartup {
 				require.ErrorIs(t, err, test.broadcastErr)
@@ -3132,4 +3171,12 @@ func (m *mockChannel) ForceCloseChan() (*wire.MsgTx, error) {
 	}
 
 	return &wire.MsgTx{}, nil
+}
+
+func newBeatFromHeight(height int32) *chainio.Beat {
+	epoch := chainntnfs.BlockEpoch{
+		Height: height,
+	}
+
+	return chainio.NewBeat(epoch)
 }
