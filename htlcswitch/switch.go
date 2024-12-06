@@ -917,6 +917,7 @@ func (s *Switch) getLocalLink(pkt *htlcPacket, htlc *lnwire.UpdateAddHTLC) (
 	currentHeight := atomic.LoadUint32(&s.bestHeight)
 	htlcErr := link.CheckHtlcTransit(
 		htlc.PaymentHash, htlc.Amount, htlc.Expiry, currentHeight,
+		htlc.CustomRecords,
 	)
 	if htlcErr != nil {
 		log.Errorf("Link %v policy for local forward not "+
@@ -1605,7 +1606,7 @@ out:
 				}
 			}
 
-			log.Infof("Received outside contract resolution, "+
+			log.Debugf("Received outside contract resolution, "+
 				"mapping to: %v", spew.Sdump(pkt))
 
 			// We don't check the error, as the only failure we can
@@ -2887,10 +2888,9 @@ func (s *Switch) handlePacketAdd(packet *htlcPacket,
 			failure = link.CheckHtlcForward(
 				htlc.PaymentHash, packet.incomingAmount,
 				packet.amount, packet.incomingTimeout,
-				packet.outgoingTimeout,
-				packet.inboundFee,
-				currentHeight,
-				packet.originalOutgoingChanID,
+				packet.outgoingTimeout, packet.inboundFee,
+				currentHeight, packet.originalOutgoingChanID,
+				htlc.CustomRecords,
 			)
 		}
 
