@@ -2371,7 +2371,8 @@ func (d *AuthenticatedGossiper) handleNodeAnnouncement(nMsg *networkMsg,
 	timestamp := time.Unix(int64(nodeAnn.Timestamp), 0)
 
 	log.Debugf("Processing NodeAnnouncement: peer=%v, timestamp=%v, "+
-		"node=%x", nMsg.peer, timestamp, nodeAnn.NodeID)
+		"node=%x, source=%x", nMsg.peer, timestamp, nodeAnn.NodeID,
+		nMsg.source.SerializeCompressed())
 
 	// We'll quickly ask the router if it already has a newer update for
 	// this node so we can skip validating signatures if not required.
@@ -2430,7 +2431,8 @@ func (d *AuthenticatedGossiper) handleNodeAnnouncement(nMsg *networkMsg,
 	// TODO(roasbeef): get rid of the above
 
 	log.Debugf("Processed NodeAnnouncement: peer=%v, timestamp=%v, "+
-		"node=%x", nMsg.peer, timestamp, nodeAnn.NodeID)
+		"node=%x, source=%x", nMsg.peer, timestamp, nodeAnn.NodeID,
+		nMsg.source.SerializeCompressed())
 
 	return announcements, true
 }
