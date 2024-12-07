@@ -2,7 +2,11 @@
 
 package itest
 
-import "github.com/lightningnetwork/lnd/lntest"
+import (
+	"fmt"
+
+	"github.com/lightningnetwork/lnd/lntest"
+)
 
 var allTestCases = []*lntest.TestCase{
 	{
@@ -10,28 +14,12 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testUpdateChanStatus,
 	},
 	{
-		Name:     "basic funding flow",
-		TestFunc: testBasicChannelFunding,
-	},
-	{
-		Name:     "multi hop receiver chain claim",
-		TestFunc: testMultiHopReceiverChainClaim,
-	},
-	{
 		Name:     "external channel funding",
 		TestFunc: testExternalFundingChanPoint,
 	},
 	{
-		Name:     "channel backup restore basic",
-		TestFunc: testChannelBackupRestoreBasic,
-	},
-	{
 		Name:     "channel backup restore unconfirmed",
 		TestFunc: testChannelBackupRestoreUnconfirmed,
-	},
-	{
-		Name:     "channel backup restore commit types",
-		TestFunc: testChannelBackupRestoreCommitTypes,
 	},
 	{
 		Name:     "channel backup restore force close",
@@ -154,18 +142,6 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testAddPeerConfig,
 	},
 	{
-		Name:     "multi hop htlc local timeout",
-		TestFunc: testMultiHopHtlcLocalTimeout,
-	},
-	{
-		Name:     "multi hop local force close on-chain htlc timeout",
-		TestFunc: testMultiHopLocalForceCloseOnChainHtlcTimeout,
-	},
-	{
-		Name:     "multi hop remote force close on-chain htlc timeout",
-		TestFunc: testMultiHopRemoteForceCloseOnChainHtlcTimeout,
-	},
-	{
 		Name:     "private channel update policy",
 		TestFunc: testUpdateChannelPolicyForPrivateChannel,
 	},
@@ -194,8 +170,12 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testListPayments,
 	},
 	{
-		Name:     "send direct payment",
-		TestFunc: testSendDirectPayment,
+		Name:     "send direct payment anchor",
+		TestFunc: testSendDirectPaymentAnchor,
+	},
+	{
+		Name:     "send direct payment simple taproot",
+		TestFunc: testSendDirectPaymentSimpleTaproot,
 	},
 	{
 		Name:     "immediate payment after channel opened",
@@ -226,11 +206,15 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testChannelUnsettledBalance,
 	},
 	{
-		Name:     "channel force closure",
-		TestFunc: testChannelForceClosure,
+		Name:     "channel force closure anchor",
+		TestFunc: testChannelForceClosureAnchor,
 	},
 	{
-		Name:     "failing link",
+		Name:     "channel force closure simple taproot",
+		TestFunc: testChannelForceClosureSimpleTaproot,
+	},
+	{
+		Name:     "failing channel",
 		TestFunc: testFailingChannel,
 	},
 	{
@@ -294,10 +278,6 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testOpenChannelAfterReorg,
 	},
 	{
-		Name:     "psbt channel funding",
-		TestFunc: testPsbtChanFunding,
-	},
-	{
 		Name:     "sign psbt",
 		TestFunc: testSignPsbt,
 	},
@@ -314,18 +294,6 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testRestAPI,
 	},
 	{
-		Name:     "multi hop htlc local chain claim",
-		TestFunc: testMultiHopHtlcLocalChainClaim,
-	},
-	{
-		Name:     "multi hop htlc remote chain claim",
-		TestFunc: testMultiHopHtlcRemoteChainClaim,
-	},
-	{
-		Name:     "multi hop htlc aggregation",
-		TestFunc: testMultiHopHtlcAggregation,
-	},
-	{
 		Name:     "revoked uncooperative close retribution",
 		TestFunc: testRevokedCloseRetribution,
 	},
@@ -337,10 +305,6 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "revoked uncooperative close retribution remote hodl",
 		TestFunc: testRevokedCloseRetributionRemoteHodl,
-	},
-	{
-		Name:     "single-hop send to route",
-		TestFunc: testSingleHopSendToRoute,
 	},
 	{
 		Name:     "multi-hop send to route",
@@ -479,10 +443,6 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testOptionScidAlias,
 	},
 	{
-		Name:     "scid alias channel update",
-		TestFunc: testUpdateChannelPolicyScidAlias,
-	},
-	{
 		Name:     "scid alias upgrade",
 		TestFunc: testOptionScidUpgrade,
 	},
@@ -515,16 +475,20 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testBumpForceCloseFee,
 	},
 	{
-		Name:     "taproot",
-		TestFunc: testTaproot,
+		Name:     "taproot spend",
+		TestFunc: testTaprootSpend,
+	},
+	{
+		Name:     "taproot musig2",
+		TestFunc: testTaprootMuSig2,
+	},
+	{
+		Name:     "taproot import scripts",
+		TestFunc: testTaprootImportScripts,
 	},
 	{
 		Name:     "simple taproot channel activation",
 		TestFunc: testSimpleTaprootChannelActivation,
-	},
-	{
-		Name:     "wallet import account",
-		TestFunc: testWalletImportAccount,
 	},
 	{
 		Name:     "wallet import pubkey",
@@ -533,10 +497,6 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "async payments benchmark",
 		TestFunc: testAsyncPayments,
-	},
-	{
-		Name:     "remote signer",
-		TestFunc: testRemoteSigner,
 	},
 	{
 		Name:     "taproot coop close",
@@ -549,10 +509,6 @@ var allTestCases = []*lntest.TestCase{
 	{
 		Name:     "trackpayments compatible",
 		TestFunc: testTrackPaymentsCompatible,
-	},
-	{
-		Name:     "open channel fee policy",
-		TestFunc: testOpenChannelUpdateFeePolicy,
 	},
 	{
 		Name:     "custom message",
@@ -575,12 +531,16 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testLookupHtlcResolution,
 	},
 	{
-		Name:     "watchtower",
-		TestFunc: testWatchtower,
+		Name:     "channel fundmax error",
+		TestFunc: testChannelFundMaxError,
 	},
 	{
-		Name:     "channel fundmax",
-		TestFunc: testChannelFundMax,
+		Name:     "channel fundmax wallet amount",
+		TestFunc: testChannelFundMaxWalletAmount,
+	},
+	{
+		Name:     "channel fundmax anchor reserve",
+		TestFunc: testChannelFundMaxAnchorReserve,
 	},
 	{
 		Name:     "htlc timeout resolver extract preimage remote",
@@ -595,12 +555,12 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testCustomFeatures,
 	},
 	{
-		Name:     "utxo selection funding",
-		TestFunc: testChannelUtxoSelection,
+		Name:     "update pending open channels on funder side",
+		TestFunc: testUpdateOnFunderPendingOpenChannels,
 	},
 	{
-		Name:     "update pending open channels",
-		TestFunc: testUpdateOnPendingOpenChannels,
+		Name:     "update pending open channels on fundee side",
+		TestFunc: testUpdateOnFundeePendingOpenChannels,
 	},
 	{
 		Name:     "blinded payment htlc re-forward",
@@ -695,12 +655,20 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testPaymentFailedHTLCLocalSwept,
 	},
 	{
+		Name:     "payment failed htlc local swept resumed",
+		TestFunc: testPaymentFailedHTLCLocalSweptResumed,
+	},
+	{
 		Name:     "payment succeeded htlc remote swept",
 		TestFunc: testPaymentSucceededHTLCRemoteSwept,
 	},
 	{
 		Name:     "send to route failed htlc timeout",
 		TestFunc: testSendToRouteFailHTLCTimeout,
+	},
+	{
+		Name:     "send to route failed htlc timeout resumed",
+		TestFunc: testSendToRouteFailHTLCTimeoutResumed,
 	},
 	{
 		Name:     "debuglevel show",
@@ -714,4 +682,73 @@ var allTestCases = []*lntest.TestCase{
 		Name:     "quiescence",
 		TestFunc: testQuiescence,
 	},
+}
+
+// appendPrefixed is used to add a prefix to each test name in the subtests
+// before appending them to the main test cases.
+func appendPrefixed(prefix string, testCases,
+	subtestCases []*lntest.TestCase) []*lntest.TestCase {
+
+	for _, tc := range subtestCases {
+		name := fmt.Sprintf("%s-%s", prefix, tc.Name)
+		testCases = append(testCases, &lntest.TestCase{
+			Name:     name,
+			TestFunc: tc.TestFunc,
+		})
+	}
+
+	return testCases
+}
+
+func init() {
+	// Register subtests.
+	allTestCases = appendPrefixed(
+		"multihop", allTestCases, multiHopForceCloseTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"watchtower", allTestCases, watchtowerTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"psbt", allTestCases, psbtFundingTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"remote signer", allTestCases, remoteSignerTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"channel backup", allTestCases, channelRestoreTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"utxo selection", allTestCases, fundUtxoSelectionTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"zero conf", allTestCases, zeroConfPolicyTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"channel fee policy", allTestCases, channelFeePolicyTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"wallet import account", allTestCases,
+		walletImportAccountTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"funding", allTestCases, basicFundingTestCases,
+	)
+	allTestCases = appendPrefixed(
+		"send to route", allTestCases, sendToRouteTestCases,
+	)
+
+	// Prepare the test cases for windows to exclude some of the flaky
+	// ones.
+	//
+	// NOTE: We need to run this before the isWindowsOS check to make sure
+	// the excluded tests are found in allTestCases. Otherwise, if a
+	// non-existing test is included in excludedTestsWindows, we won't be
+	// able to find it until it's pushed to the CI, which creates a much
+	// longer feedback loop.
+	windowsTestCases := filterWindowsFlakyTests()
+
+	// If this is Windows, we'll skip running some of the flaky tests.
+	if isWindowsOS() {
+		allTestCases = windowsTestCases
+	}
 }

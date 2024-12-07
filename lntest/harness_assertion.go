@@ -19,7 +19,6 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
@@ -29,6 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntest/rpc"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -61,9 +61,9 @@ func (h *HarnessTest) WaitForBlockchainSync(hn *node.HarnessNode) {
 
 // WaitForBlockchainSyncTo waits until the node is synced to bestBlock.
 func (h *HarnessTest) WaitForBlockchainSyncTo(hn *node.HarnessNode,
-	bestBlock *wire.MsgBlock) {
+	bestBlock chainhash.Hash) {
 
-	bestBlockHash := bestBlock.BlockHash().String()
+	bestBlockHash := bestBlock.String()
 	err := wait.NoError(func() error {
 		resp := hn.RPC.GetInfo()
 		if resp.SyncedToChain {
@@ -238,59 +238,6 @@ func (h *HarnessTest) EnsureConnected(a, b *node.HarnessNode) {
 	// peers lists to reflect the connection.
 	h.AssertPeerConnected(a, b)
 	h.AssertPeerConnected(b, a)
-}
-
-// AssertNumActiveEdges checks that an expected number of active edges can be
-// found in the node specified.
-func (h *HarnessTest) AssertNumActiveEdges(hn *node.HarnessNode,
-	expected int, includeUnannounced bool) []*lnrpc.ChannelEdge {
-
-	var edges []*lnrpc.ChannelEdge
-
-	old := hn.State.Edge.Public
-	if includeUnannounced {
-		old = hn.State.Edge.Total
-	}
-
-	// filterDisabled is a helper closure that filters out disabled
-	// channels.
-	filterDisabled := func(edge *lnrpc.ChannelEdge) bool {
-		if edge.Node1Policy != nil && edge.Node1Policy.Disabled {
-			return false
-		}
-		if edge.Node2Policy != nil && edge.Node2Policy.Disabled {
-			return false
-		}
-
-		return true
-	}
-
-	err := wait.NoError(func() error {
-		req := &lnrpc.ChannelGraphRequest{
-			IncludeUnannounced: includeUnannounced,
-		}
-		resp := hn.RPC.DescribeGraph(req)
-		activeEdges := fn.Filter(filterDisabled, resp.Edges)
-		total := len(activeEdges)
-
-		if total-old == expected {
-			if expected != 0 {
-				// NOTE: assume edges come in ascending order
-				// that the old edges are at the front of the
-				// slice.
-				edges = activeEdges[old:]
-			}
-
-			return nil
-		}
-
-		return errNumNotMatched(hn.Name(), "num of channel edges",
-			expected, total-old, total, old)
-	}, DefaultTimeout)
-
-	require.NoError(h, err, "timeout while checking for edges")
-
-	return edges
 }
 
 // AssertNumEdges checks that an expected number of edges can be found in the
@@ -738,15 +685,19 @@ func (h *HarnessTest) AssertStreamChannelForceClosed(hn *node.HarnessNode,
 		channeldb.ChanStatusLocalCloseInitiator.String(),
 		"channel not coop broadcasted")
 
+	// Get the closing txid.
+	closeTxid, err := chainhash.NewHashFromStr(resp.ClosingTxid)
+	require.NoError(h, err)
+
 	// We'll now, generate a single block, wait for the final close status
 	// update, then ensure that the closing transaction was included in the
 	// block.
-	block := h.MineBlocksAndAssertNumTxes(1, 1)[0]
+	closeTx := h.AssertTxInMempool(*closeTxid)
+	h.MineBlockWithTx(closeTx)
 
 	// Consume one close event and assert the closing txid can be found in
 	// the block.
 	closingTxid := h.WaitForChannelCloseEvent(stream)
-	h.AssertTxInBlock(block, closingTxid)
 
 	// We should see zero waiting close channels and 1 pending force close
 	// channels now.
@@ -1309,58 +1260,6 @@ func (h *HarnessTest) AssertNumActiveHtlcs(hn *node.HarnessNode, num int) {
 		hn.Name())
 }
 
-// AssertActiveHtlcs makes sure the node has the _exact_ HTLCs matching
-// payHashes on _all_ their channels.
-func (h *HarnessTest) AssertActiveHtlcs(hn *node.HarnessNode,
-	payHashes ...[]byte) {
-
-	err := wait.NoError(func() error {
-		// We require the RPC call to be succeeded and won't wait for
-		// it as it's an unexpected behavior.
-		req := &lnrpc.ListChannelsRequest{}
-		nodeChans := hn.RPC.ListChannels(req)
-
-		for _, ch := range nodeChans.Channels {
-			// Record all payment hashes active for this channel.
-			htlcHashes := make(map[string]struct{})
-
-			for _, htlc := range ch.PendingHtlcs {
-				h := hex.EncodeToString(htlc.HashLock)
-				_, ok := htlcHashes[h]
-				if ok {
-					return fmt.Errorf("duplicate HashLock "+
-						"in PendingHtlcs: %v",
-						ch.PendingHtlcs)
-				}
-				htlcHashes[h] = struct{}{}
-			}
-
-			// Channel should have exactly the payHashes active.
-			if len(payHashes) != len(htlcHashes) {
-				return fmt.Errorf("node [%s:%x] had %v "+
-					"htlcs active, expected %v",
-					hn.Name(), hn.PubKey[:],
-					len(htlcHashes), len(payHashes))
-			}
-
-			// Make sure all the payHashes are active.
-			for _, payHash := range payHashes {
-				h := hex.EncodeToString(payHash)
-				if _, ok := htlcHashes[h]; ok {
-					continue
-				}
-
-				return fmt.Errorf("node [%s:%x] didn't have: "+
-					"the payHash %v active", hn.Name(),
-					hn.PubKey[:], h)
-			}
-		}
-
-		return nil
-	}, DefaultTimeout)
-	require.NoError(h, err, "timeout checking active HTLCs")
-}
-
 // AssertIncomingHTLCActive asserts the node has a pending incoming HTLC in the
 // given channel. Returns the HTLC if found and active.
 func (h *HarnessTest) AssertIncomingHTLCActive(hn *node.HarnessNode,
@@ -1609,17 +1508,19 @@ func (h *HarnessTest) AssertNumHTLCsAndStage(hn *node.HarnessNode,
 		}
 
 		if len(target.PendingHtlcs) != num {
-			return fmt.Errorf("got %d pending htlcs, want %d",
-				len(target.PendingHtlcs), num)
+			return fmt.Errorf("got %d pending htlcs, want %d, %s",
+				len(target.PendingHtlcs), num,
+				lnutils.SpewLogClosure(target.PendingHtlcs)())
 		}
 
-		for i, htlc := range target.PendingHtlcs {
+		for _, htlc := range target.PendingHtlcs {
 			if htlc.Stage == stage {
 				continue
 			}
 
-			return fmt.Errorf("HTLC %d got stage: %v, "+
-				"want stage: %v", i, htlc.Stage, stage)
+			return fmt.Errorf("HTLC %s got stage: %v, "+
+				"want stage: %v", htlc.Outpoint, htlc.Stage,
+				stage)
 		}
 
 		return nil
@@ -1728,7 +1629,7 @@ func (h *HarnessTest) AssertActiveNodesSynced() {
 
 // AssertActiveNodesSyncedTo asserts all active nodes have synced to the
 // provided bestBlock.
-func (h *HarnessTest) AssertActiveNodesSyncedTo(bestBlock *wire.MsgBlock) {
+func (h *HarnessTest) AssertActiveNodesSyncedTo(bestBlock chainhash.Hash) {
 	for _, node := range h.manager.activeNodes {
 		h.WaitForBlockchainSyncTo(node, bestBlock)
 	}
@@ -1955,6 +1856,18 @@ func (h *HarnessTest) AssertChannelInGraph(hn *node.HarnessNode,
 		)
 		if err != nil {
 			return fmt.Errorf("channel %s not found in graph: %w",
+				op, err)
+		}
+
+		// Make sure the policies are populated, otherwise this edge
+		// cannot be used for routing.
+		if resp.Node1Policy == nil {
+			return fmt.Errorf("channel %s has no policy1: %w",
+				op, err)
+		}
+
+		if resp.Node2Policy == nil {
+			return fmt.Errorf("channel %s has no policy2: %w",
 				op, err)
 		}
 
@@ -2785,4 +2698,37 @@ func (h *HarnessTest) FindSweepingTxns(txns []*wire.MsgTx,
 	require.Len(h, sweepTxns, expectedNumSweeps, "unexpected num of sweeps")
 
 	return sweepTxns
+}
+
+// AssertForceCloseAndAnchorTxnsInMempool asserts that the force close and
+// anchor sweep txns are found in the mempool and returns the force close tx
+// and the anchor sweep tx.
+func (h *HarnessTest) AssertForceCloseAndAnchorTxnsInMempool() (*wire.MsgTx,
+	*wire.MsgTx) {
+
+	// Assert there are two txns in the mempool.
+	txns := h.GetNumTxsFromMempool(2)
+
+	// Assume the first is the force close tx.
+	forceCloseTx, anchorSweepTx := txns[0], txns[1]
+
+	// Get the txid.
+	closeTxid := forceCloseTx.TxHash()
+
+	// We now check whether there is an anchor input used in the assumed
+	// anchorSweepTx by checking every input's previous outpoint against
+	// the assumed closingTxid. If we fail to find one, it means the first
+	// item from the above txns is the anchor sweeping tx.
+	for _, inp := range anchorSweepTx.TxIn {
+		if inp.PreviousOutPoint.Hash == closeTxid {
+			// Found a match, this is indeed the anchor sweeping tx
+			// so we return it here.
+			return forceCloseTx, anchorSweepTx
+		}
+	}
+
+	// The assumed order is incorrect so we swap and return.
+	forceCloseTx, anchorSweepTx = anchorSweepTx, forceCloseTx
+
+	return forceCloseTx, anchorSweepTx
 }
