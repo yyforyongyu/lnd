@@ -917,6 +917,7 @@ func (s *Switch) getLocalLink(pkt *htlcPacket, htlc *lnwire.UpdateAddHTLC) (
 	currentHeight := atomic.LoadUint32(&s.bestHeight)
 	htlcErr := link.CheckHtlcTransit(
 		htlc.PaymentHash, htlc.Amount, htlc.Expiry, currentHeight,
+		htlc.CustomRecords,
 	)
 	if htlcErr != nil {
 		log.Errorf("Link %v policy for local forward not "+
@@ -1605,7 +1606,7 @@ out:
 				}
 			}
 
-			log.Infof("Received outside contract resolution, "+
+			log.Debugf("Received outside contract resolution, "+
 				"mapping to: %v", spew.Sdump(pkt))
 
 			// We don't check the error, as the only failure we can
@@ -2887,10 +2888,9 @@ func (s *Switch) handlePacketAdd(packet *htlcPacket,
 			failure = link.CheckHtlcForward(
 				htlc.PaymentHash, packet.incomingAmount,
 				packet.amount, packet.incomingTimeout,
-				packet.outgoingTimeout,
-				packet.inboundFee,
-				currentHeight,
-				packet.originalOutgoingChanID,
+				packet.outgoingTimeout, packet.inboundFee,
+				currentHeight, packet.originalOutgoingChanID,
+				htlc.CustomRecords,
 			)
 		}
 
@@ -2994,6 +2994,15 @@ func (s *Switch) handlePacketSettle(packet *htlcPacket) error {
 	// If the source of this packet has not been set, use the circuit map
 	// to lookup the origin.
 	circuit, err := s.closeCircuit(packet)
+
+	// If the circuit is in the process of closing, we will return a nil as
+	// there's another packet handling undergoing.
+	if errors.Is(err, ErrCircuitClosing) {
+		log.Debugf("Circuit is closing for packet=%v", packet)
+		return nil
+	}
+
+	// Exit early if there's another error.
 	if err != nil {
 		return err
 	}
@@ -3005,7 +3014,7 @@ func (s *Switch) handlePacketSettle(packet *htlcPacket) error {
 	// and when `UpdateFulfillHTLC` is received. After which `RevokeAndAck`
 	// is received, which invokes `processRemoteSettleFails` in its link.
 	if circuit == nil {
-		log.Debugf("Found nil circuit: packet=%v", spew.Sdump(packet))
+		log.Debugf("Circuit already closed for packet=%v", packet)
 		return nil
 	}
 

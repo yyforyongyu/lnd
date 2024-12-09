@@ -90,6 +90,10 @@
 * [The `walletrpc.FundPsbt` method now has a new option to specify the maximum
   fee to output amounts ratio.](https://github.com/lightningnetwork/lnd/pull/8600)
 
+* When returning the response from list invoices RPC, the `lnrpc.Invoice.Htlcs`
+  are now [sorted](https://github.com/lightningnetwork/lnd/pull/9337) based on
+  the `InvoiceHTLC.HtlcIndex`.
+
 ## lncli Additions
 
 * [A pre-generated macaroon root key can now be specified in `lncli create` and
@@ -115,6 +119,18 @@
   around.
 
 * LND updates channel.backup file at shutdown time.
+
+* A new subsystem `chainio` is
+  [introduced](https://github.com/lightningnetwork/lnd/pull/9277) to make sure
+  the subsystems are in sync with their current best block. Previously, when
+  resolving a force close channel, the sweeping of HTLCs may be delayed for one
+  or two blocks due to block heights not in sync in the relevant subsystems
+  (`ChainArbitrator`, `UtxoSweeper` and `TxPublisher`), causing a slight
+  inaccuracy when deciding the sweeping feerate and urgency. With `chainio`,
+  this is now fixed as these subsystems now share the same view on the best
+  block. Check
+  [here](https://github.com/lightningnetwork/lnd/blob/master/chainio/README.md)
+  to learn more.
 
 ## RPC Updates
 
@@ -200,6 +216,10 @@ The underlying functionality between those two options remain the same.
 * LND [uses](https://github.com/lightningnetwork/lnd/pull/9257) the feerate
   estimator provided by bitcoind or btcd in regtest and simnet modes instead of
   static fee estimator if feeurl is not provided.
+
+* The integration tests CI have been optimized to run faster and all flakes are
+  now documented and
+  [fixedo](https://github.com/lightningnetwork/lnd/pull/9260).
 
 ## Database
 

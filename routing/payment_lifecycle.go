@@ -180,6 +180,9 @@ func (p *paymentLifecycle) resumePayment(ctx context.Context) ([32]byte,
 		return [32]byte{}, nil, err
 	}
 
+	// Get the payment state.
+	ps := payment.GetState()
+
 	for _, a := range payment.InFlightHTLCs() {
 		a := a
 
@@ -192,7 +195,7 @@ func (p *paymentLifecycle) resumePayment(ctx context.Context) ([32]byte,
 	// exitWithErr is a helper closure that logs and returns an error.
 	exitWithErr := func(err error) ([32]byte, *route.Route, error) {
 		log.Errorf("Payment %v with status=%v failed: %v",
-			p.identifier, payment.GetStatus(), err)
+			p.identifier, ps, err)
 		return [32]byte{}, nil, err
 	}
 
@@ -210,7 +213,7 @@ lifecycle:
 			return exitWithErr(err)
 		}
 
-		ps := payment.GetState()
+		ps = payment.GetState()
 		remainingFees := p.calcFeeBudget(ps.FeesPaid)
 
 		log.Debugf("Payment %v: status=%v, active_shards=%v, "+
@@ -337,7 +340,7 @@ func (p *paymentLifecycle) checkContext(ctx context.Context) error {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			reason = channeldb.FailureReasonTimeout
 			log.Warnf("Payment attempt not completed before "+
-				"timeout, id=%s", p.identifier.String())
+				"context timeout, id=%s", p.identifier.String())
 		} else {
 			reason = channeldb.FailureReasonCanceled
 			log.Warnf("Payment attempt context canceled, id=%s",
@@ -761,7 +764,8 @@ func (p *paymentLifecycle) amendFirstHopData(rt *route.Route) error {
 	// and apply its side effects to the UpdateAddHTLC message.
 	result, err := fn.MapOptionZ(
 		p.router.cfg.TrafficShaper,
-		func(ts TlvTrafficShaper) fn.Result[extraDataRequest] {
+		//nolint:ll
+		func(ts htlcswitch.AuxTrafficShaper) fn.Result[extraDataRequest] {
 			newAmt, newRecords, err := ts.ProduceHtlcExtraData(
 				rt.TotalAmount, p.firstHopCustomRecords,
 			)
@@ -774,7 +778,7 @@ func (p *paymentLifecycle) amendFirstHopData(rt *route.Route) error {
 				return fn.Err[extraDataRequest](err)
 			}
 
-			log.Debugf("TLV traffic shaper returned custom "+
+			log.Debugf("Aux traffic shaper returned custom "+
 				"records %v and amount %d msat for HTLC",
 				spew.Sdump(newRecords), newAmt)
 
