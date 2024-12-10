@@ -215,3 +215,5 @@ go 1.23.6
 retract v0.0.2
 
 replace github.com/lightningnetwork/lnd/sqldb => ../lnd/sqldb
+
+replace github.com/btcsuite/btcwallet => github.com/yyforyongyu/btcwallet v0.16.11-0.20250318105900-f52b51e038bd
