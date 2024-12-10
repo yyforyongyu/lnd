@@ -17,10 +17,11 @@ import (
 // would otherwise trigger force closes when they expire.
 func testHoldInvoiceForceClose(ht *lntest.HarnessTest) {
 	// Open a channel between alice and bob.
-	alice, bob := ht.Alice, ht.Bob
-	chanPoint := ht.OpenChannel(
-		alice, bob, lntest.OpenChannelParams{Amt: 300000},
+	chanPoints, nodes := ht.CreateSimpleNetwork(
+		[][]string{nil, nil}, lntest.OpenChannelParams{Amt: 300000},
 	)
+	alice, bob := nodes[0], nodes[1]
+	chanPoint := chanPoints[0]
 
 	// Create a non-dust hold invoice for bob.
 	var (
@@ -29,7 +30,7 @@ func testHoldInvoiceForceClose(ht *lntest.HarnessTest) {
 	)
 	invoiceReq := &invoicesrpc.AddHoldInvoiceRequest{
 		Value:      30000,
-		CltvExpiry: 40,
+		CltvExpiry: finalCltvDelta,
 		Hash:       payHash[:],
 	}
 	bobInvoice := bob.RPC.AddHoldInvoice(invoiceReq)
@@ -44,14 +45,18 @@ func testHoldInvoiceForceClose(ht *lntest.HarnessTest) {
 		TimeoutSeconds: 60,
 		FeeLimitMsat:   noFeeLimitMsat,
 	}
-	alice.RPC.SendPayment(req)
+	ht.SendPaymentAssertInflight(alice, req)
 
 	ht.AssertInvoiceState(stream, lnrpc.Invoice_ACCEPTED)
 
 	// Once the HTLC has cleared, alice and bob should both have a single
 	// htlc locked in.
-	ht.AssertActiveHtlcs(alice, payHash[:])
-	ht.AssertActiveHtlcs(bob, payHash[:])
+	//
+	// Alice should have one outgoing HTLCs on channel Alice -> Bob.
+	ht.AssertOutgoingHTLCActive(alice, chanPoint, payHash[:])
+
+	// Bob should have one incoming HTLC on channel Alice -> Bob.
+	ht.AssertIncomingHTLCActive(bob, chanPoint, payHash[:])
 
 	// Get our htlc expiry height and current block height so that we
 	// can mine the exact number of blocks required to expire the htlc.
@@ -135,7 +140,4 @@ func testHoldInvoiceForceClose(ht *lntest.HarnessTest) {
 	// outgoing HTLCs in her channel as the only HTLC has already been
 	// canceled.
 	ht.AssertNumPendingForceClose(alice, 0)
-
-	// Clean up the channel.
-	ht.CloseChannel(alice, chanPoint)
 }
