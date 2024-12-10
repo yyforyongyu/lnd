@@ -3,6 +3,10 @@ package btcwallet
 import (
 	"github.com/btcsuite/btclog/v2"
 	"github.com/lightningnetwork/lnd/build"
+
+	"github.com/btcsuite/btcwallet/chain"
+	basewallet "github.com/btcsuite/btcwallet/wallet"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
 // Subsystem defines the logging code for this subsystem.
@@ -29,4 +33,8 @@ func DisableLog() {
 // btclog.
 func UseLogger(logger btclog.Logger) {
 	log = logger
+
+	basewallet.UseLogger(logger)
+	wtxmgr.UseLogger(logger)
+	chain.UseLogger(logger)
 }
