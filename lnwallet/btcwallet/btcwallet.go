@@ -95,13 +95,9 @@ type BtcWallet struct {
 	// wallet is an active instance of btcwallet.
 	wallet *base.Wallet
 
-	chain chain.Interface
-
 	db walletdb.DB
 
 	cfg *Config
-
-	netParams *chaincfg.Params
 
 	chainKeyScope waddrmgr.KeyScope
 
@@ -173,8 +169,6 @@ func New(cfg Config, blockCache *blockcache.BlockCache) (*BtcWallet, error) {
 		cfg:           &cfg,
 		wallet:        wallet,
 		db:            wallet.Database(),
-		chain:         cfg.ChainSource,
-		netParams:     cfg.NetParams,
 		chainKeyScope: chainKeyScope,
 		blockCache:    blockCache,
 	}
@@ -288,8 +282,8 @@ func onWalletCreated(tx kvdb.RwTx) error {
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) BackEnd() string {
-	if b.chain != nil {
-		return b.chain.BackEnd()
+	if b.cfg.ChainSource != nil {
+		return b.cfg.ChainSource.BackEnd()
 	}
 
 	return ""
@@ -438,7 +432,7 @@ func (b *BtcWallet) Start() error {
 
 	// Establish an RPC connection in addition to starting the goroutines
 	// in the underlying wallet.
-	if err := b.chain.Start(); err != nil {
+	if err := b.cfg.ChainSource.Start(); err != nil {
 		return err
 	}
 
@@ -447,7 +441,7 @@ func (b *BtcWallet) Start() error {
 
 	// Pass the rpc client into the wallet so it can sync up to the
 	// current main chain.
-	b.wallet.SynchronizeRPC(b.chain)
+	b.wallet.SynchronizeRPC(b.cfg.ChainSource)
 
 	return nil
 }
@@ -458,10 +452,9 @@ func (b *BtcWallet) Start() error {
 // This is a part of the WalletController interface.
 func (b *BtcWallet) Stop() error {
 	b.wallet.Stop()
-
 	b.wallet.WaitForShutdown()
 
-	b.chain.Stop()
+	b.cfg.ChainSource.Stop()
 
 	return nil
 }
@@ -1226,7 +1219,7 @@ func mapRpcclientError(err error) error {
 func (b *BtcWallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 	// For neutrino backend there's no mempool, so we return early by
 	// publishing the transaction.
-	if b.chain.BackEnd() == "neutrino" {
+	if b.BackEnd() == "neutrino" {
 		err := b.wallet.PublishTransaction(tx, label)
 
 		return mapRpcclientError(err)
@@ -1237,14 +1230,16 @@ func (b *BtcWallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 	// Use a max feerate of 0 means the default value will be used when
 	// testing mempool acceptance. The default max feerate is 0.10 BTC/kvb,
 	// or 10,000 sat/vb.
-	results, err := b.chain.TestMempoolAccept([]*wire.MsgTx{tx}, 0)
+	results, err := b.cfg.ChainSource.TestMempoolAccept(
+		[]*wire.MsgTx{tx}, 0,
+	)
 	if err != nil {
 		// If the chain backend doesn't support the mempool acceptance
 		// test RPC, we'll just attempt to publish the transaction.
 		if errors.Is(err, rpcclient.ErrBackendVersion) {
 			log.Warnf("TestMempoolAccept not supported by "+
 				"backend, consider upgrading %s to a newer "+
-				"version", b.chain.BackEnd())
+				"version", b.BackEnd())
 
 			err := b.wallet.PublishTransaction(tx, label)
 
@@ -1277,7 +1272,7 @@ func (b *BtcWallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 
 	// We need to use the string to create an error type and map it to a
 	// btcwallet error.
-	err = b.chain.MapRPCErr(errors.New(result.RejectReason))
+	err = b.cfg.ChainSource.MapRPCErr(errors.New(result.RejectReason))
 
 	//nolint:ll
 	// These two errors are ignored inside `PublishTransaction`:
@@ -1390,7 +1385,7 @@ func (b *BtcWallet) GetTransactionDetails(
 				Hash:      tx.BlockHash,
 				Height:    tx.Height,
 				Timestamp: tx.Summary.Timestamp},
-			b.netParams,
+			b.cfg.NetParams,
 		)
 		if err != nil {
 			return nil, err
@@ -1399,7 +1394,7 @@ func (b *BtcWallet) GetTransactionDetails(
 		return txDetails[0], nil
 	}
 
-	return unminedTransactionsToDetail(tx.Summary, b.netParams)
+	return unminedTransactionsToDetail(tx.Summary, b.cfg.NetParams)
 }
 
 // minedTransactionsToDetails is a helper function which converts a summary
@@ -1579,7 +1574,7 @@ func (b *BtcWallet) ListTransactionDetails(startHeight, endHeight int32,
 	// wallet.
 	for _, blockPackage := range txns.MinedTransactions {
 		details, err := minedTransactionsToDetails(
-			currentHeight, blockPackage, b.netParams,
+			currentHeight, blockPackage, b.cfg.NetParams,
 		)
 		if err != nil {
 			return nil, 0, 0, err
@@ -1588,7 +1583,7 @@ func (b *BtcWallet) ListTransactionDetails(startHeight, endHeight int32,
 		txDetails = append(txDetails, details...)
 	}
 	for _, tx := range txns.UnminedTransactions {
-		detail, err := unminedTransactionsToDetail(tx, b.netParams)
+		detail, err := unminedTransactionsToDetail(tx, b.cfg.NetParams)
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -1931,7 +1926,9 @@ func (b *BtcWallet) CheckMempoolAcceptance(tx *wire.MsgTx) error {
 	// Use a max feerate of 0 means the default value will be used when
 	// testing mempool acceptance. The default max feerate is 0.10 BTC/kvb,
 	// or 10,000 sat/vb.
-	results, err := b.chain.TestMempoolAccept([]*wire.MsgTx{tx}, 0)
+	results, err := b.cfg.ChainSource.TestMempoolAccept(
+		[]*wire.MsgTx{tx}, 0,
+	)
 	if err != nil {
 		return err
 	}
@@ -1948,7 +1945,9 @@ func (b *BtcWallet) CheckMempoolAcceptance(tx *wire.MsgTx) error {
 	// Mempool check failed, we now map the reject reason to a proper RPC
 	// error and return it.
 	if !result.Allowed {
-		err := b.chain.MapRPCErr(errors.New(result.RejectReason))
+		err := b.cfg.ChainSource.MapRPCErr(
+			errors.New(result.RejectReason),
+		)
 
 		return fmt.Errorf("mempool rejection: %w", err)
 	}
