@@ -17,6 +17,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/sweep"
@@ -113,13 +114,8 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 		ht.FundCoins(btcutil.SatoshiPerBitcoin, bob)
 	}
 
-	// Bob should have enough wallet UTXOs here to sweep the HTLC in the
-	// end of this test. However, due to a known issue, Bob's wallet may
-	// report there's no UTXO available. For details,
-	// - https://github.com/lightningnetwork/lnd/issues/8786
-	//
-	// TODO(yy): remove this step once the issue is resolved.
-	ht.FundCoins(btcutil.SatoshiPerBitcoin, bob)
+	resp := bob.RPC.ListUnspent(&walletrpc.ListUnspentRequest{})
+	ht.Logf("Bob has utxos: %v", lnutils.SpewLogClosure(resp.Utxos))
 
 	// Subscribe the invoice.
 	streamCarol := carol.RPC.SubscribeSingleInvoice(payHash[:])
@@ -339,6 +335,9 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 	// needed to clean up the mempool.
 	ht.MineBlocksAndAssertNumTxes(1, 2)
 
+	resp = bob.RPC.ListUnspent(&walletrpc.ListUnspentRequest{})
+	ht.Logf("Bob has utxos in the end: %v", lnutils.SpewLogClosure(resp.Utxos))
+
 	// The above mined block should confirm Bob's force close tx, and his
 	// contractcourt will offer the HTLC to his sweeper. We are not testing
 	// the HTLC sweeping behaviors so we just perform a simple check and
@@ -431,14 +430,6 @@ func testSweepCPFPAnchorIncomingTimeout(ht *lntest.HarnessTest) {
 	if ht.IsNeutrinoBackend() {
 		ht.FundCoins(btcutil.SatoshiPerBitcoin, bob)
 	}
-
-	// Bob should have enough wallet UTXOs here to sweep the HTLC in the
-	// end of this test. However, due to a known issue, Bob's wallet may
-	// report there's no UTXO available. For details,
-	// - https://github.com/lightningnetwork/lnd/issues/8786
-	//
-	// TODO(yy): remove this step once the issue is resolved.
-	ht.FundCoins(btcutil.SatoshiPerBitcoin, bob)
 
 	// Subscribe the invoice.
 	streamCarol := carol.RPC.SubscribeSingleInvoice(payHash[:])

@@ -155,7 +155,9 @@ func TestCheckMempoolAcceptance(t *testing.T) {
 
 	// Create a test wallet.
 	wallet := &BtcWallet{
-		chain: mockChain,
+		cfg: &Config{
+			ChainSource: mockChain,
+		},
 	}
 
 	// Assert that when the chain backend doesn't support

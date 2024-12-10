@@ -57,14 +57,6 @@ const (
 )
 
 var (
-	// waddrmgrNamespaceKey is the namespace key that the waddrmgr state is
-	// stored within the top-level walletdb buckets of btcwallet.
-	waddrmgrNamespaceKey = []byte("waddrmgr")
-
-	// wtxmgrNamespaceKey is the namespace key that the wtxmgr state is
-	// stored within the top-level waleltdb buckets of btcwallet.
-	wtxmgrNamespaceKey = []byte("wtxmgr")
-
 	// lightningAddrSchema is the scope addr schema for all keys that we
 	// derive. We'll treat them all as p2wkh addresses, as atm we must
 	// specify a particular type.
@@ -95,13 +87,9 @@ type BtcWallet struct {
 	// wallet is an active instance of btcwallet.
 	wallet *base.Wallet
 
-	chain chain.Interface
-
 	db walletdb.DB
 
 	cfg *Config
-
-	netParams *chaincfg.Params
 
 	chainKeyScope waddrmgr.KeyScope
 
@@ -173,8 +161,6 @@ func New(cfg Config, blockCache *blockcache.BlockCache) (*BtcWallet, error) {
 		cfg:           &cfg,
 		wallet:        wallet,
 		db:            wallet.Database(),
-		chain:         cfg.ChainSource,
-		netParams:     cfg.NetParams,
 		chainKeyScope: chainKeyScope,
 		blockCache:    blockCache,
 	}
@@ -288,8 +274,8 @@ func onWalletCreated(tx kvdb.RwTx) error {
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) BackEnd() string {
-	if b.chain != nil {
-		return b.chain.BackEnd()
+	if b.cfg.ChainSource != nil {
+		return b.cfg.ChainSource.BackEnd()
 	}
 
 	return ""
@@ -350,18 +336,7 @@ func (b *BtcWallet) Start() error {
 			// it was added recently and older wallets don't know it
 			// yet. Let's add it now.
 			addrSchema := waddrmgr.ScopeAddrMap[scope]
-			err := walletdb.Update(
-				b.db, func(tx walletdb.ReadWriteTx) error {
-					addrmgrNs := tx.ReadWriteBucket(
-						waddrmgrNamespaceKey,
-					)
-
-					_, err := b.wallet.Manager.NewScopedKeyManager(
-						addrmgrNs, scope, addrSchema,
-					)
-					return err
-				},
-			)
+			_, err := b.wallet.AddScopeManager(scope, addrSchema)
 			if err != nil {
 				return err
 			}
@@ -373,72 +348,31 @@ func (b *BtcWallet) Start() error {
 		// If the scope hasn't yet been created (it wouldn't been
 		// loaded by default if it was), then we'll manually create the
 		// scope for the first time ourselves.
-		err := walletdb.Update(b.db, func(tx walletdb.ReadWriteTx) error {
-			addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-			scope, err = b.wallet.Manager.NewScopedKeyManager(
-				addrmgrNs, b.chainKeyScope, lightningAddrSchema,
-			)
-			return err
-		})
+		manager, err := b.wallet.AddScopeManager(
+			b.chainKeyScope, lightningAddrSchema,
+		)
 		if err != nil {
 			return err
 		}
+
+		scope = manager
 	}
+
+	watchOnly := !walletIsWatchOnly && b.cfg.WatchOnly &&
+		b.cfg.MigrateWatchOnly
 
 	// Now that the wallet is unlocked, we'll go ahead and make sure we
 	// create accounts for all the key families we're going to use. This
 	// will make it possible to list all the account/family xpubs in the
 	// wallet list RPC.
-	err = walletdb.Update(b.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		// Generate all accounts that we could ever need. This includes
-		// all lnd key families as well as some key families used in
-		// external liquidity tools.
-		for keyFam := uint32(1); keyFam <= 255; keyFam++ {
-			// Otherwise, we'll check if the account already exists,
-			// if so, we can once again bail early.
-			_, err := scope.AccountName(addrmgrNs, keyFam)
-			if err == nil {
-				continue
-			}
-
-			// If we reach this point, then the account hasn't yet
-			// been created, so we'll need to create it before we
-			// can proceed.
-			err = scope.NewRawAccount(addrmgrNs, keyFam)
-			if err != nil {
-				return err
-			}
-		}
-
-		// If this is the first startup with remote signing and wallet
-		// migration turned on and the wallet wasn't previously
-		// migrated, we can do that now that we made sure all accounts
-		// that we need were derived correctly.
-		if !walletIsWatchOnly && b.cfg.WatchOnly &&
-			b.cfg.MigrateWatchOnly {
-
-			log.Infof("Migrating wallet to watch-only mode, " +
-				"purging all private key material")
-
-			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-			err = b.wallet.Manager.ConvertToWatchingOnly(ns)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
+	err = b.wallet.InitAccounts(scope, watchOnly)
 	if err != nil {
 		return err
 	}
 
 	// Establish an RPC connection in addition to starting the goroutines
 	// in the underlying wallet.
-	if err := b.chain.Start(); err != nil {
+	if err := b.cfg.ChainSource.Start(); err != nil {
 		return err
 	}
 
@@ -447,7 +381,7 @@ func (b *BtcWallet) Start() error {
 
 	// Pass the rpc client into the wallet so it can sync up to the
 	// current main chain.
-	b.wallet.SynchronizeRPC(b.chain)
+	b.wallet.SynchronizeRPC(b.cfg.ChainSource)
 
 	return nil
 }
@@ -458,10 +392,9 @@ func (b *BtcWallet) Start() error {
 // This is a part of the WalletController interface.
 func (b *BtcWallet) Stop() error {
 	b.wallet.Stop()
-
 	b.wallet.WaitForShutdown()
 
-	b.chain.Stop()
+	b.cfg.ChainSource.Stop()
 
 	return nil
 }
@@ -769,29 +702,8 @@ func (b *BtcWallet) ListAddresses(name string,
 
 	for _, accntDetails := range accounts {
 		accntScope := accntDetails.KeyScope
-		scopedMgr, err := b.wallet.Manager.FetchScopedKeyManager(
-			accntScope,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		var managedAddrs []waddrmgr.ManagedAddress
-		err = walletdb.View(
-			b.wallet.Database(), func(tx walletdb.ReadTx) error {
-				managedAddrs = nil
-				addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-				return scopedMgr.ForEachAccountAddress(
-					addrmgrNs, accntDetails.AccountNumber,
-					func(a waddrmgr.ManagedAddress) error {
-						managedAddrs = append(
-							managedAddrs, a,
-						)
-
-						return nil
-					},
-				)
-			},
+		managedAddrs, err := b.wallet.AccountManagedAddresses(
+			accntDetails.KeyScope, accntDetails.AccountNumber,
 		)
 		if err != nil {
 			return nil, err
@@ -1135,7 +1047,8 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 	}
 
 	// Next, we'll run through all the regular outputs, only saving those
-	// which are p2wkh outputs or a p2wsh output nested within a p2sh output.
+	// which are p2wkh outputs or a p2wsh output nested within a p2sh
+	// output.
 	witnessOutputs := make([]*lnwallet.Utxo, 0, len(unspentOutputs))
 	for _, output := range unspentOutputs {
 		pkScript, err := hex.DecodeString(output.ScriptPubKey)
@@ -1146,11 +1059,14 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 		addressType := lnwallet.UnknownAddressType
 		if txscript.IsPayToWitnessPubKeyHash(pkScript) {
 			addressType = lnwallet.WitnessPubKey
+
 		} else if txscript.IsPayToScriptHash(pkScript) {
-			// TODO(roasbeef): This assumes all p2sh outputs returned by the
-			// wallet are nested p2pkh. We can't check the redeem script because
-			// the btcwallet service does not include it.
+			// TODO(roasbeef): This assumes all p2sh outputs
+			// returned by the wallet are nested p2pkh. We can't
+			// check the redeem script because the btcwallet
+			// service does not include it.
 			addressType = lnwallet.NestedWitnessPubKey
+
 		} else if txscript.IsPayToTaproot(pkScript) {
 			addressType = lnwallet.TaprootPubkey
 		}
@@ -1226,7 +1142,7 @@ func mapRpcclientError(err error) error {
 func (b *BtcWallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 	// For neutrino backend there's no mempool, so we return early by
 	// publishing the transaction.
-	if b.chain.BackEnd() == "neutrino" {
+	if b.BackEnd() == "neutrino" {
 		err := b.wallet.PublishTransaction(tx, label)
 
 		return mapRpcclientError(err)
@@ -1237,14 +1153,16 @@ func (b *BtcWallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 	// Use a max feerate of 0 means the default value will be used when
 	// testing mempool acceptance. The default max feerate is 0.10 BTC/kvb,
 	// or 10,000 sat/vb.
-	results, err := b.chain.TestMempoolAccept([]*wire.MsgTx{tx}, 0)
+	results, err := b.cfg.ChainSource.TestMempoolAccept(
+		[]*wire.MsgTx{tx}, 0,
+	)
 	if err != nil {
 		// If the chain backend doesn't support the mempool acceptance
 		// test RPC, we'll just attempt to publish the transaction.
 		if errors.Is(err, rpcclient.ErrBackendVersion) {
 			log.Warnf("TestMempoolAccept not supported by "+
 				"backend, consider upgrading %s to a newer "+
-				"version", b.chain.BackEnd())
+				"version", b.BackEnd())
 
 			err := b.wallet.PublishTransaction(tx, label)
 
@@ -1277,7 +1195,7 @@ func (b *BtcWallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 
 	// We need to use the string to create an error type and map it to a
 	// btcwallet error.
-	err = b.chain.MapRPCErr(errors.New(result.RejectReason))
+	err = b.cfg.ChainSource.MapRPCErr(errors.New(result.RejectReason))
 
 	//nolint:ll
 	// These two errors are ignored inside `PublishTransaction`:
@@ -1319,10 +1237,9 @@ func (b *BtcWallet) LabelTransaction(hash chainhash.Hash, label string,
 
 // extractBalanceDelta extracts the net balance delta from the PoV of the
 // wallet given a TransactionSummary.
-func extractBalanceDelta(
-	txSummary base.TransactionSummary,
-	tx *wire.MsgTx,
-) (btcutil.Amount, error) {
+func extractBalanceDelta(txSummary base.TransactionSummary,
+	tx *wire.MsgTx) (btcutil.Amount, error) {
+
 	// For each input we debit the wallet's outflow for this transaction,
 	// and for each output we credit the wallet's inflow for this
 	// transaction.
@@ -1345,8 +1262,8 @@ func getPreviousOutpoints(wireTx *wire.MsgTx,
 	// isOurOutput is a map containing the output indices
 	// controlled by the wallet.
 	// Note: We make use of the information in `myInputs` provided
-	// by the `wallet.TransactionSummary` structure that holds
-	// information only if the input/previous_output is controlled by the wallet.
+	// by the `wallet.TransactionSummary` structure that holds information
+	// only if the input/previous_output is controlled by the wallet.
 	isOurOutput := make(map[uint32]bool, len(myInputs))
 	for _, myInput := range myInputs {
 		isOurOutput[myInput.Index] = true
@@ -1390,7 +1307,7 @@ func (b *BtcWallet) GetTransactionDetails(
 				Hash:      tx.BlockHash,
 				Height:    tx.Height,
 				Timestamp: tx.Summary.Timestamp},
-			b.netParams,
+			b.cfg.NetParams,
 		)
 		if err != nil {
 			return nil, err
@@ -1399,18 +1316,17 @@ func (b *BtcWallet) GetTransactionDetails(
 		return txDetails[0], nil
 	}
 
-	return unminedTransactionsToDetail(tx.Summary, b.netParams)
+	return unminedTransactionsToDetail(tx.Summary, b.cfg.NetParams)
 }
 
 // minedTransactionsToDetails is a helper function which converts a summary
 // information about mined transactions to a TransactionDetail.
-func minedTransactionsToDetails(
-	currentHeight int32,
-	block base.Block,
-	chainParams *chaincfg.Params,
-) ([]*lnwallet.TransactionDetail, error) {
+func minedTransactionsToDetails(currentHeight int32, block base.Block,
+	chainParams *chaincfg.Params) ([]*lnwallet.TransactionDetail, error) {
 
-	details := make([]*lnwallet.TransactionDetail, 0, len(block.Transactions))
+	details := make(
+		[]*lnwallet.TransactionDetail, 0, len(block.Transactions),
+	)
 	for _, tx := range block.Transactions {
 		wireTx := &wire.MsgTx{}
 		txReader := bytes.NewReader(tx.Transaction)
@@ -1479,10 +1395,8 @@ func minedTransactionsToDetails(
 
 // unminedTransactionsToDetail is a helper function which converts a summary
 // for an unconfirmed transaction to a transaction detail.
-func unminedTransactionsToDetail(
-	summary base.TransactionSummary,
-	chainParams *chaincfg.Params,
-) (*lnwallet.TransactionDetail, error) {
+func unminedTransactionsToDetail(summary base.TransactionSummary,
+	chainParams *chaincfg.Params) (*lnwallet.TransactionDetail, error) {
 
 	wireTx := &wire.MsgTx{}
 	txReader := bytes.NewReader(summary.Transaction)
@@ -1579,7 +1493,7 @@ func (b *BtcWallet) ListTransactionDetails(startHeight, endHeight int32,
 	// wallet.
 	for _, blockPackage := range txns.MinedTransactions {
 		details, err := minedTransactionsToDetails(
-			currentHeight, blockPackage, b.netParams,
+			currentHeight, blockPackage, b.cfg.NetParams,
 		)
 		if err != nil {
 			return nil, 0, 0, err
@@ -1588,7 +1502,7 @@ func (b *BtcWallet) ListTransactionDetails(startHeight, endHeight int32,
 		txDetails = append(txDetails, details...)
 	}
 	for _, tx := range txns.UnminedTransactions {
-		detail, err := unminedTransactionsToDetail(tx, b.netParams)
+		detail, err := unminedTransactionsToDetail(tx, b.cfg.NetParams)
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -1731,7 +1645,9 @@ out:
 // blocks.
 //
 // This is a part of the WalletController interface.
-func (b *BtcWallet) SubscribeTransactions() (lnwallet.TransactionSubscription, error) {
+func (b *BtcWallet) SubscribeTransactions() (lnwallet.TransactionSubscription,
+	error) {
+
 	walletClient := b.wallet.NtfnServer.TransactionNotifications()
 
 	txClient := &txSubscriptionClient{
@@ -1817,22 +1733,13 @@ func (b *BtcWallet) GetRecoveryInfo() (bool, float64, error) {
 		return isRecoveryMode, progress, nil
 	}
 
-	// Query the wallet's birthday block height from db.
-	var birthdayBlock waddrmgr.BlockStamp
-	err := walletdb.View(b.db, func(tx walletdb.ReadTx) error {
-		var err error
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		birthdayBlock, _, err = b.wallet.Manager.BirthdayBlock(addrmgrNs)
-		if err != nil {
-			return err
-		}
-		return nil
-	})
-
+	// Query the wallet's birthday block from db.
+	birthdayBlock, err := b.wallet.BirthdayBlock()
 	if err != nil {
-		// The wallet won't start until the backend is synced, thus the birthday
-		// block won't be set and this particular error will be returned. We'll
-		// catch this error and return a progress of 0 instead.
+		// The wallet won't start until the backend is synced, thus the
+		// birthday block won't be set and this particular error will
+		// be returned. We'll catch this error and return a progress of
+		// 0 instead.
 		if waddrmgr.IsError(err, waddrmgr.ErrBirthdayBlockNotSet) {
 			return isRecoveryMode, progress, nil
 		}
@@ -1846,30 +1753,32 @@ func (b *BtcWallet) GetRecoveryInfo() (bool, float64, error) {
 	// Next, query the chain backend to grab the info about the tip of the
 	// main chain.
 	//
-	// NOTE: The actual recovery process is handled by the btcsuite/btcwallet.
-	// The process purposefully doesn't update the best height. It might create
-	// a small difference between the height queried here and the height used
-	// in the recovery process, ie, the bestHeight used here might be greater,
-	// showing the recovery being unfinished while it's actually done. However,
-	// during a wallet rescan after the recovery, the wallet's synced height
-	// will catch up and this won't be an issue.
+	// NOTE: The actual recovery process is handled by the
+	// btcsuite/btcwallet.  The process purposefully doesn't update the
+	// best height. It might create a small difference between the height
+	// queried here and the height used in the recovery process, ie, the
+	// bestHeight used here might be greater, showing the recovery being
+	// unfinished while it's actually done. However, during a wallet rescan
+	// after the recovery, the wallet's synced height will catch up and
+	// this won't be an issue.
 	_, bestHeight, err := b.cfg.ChainSource.GetBestBlock()
 	if err != nil {
 		return isRecoveryMode, progress, err
 	}
 
-	// The birthday block height might be greater than the current synced height
-	// in a newly restored wallet, and might be greater than the chain tip if a
-	// rollback happens. In that case, we will return zero progress here.
+	// The birthday block height might be greater than the current synced
+	// height in a newly restored wallet, and might be greater than the
+	// chain tip if a rollback happens. In that case, we will return zero
+	// progress here.
 	if syncState.Height < birthdayBlock.Height ||
 		bestHeight < birthdayBlock.Height {
 
 		return isRecoveryMode, progress, nil
 	}
 
-	// progress is the ratio of the [number of blocks processed] over the [total
-	// number of blocks] needed in a recovery mode, ranging from 0 to 1, in
-	// which,
+	// progress is the ratio of the [number of blocks processed] over the
+	// [total number of blocks] needed in a recovery mode, ranging from 0
+	// to 1, in which,
 	// - total number of blocks is the current chain's best height minus the
 	//   wallet's birthday height plus 1.
 	// - number of blocks processed is the wallet's synced height minus its
@@ -1886,27 +1795,12 @@ func (b *BtcWallet) GetRecoveryInfo() (bool, float64, error) {
 // by the passed transaction hash. If the transaction can't be found, then a
 // nil pointer is returned.
 func (b *BtcWallet) FetchTx(txHash chainhash.Hash) (*wire.MsgTx, error) {
-	var targetTx *wtxmgr.TxDetails
-	err := walletdb.View(b.db, func(tx walletdb.ReadTx) error {
-		wtxmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-		txDetails, err := b.wallet.TxStore.TxDetails(wtxmgrNs, &txHash)
-		if err != nil {
-			return err
-		}
-
-		targetTx = txDetails
-
-		return nil
-	})
+	tx, err := b.wallet.GetTransaction(txHash)
 	if err != nil {
 		return nil, err
 	}
 
-	if targetTx == nil {
-		return nil, nil
-	}
-
-	return &targetTx.TxRecord.MsgTx, nil
+	return tx.Summary.Tx, nil
 }
 
 // RemoveDescendants attempts to remove any transaction from the wallet's tx
@@ -1914,15 +1808,7 @@ func (b *BtcWallet) FetchTx(txHash chainhash.Hash) (*wire.MsgTx, error) {
 // transaction. This remove propagates recursively down the chain of descendent
 // transactions.
 func (b *BtcWallet) RemoveDescendants(tx *wire.MsgTx) error {
-	txRecord, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
-	if err != nil {
-		return err
-	}
-
-	return walletdb.Update(b.db, func(tx walletdb.ReadWriteTx) error {
-		wtxmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		return b.wallet.TxStore.RemoveUnminedTx(wtxmgrNs, txRecord)
-	})
+	return b.wallet.RemoveDescendants(tx)
 }
 
 // CheckMempoolAcceptance is a wrapper around `TestMempoolAccept` which checks
@@ -1931,7 +1817,9 @@ func (b *BtcWallet) CheckMempoolAcceptance(tx *wire.MsgTx) error {
 	// Use a max feerate of 0 means the default value will be used when
 	// testing mempool acceptance. The default max feerate is 0.10 BTC/kvb,
 	// or 10,000 sat/vb.
-	results, err := b.chain.TestMempoolAccept([]*wire.MsgTx{tx}, 0)
+	results, err := b.cfg.ChainSource.TestMempoolAccept(
+		[]*wire.MsgTx{tx}, 0,
+	)
 	if err != nil {
 		return err
 	}
@@ -1948,7 +1836,9 @@ func (b *BtcWallet) CheckMempoolAcceptance(tx *wire.MsgTx) error {
 	// Mempool check failed, we now map the reject reason to a proper RPC
 	// error and return it.
 	if !result.Allowed {
-		err := b.chain.MapRPCErr(errors.New(result.RejectReason))
+		err := b.cfg.ChainSource.MapRPCErr(
+			errors.New(result.RejectReason),
+		)
 
 		return fmt.Errorf("mempool rejection: %w", err)
 	}
