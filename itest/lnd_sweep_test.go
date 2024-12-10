@@ -17,6 +17,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/sweep"
@@ -112,6 +113,9 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 	if ht.IsNeutrinoBackend() {
 		ht.FundCoins(btcutil.SatoshiPerBitcoin, bob)
 	}
+
+	resp := bob.RPC.ListUnspent(&walletrpc.ListUnspentRequest{})
+	ht.Logf("Bob has utxos: %v", lnutils.SpewLogClosure(resp.Utxos))
 
 	// Subscribe the invoice.
 	streamCarol := carol.RPC.SubscribeSingleInvoice(payHash[:])
@@ -338,6 +342,9 @@ func testSweepCPFPAnchorOutgoingTimeout(ht *lntest.HarnessTest) {
 	// Mine a block to confirm Bob's sweeping and force close txns, this is
 	// needed to clean up the mempool.
 	ht.MineBlocksAndAssertNumTxes(1, 2)
+
+	resp = bob.RPC.ListUnspent(&walletrpc.ListUnspentRequest{})
+	ht.Logf("Bob has utxos in the end: %v", lnutils.SpewLogClosure(resp.Utxos))
 
 	// The above mined block should confirm Bob's force close tx, and his
 	// contractcourt will offer the HTLC to his sweeper. We are not testing
