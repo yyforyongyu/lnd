@@ -10,7 +10,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lntypes"
@@ -761,7 +761,8 @@ func (p *paymentLifecycle) amendFirstHopData(rt *route.Route) error {
 	// and apply its side effects to the UpdateAddHTLC message.
 	result, err := fn.MapOptionZ(
 		p.router.cfg.TrafficShaper,
-		func(ts TlvTrafficShaper) fn.Result[extraDataRequest] {
+		//nolint:ll
+		func(ts htlcswitch.AuxTrafficShaper) fn.Result[extraDataRequest] {
 			newAmt, newRecords, err := ts.ProduceHtlcExtraData(
 				rt.TotalAmount, p.firstHopCustomRecords,
 			)
@@ -774,7 +775,7 @@ func (p *paymentLifecycle) amendFirstHopData(rt *route.Route) error {
 				return fn.Err[extraDataRequest](err)
 			}
 
-			log.Debugf("TLV traffic shaper returned custom "+
+			log.Debugf("Aux traffic shaper returned custom "+
 				"records %v and amount %d msat for HTLC",
 				spew.Sdump(newRecords), newAmt)
 
