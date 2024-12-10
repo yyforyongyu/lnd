@@ -1128,7 +1128,8 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 	}
 
 	// Next, we'll run through all the regular outputs, only saving those
-	// which are p2wkh outputs or a p2wsh output nested within a p2sh output.
+	// which are p2wkh outputs or a p2wsh output nested within a p2sh
+	// output.
 	witnessOutputs := make([]*lnwallet.Utxo, 0, len(unspentOutputs))
 	for _, output := range unspentOutputs {
 		pkScript, err := hex.DecodeString(output.ScriptPubKey)
@@ -1139,11 +1140,14 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 		addressType := lnwallet.UnknownAddressType
 		if txscript.IsPayToWitnessPubKeyHash(pkScript) {
 			addressType = lnwallet.WitnessPubKey
+
 		} else if txscript.IsPayToScriptHash(pkScript) {
-			// TODO(roasbeef): This assumes all p2sh outputs returned by the
-			// wallet are nested p2pkh. We can't check the redeem script because
-			// the btcwallet service does not include it.
+			// TODO(roasbeef): This assumes all p2sh outputs
+			// returned by the wallet are nested p2pkh. We can't
+			// check the redeem script because the btcwallet
+			// service does not include it.
 			addressType = lnwallet.NestedWitnessPubKey
+
 		} else if txscript.IsPayToTaproot(pkScript) {
 			addressType = lnwallet.TaprootPubkey
 		}
@@ -1314,10 +1318,9 @@ func (b *BtcWallet) LabelTransaction(hash chainhash.Hash, label string,
 
 // extractBalanceDelta extracts the net balance delta from the PoV of the
 // wallet given a TransactionSummary.
-func extractBalanceDelta(
-	txSummary base.TransactionSummary,
-	tx *wire.MsgTx,
-) (btcutil.Amount, error) {
+func extractBalanceDelta(txSummary base.TransactionSummary,
+	tx *wire.MsgTx) (btcutil.Amount, error) {
+
 	// For each input we debit the wallet's outflow for this transaction,
 	// and for each output we credit the wallet's inflow for this
 	// transaction.
@@ -1340,8 +1343,8 @@ func getPreviousOutpoints(wireTx *wire.MsgTx,
 	// isOurOutput is a map containing the output indices
 	// controlled by the wallet.
 	// Note: We make use of the information in `myInputs` provided
-	// by the `wallet.TransactionSummary` structure that holds
-	// information only if the input/previous_output is controlled by the wallet.
+	// by the `wallet.TransactionSummary` structure that holds information
+	// only if the input/previous_output is controlled by the wallet.
 	isOurOutput := make(map[uint32]bool, len(myInputs))
 	for _, myInput := range myInputs {
 		isOurOutput[myInput.Index] = true
@@ -1399,13 +1402,12 @@ func (b *BtcWallet) GetTransactionDetails(
 
 // minedTransactionsToDetails is a helper function which converts a summary
 // information about mined transactions to a TransactionDetail.
-func minedTransactionsToDetails(
-	currentHeight int32,
-	block base.Block,
-	chainParams *chaincfg.Params,
-) ([]*lnwallet.TransactionDetail, error) {
+func minedTransactionsToDetails(currentHeight int32, block base.Block,
+	chainParams *chaincfg.Params) ([]*lnwallet.TransactionDetail, error) {
 
-	details := make([]*lnwallet.TransactionDetail, 0, len(block.Transactions))
+	details := make(
+		[]*lnwallet.TransactionDetail, 0, len(block.Transactions),
+	)
 	for _, tx := range block.Transactions {
 		wireTx := &wire.MsgTx{}
 		txReader := bytes.NewReader(tx.Transaction)
@@ -1474,10 +1476,8 @@ func minedTransactionsToDetails(
 
 // unminedTransactionsToDetail is a helper function which converts a summary
 // for an unconfirmed transaction to a transaction detail.
-func unminedTransactionsToDetail(
-	summary base.TransactionSummary,
-	chainParams *chaincfg.Params,
-) (*lnwallet.TransactionDetail, error) {
+func unminedTransactionsToDetail(summary base.TransactionSummary,
+	chainParams *chaincfg.Params) (*lnwallet.TransactionDetail, error) {
 
 	wireTx := &wire.MsgTx{}
 	txReader := bytes.NewReader(summary.Transaction)
@@ -1726,7 +1726,9 @@ out:
 // blocks.
 //
 // This is a part of the WalletController interface.
-func (b *BtcWallet) SubscribeTransactions() (lnwallet.TransactionSubscription, error) {
+func (b *BtcWallet) SubscribeTransactions() (lnwallet.TransactionSubscription,
+	error) {
+
 	walletClient := b.wallet.NtfnServer.TransactionNotifications()
 
 	txClient := &txSubscriptionClient{
@@ -1825,9 +1827,10 @@ func (b *BtcWallet) GetRecoveryInfo() (bool, float64, error) {
 	})
 
 	if err != nil {
-		// The wallet won't start until the backend is synced, thus the birthday
-		// block won't be set and this particular error will be returned. We'll
-		// catch this error and return a progress of 0 instead.
+		// The wallet won't start until the backend is synced, thus the
+		// birthday block won't be set and this particular error will
+		// be returned. We'll catch this error and return a progress of
+		// 0 instead.
 		if waddrmgr.IsError(err, waddrmgr.ErrBirthdayBlockNotSet) {
 			return isRecoveryMode, progress, nil
 		}
@@ -1841,30 +1844,32 @@ func (b *BtcWallet) GetRecoveryInfo() (bool, float64, error) {
 	// Next, query the chain backend to grab the info about the tip of the
 	// main chain.
 	//
-	// NOTE: The actual recovery process is handled by the btcsuite/btcwallet.
-	// The process purposefully doesn't update the best height. It might create
-	// a small difference between the height queried here and the height used
-	// in the recovery process, ie, the bestHeight used here might be greater,
-	// showing the recovery being unfinished while it's actually done. However,
-	// during a wallet rescan after the recovery, the wallet's synced height
-	// will catch up and this won't be an issue.
+	// NOTE: The actual recovery process is handled by the
+	// btcsuite/btcwallet.  The process purposefully doesn't update the
+	// best height. It might create a small difference between the height
+	// queried here and the height used in the recovery process, ie, the
+	// bestHeight used here might be greater, showing the recovery being
+	// unfinished while it's actually done. However, during a wallet rescan
+	// after the recovery, the wallet's synced height will catch up and
+	// this won't be an issue.
 	_, bestHeight, err := b.cfg.ChainSource.GetBestBlock()
 	if err != nil {
 		return isRecoveryMode, progress, err
 	}
 
-	// The birthday block height might be greater than the current synced height
-	// in a newly restored wallet, and might be greater than the chain tip if a
-	// rollback happens. In that case, we will return zero progress here.
+	// The birthday block height might be greater than the current synced
+	// height in a newly restored wallet, and might be greater than the
+	// chain tip if a rollback happens. In that case, we will return zero
+	// progress here.
 	if syncState.Height < birthdayBlock.Height ||
 		bestHeight < birthdayBlock.Height {
 
 		return isRecoveryMode, progress, nil
 	}
 
-	// progress is the ratio of the [number of blocks processed] over the [total
-	// number of blocks] needed in a recovery mode, ranging from 0 to 1, in
-	// which,
+	// progress is the ratio of the [number of blocks processed] over the
+	// [total number of blocks] needed in a recovery mode, ranging from 0
+	// to 1, in which,
 	// - total number of blocks is the current chain's best height minus the
 	//   wallet's birthday height plus 1.
 	// - number of blocks processed is the wallet's synced height minus its
