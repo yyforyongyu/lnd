@@ -294,7 +294,9 @@ func (b *BtcWallet) fetchPrivKey(
 	}
 
 	hash160 := btcutil.Hash160(keyDesc.PubKey.SerializeCompressed())
-	addr, err := btcutil.NewAddressWitnessPubKeyHash(hash160, b.netParams)
+	addr, err := btcutil.NewAddressWitnessPubKeyHash(
+		hash160, b.cfg.NetParams,
+	)
 	if err != nil {
 		return nil, err
 	}
