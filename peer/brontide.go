@@ -26,7 +26,7 @@ import (
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/feature"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/funding"
 	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/graph/db/models"
@@ -399,6 +399,10 @@ type Config struct {
 	// AuxResolver is an optional interface that can be used to modify the
 	// way contracts are resolved.
 	AuxResolver fn.Option[lnwallet.AuxContractResolver]
+
+	// AuxTrafficShaper is an optional auxiliary traffic shaper that can be
+	// used to manage the bandwidth of peer links.
+	AuxTrafficShaper fn.Option[htlcswitch.AuxTrafficShaper]
 
 	// PongBuf is a slice we'll reuse instead of allocating memory on the
 	// heap. Since only reads will occur and no writes, there is no need
@@ -1330,6 +1334,7 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 		ShouldFwdExpEndorsement: p.cfg.ShouldFwdExpEndorsement,
 		DisallowQuiescence: p.cfg.DisallowQuiescence ||
 			!p.remoteFeatures.HasFeature(lnwire.QuiescenceOptional),
+		AuxTrafficShaper: p.cfg.AuxTrafficShaper,
 	}
 
 	// Before adding our new link, purge the switch of any pending or live

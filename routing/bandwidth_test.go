@@ -5,7 +5,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/go-errors/errors"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/tlv"
@@ -118,7 +118,9 @@ func TestBandwidthManager(t *testing.T) {
 			m, err := newBandwidthManager(
 				g, sourceNode.pubkey, testCase.linkQuery,
 				fn.None[[]byte](),
-				fn.Some[TlvTrafficShaper](&mockTrafficShaper{}),
+				fn.Some[htlcswitch.AuxTrafficShaper](
+					&mockTrafficShaper{},
+				),
 			)
 			require.NoError(t, err)
 

@@ -9,7 +9,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/fn"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/lntest/wait"
@@ -30,7 +30,7 @@ func createTestPaymentLifecycle() *paymentLifecycle {
 	quitChan := make(chan struct{})
 	rt := &ChannelRouter{
 		cfg: &Config{
-			TrafficShaper: fn.Some[TlvTrafficShaper](
+			TrafficShaper: fn.Some[htlcswitch.AuxTrafficShaper](
 				&mockTrafficShaper{},
 			),
 		},
@@ -83,7 +83,7 @@ func newTestPaymentLifecycle(t *testing.T) (*paymentLifecycle, *mockers) {
 			Payer:          mockPayer,
 			Clock:          mockClock,
 			MissionControl: mockMissionControl,
-			TrafficShaper: fn.Some[TlvTrafficShaper](
+			TrafficShaper: fn.Some[htlcswitch.AuxTrafficShaper](
 				&mockTrafficShaper{},
 			),
 		},
