@@ -31,6 +31,7 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
@@ -1052,6 +1053,9 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 	if err != nil {
 		return nil, err
 	}
+
+	log.Debugf("===> ListUnspent for account=%v minConfs=%v, maxConfs=%v got: %v",
+		accountFilter, minConfs, maxConfs, lnutils.SpewLogClosure(unspentOutputs))
 
 	// Next, we'll run through all the regular outputs, only saving those
 	// which are p2wkh outputs or a p2wsh output nested within a p2sh output.
