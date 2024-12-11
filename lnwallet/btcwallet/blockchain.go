@@ -30,7 +30,7 @@ var (
 //
 // This method is a part of the lnwallet.BlockChainIO interface.
 func (b *BtcWallet) GetBestBlock() (*chainhash.Hash, int32, error) {
-	return b.chain.GetBestBlock()
+	return b.cfg.ChainSource.GetBestBlock()
 }
 
 // GetUtxo returns the original output referenced by the passed outpoint that
@@ -40,7 +40,7 @@ func (b *BtcWallet) GetBestBlock() (*chainhash.Hash, int32, error) {
 func (b *BtcWallet) GetUtxo(op *wire.OutPoint, pkScript []byte,
 	heightHint uint32, cancel <-chan struct{}) (*wire.TxOut, error) {
 
-	switch backend := b.chain.(type) {
+	switch backend := b.cfg.ChainSource.(type) {
 
 	case *chain.NeutrinoClient:
 		spendReport, err := backend.CS.GetUtxo(
@@ -134,9 +134,11 @@ func (b *BtcWallet) GetUtxo(op *wire.OutPoint, pkScript []byte,
 //
 // This method is a part of the lnwallet.BlockChainIO interface.
 func (b *BtcWallet) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error) {
-	_, ok := b.chain.(*chain.NeutrinoClient)
+	_, ok := b.cfg.ChainSource.(*chain.NeutrinoClient)
 	if !ok {
-		return b.blockCache.GetBlock(blockHash, b.chain.GetBlock)
+		return b.blockCache.GetBlock(
+			blockHash, b.cfg.ChainSource.GetBlock,
+		)
 	}
 
 	// For the neutrino implementation of lnwallet.BlockChainIO the neutrino
@@ -146,7 +148,7 @@ func (b *BtcWallet) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error) 
 	b.blockCache.HashMutex.Lock(lntypes.Hash(*blockHash))
 	defer b.blockCache.HashMutex.Unlock(lntypes.Hash(*blockHash))
 
-	return b.chain.GetBlock(blockHash)
+	return b.cfg.ChainSource.GetBlock(blockHash)
 }
 
 // GetBlockHeader returns a block header for the block with the given hash.
@@ -155,7 +157,7 @@ func (b *BtcWallet) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error) 
 func (b *BtcWallet) GetBlockHeader(
 	blockHash *chainhash.Hash) (*wire.BlockHeader, error) {
 
-	return b.chain.GetBlockHeader(blockHash)
+	return b.cfg.ChainSource.GetBlockHeader(blockHash)
 }
 
 // GetBlockHash returns the hash of the block in the best blockchain at the
@@ -163,7 +165,7 @@ func (b *BtcWallet) GetBlockHeader(
 //
 // This method is a part of the lnwallet.BlockChainIO interface.
 func (b *BtcWallet) GetBlockHash(blockHeight int64) (*chainhash.Hash, error) {
-	return b.chain.GetBlockHash(blockHeight)
+	return b.cfg.ChainSource.GetBlockHash(blockHeight)
 }
 
 // A compile time check to ensure that BtcWallet implements the BlockChainIO
