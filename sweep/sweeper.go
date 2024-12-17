@@ -1715,8 +1715,8 @@ func (s *UtxoSweeper) handleBumpEventTxReplaced(resp *bumpResp) error {
 	s.cfg.Wallet.CancelRebroadcast(oldTxid)
 
 	log.Infof("RBFed tx=%v(fee=%v sats, feerate=%v sats/kw) with new "+
-		"tx=%v(fee=%v, "+"feerate=%v)", record.Txid, record.Fee,
-		record.FeeRate, tr.Txid, tr.Fee, tr.FeeRate)
+		"tx=%v(fee=%v sats, feerate=%v sats/kw)", record.Txid,
+		record.Fee, record.FeeRate, tr.Txid, tr.Fee, tr.FeeRate)
 
 	// The old sweeping tx has been replaced by a new one, we will update
 	// the tx record in the sweeper db.

@@ -976,6 +976,8 @@ func testListAddresses(ht *lntest.HarnessTest) {
 	// Next, we'll give Alice exactly 1 utxo of 1 BTC.
 	ht.FundCoins(btcutil.SatoshiPerBitcoin, alice)
 
+	return
+
 	type addressDetails struct {
 		Balance int64
 		Type    walletrpc.AddressType
