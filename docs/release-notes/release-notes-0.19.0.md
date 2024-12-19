@@ -120,6 +120,18 @@
 
 * LND updates channel.backup file at shutdown time.
 
+* A new subsystem `chainio` is
+  [introduced](https://github.com/lightningnetwork/lnd/pull/9277) to make sure
+  the subsystems are in sync with their current best block. Previously, when
+  resolving a force close channel, the sweeping of HTLCs may be delayed for one
+  or two blocks due to block heights not in sync in the relevant subsystems
+  (`ChainArbitrator`, `UtxoSweeper` and `TxPublisher`), causing a slight
+  inaccuracy when deciding the sweeping feerate and urgency. With `chainio`,
+  this is now fixed as these subsystems now share the same view on the best
+  block. Check
+  [here](https://github.com/lightningnetwork/lnd/blob/master/chainio/README.md)
+  to learn more.
+
 ## RPC Updates
 
 * Some RPCs that previously just returned an empty response message now at least
@@ -216,6 +228,11 @@ The underlying functionality between those two options remain the same.
   store](https://github.com/lightningnetwork/lnd/pull/9001) so that results are 
   namespaced. All existing results are written to the "default" namespace.
 
+* [Remove global application level lock for
+  Postgres](https://github.com/lightningnetwork/lnd/pull/9242) so multiple DB
+  transactions can run at once, increasing efficiency. Includes several bugfixes
+  to allow this to work properly.
+
 ## Code Health
 
 * A code refactor that [moves all the graph related DB code out of the 
@@ -239,6 +256,7 @@ The underlying functionality between those two options remain the same.
 # Contributors (Alphabetical Order)
 
 * Abdullahi Yunus
+* Alex Akselrod
 * Animesh Bilthare
 * Boris Nagaev
 * Carla Kirk-Cohen

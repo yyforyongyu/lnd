@@ -8,7 +8,7 @@ require (
 	github.com/google/btree v1.0.1
 	github.com/jackc/pgx/v4 v4.18.1
 	github.com/lightningnetwork/lnd/healthcheck v1.2.4
-	github.com/lightningnetwork/lnd/sqldb v1.0.2
+	github.com/lightningnetwork/lnd/sqldb v1.0.6
 	github.com/stretchr/testify v1.9.0
 	go.etcd.io/bbolt v1.3.11
 	go.etcd.io/etcd/api/v3 v3.5.7
@@ -16,7 +16,7 @@ require (
 	go.etcd.io/etcd/client/v3 v3.5.7
 	go.etcd.io/etcd/server/v3 v3.5.7
 	golang.org/x/net v0.22.0
-	modernc.org/sqlite v1.29.8
+	modernc.org/sqlite v1.29.10
 )
 
 require (
@@ -59,6 +59,7 @@ require (
 	github.com/jackc/pgproto3/v2 v2.3.3 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
 	github.com/jackc/pgtype v1.14.0 // indirect
+	github.com/jackc/pgx/v5 v5.3.1 // indirect
 	github.com/jonboulle/clockwork v0.2.2 // indirect
 	github.com/json-iterator/go v1.1.11 // indirect
 	github.com/lib/pq v1.10.9 // indirect
