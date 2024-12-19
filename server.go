@@ -1118,7 +1118,6 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 
 			return s.genNodeAnnouncement(nil)
 		},
-		ProofMatureDelta:        0,
 		TrickleDelay:            time.Millisecond * time.Duration(cfg.TrickleDelay),
 		RetransmitTicker:        ticker.New(time.Minute * 30),
 		RebroadcastInterval:     time.Hour * 24,

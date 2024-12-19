@@ -227,10 +227,6 @@ type Config struct {
 	// an updated timestamp which can be broadcast to our peers.
 	UpdateSelfAnnouncement func() (lnwire.NodeAnnouncement, error)
 
-	// ProofMatureDelta the number of confirmations which is needed before
-	// exchange the channel announcement proofs.
-	ProofMatureDelta uint32
-
 	// TrickleDelay the period of trickle timer which flushes to the
 	// network the pending batch of new announcements we've received since
 	// the last trickle tick.
@@ -1983,11 +1979,9 @@ func (d *AuthenticatedGossiper) addNode(msg *lnwire.NodeAnnouncement,
 //
 // NOTE: must be used inside a lock.
 func (d *AuthenticatedGossiper) isPremature(chanID lnwire.ShortChannelID,
-	delta uint32, msg *networkMsg) bool {
-	// TODO(roasbeef) make height delta 6
-	//  * or configurable
+	msg *networkMsg) bool {
 
-	msgHeight := chanID.BlockHeight + delta
+	msgHeight := chanID.BlockHeight
 
 	// The message height is smaller or equal to our best known height,
 	// thus the message is mature.
@@ -2483,7 +2477,7 @@ func (d *AuthenticatedGossiper) handleChanAnnouncement(nMsg *networkMsg,
 	// If the advertised inclusionary block is beyond our knowledge of the
 	// chain tip, then we'll ignore it for now.
 	d.Lock()
-	if nMsg.isRemote && d.isPremature(scid, 0, nMsg) {
+	if nMsg.isRemote && d.isPremature(scid, nMsg) {
 		log.Warnf("Announcement for chan_id=(%v), is premature: "+
 			"advertises height %v, only height %v is known",
 			scid.ToUint64(), scid.BlockHeight, d.bestHeight)
@@ -2861,7 +2855,7 @@ func (d *AuthenticatedGossiper) handleChanUpdate(nMsg *networkMsg,
 	// since aliases start at block height 16_000_000.
 	d.Lock()
 	if nMsg.isRemote && !d.cfg.IsAlias(upd.ShortChannelID) &&
-		d.isPremature(upd.ShortChannelID, 0, nMsg) {
+		d.isPremature(upd.ShortChannelID, nMsg) {
 
 		log.Warnf("Update announcement for short_chan_id(%v), is "+
 			"premature: advertises height %v, only height %v is "+
@@ -3234,8 +3228,7 @@ func (d *AuthenticatedGossiper) handleChanUpdate(nMsg *networkMsg,
 func (d *AuthenticatedGossiper) handleAnnSig(nMsg *networkMsg,
 	ann *lnwire.AnnounceSignatures1) ([]networkMsg, bool) {
 
-	needBlockHeight := ann.ShortChannelID.BlockHeight +
-		d.cfg.ProofMatureDelta
+	needBlockHeight := ann.ShortChannelID.BlockHeight
 	shortChanID := ann.ShortChannelID.ToUint64()
 
 	prefix := "local"
@@ -3250,9 +3243,7 @@ func (d *AuthenticatedGossiper) handleAnnSig(nMsg *networkMsg,
 	// after some number of confirmations after channel was registered in
 	// bitcoin blockchain. Therefore, we check if the proof is mature.
 	d.Lock()
-	premature := d.isPremature(
-		ann.ShortChannelID, d.cfg.ProofMatureDelta, nMsg,
-	)
+	premature := d.isPremature(ann.ShortChannelID, nMsg)
 	if premature {
 		log.Warnf("Premature proof announcement, current block height"+
 			"lower than needed: %v < %v", d.bestHeight,
