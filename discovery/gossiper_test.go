@@ -788,7 +788,6 @@ func createTestCtx(t *testing.T, startHeight uint32, isChanPeer bool) (
 		TrickleDelay:          trickleDelay,
 		RetransmitTicker:      ticker.NewForce(retransmitDelay),
 		RebroadcastInterval:   rebroadcastInterval,
-		ProofMatureDelta:      proofMatureDelta,
 		WaitingProofStore:     waitingProofStore,
 		MessageStore:          newMockMessageStore(),
 		RotateTicker:          ticker.NewForce(DefaultSyncerRotationInterval),
@@ -1473,7 +1472,6 @@ func TestSignatureAnnouncementRetryAtStartup(t *testing.T) {
 		TrickleDelay:           trickleDelay,
 		RetransmitTicker:       ticker.NewForce(retransmitDelay),
 		RebroadcastInterval:    rebroadcastInterval,
-		ProofMatureDelta:       proofMatureDelta,
 		WaitingProofStore:      ctx.gossiper.cfg.WaitingProofStore,
 		MessageStore:           ctx.gossiper.cfg.MessageStore,
 		RotateTicker:           ticker.NewForce(DefaultSyncerRotationInterval),
@@ -3625,9 +3623,7 @@ func TestSplitAnnouncementsCorrectSubBatches(t *testing.T) {
 	lengthAnnouncementBatchSizes := len(announcementBatchSizes)
 	lengthExpectedNumberMiniBatches := len(expectedNumberMiniBatches)
 
-	batchSizeCalculator = func(totalDelay, subBatchDelay time.Duration,
-		minimumBatchSize, batchSize int) int {
-
+	batchSizeCalculator = func(_, _ time.Duration, _, _ int) int {
 		return subBatchSize
 	}
 
