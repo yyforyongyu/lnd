@@ -39,9 +39,6 @@ const (
 	// release of announcements by AuthenticatedGossiper to the network.
 	trickleDelay = 50
 
-	postgresDsn = "postgres://postgres:postgres@localhost:" +
-		"6432/%s?sslmode=disable"
-
 	// commitInterval specifies the maximum interval the graph database
 	// will wait between attempting to flush a batch of modifications to
 	// disk(db.batch-commit-interval).
@@ -123,11 +120,11 @@ func NewHarnessNode(t *testing.T, cfg *BaseNodeConfig) (*HarnessNode, error) {
 	var dbName string
 	if cfg.DBBackend == BackendPostgres {
 		var err error
-		dbName, err = createTempPgDB()
+		dbName, err = createTempPgDB(cfg.PostgresPort)
 		if err != nil {
 			return nil, err
 		}
-		cfg.PostgresDsn = postgresDatabaseDsn(dbName)
+		cfg.PostgresDsn = postgresDatabaseDsn(dbName, cfg.PostgresPort)
 	}
 
 	cfg.OriginalExtraArgs = cfg.ExtraArgs
@@ -838,8 +835,8 @@ func (hn *HarnessNode) BackupDB() error {
 		// Backup database.
 		backupDBName := hn.Cfg.postgresDBName + "_backup"
 		err := executePgQuery(
-			"CREATE DATABASE " + backupDBName + " WITH TEMPLATE " +
-				hn.Cfg.postgresDBName,
+			"CREATE DATABASE "+backupDBName+" WITH TEMPLATE "+
+				hn.Cfg.postgresDBName, hn.Cfg.PostgresPort,
 		)
 		if err != nil {
 			return err
@@ -869,14 +866,15 @@ func (hn *HarnessNode) RestoreDB() error {
 		// Restore database.
 		backupDBName := hn.Cfg.postgresDBName + "_backup"
 		err := executePgQuery(
-			"DROP DATABASE " + hn.Cfg.postgresDBName,
+			"DROP DATABASE "+hn.Cfg.postgresDBName,
+			hn.Cfg.PostgresPort,
 		)
 		if err != nil {
 			return err
 		}
 		err = executePgQuery(
-			"ALTER DATABASE " + backupDBName + " RENAME TO " +
-				hn.Cfg.postgresDBName,
+			"ALTER DATABASE "+backupDBName+" RENAME TO "+
+				hn.Cfg.postgresDBName, hn.Cfg.PostgresPort,
 		)
 		if err != nil {
 			return err
@@ -916,12 +914,15 @@ func (hn *HarnessNode) UpdateGlobalPolicy(policy *lnrpc.RoutingPolicy) {
 	hn.RPC.UpdateChannelPolicy(updateFeeReq)
 }
 
-func postgresDatabaseDsn(dbName string) string {
-	return fmt.Sprintf(postgresDsn, dbName)
+func postgresDatabaseDsn(dbName string, port int) string {
+	postgresDsn := "postgres://postgres:postgres@localhost:" +
+		"%d/%s?sslmode=disable"
+
+	return fmt.Sprintf(postgresDsn, port, dbName)
 }
 
 // createTempPgDB creates a temp postgres database.
-func createTempPgDB() (string, error) {
+func createTempPgDB(port int) (string, error) {
 	// Create random database name.
 	randBytes := make([]byte, 8)
 	_, err := rand.Read(randBytes)
@@ -931,7 +932,7 @@ func createTempPgDB() (string, error) {
 	dbName := "itest_" + hex.EncodeToString(randBytes)
 
 	// Create database.
-	err = executePgQuery("CREATE DATABASE " + dbName)
+	err = executePgQuery("CREATE DATABASE "+dbName, port)
 	if err != nil {
 		return "", err
 	}
@@ -940,10 +941,10 @@ func createTempPgDB() (string, error) {
 }
 
 // executePgQuery executes a SQL statement in a postgres db.
-func executePgQuery(query string) error {
+func executePgQuery(query string, port int) error {
 	pool, err := pgxpool.Connect(
 		context.Background(),
-		postgresDatabaseDsn("postgres"),
+		postgresDatabaseDsn("postgres", port),
 	)
 	if err != nil {
 		return fmt.Errorf("unable to connect to database: %w", err)

@@ -127,6 +127,12 @@ func TestLightningNetworkDaemon(t *testing.T) {
 			ht := harnessTest.Subtest(t1)
 			ht.SetTestName(testCase.Name)
 
+			postgresPort := 6432
+			if testCasesRunTranche != nil {
+				postgresPort += int(*testCasesRunTranche)
+			}
+			ht.SetPostgresPort(postgresPort)
+
 			ht.RunTestCase(testCase)
 		})
 
