@@ -469,6 +469,10 @@ func (h *HarnessTest) SetTestName(name string) {
 	h.manager.currentTestCase = cleanTestCaseName
 }
 
+func (h *HarnessTest) SetPostgresPort(port int) {
+	h.manager.postgresPort = port
+}
+
 // NewNode creates a new node and asserts its creation. The node is guaranteed
 // to have finished its initialization and all its subservers are started.
 func (h *HarnessTest) NewNode(name string,
