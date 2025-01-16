@@ -159,6 +159,10 @@ type BaseNodeConfig struct {
 	// postgresDBName is the name of the postgres database where lnd data
 	// is stored in.
 	postgresDBName string
+
+	// postgresPort is the port where the postgres database is listening
+	// on.
+	PostgresPort int
 }
 
 func (cfg BaseNodeConfig) P2PAddr() string {
@@ -233,7 +237,7 @@ func (cfg *BaseNodeConfig) GenArgs() []string {
 
 	nodeArgs := []string{
 		"--nobootstrap",
-		"--debuglevel=debug",
+		"--debuglevel=debug,DISC=trace",
 		"--bitcoin.defaultchanconfs=1",
 		"--accept-keysend",
 		"--keep-failed-payment-attempts",
