@@ -1687,6 +1687,61 @@ func (s *UtxoSweeper) handleBumpEventTxFailed(resp *bumpResp) {
 	//
 	// TODO(yy): should we also remove the failed tx from db?
 	s.markInputsPublishFailed(resp.set)
+
+	if errors.Is(r.Err, ErrThirdPartySpent) {
+		s.handleThirdPartySpent(resp)
+	}
+}
+
+// handleThirdPartySpent handles the case when the sweeping tx has been replaced
+// by another party with their tx being confirmed. It will retry sweeping the
+// "good" inputs once the "bad" ones are kicked out.
+func (s *UtxoSweeper) handleThirdPartySpent(r *bumpResp) {
+	inputsSpent := r.result.InputsFailed
+
+	// Iterate all the inputs found in this bump and mark the ones spent by
+	// the third party as failed. The rest of inputs will then be updated
+	// with a new fee rate and be retried immediately.
+	for _, inp := range r.set.Inputs() {
+		op := inp.OutPoint()
+		input, ok := s.inputs[op]
+		if !ok {
+			log.Errorf("Skipped marking input as failed: %v not "+
+				"found in pending inputs", op)
+
+			continue
+		}
+
+		// Check whether this input has been spent, if so we mark it as
+		// failed and move to the next.
+		_, spent := inputsSpent[op]
+		if spent {
+			s.markInputFailed(input, ErrThirdPartySpent)
+
+			continue
+		}
+
+		log.Debugf("Input(%v): updating params: starting fee rate "+
+			"[%v -> %v], immediate [%v -> true]", op,
+			input.params.StartingFeeRate, r.result.FeeRate,
+			input.params.Immediate)
+
+		// Update the input using the fee rate specified from the
+		// BumpResult, which should be the starting fee rate to use for
+		// the next sweeping attempt.
+		input.params.StartingFeeRate = fn.Some(r.result.FeeRate)
+		input.params.Immediate = true
+	}
+
+	// Get the latest inputs, which should put the PublishFailed inputs back
+	// to the sweeping queue.
+	inputs := s.updateSweeperInputs()
+
+	// Immediately sweep the remaining inputs - the previous inputs should
+	// now be swept with the updated StartingFeeRate immediately. We may
+	// also include more inputs in the new sweeping tx if new ones with the
+	// same deadline are offered.
+	s.sweepPendingInputs(inputs)
 }
 
 // handleBumpEventTxReplaced handles the case where the sweeping tx has been
