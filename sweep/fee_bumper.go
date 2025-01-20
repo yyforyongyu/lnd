@@ -264,6 +264,10 @@ type BumpResult struct {
 	// Err is the error that occurred during the broadcast.
 	Err error
 
+	// InputsFailed is a slice of inputs that have caused this tx to be
+	// failed.
+	InputsFailed map[wire.OutPoint]struct{}
+
 	// requestID is the ID of the request that created this record.
 	requestID uint64
 }
@@ -791,6 +795,9 @@ type monitorRecord struct {
 
 	// outpointToTxIndex is a map of outpoint to tx index.
 	outpointToTxIndex map[wire.OutPoint]int
+
+	// inputsFailed are the inputs caused the tx to be failed.
+	inputsFailed map[wire.OutPoint]struct{}
 }
 
 // Start starts the publisher by subscribing to block epoch updates and kicking
@@ -899,10 +906,13 @@ func (t *TxPublisher) processRecords() {
 			return nil
 		}
 
-		// Check whether the inputs has been spent by a third party.
-		//
-		// NOTE: this check is only done for neutrino backend.
-		if t.isThirdPartySpent(r.tx.TxHash(), r.req.Inputs) {
+		// Check whether the inputs have been spent by a third party.
+		spends := t.hasThirdPartySpent(r.tx.TxHash(), r.req.Inputs)
+
+		// If there are inputs spent by a third party, we will fail this
+		// sweeping tx.
+		if len(spends) != 0 {
+			r.inputsFailed = spends
 			failedRecords[requestID] = r
 
 			// Move to the next record.
@@ -1118,6 +1128,20 @@ func (t *TxPublisher) handleThirdPartySpent(r *monitorRecord,
 
 	defer t.wg.Done()
 
+	// Since the sweeping tx has been replaced by another party's tx, we
+	// missed this block window to increase its fee rate. To make sure the
+	// fee rate stays in the initial line, we now ask the fee function to
+	// give us the next fee rate as if the sweeping tx were RBFed. This new
+	// fee rate will be used as the starting fee rate if the upper system
+	// decides to continue sweeping the rest of the inputs.
+	_, err := r.feeFunction.Increment()
+	if err != nil {
+		// The fee function has reached its max position - nothing we
+		// can do here other than letting the user increase the budget.
+		log.Errorf("Failed to calculate the next fee rate for "+
+			"Record(%v): %v", requestID, err)
+	}
+
 	// Create a result that will be sent to the resultChan which is
 	// listened by the caller.
 	//
@@ -1125,10 +1149,12 @@ func (t *TxPublisher) handleThirdPartySpent(r *monitorRecord,
 	// sweeper to remove the input, hence moving the monitoring of inputs
 	// spent inside the fee bumper.
 	result := &BumpResult{
-		Event:     TxFailed,
-		Tx:        r.tx,
-		requestID: requestID,
-		Err:       ErrThirdPartySpent,
+		Event:        TxFailed,
+		Tx:           r.tx,
+		requestID:    requestID,
+		Err:          ErrThirdPartySpent,
+		InputsFailed: r.inputsFailed,
+		FeeRate:      r.feeFunction.FeeRate(),
 	}
 
 	// Notify that this tx is confirmed and remove the record from the map.
@@ -1253,19 +1279,14 @@ func (t *TxPublisher) isConfirmed(txid chainhash.Hash) bool {
 	return details.NumConfirmations > 0
 }
 
-// isThirdPartySpent checks whether the inputs of the tx has already been spent
+// hasThirdPartySpent checks whether the inputs of the tx has already been spent
 // by a third party. When a tx is not confirmed, yet its inputs has been spent,
 // then it must be spent by a different tx other than the sweeping tx here.
-//
-// NOTE: this check is only performed for neutrino backend as it has no
-// reliable way to tell a tx has been replaced.
-func (t *TxPublisher) isThirdPartySpent(txid chainhash.Hash,
-	inputs []input.Input) bool {
+func (t *TxPublisher) hasThirdPartySpent(txid chainhash.Hash,
+	inputs []input.Input) map[wire.OutPoint]struct{} {
 
-	// Skip this check for if this is not neutrino backend.
-	if !t.isNeutrinoBackend() {
-		return false
-	}
+	// Create a slice to record the inputs spent by third party.
+	inputsSpent := make(map[wire.OutPoint]struct{}, len(inputs))
 
 	// Iterate all the inputs and check if they have been spent already.
 	for _, inp := range inputs {
@@ -1283,13 +1304,17 @@ func (t *TxPublisher) isThirdPartySpent(txid chainhash.Hash,
 
 		// If the input has already been spent after the height hint, a
 		// spend event is sent back immediately.
+		//
+		// TODO: make this subscription earlier and remove the
+		// subscriptions in the sweeper.
 		spendEvent, err := t.cfg.Notifier.RegisterSpendNtfn(
 			&op, inp.SignDesc().Output.PkScript, heightHint,
 		)
 		if err != nil {
 			log.Criticalf("Failed to register spend ntfn for "+
 				"input=%v: %v", op, err)
-			return false
+
+			return nil
 		}
 
 		// Remove the subscription when exit.
@@ -1300,7 +1325,8 @@ func (t *TxPublisher) isThirdPartySpent(txid chainhash.Hash,
 		case spend, ok := <-spendEvent.Spend:
 			if !ok {
 				log.Debugf("Spend ntfn for %v canceled", op)
-				return false
+
+				continue
 			}
 
 			spendingTxID := spend.SpendingTx.TxHash()
@@ -1314,14 +1340,14 @@ func (t *TxPublisher) isThirdPartySpent(txid chainhash.Hash,
 			log.Warnf("Detected third party spent of output=%v "+
 				"in tx=%v", op, spend.SpendingTx.TxHash())
 
-			return true
+			inputsSpent[inp.OutPoint()] = struct{}{}
 
 		// Move to the next input.
 		default:
 		}
 	}
 
-	return false
+	return inputsSpent
 }
 
 // calcCurrentConfTarget calculates the current confirmation target based on
