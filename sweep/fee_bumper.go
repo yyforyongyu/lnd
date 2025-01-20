@@ -424,8 +424,49 @@ func (t *TxPublisher) Broadcast(req *BumpRequest) <-chan *BumpResult {
 	return subscriber
 }
 
+// createSpendNotifications makes spending subscriptions for each of the inputs.
+func (t *TxPublisher) createSpendNotifications(
+	inputs []input.Input) map[wire.OutPoint]*chainntnfs.SpendEvent {
+
+	spendNotifiers := make(
+		map[wire.OutPoint]*chainntnfs.SpendEvent, len(inputs),
+	)
+
+	for _, inp := range inputs {
+		op := inp.OutPoint()
+
+		// For wallet utxos, the height hint is not set - we don't need
+		// to monitor them.
+		heightHint := inp.HeightHint()
+		if heightHint == 0 {
+			log.Debugf("Skipped subscribing spending notification "+
+				"for wallet input %v", op)
+
+			continue
+		}
+
+		// Register spend notification for this input.
+		spendEvent, err := t.cfg.Notifier.RegisterSpendNtfn(
+			&op, inp.SignDesc().Output.PkScript, heightHint,
+		)
+		if err != nil {
+			log.Criticalf("Failed to register spend ntfn for "+
+				"input=%v: %v", op, err)
+
+			return nil
+		}
+
+		spendNotifiers[op] = spendEvent
+	}
+
+	return spendNotifiers
+}
+
 // storeInitialRecord initializes a monitor record and saves it in the map.
 func (t *TxPublisher) storeInitialRecord(req *BumpRequest) *monitorRecord {
+	// Start subscribing for spending events for these inputs.
+	spendNotifiers := t.createSpendNotifications(req.Inputs)
+
 	// Increase the request counter.
 	//
 	// NOTE: this is the only place where we increase the counter.
@@ -433,8 +474,9 @@ func (t *TxPublisher) storeInitialRecord(req *BumpRequest) *monitorRecord {
 
 	// Register the record.
 	record := &monitorRecord{
-		requestID: requestID,
-		req:       req,
+		requestID:      requestID,
+		req:            req,
+		spendNotifiers: spendNotifiers,
 	}
 	t.records.Store(requestID, record)
 
@@ -762,8 +804,20 @@ func (t *TxPublisher) removeResult(result *BumpResult) {
 		return
 	}
 
-	t.records.Delete(id)
 	t.subscriberChans.Delete(id)
+
+	// Load the record and delete it.
+	record, ok := t.records.LoadAndDelete(id)
+	if !ok {
+		log.Warnf("Monitor record %v not found", id)
+
+		return
+	}
+
+	// Cancel the spending subscriptions for all the inputs.
+	for _, sub := range record.spendNotifiers {
+		sub.Cancel()
+	}
 }
 
 // handleResult handles the result of a tx broadcast. It will notify the
@@ -797,6 +851,10 @@ type monitorRecord struct {
 
 	// outpointToTxIndex is a map of outpoint to tx index.
 	outpointToTxIndex map[wire.OutPoint]int
+
+	// spendNotifiers is a map of spend notifiers registered for all the
+	// inputs.
+	spendNotifiers map[wire.OutPoint]*chainntnfs.SpendEvent
 }
 
 // Start starts the publisher by subscribing to block epoch updates and kicking
@@ -908,7 +966,7 @@ func (t *TxPublisher) processRecords() {
 		// Check whether the inputs has been spent by a third party.
 		//
 		// NOTE: this check is only done for neutrino backend.
-		if t.isThirdPartySpent(r.tx.TxHash(), r.req.Inputs) {
+		if t.isThirdPartySpent(r) {
 			failedRecords[requestID] = r
 
 			// Move to the next record.
@@ -1253,42 +1311,16 @@ func (t *TxPublisher) isConfirmed(txid chainhash.Hash) bool {
 //
 // NOTE: this check is only performed for neutrino backend as it has no
 // reliable way to tell a tx has been replaced.
-func (t *TxPublisher) isThirdPartySpent(txid chainhash.Hash,
-	inputs []input.Input) bool {
-
+func (t *TxPublisher) isThirdPartySpent(r *monitorRecord) bool {
 	// Skip this check for if this is not neutrino backend.
 	if !t.isNeutrinoBackend() {
 		return false
 	}
 
+	txid := r.tx.TxHash()
+
 	// Iterate all the inputs and check if they have been spent already.
-	for _, inp := range inputs {
-		op := inp.OutPoint()
-
-		// For wallet utxos, the height hint is not set - we don't need
-		// to monitor them for third party spend.
-		heightHint := inp.HeightHint()
-		if heightHint == 0 {
-			log.Debugf("Skipped third party check for wallet "+
-				"input %v", op)
-
-			continue
-		}
-
-		// If the input has already been spent after the height hint, a
-		// spend event is sent back immediately.
-		spendEvent, err := t.cfg.Notifier.RegisterSpendNtfn(
-			&op, inp.SignDesc().Output.PkScript, heightHint,
-		)
-		if err != nil {
-			log.Criticalf("Failed to register spend ntfn for "+
-				"input=%v: %v", op, err)
-			return false
-		}
-
-		// Remove the subscription when exit.
-		defer spendEvent.Cancel()
-
+	for op, spendEvent := range r.spendNotifiers {
 		// Do a non-blocking read to see if the output has been spent.
 		select {
 		case spend, ok := <-spendEvent.Spend:

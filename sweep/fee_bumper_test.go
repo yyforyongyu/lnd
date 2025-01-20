@@ -1776,3 +1776,85 @@ func TestHandleInitialBroadcastFail(t *testing.T) {
 	require.Equal(t, 0, tp.records.Len())
 	require.Equal(t, 0, tp.subscriberChans.Len())
 }
+
+// TestCreateSpendNotifications creates the spending notifications for each of
+// the inputs.
+func TestCreateSpendNotifications(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, m := createTestPublisher(t)
+
+	// Create mock inputs.
+	op1 := wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 1,
+	}
+	inp1 := &input.MockInput{}
+	heightHint1 := uint32(1)
+	defer inp1.AssertExpectations(t)
+
+	op2 := wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 2,
+	}
+	inp2 := &input.MockInput{}
+	heightHint2 := uint32(2)
+	defer inp2.AssertExpectations(t)
+
+	op3 := wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 3,
+	}
+	walletInp := &input.MockInput{}
+	heightHint3 := uint32(0)
+	defer walletInp.AssertExpectations(t)
+
+	// We expect all the inputs to call OutPoint and HeightHint.
+	inp1.On("OutPoint").Return(op1).Once()
+	inp2.On("OutPoint").Return(op2).Once()
+	walletInp.On("OutPoint").Return(op3).Once()
+	inp1.On("HeightHint").Return(heightHint1).Once()
+	inp2.On("HeightHint").Return(heightHint2).Once()
+	walletInp.On("HeightHint").Return(heightHint3).Once()
+
+	// We expect the normal inputs to call SignDesc. For the wallet input,
+	// since it's skipped, this method should not be called.
+	pkScript1 := []byte{1}
+	sd1 := &input.SignDescriptor{
+		Output: &wire.TxOut{
+			PkScript: pkScript1,
+		},
+	}
+	inp1.On("SignDesc").Return(sd1).Once()
+
+	pkScript2 := []byte{1}
+	sd2 := &input.SignDescriptor{
+		Output: &wire.TxOut{
+			PkScript: pkScript2,
+		},
+	}
+	inp2.On("SignDesc").Return(sd2).Once()
+
+	// Mock RegisterSpendNtfn.
+	se1 := &chainntnfs.SpendEvent{}
+	m.notifier.On("RegisterSpendNtfn",
+		&op1, pkScript1, heightHint1).Return(se1, nil).Once()
+
+	se2 := &chainntnfs.SpendEvent{}
+	m.notifier.On("RegisterSpendNtfn",
+		&op2, pkScript2, heightHint2).Return(se2, nil).Once()
+
+	// Prepare the test inputs.
+	inputs := []input.Input{inp1, inp2, walletInp}
+
+	// Call the method under test.
+	result := tp.createSpendNotifications(inputs)
+
+	// Assert the expected notifications are created.
+	expected := map[wire.OutPoint]*chainntnfs.SpendEvent{
+		op1: se1,
+		op2: se2,
+	}
+	require.Equal(t, expected, result)
+}
