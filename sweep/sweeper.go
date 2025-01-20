@@ -1793,6 +1793,48 @@ func (s *UtxoSweeper) handleBumpEventTxFatal(resp *bumpResp) error {
 	return nil
 }
 
+// handleBumpEventTxUnknownSpent handles the case where the confirmed tx is
+// unknown to the fee bumper.
+func (s *UtxoSweeper) handleBumpEventTxUnknownSpent(resp *bumpResp) {
+	r := resp.result
+	tx := r.Tx
+	txid := tx.TxHash()
+
+	isOurTx, err := s.cfg.Store.IsOurTx(txid)
+	if err != nil {
+		log.Errorf("Cannot determine if tx %v is ours: %v", txid, err)
+		return
+	}
+
+	// We now use the spending tx to update the state of the inputs.
+	s.markInputsSwept(tx, isOurTx)
+
+	// If this is our tx, it means it's a previous sweeping tx that got
+	// confirmed, which could happen when a restart happens during the
+	// sweeping process.
+	if isOurTx {
+		return
+	}
+
+	// Construct a map of the inputs this transaction spends.
+	inputsSpent := make(map[wire.OutPoint]struct{}, len(tx.TxIn))
+	for _, txIn := range tx.TxIn {
+		inputsSpent[txIn.PreviousOutPoint] = struct{}{}
+	}
+
+	log.Debugf("Attempting to remove descendant txns invalidated "+
+		"by (txid=%v): %v", tx.TxHash(), spew.Sdump(tx))
+
+	err = s.removeConflictSweepDescendants(inputsSpent)
+	if err != nil {
+		log.Warnf("unable to remove descendant transactions "+
+			"due to tx %v: ", tx.TxHash())
+	}
+
+	log.Debugf("Detected third party spend related to in flight "+
+		"inputs %v", lnutils.SpewLogClosure(tx))
+}
+
 // markInputsFatal  marks all inputs in the input set as failed. It will also
 // notify all the subscribers of these inputs.
 func (s *UtxoSweeper) markInputsFatal(set InputSet, err error) {
@@ -1851,6 +1893,12 @@ func (s *UtxoSweeper) handleBumpEvent(r *bumpResp) error {
 	// the sweeper db and mark the inputs as failed.
 	case TxFatal:
 		return s.handleBumpEventTxFatal(r)
+
+	// There are inputs being spent in a tx which the fee bumper doesn't
+	// understand. We will remove the tx from the sweeper db and mark the
+	// inputs as swept.
+	case TxUnknownSpend:
+		s.handleBumpEventTxUnknownSpent(r)
 	}
 
 	return nil
