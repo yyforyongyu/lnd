@@ -1394,35 +1394,6 @@ func (s *UtxoSweeper) handleInputSpent(spend *chainntnfs.SpendDetail) {
 		return
 	}
 
-	// If this isn't our transaction, it means someone else swept outputs
-	// that we were attempting to sweep. This can happen for anchor outputs
-	// as well as justice transactions. In this case, we'll notify the
-	// wallet to remove any spends that descent from this output.
-	if !isOurTx {
-		// Construct a map of the inputs this transaction spends.
-		spendingTx := spend.SpendingTx
-		inputsSpent := make(
-			map[wire.OutPoint]struct{}, len(spendingTx.TxIn),
-		)
-		for _, txIn := range spendingTx.TxIn {
-			inputsSpent[txIn.PreviousOutPoint] = struct{}{}
-		}
-
-		log.Debugf("Attempting to remove descendant txns invalidated "+
-			"by (txid=%v): %v", spendingTx.TxHash(),
-			spew.Sdump(spendingTx))
-
-		err := s.removeConflictSweepDescendants(inputsSpent)
-		if err != nil {
-			log.Warnf("unable to remove descendant transactions "+
-				"due to tx %v: ", spendHash)
-		}
-
-		log.Debugf("Detected third party spend related to in flight "+
-			"inputs (is_ours=%v): %v", isOurTx,
-			lnutils.SpewLogClosure(spend.SpendingTx))
-	}
-
 	// We now use the spending tx to update the state of the inputs.
 	s.markInputsSwept(spend.SpendingTx, isOurTx)
 }
@@ -1793,6 +1764,39 @@ func (s *UtxoSweeper) handleBumpEventTxFatal(resp *bumpResp) error {
 	return nil
 }
 
+// handleBumpEventTxNotSpentByUs handles the case where the tx has been spent by
+// another party.
+func (s *UtxoSweeper) handleBumpEventTxNotSpentByUs(resp *bumpResp) {
+	r := resp.result
+	tx, err := r.Tx, r.Err
+
+	if tx != nil {
+		log.Warnf("Fee bump attempt failed for tx=%v: %v", tx.TxHash(),
+			err)
+	}
+
+	// Construct a map of the inputs this transaction spends.
+	inputsSpent := make(map[wire.OutPoint]struct{}, len(tx.TxIn))
+	for _, txIn := range tx.TxIn {
+		inputsSpent[txIn.PreviousOutPoint] = struct{}{}
+	}
+
+	log.Debugf("Attempting to remove descendant txns invalidated "+
+		"by (txid=%v): %v", tx.TxHash(), spew.Sdump(tx))
+
+	err = s.removeConflictSweepDescendants(inputsSpent)
+	if err != nil {
+		log.Warnf("unable to remove descendant transactions "+
+			"due to tx %v: ", tx.TxHash())
+	}
+
+	log.Debugf("Detected third party spend related to in flight "+
+		"inputs %v", lnutils.SpewLogClosure(tx))
+
+	// We now use the spending tx to update the state of the inputs.
+	s.markInputsSwept(tx, false)
+}
+
 // markInputsFatal  marks all inputs in the input set as failed. It will also
 // notify all the subscribers of these inputs.
 func (s *UtxoSweeper) markInputsFatal(set InputSet, err error) {
@@ -1851,6 +1855,11 @@ func (s *UtxoSweeper) handleBumpEvent(r *bumpResp) error {
 	// the sweeper db and mark the inputs as failed.
 	case TxFatal:
 		return s.handleBumpEventTxFatal(r)
+
+	// There are inputs being spent by another party, we will remove the tx
+	// from the sweeper db and mark the inputs as swept.
+	case TxNotSpentByUs:
+		s.handleBumpEventTxNotSpentByUs(r)
 	}
 
 	return nil

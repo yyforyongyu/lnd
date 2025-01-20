@@ -100,6 +100,11 @@ const (
 	// error, which means they cannot be retried with increased budget.
 	TxFatal
 
+	// TxNotSpentByUs is sent when at least one of the inputs is spent but
+	// not by us, which means either a remote party or a third party has
+	// replaced our sweeping tx by spending the input(s).
+	TxNotSpentByUs
+
 	// sentinalEvent is used to check if an event is unknown.
 	sentinalEvent
 )
@@ -117,6 +122,8 @@ func (e BumpEvent) String() string {
 		return "Confirmed"
 	case TxFatal:
 		return "Fatal"
+	case TxNotSpentByUs:
+		return "NotSpentByUs"
 	default:
 		return "Unknown"
 	}
@@ -796,6 +803,11 @@ func (t *TxPublisher) removeResult(result *BumpResult) {
 		log.Debugf("Removing monitor record=%v due to fatal err: %v",
 			id, result.Err)
 
+	case TxNotSpentByUs:
+		// Remove the record if there's an error.
+		log.Debugf("Removing monitor record=%v due third party spent: "+
+			"%v", id, result.Err)
+
 	// Do nothing if it's neither failed or confirmed.
 	default:
 		log.Tracef("Skipping record removal for id=%v, event=%v", id,
@@ -810,6 +822,7 @@ func (t *TxPublisher) removeResult(result *BumpResult) {
 	record, ok := t.records.LoadAndDelete(id)
 	if !ok {
 		log.Errorf("Monitor record %v not found", id)
+		return
 	}
 
 	// Cancel the spending subscriptions for all the inputs.
@@ -962,8 +975,6 @@ func (t *TxPublisher) processRecords() {
 		}
 
 		// Check whether the inputs has been spent by a third party.
-		//
-		// NOTE: this check is only done for neutrino backend.
 		if t.isThirdPartySpent(r) {
 			failedRecords[requestID] = r
 
@@ -1177,12 +1188,8 @@ func (t *TxPublisher) handleThirdPartySpent(r *monitorRecord) {
 
 	// Create a result that will be sent to the resultChan which is
 	// listened by the caller.
-	//
-	// TODO(yy): create a new state `TxThirdPartySpent` to notify the
-	// sweeper to remove the input, hence moving the monitoring of inputs
-	// spent inside the fee bumper.
 	result := &BumpResult{
-		Event:     TxFailed,
+		Event:     TxNotSpentByUs,
 		Tx:        r.tx,
 		requestID: r.requestID,
 		Err:       ErrThirdPartySpent,
@@ -1307,16 +1314,7 @@ func (t *TxPublisher) isConfirmed(txid chainhash.Hash) bool {
 // isThirdPartySpent checks whether the inputs of the tx has already been spent
 // by a third party. When a tx is not confirmed, yet its inputs has been spent,
 // then it must be spent by a different tx other than the sweeping tx here.
-//
-// NOTE: this check is only performed for neutrino backend as it has no
-// reliable way to tell a tx has been replaced.
 func (t *TxPublisher) isThirdPartySpent(r *monitorRecord) bool {
-
-	// Skip this check for if this is not neutrino backend.
-	if !t.isNeutrinoBackend() {
-		return false
-	}
-
 	txid := r.tx.TxHash()
 
 	// Iterate all the inputs and check if they have been spent already.
