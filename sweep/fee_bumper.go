@@ -687,6 +687,14 @@ func (t *TxPublisher) createAndCheckTx(req *BumpRequest,
 		return sweepCtx, nil
 	}
 
+	//
+	if errors.Is(err, chain.ErrMissingInputs) {
+		log.Debugf("Tx %v missing inputs, it's likely the input has "+
+			"been spent by others", sweepCtx.tx.TxHash())
+
+		return sweepCtx, ErrThirdPartySpent
+	}
+
 	return sweepCtx, fmt.Errorf("tx=%v failed mempool check: %w",
 		sweepCtx.tx.TxHash(), err)
 }
@@ -1235,13 +1243,24 @@ func (t *TxPublisher) createAndPublishTx(
 	// If the error is not fee related, we will return a `TxFailed` event
 	// so this input can be retried.
 	if err != nil {
+		switch {
+		case errors.Is(err, ErrThirdPartySpent):
+			log.Warnf("Fail to fee bump tx %v: %v", oldTx.TxHash(),
+				err)
+
+			t.wg.Add(1)
+			t.handleThirdPartySpent(r)
+
+			return fn.None[BumpResult]()
+
 		// If the tx doesn't not have enought budget, we will return a
 		// result so the sweeper can handle it by re-clustering the
 		// utxos.
-		if errors.Is(err, ErrNotEnoughBudget) {
+		case errors.Is(err, ErrNotEnoughBudget):
 			log.Warnf("Fail to fee bump tx %v: %v", oldTx.TxHash(),
 				err)
-		} else {
+
+		default:
 			// Otherwise, an unexpected error occurred, we will
 			// fail the tx and let the sweeper retry the whole
 			// process.
