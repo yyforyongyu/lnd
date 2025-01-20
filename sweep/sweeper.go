@@ -182,10 +182,6 @@ type SweeperInput struct {
 	// sweep needs to be broadcasted.
 	listeners []chan Result
 
-	// ntfnRegCancel is populated with a function that cancels the chain
-	// notifier spend registration.
-	ntfnRegCancel func()
-
 	// publishAttempts records the number of attempts that have already been
 	// made to sweep this tx.
 	publishAttempts int
@@ -334,7 +330,6 @@ type UtxoSweeper struct {
 	cfg *UtxoSweeperConfig
 
 	newInputs chan *sweepInputMessage
-	spendChan chan *chainntnfs.SpendDetail
 
 	// pendingSweepsReq is a channel that will be sent requests by external
 	// callers in order to retrieve the set of pending inputs the
@@ -444,7 +439,6 @@ func New(cfg *UtxoSweeperConfig) *UtxoSweeper {
 	s := &UtxoSweeper{
 		cfg:               cfg,
 		newInputs:         make(chan *sweepInputMessage),
-		spendChan:         make(chan *chainntnfs.SpendDetail),
 		updateReqs:        make(chan *updateReq),
 		pendingSweepsReqs: make(chan *pendingSweepsReq),
 		quit:              make(chan struct{}),
@@ -674,11 +668,6 @@ func (s *UtxoSweeper) collector() {
 				s.sweepPendingInputs(inputs)
 			}
 
-		// A spend of one of our inputs is detected. Signal sweep
-		// results to the caller(s).
-		case spend := <-s.spendChan:
-			s.handleInputSpent(spend)
-
 		// A new external request has been received to retrieve all of
 		// the inputs we're currently attempting to sweep.
 		case req := <-s.pendingSweepsReqs:
@@ -803,14 +792,6 @@ func (s *UtxoSweeper) signalResult(pi *SweeperInput, result Result) {
 	// on every channel, it should never block.
 	for _, resultChan := range listeners {
 		resultChan <- result
-	}
-
-	// Cancel spend notification with chain notifier. This is not necessary
-	// in case of a success, except for that a reorg could still happen.
-	if pi.ntfnRegCancel != nil {
-		log.Debugf("Canceling spend ntfn for %v", op)
-
-		pi.ntfnRegCancel()
 	}
 }
 
@@ -976,49 +957,6 @@ func (s *UtxoSweeper) markInputsPublishFailed(set InputSet) {
 		// Update the input's state.
 		pi.state = PublishFailed
 	}
-}
-
-// monitorSpend registers a spend notification with the chain notifier. It
-// returns a cancel function that can be used to cancel the registration.
-func (s *UtxoSweeper) monitorSpend(outpoint wire.OutPoint,
-	script []byte, heightHint uint32) (func(), error) {
-
-	log.Tracef("Wait for spend of %v at heightHint=%v",
-		outpoint, heightHint)
-
-	spendEvent, err := s.cfg.Notifier.RegisterSpendNtfn(
-		&outpoint, script, heightHint,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("register spend ntfn: %w", err)
-	}
-
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-
-		select {
-		case spend, ok := <-spendEvent.Spend:
-			if !ok {
-				log.Debugf("Spend ntfn for %v canceled",
-					outpoint)
-				return
-			}
-
-			log.Debugf("Delivering spend ntfn for %v", outpoint)
-
-			select {
-			case s.spendChan <- spend:
-				log.Debugf("Delivered spend ntfn for %v",
-					outpoint)
-
-			case <-s.quit:
-			}
-		case <-s.quit:
-		}
-	}()
-
-	return spendEvent.Cancel, nil
 }
 
 // PendingInputs returns the set of inputs that the UtxoSweeper is currently
@@ -1259,21 +1197,6 @@ func (s *UtxoSweeper) handleNewInput(input *sweepInputMessage) error {
 		btcutil.Amount(pi.SignDesc().Output.Value), pi.DeadlineHeight,
 		pi.state, pi.params)
 
-	// Start watching for spend of this input, either by us or the remote
-	// party.
-	cancel, err := s.monitorSpend(
-		outpoint, input.input.SignDesc().Output.PkScript,
-		input.input.HeightHint(),
-	)
-	if err != nil {
-		err := fmt.Errorf("wait for spend: %w", err)
-		s.markInputFatal(pi, err)
-
-		return err
-	}
-
-	pi.ntfnRegCancel = cancel
-
 	return nil
 }
 
@@ -1380,22 +1303,6 @@ func (s *UtxoSweeper) handleExistingInput(input *sweepInputMessage,
 	if prevExclGroup != nil {
 		s.removeExclusiveGroup(*prevExclGroup)
 	}
-}
-
-// handleInputSpent takes a spend event of our input and updates the sweeper's
-// internal state to remove the input.
-func (s *UtxoSweeper) handleInputSpent(spend *chainntnfs.SpendDetail) {
-	// Query store to find out if we ever published this tx.
-	spendHash := *spend.SpenderTxHash
-	isOurTx, err := s.cfg.Store.IsOurTx(spendHash)
-	if err != nil {
-		log.Errorf("cannot determine if tx %v is ours: %v",
-			spendHash, err)
-		return
-	}
-
-	// We now use the spending tx to update the state of the inputs.
-	s.markInputsSwept(spend.SpendingTx, isOurTx)
 }
 
 // markInputsSwept marks all inputs swept by the spending transaction as swept.
@@ -1797,6 +1704,29 @@ func (s *UtxoSweeper) handleBumpEventTxNotSpentByUs(resp *bumpResp) {
 	s.markInputsSwept(tx, false)
 }
 
+// handleBumpEventTxConfirmed takes a spend event of our input and updates the
+// sweeper's internal state to remove the input.
+func (s *UtxoSweeper) handleBumpEventTxConfirmed(r *bumpResp) {
+	// Query store to find out if we ever published this tx.
+	tx := r.result.Tx
+	txid := tx.TxHash()
+
+	isOurTx, err := s.cfg.Store.IsOurTx(txid)
+	if err != nil {
+		log.Errorf("Cannot determine if tx %v is ours: %v", txid, err)
+
+		return
+	}
+
+	// This tx must be ours, otherwise it indicates an error.
+	if !isOurTx {
+		log.Errorf("Tx %v is not ours", txid)
+	}
+
+	// We now use the spending tx to update the state of the inputs.
+	s.markInputsSwept(tx, isOurTx)
+}
+
 // markInputsFatal  marks all inputs in the input set as failed. It will also
 // notify all the subscribers of these inputs.
 func (s *UtxoSweeper) markInputsFatal(set InputSet, err error) {
@@ -1860,6 +1790,9 @@ func (s *UtxoSweeper) handleBumpEvent(r *bumpResp) error {
 	// from the sweeper db and mark the inputs as swept.
 	case TxNotSpentByUs:
 		s.handleBumpEventTxNotSpentByUs(r)
+
+	case TxConfirmed:
+		s.handleBumpEventTxConfirmed(r)
 	}
 
 	return nil
