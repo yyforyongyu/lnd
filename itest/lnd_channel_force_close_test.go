@@ -374,6 +374,7 @@ func runChannelForceClosureTest(ht *lntest.HarnessTest,
 	// Check that we can find the commitment sweep in our set of known
 	// sweeps, using the simple transaction id ListSweeps output.
 	ht.AssertSweepFound(alice, sweepingTXID.String(), false, 0)
+	ht.Logf("Alice has sweeping tx: %v", sweepingTXID)
 
 	// Next, we mine an additional block which should include the sweep
 	// transaction as the input scripts and the sequence locks on the

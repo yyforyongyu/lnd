@@ -585,7 +585,7 @@ func (t *TxPublisher) createRBFCompliantTx(
 	for {
 		// Create a new tx with the given fee rate and check its
 		// mempool acceptance.
-		sweepCtx, err := t.createAndCheckTx(r.req, f)
+		sweepCtx, err := t.createAndCheckTx(r)
 
 		switch {
 		case err == nil:
@@ -648,8 +648,9 @@ func (t *TxPublisher) createRBFCompliantTx(
 // script, and the fee rate. In addition, it validates the tx's mempool
 // acceptance before returning a tx that can be published directly, along with
 // its fee.
-func (t *TxPublisher) createAndCheckTx(req *BumpRequest,
-	f FeeFunction) (*sweepTxCtx, error) {
+func (t *TxPublisher) createAndCheckTx(r *monitorRecord) (*sweepTxCtx, error) {
+	req := r.req
+	f := r.feeFunction
 
 	// Create the sweep tx with max fee rate of 0 as the fee function
 	// guarantees the fee rate used here won't exceed the max fee rate.
@@ -691,6 +692,21 @@ func (t *TxPublisher) createAndCheckTx(req *BumpRequest,
 	if errors.Is(err, chain.ErrUnimplemented) {
 		log.Debug("Skipped testmempoolaccept due to not implemented")
 		return sweepCtx, nil
+	}
+
+	// If the inputs are spent by another tx, we will exit with the latest
+	// sweepCtx and an error.
+	if errors.Is(err, chain.ErrMissingInputs) {
+		log.Debugf("Tx %v missing inputs, it's likely the input has "+
+			"been spent by others", sweepCtx.tx.TxHash())
+
+		// Make sure to update the record with the latest attempt.
+		record := t.updateRecord(r, sweepCtx)
+
+		t.wg.Add(1)
+		go t.handleThirdPartySpent(record)
+
+		return sweepCtx, ErrThirdPartySpent
 	}
 
 	return sweepCtx, fmt.Errorf("tx=%v failed mempool check: %w",
@@ -1076,6 +1092,12 @@ func (t *TxPublisher) handleInitialTxError(requestID uint64, err error) {
 	case errors.Is(err, ErrZeroFeeRateDelta):
 		event = TxFailed
 
+	// Exit when there are missing inputs - we'll send a TxUnknownSpend
+	// event in `createAndCheckTx`` so the rest of the inputs can be
+	// retried.
+	case errors.Is(err, ErrThirdPartySpent):
+		return
+
 	// Otherwise this is not a fee-related error and the tx cannot be
 	// retried. In that case we will fail ALL the inputs in this tx, which
 	// means they will be removed from the sweeper and never be tried
@@ -1219,7 +1241,7 @@ func (t *TxPublisher) createAndPublishTx(
 	// NOTE: The fee function is expected to have increased its returned
 	// fee rate after calling the SkipFeeBump method. So we can use it
 	// directly here.
-	sweepCtx, err := t.createAndCheckTx(r.req, r.feeFunction)
+	sweepCtx, err := t.createAndCheckTx(r)
 
 	// If the error is fee related, we will return no error and let the fee
 	// bumper retry it at next block.
@@ -1239,15 +1261,27 @@ func (t *TxPublisher) createAndPublishTx(
 	}
 
 	// If the error is not fee related, we will return a `TxFailed` event
-	// so this input can be retried.
+	// so this input can be retried, or `TxUnknownSpend` if the mempool
+	// gives us missing inputs error.
 	if err != nil {
+		switch {
+		// At least one of the inputs is missing, which means it has
+		// already been spent by another tx and confirmed. In this case
+		// we will handle it by spending the TxUnknownSpend event.
+		case errors.Is(err, ErrThirdPartySpent):
+			log.Warnf("Fail to fee bump tx %v: %v", oldTx.TxHash(),
+				err)
+
+			return fn.None[BumpResult]()
+
 		// If the tx doesn't not have enought budget, we will return a
 		// result so the sweeper can handle it by re-clustering the
 		// utxos.
-		if errors.Is(err, ErrNotEnoughBudget) {
+		case errors.Is(err, ErrNotEnoughBudget):
 			log.Warnf("Fail to fee bump tx %v: %v", oldTx.TxHash(),
 				err)
-		} else {
+
+		default:
 			// Otherwise, an unexpected error occurred, we will
 			// fail the tx and let the sweeper retry the whole
 			// process.
