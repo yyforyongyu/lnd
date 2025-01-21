@@ -1676,10 +1676,20 @@ func (s *UtxoSweeper) handleBumpEventTxFatal(resp *bumpResp) error {
 func (s *UtxoSweeper) handleBumpEventTxNotSpentByUs(resp *bumpResp) {
 	r := resp.result
 	tx, err := r.Tx, r.Err
+	txid := tx.TxHash()
 
-	if tx != nil {
-		log.Warnf("Fee bump attempt failed for tx=%v: %v", tx.TxHash(),
-			err)
+	log.Warnf("Fee bump attempt failed for tx=%v: %v", tx.TxHash(), err)
+
+	isOurTx, err := s.cfg.Store.IsOurTx(txid)
+	if err != nil {
+		log.Errorf("Cannot determine if tx %v is ours: %v", txid, err)
+
+		return
+	}
+
+	if isOurTx {
+		s.markInputsSwept(tx, true)
+		return
 	}
 
 	// Construct a map of the inputs this transaction spends.

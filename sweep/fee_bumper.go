@@ -633,6 +633,10 @@ func (t *TxPublisher) createRBFCompliantTx(
 		// mempool acceptance.
 		default:
 			log.Debugf("Failed to create RBF-compliant tx: %v", err)
+			if sweepCtx != nil {
+				t.updateRecord(r, sweepCtx)
+			}
+
 			return nil, err
 		}
 	}
@@ -1077,6 +1081,19 @@ func (t *TxPublisher) handleInitialTxError(requestID uint64, err error) {
 	case errors.Is(err, ErrZeroFeeRateDelta):
 		event = TxFailed
 
+	case errors.Is(err, ErrThirdPartySpent):
+		event = TxNotSpentByUs
+
+		t.wg.Add(1)
+		r, ok := t.records.Load(requestID)
+		if !ok {
+			log.Warnf("")
+			return
+		}
+
+		t.handleThirdPartySpent(r)
+		return
+
 	// Otherwise this is not a fee-related error and the tx cannot be
 	// retried. In that case we will fail ALL the inputs in this tx, which
 	// means they will be removed from the sweeper and never be tried
@@ -1248,8 +1265,10 @@ func (t *TxPublisher) createAndPublishTx(
 			log.Warnf("Fail to fee bump tx %v: %v", oldTx.TxHash(),
 				err)
 
+			record := t.updateRecord(r, sweepCtx)
+
 			t.wg.Add(1)
-			t.handleThirdPartySpent(r)
+			t.handleThirdPartySpent(record)
 
 			return fn.None[BumpResult]()
 
