@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -276,6 +277,10 @@ type BumpResult struct {
 
 	// Err is the error that occurred during the broadcast.
 	Err error
+
+	// InputsSpent are the inputs spent by another tx which caused the
+	// current tx failed.
+	InputsSpent map[wire.OutPoint]*wire.MsgTx
 
 	// requestID is the ID of the request that created this record.
 	requestID uint64
@@ -889,6 +894,10 @@ type monitorRecord struct {
 	// spendNotifiers is a map of spend notifiers registered for all the
 	// inputs.
 	spendNotifiers map[wire.OutPoint]*chainntnfs.SpendEvent
+
+	// inputsSpent are the inputs spent by another tx which caused the
+	// current tx failed.
+	inputsSpent map[wire.OutPoint]*wire.MsgTx
 }
 
 // Start starts the publisher by subscribing to block epoch updates and kicking
@@ -997,8 +1006,13 @@ func (t *TxPublisher) processRecords() {
 			return nil
 		}
 
-		// Check whether the inputs has been spent by a third party.
-		if t.isThirdPartySpent(r) {
+		// Check whether the inputs have been spent by a third party.
+		spends := t.hasThirdPartySpent(r)
+
+		// If there are inputs spent by a third party, we will fail this
+		// sweeping tx.
+		if len(spends) != 0 {
+			r.inputsSpent = spends
 			failedRecords[requestID] = r
 
 			// Move to the next record.
@@ -1214,13 +1228,29 @@ func (t *TxPublisher) handleFeeBumpTx(r *monitorRecord, currentHeight int32) {
 func (t *TxPublisher) handleThirdPartySpent(r *monitorRecord) {
 	defer t.wg.Done()
 
+	// Since the sweeping tx has been replaced by another party's tx, we
+	// missed this block window to increase its fee rate. To make sure the
+	// fee rate stays in the initial line, we now ask the fee function to
+	// give us the next fee rate as if the sweeping tx were RBFed. This new
+	// fee rate will be used as the starting fee rate if the upper system
+	// decides to continue sweeping the rest of the inputs.
+	_, err := r.feeFunction.Increment()
+	if err != nil {
+		// The fee function has reached its max position - nothing we
+		// can do here other than letting the user increase the budget.
+		log.Errorf("Failed to calculate the next fee rate for "+
+			"Record(%v): %v", r.requestID, err)
+	}
+
 	// Create a result that will be sent to the resultChan which is
 	// listened by the caller.
 	result := &BumpResult{
-		Event:     TxUnknownSpend,
-		Tx:        r.tx,
-		requestID: r.requestID,
-		Err:       ErrThirdPartySpent,
+		Event:       TxUnknownSpend,
+		Tx:          r.tx,
+		requestID:   r.requestID,
+		Err:         ErrThirdPartySpent,
+		InputsSpent: r.inputsSpent,
+		FeeRate:     r.feeFunction.FeeRate(),
 	}
 
 	// Notify that this tx is confirmed and remove the record from the map.
@@ -1351,20 +1381,38 @@ func (t *TxPublisher) isConfirmed(txid chainhash.Hash) bool {
 	return details.NumConfirmations > 0
 }
 
-// isThirdPartySpent checks whether the inputs of the tx has already been spent
+// hasThirdPartySpent checks whether the inputs of the tx has already been spent
 // by a third party. When a tx is not confirmed, yet its inputs has been spent,
 // then it must be spent by a different tx other than the sweeping tx here.
-func (t *TxPublisher) isThirdPartySpent(r *monitorRecord) bool {
+func (t *TxPublisher) hasThirdPartySpent(
+	r *monitorRecord) map[wire.OutPoint]*wire.MsgTx {
+
 	txid := r.tx.TxHash()
 
-	// Iterate all the inputs and check if they have been spent already.
-	for op, spendEvent := range r.spendNotifiers {
-		// Do a non-blocking read to see if the output has been spent.
+	// Create a slice to record the inputs spent by third party.
+	inputsSpent := make(
+		map[wire.OutPoint]*wire.MsgTx, len(r.spendNotifiers),
+	)
+
+	wg := sync.WaitGroup{}
+
+	// processSpend is a helper closure to read a spending event from the
+	// notification. It waits for 100ms before giving up reading the spend
+	// event. When a spending tx is found and it's different from our
+	// sweeping tx, it will be saved to the inputsSpent map.
+	//
+	// NOTE: mnust be run inside a goroutine.
+	processSpend := func(op wire.OutPoint,
+		spendEvent *chainntnfs.SpendEvent) {
+
+		defer wg.Done()
+
 		select {
 		case spend, ok := <-spendEvent.Spend:
 			if !ok {
 				log.Debugf("Spend ntfn for %v canceled", op)
-				return false
+
+				return
 			}
 
 			spendingTxID := spend.SpendingTx.TxHash()
@@ -1372,20 +1420,46 @@ func (t *TxPublisher) isThirdPartySpent(r *monitorRecord) bool {
 			// If the spending tx is the same as the sweeping tx
 			// then we are good.
 			if spendingTxID == txid {
-				continue
+				return
 			}
 
-			log.Warnf("Detected third party spent of output=%v "+
+			log.Warnf("Detected unknown spent of output=%v "+
 				"in tx=%v", op, spend.SpendingTx.TxHash())
 
-			return true
+			inputsSpent[op] = spend.SpendingTx
 
-		// Move to the next input.
-		default:
+		// Wait for 100ms before giving up. When a spending tx is
+		// confirmed in block X, we get two notifications - one for the
+		// block, which is sent by the blockbeat, the other for the
+		// spending tx, which is sent by the notification client
+		// returned from RegisterSpendNtfn. Unfornately there's no
+		// guarantee on the order of these two events, which may cause
+		// us to miss the spending event if it's sent later. To counter
+		// this race, we wait for 100ms, which should give us enough
+		// time if there's spending event, or exit if there isn't.
+		// Given all the events are read in goroutines, it should only
+		// add an overhead of 100ms for the whole process.
+		case <-time.After(100 * time.Millisecond):
+			log.Debugf("No spend event returned for input %v", op)
+
+			return
+
+		case <-t.quit:
+			log.Tracef("TxPublished quit for %v", op)
+
+			return
 		}
 	}
 
-	return false
+	// Iterate all the inputs and check if they have been spent already.
+	for op, spendEvent := range r.spendNotifiers {
+		wg.Add(1)
+		go processSpend(op, spendEvent)
+	}
+
+	wg.Wait()
+
+	return inputsSpent
 }
 
 // calcCurrentConfTarget calculates the current confirmation target based on

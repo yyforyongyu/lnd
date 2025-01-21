@@ -1862,3 +1862,65 @@ func TestCreateSpendNotifications(t *testing.T) {
 	}
 	require.Equal(t, expected, result)
 }
+
+// TestHasThirdPartySpent checks the expected outpoint:tx map is returned.
+func TestHasThirdPartySpent(t *testing.T) {
+	t.Parallel()
+
+	// Create a publisher using the mocks.
+	tp, _ := createTestPublisher(t)
+
+	// Create mock inputs.
+	op1 := wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 1,
+	}
+	op2 := wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 2,
+	}
+
+	// Create three txns.
+	//
+	// sweepingTx is the current tx stored in the record.
+	sweepingTx := &wire.MsgTx{}
+
+	// spendingTx1 is the tx spending op1, which is the sweepingTx.
+	spendingTx1 := sweepingTx
+	spendDetails1 := chainntnfs.SpendDetail{
+		SpendingTx: spendingTx1,
+	}
+	spendChan1 := make(chan *chainntnfs.SpendDetail, 1)
+	spendChan1 <- &spendDetails1
+
+	// spendingTx2 is the tx spending op2, which is a third party tx.
+	spendingTx2 := &wire.MsgTx{LockTime: 1}
+	spendDetails2 := chainntnfs.SpendDetail{
+		SpendingTx: spendingTx2,
+	}
+	spendChan2 := make(chan *chainntnfs.SpendDetail, 1)
+	spendChan2 <- &spendDetails2
+
+	// Create the spend events.
+	se1 := &chainntnfs.SpendEvent{Spend: spendChan1}
+	se2 := &chainntnfs.SpendEvent{Spend: spendChan2}
+
+	// Prepare the test record.
+	record := &monitorRecord{
+		tx: sweepingTx,
+		spendNotifiers: map[wire.OutPoint]*chainntnfs.SpendEvent{
+			op1: se1,
+			op2: se2,
+		},
+	}
+
+	// Call the method under test.
+	result := tp.hasThirdPartySpent(record)
+
+	// Assert the expected map is created - op1 is spent by the sweeping tx
+	// so it should not be included.
+	expected := map[wire.OutPoint]*wire.MsgTx{
+		op2: spendingTx2,
+	}
+	require.Equal(t, expected, result)
+}
