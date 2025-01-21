@@ -44,6 +44,10 @@ var (
 	// ErrThirdPartySpent is returned when a third party has spent the
 	// input in the sweeping tx.
 	ErrThirdPartySpent = errors.New("third party spent the output")
+
+	// ErrInputMissing is returned when a given input no longer exists,
+	// e.g., spending from an orphan tx.
+	ErrInputMissing = errors.New("input no longer exists")
 )
 
 var (
@@ -708,14 +712,37 @@ func (t *TxPublisher) createAndCheckTx(r *monitorRecord) (*sweepTxCtx, error) {
 		// Make sure to update the record with the latest attempt.
 		record := t.updateRecord(r, sweepCtx)
 
-		t.wg.Add(1)
-		go t.handleThirdPartySpent(record)
+		t.handleMissingInputs(record)
 
 		return sweepCtx, ErrThirdPartySpent
 	}
 
 	return sweepCtx, fmt.Errorf("tx=%v failed mempool check: %w",
 		sweepCtx.tx.TxHash(), err)
+}
+
+func (t *TxPublisher) handleMissingInputs(r *monitorRecord) {
+	// Get the inputs have been spent by a third party.
+	r.inputsSpent = t.hasThirdPartySpent(r)
+
+	if len(r.inputsSpent) != 0 {
+		t.wg.Add(1)
+		go t.handleThirdPartySpent(r)
+
+		return
+	}
+
+	// Create a result that will be sent to the resultChan which is listened
+	// by the caller.
+	result := &BumpResult{
+		Event:     TxFatal,
+		Tx:        r.tx,
+		requestID: r.requestID,
+		Err:       ErrInputMissing,
+	}
+
+	// Notify that this tx is confirmed and remove the record from the map.
+	t.handleResult(result)
 }
 
 // broadcast takes a monitored tx and publishes it to the network. Prior to the
