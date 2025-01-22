@@ -902,16 +902,18 @@ func (u *UtxoNursery) waitForSweepConf(classHeight uint32,
 
 		// In case of a remote spend, still graduate the output. There
 		// is no way to sweep it anymore.
-		if result.Err == sweep.ErrRemoteSpend {
+		switch result.Err {
+		case sweep.ErrRemoteSpend, sweep.ErrInputMissing:
 			utxnLog.Infof("Output %v was spend by remote party",
 				output.OutPoint())
-			break
-		}
 
-		if result.Err != nil {
+		case nil:
+
+		default:
 			utxnLog.Errorf("Failed to sweep %v at "+
 				"height=%d", output.OutPoint(),
 				classHeight)
+
 			return
 		}
 

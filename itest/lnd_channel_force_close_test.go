@@ -359,6 +359,14 @@ func runChannelForceClosureTest(ht *lntest.HarnessTest,
 	// commitment sweep txid.
 	ht.RestartNode(alice)
 
+	// Once restarted, Alice will offer her anchor and to_local outputs to
+	// the sweeper again. This time the two inputs will be swept using the
+	// same tx.
+	if !ht.IsNeutrinoBackend() {
+		ht.AssertTxNotInMempool(sweepingTXID)
+		sweepingTXID = ht.AssertNumTxsInMempool(1)[0]
+	}
+
 	// Alice's anchor report won't be created since it's uneconomical to
 	// sweep. We expect a resolution which spends our commit output.
 	op = fmt.Sprintf("%v:%v", commitSweep.Outpoint.TxidStr,
@@ -369,6 +377,18 @@ func runChannelForceClosureTest(ht *lntest.HarnessTest,
 		SweepTxid:      sweepingTXID.String(),
 		Outpoint:       commitSweep.Outpoint,
 		AmountSat:      uint64(aliceBalance),
+	}
+
+	if !ht.IsNeutrinoBackend() {
+		op = fmt.Sprintf("%v:%v", anchorSweep.Outpoint.TxidStr,
+			anchorSweep.Outpoint.OutputIndex)
+		aliceReports[op] = &lnrpc.Resolution{
+			ResolutionType: lnrpc.ResolutionType_ANCHOR,
+			Outcome:        lnrpc.ResolutionOutcome_CLAIMED,
+			SweepTxid:      sweepingTXID.String(),
+			Outpoint:       anchorSweep.Outpoint,
+			AmountSat:      uint64(anchorSweep.AmountSat),
+		}
 	}
 
 	// Check that we can find the commitment sweep in our set of known
@@ -482,13 +502,18 @@ func runChannelForceClosureTest(ht *lntest.HarnessTest,
 
 	// Now, generate the block which will cause Alice to offer the
 	// presigned htlc timeout txns to the sweeper.
-	ht.MineBlocks(1)
+	ht.MineEmptyBlocks(1)
+
+	numSweeps := numInvoices
+	if ht.IsNeutrinoBackend() {
+		numSweeps++
+	}
 
 	// Since Alice had numInvoices (6) htlcs extended to Carol before force
 	// closing, we expect Alice to broadcast an htlc timeout txn for each
 	// one. We also expect Alice to still have her anchor since it's not
 	// swept.
-	ht.AssertNumPendingSweeps(alice, numInvoices+1)
+	ht.AssertNumPendingSweeps(alice, numSweeps)
 
 	// Wait for them all to show up in the mempool
 	htlcTxIDs := ht.AssertNumTxsInMempool(1)
@@ -616,7 +641,7 @@ func runChannelForceClosureTest(ht *lntest.HarnessTest,
 	numBlocks := int(htlcCsvMaturityHeight - uint32(currentHeight) - 1)
 	ht.MineBlocks(numBlocks)
 
-	ht.AssertNumPendingSweeps(alice, numInvoices+1)
+	ht.AssertNumPendingSweeps(alice, numSweeps)
 
 	// Restart Alice to ensure that she can recover from a failure.
 	//
@@ -643,7 +668,7 @@ func runChannelForceClosureTest(ht *lntest.HarnessTest,
 	}, defaultTimeout)
 	require.NoError(ht, err, "timeout while checking force closed channel")
 
-	ht.AssertNumPendingSweeps(alice, numInvoices+1)
+	ht.AssertNumPendingSweeps(alice, numSweeps)
 
 	// Wait for the single sweep txn to appear in the mempool.
 	htlcSweepTxid := ht.AssertNumTxsInMempool(1)[0]
@@ -657,6 +682,21 @@ func runChannelForceClosureTest(ht *lntest.HarnessTest,
 		"htlc transaction has wrong num of inputs")
 	require.Len(ht, htlcSweepTx.MsgTx().TxOut, 1,
 		"htlc sweep transaction should have one output")
+
+	// Check that we can find the htlc sweep in our set of sweeps using
+	// the verbose output of the listsweeps output.
+	ht.AssertSweepFound(alice, htlcSweepTxid.String(), true, 0)
+
+	// The following restart checks to ensure that the sweeper is storing
+	// the txid of the previously broadcast htlc sweep txn, and that it
+	// begins watching that txid after restarting.
+	ht.RestartNode(alice)
+
+	if !ht.IsNeutrinoBackend() {
+		ht.AssertTxNotInMempool(htlcSweepTxid)
+		htlcSweepTxid = ht.AssertNumTxsInMempool(1)[0]
+		htlcSweepTx = ht.GetRawTransaction(htlcSweepTxid)
+	}
 
 	// Ensure that each output spends from exactly one htlc timeout output.
 	for _, txIn := range htlcSweepTx.MsgTx().TxIn {
@@ -696,15 +736,6 @@ func runChannelForceClosureTest(ht *lntest.HarnessTest,
 		require.Equalf(ht, 1, num,
 			"HTLC outpoint:%s was spent times", op)
 	}
-
-	// Check that we can find the htlc sweep in our set of sweeps using
-	// the verbose output of the listsweeps output.
-	ht.AssertSweepFound(alice, htlcSweepTxid.String(), true, 0)
-
-	// The following restart checks to ensure that the sweeper is storing
-	// the txid of the previously broadcast htlc sweep txn, and that it
-	// begins watching that txid after restarting.
-	ht.RestartNode(alice)
 
 	// Now that the channel has been fully swept, it should no longer show
 	// incubated, check to see that Alice's node still reports the channel

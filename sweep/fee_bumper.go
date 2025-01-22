@@ -446,6 +446,43 @@ func (t *TxPublisher) Broadcast(req *BumpRequest) <-chan *BumpResult {
 	return subscriber
 }
 
+func (t *TxPublisher) RecoverSweepingTx(req *BumpRequest, tx *wire.MsgTx) error {
+	// Store the request.
+	record := t.storeInitialRecord(req)
+
+	// Create a chan to send the result to the caller.
+	subscriber := make(chan *BumpResult, 1)
+	t.subscriberChans.Store(record.requestID, subscriber)
+
+	// Create a fee bumping algorithm to be used for future RBF.
+	feeAlgo, err := t.initializeFeeFunction(req)
+	if err != nil {
+		return fmt.Errorf("init fee function: %w", err)
+	}
+
+	record.feeFunction = feeAlgo
+	record.tx = tx
+
+	// outpointToTxIndex := make(map[wire.OutPoint]int)
+	// for _, o := range req.Inputs {
+	// 	if o.RequiredTxOut() == nil {
+	// 		continue
+	// 	}
+	//
+	// 	sweepTx.AddTxIn(&wire.TxIn{
+	// 		PreviousOutPoint: o.OutPoint(),
+	// 		Sequence:         o.BlocksToMaturity(),
+	// 	})
+	// 	sweepTx.AddTxOut(o.RequiredTxOut())
+	//
+	// 	outpointToTxIndex[o.OutPoint()] = len(sweepTx.TxOut) - 1
+	// }
+	//
+	// t.updateRecord(record, sweepCtx)
+
+	return nil
+}
+
 // createSpendNotifications makes spending subscriptions for each of the inputs.
 func (t *TxPublisher) createSpendNotifications(
 	inputs []input.Input) map[wire.OutPoint]*chainntnfs.SpendEvent {
@@ -709,10 +746,7 @@ func (t *TxPublisher) createAndCheckTx(r *monitorRecord) (*sweepTxCtx, error) {
 		log.Debugf("Tx %v missing inputs, it's likely the input has "+
 			"been spent by others", sweepCtx.tx.TxHash())
 
-		// Make sure to update the record with the latest attempt.
-		record := t.updateRecord(r, sweepCtx)
-
-		t.handleMissingInputs(record)
+		t.handleMissingInputs(r, sweepCtx)
 
 		return sweepCtx, ErrThirdPartySpent
 	}
@@ -721,9 +755,19 @@ func (t *TxPublisher) createAndCheckTx(r *monitorRecord) (*sweepTxCtx, error) {
 		sweepCtx.tx.TxHash(), err)
 }
 
-func (t *TxPublisher) handleMissingInputs(r *monitorRecord) {
+func (t *TxPublisher) handleMissingInputs(record *monitorRecord,
+	sweepCtx *sweepTxCtx) {
+
+	// Make sure to update the record with the latest attempt.
+	r := t.updateRecord(record, sweepCtx)
+
+	var isOurTx bool
 	// Get the inputs have been spent by a third party.
-	r.inputsSpent = t.hasThirdPartySpent(r)
+	r.inputsSpent, isOurTx = t.hasThirdPartySpent(r)
+
+	if isOurTx {
+		log.Debugf("--->???")
+	}
 
 	if len(r.inputsSpent) != 0 {
 		t.wg.Add(1)
@@ -1018,7 +1062,21 @@ func (t *TxPublisher) processRecords() {
 	// into two groups.
 	visitor := func(requestID uint64, r *monitorRecord) error {
 		if r.tx == nil {
-			initialRecords[requestID] = r
+			spendingTxns := t.hasSpent(r)
+			if len(spendingTxns) == 0 {
+				initialRecords[requestID] = r
+
+				return nil
+			}
+
+			r.inputsSpent = spendingTxns
+			failedRecords[requestID] = r
+
+			for _, tx := range spendingTxns {
+				r.tx = tx
+			}
+
+			// Move to the next record.
 			return nil
 		}
 
@@ -1034,7 +1092,14 @@ func (t *TxPublisher) processRecords() {
 		}
 
 		// Check whether the inputs have been spent by a third party.
-		spends := t.hasThirdPartySpent(r)
+		spends, isOurTx := t.hasThirdPartySpent(r)
+
+		if isOurTx {
+			confirmedRecords[requestID] = r
+
+			// Move to the next record.
+			return nil
+		}
 
 		// If there are inputs spent by a third party, we will fail this
 		// sweeping tx.
@@ -1081,8 +1146,8 @@ func (t *TxPublisher) processRecords() {
 	// For records that are failed, we'll notify the caller about this
 	// result.
 	for _, r := range failedRecords {
-		log.Debugf("Tx=%v has inputs been spent by a third party, "+
-			"failing it now", r.tx.TxHash())
+		log.Debugf("Record=%v has inputs been spent by a third party, "+
+			"failing it now", r.requestID)
 		t.wg.Add(1)
 		go t.handleThirdPartySpent(r)
 	}
@@ -1255,18 +1320,24 @@ func (t *TxPublisher) handleFeeBumpTx(r *monitorRecord, currentHeight int32) {
 func (t *TxPublisher) handleThirdPartySpent(r *monitorRecord) {
 	defer t.wg.Done()
 
-	// Since the sweeping tx has been replaced by another party's tx, we
-	// missed this block window to increase its fee rate. To make sure the
-	// fee rate stays in the initial line, we now ask the fee function to
-	// give us the next fee rate as if the sweeping tx were RBFed. This new
-	// fee rate will be used as the starting fee rate if the upper system
-	// decides to continue sweeping the rest of the inputs.
-	_, err := r.feeFunction.Increment()
-	if err != nil {
-		// The fee function has reached its max position - nothing we
-		// can do here other than letting the user increase the budget.
-		log.Errorf("Failed to calculate the next fee rate for "+
-			"Record(%v): %v", r.requestID, err)
+	var feeRate chainfee.SatPerKWeight
+
+	if r.feeFunction != nil {
+		// Since the sweeping tx has been replaced by another party's tx, we
+		// missed this block window to increase its fee rate. To make sure the
+		// fee rate stays in the initial line, we now ask the fee function to
+		// give us the next fee rate as if the sweeping tx were RBFed. This new
+		// fee rate will be used as the starting fee rate if the upper system
+		// decides to continue sweeping the rest of the inputs.
+		_, err := r.feeFunction.Increment()
+		if err != nil {
+			// The fee function has reached its max position - nothing we
+			// can do here other than letting the user increase the budget.
+			log.Errorf("Failed to calculate the next fee rate for "+
+				"Record(%v): %v", r.requestID, err)
+		}
+
+		feeRate = r.feeFunction.FeeRate()
 	}
 
 	// Create a result that will be sent to the resultChan which is
@@ -1277,7 +1348,7 @@ func (t *TxPublisher) handleThirdPartySpent(r *monitorRecord) {
 		requestID:   r.requestID,
 		Err:         ErrThirdPartySpent,
 		InputsSpent: r.inputsSpent,
-		FeeRate:     r.feeFunction.FeeRate(),
+		FeeRate:     feeRate,
 	}
 
 	// Notify that this tx is confirmed and remove the record from the map.
@@ -1408,13 +1479,27 @@ func (t *TxPublisher) isConfirmed(txid chainhash.Hash) bool {
 	return details.NumConfirmations > 0
 }
 
-// hasThirdPartySpent checks whether the inputs of the tx has already been spent
-// by a third party. When a tx is not confirmed, yet its inputs has been spent,
-// then it must be spent by a different tx other than the sweeping tx here.
-func (t *TxPublisher) hasThirdPartySpent(
-	r *monitorRecord) map[wire.OutPoint]*wire.MsgTx {
+func (t *TxPublisher) reconstruct(r *monitorRecord,
+	spends map[wire.OutPoint]*wire.MsgTx) {
 
-	txid := r.tx.TxHash()
+	inputsSpent := make(map[wire.OutPoint]*wire.MsgTx, len(spends))
+
+	for op, tx := range spends {
+		if r.tx == nil {
+			inputsSpent[op] = tx
+
+			continue
+		}
+
+		if tx.TxHash() != r.tx.TxHash() {
+			inputsSpent[op] = tx
+		}
+	}
+
+}
+
+func (t *TxPublisher) hasSpent(
+	r *monitorRecord) map[wire.OutPoint]*wire.MsgTx {
 
 	// Create a slice to record the inputs spent by third party.
 	inputsSpent := make(
@@ -1428,7 +1513,81 @@ func (t *TxPublisher) hasThirdPartySpent(
 	// event. When a spending tx is found and it's different from our
 	// sweeping tx, it will be saved to the inputsSpent map.
 	//
-	// NOTE: mnust be run inside a goroutine.
+	// NOTE: must be run inside a goroutine.
+	processSpend := func(op wire.OutPoint,
+		spendEvent *chainntnfs.SpendEvent) {
+
+		defer wg.Done()
+
+		select {
+		case spend, ok := <-spendEvent.Spend:
+			if !ok {
+				log.Debugf("Spend ntfn for %v canceled", op)
+
+				return
+			}
+
+			log.Warnf("Detected spent output=%v in tx=%v", op,
+				spend.SpendingTx.TxHash())
+
+			inputsSpent[op] = spend.SpendingTx
+
+		// Wait for 100ms before giving up. When a spending tx is
+		// confirmed in block X, we get two notifications - one for the
+		// block, which is sent by the blockbeat, the other for the
+		// spending tx, which is sent by the notification client
+		// returned from RegisterSpendNtfn. Unfornately there's no
+		// guarantee on the order of these two events, which may cause
+		// us to miss the spending event if it's sent later. To counter
+		// this race, we wait for 100ms, which should give us enough
+		// time if there's spending event, or exit if there isn't.
+		// Given all the events are read in goroutines, it should only
+		// add an overhead of 100ms for the whole process.
+		case <-time.After(100 * time.Millisecond):
+			log.Debugf("No spend event returned for input %v", op)
+
+			return
+
+		case <-t.quit:
+			log.Tracef("TxPublished quit for %v", op)
+
+			return
+		}
+	}
+
+	// Iterate all the inputs and check if they have been spent already.
+	for op, spendEvent := range r.spendNotifiers {
+		wg.Add(1)
+		go processSpend(op, spendEvent)
+	}
+
+	wg.Wait()
+
+	return inputsSpent
+}
+
+// hasThirdPartySpent checks whether the inputs of the tx has already been spent
+// by a third party. When a tx is not confirmed, yet its inputs has been spent,
+// then it must be spent by a different tx other than the sweeping tx here.
+func (t *TxPublisher) hasThirdPartySpent(
+	r *monitorRecord) (map[wire.OutPoint]*wire.MsgTx, bool) {
+
+	txid := r.tx.TxHash()
+
+	// Create a slice to record the inputs spent by third party.
+	inputsSpent := make(
+		map[wire.OutPoint]*wire.MsgTx, len(r.spendNotifiers),
+	)
+
+	isOurTx := false
+	wg := sync.WaitGroup{}
+
+	// processSpend is a helper closure to read a spending event from the
+	// notification. It waits for 100ms before giving up reading the spend
+	// event. When a spending tx is found and it's different from our
+	// sweeping tx, it will be saved to the inputsSpent map.
+	//
+	// NOTE: must be run inside a goroutine.
 	processSpend := func(op wire.OutPoint,
 		spendEvent *chainntnfs.SpendEvent) {
 
@@ -1447,6 +1606,9 @@ func (t *TxPublisher) hasThirdPartySpent(
 			// If the spending tx is the same as the sweeping tx
 			// then we are good.
 			if spendingTxID == txid {
+				log.Debugf("Input %v is spent in %v", op, txid)
+				isOurTx = true
+
 				return
 			}
 
@@ -1486,7 +1648,7 @@ func (t *TxPublisher) hasThirdPartySpent(
 
 	wg.Wait()
 
-	return inputsSpent
+	return inputsSpent, isOurTx
 }
 
 // calcCurrentConfTarget calculates the current confirmation target based on

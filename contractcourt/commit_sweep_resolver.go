@@ -186,7 +186,7 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 		// If the remote party was able to sweep this output it's
 		// likely what we sent was actually a revoked commitment.
 		// Report the error and continue to wrap up the contract.
-		case sweep.ErrRemoteSpend:
+		case sweep.ErrRemoteSpend, sweep.ErrInputMissing:
 			c.log.Warnf("local commitment output was swept by "+
 				"remote party via %v", sweepResult.Tx.TxHash())
 			outcome = channeldb.ResolverOutcomeUnclaimed

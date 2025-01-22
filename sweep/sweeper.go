@@ -1171,17 +1171,22 @@ func (s *UtxoSweeper) handleNewInput(input *sweepInputMessage) error {
 	// input has already been spent. If so, we'll start the input with
 	// state Published and attach the RBFInfo.
 	state, rbfInfo := s.decideStateAndRBFInfo(input.input.OutPoint())
+	log.Debugf("----> Input %v, %v, decided state=%v", outpoint, input.input.WitnessType(), state)
 
 	// Create a new pendingInput and initialize the listeners slice with
 	// the passed in result channel. If this input is offered for sweep
 	// again, the result channel will be appended to this slice.
 	pi = &SweeperInput{
-		state:     state,
+		state:     Init,
 		listeners: []chan Result{input.resultChan},
 		Input:     input.input,
 		params:    input.params,
 		rbf:       rbfInfo,
 	}
+
+	rbfInfo.WhenSome(func(info RBFInfo) {
+		pi.params.StartingFeeRate = fn.Some(info.FeeRate)
+	})
 
 	// Set the acutal deadline height.
 	pi.DeadlineHeight = input.params.DeadlineHeight.UnwrapOr(
@@ -1241,7 +1246,7 @@ func (s *UtxoSweeper) decideStateAndRBFInfo(op wire.OutPoint) (
 	// this tx is confirmed, we will remove the input from our inputs.
 	if errors.Is(err, ErrTxNotFound) {
 		log.Warnf("Spending tx %v not found in sweeper store", txid)
-		return Published, fn.None[RBFInfo]()
+		return PublishFailed, fn.None[RBFInfo]()
 	}
 
 	// Exit if we get an db error.
@@ -1249,7 +1254,7 @@ func (s *UtxoSweeper) decideStateAndRBFInfo(op wire.OutPoint) (
 		log.Errorf("Unable to get tx %v from sweeper store: %v",
 			txid, err)
 
-		return Published, fn.None[RBFInfo]()
+		return PublishFailed, fn.None[RBFInfo]()
 	}
 
 	// Prepare the fee info and return it.
@@ -1259,7 +1264,7 @@ func (s *UtxoSweeper) decideStateAndRBFInfo(op wire.OutPoint) (
 		FeeRate: chainfee.SatPerKWeight(tr.FeeRate),
 	})
 
-	return Published, rbf
+	return PublishFailed, rbf
 }
 
 // handleExistingInput processes an input that is already known to the sweeper.
@@ -1360,12 +1365,17 @@ func (s *UtxoSweeper) markInputsSwept(tx *wire.MsgTx, isOurTx bool) {
 
 // markInputFatal marks the given input as fatal and won't be retried. It
 // will also notify all the subscribers of this input.
-func (s *UtxoSweeper) markInputFatal(pi *SweeperInput, err error) {
+func (s *UtxoSweeper) markInputFatal(pi *SweeperInput, tx *wire.MsgTx,
+	err error) {
+
 	log.Errorf("Failed to sweep input: %v, error: %v", pi, err)
 
 	pi.state = Fatal
 
-	s.signalResult(pi, Result{Err: err})
+	s.signalResult(pi, Result{
+		Tx:  tx,
+		Err: err,
+	})
 }
 
 // updateSweeperInputs updates the sweeper's internal state and returns a map
@@ -1666,14 +1676,14 @@ func (s *UtxoSweeper) handleBumpEventTxFatal(resp *bumpResp) error {
 	}
 
 	// Mark the inputs as fatal.
-	s.markInputsFatal(resp.set, r.Err)
+	s.markInputsFatal(resp.set, r.Tx, r.Err)
 
 	return nil
 }
 
 // markInputsFatal  marks all inputs in the input set as failed. It will also
 // notify all the subscribers of these inputs.
-func (s *UtxoSweeper) markInputsFatal(set InputSet, err error) {
+func (s *UtxoSweeper) markInputsFatal(set InputSet, tx *wire.MsgTx, err error) {
 	for _, inp := range set.Inputs() {
 		outpoint := inp.OutPoint()
 
@@ -1697,7 +1707,7 @@ func (s *UtxoSweeper) markInputsFatal(set InputSet, err error) {
 			continue
 		}
 
-		s.markInputFatal(input, err)
+		s.markInputFatal(input, tx, err)
 	}
 }
 
@@ -1814,7 +1824,7 @@ func (s *UtxoSweeper) handleThirdPartySpent(inp *SweeperInput, tx *wire.MsgTx) {
 
 	// Since the input is spent by others, we now mark it as fatal and won't
 	// be retried.
-	s.markInputFatal(inp, ErrRemoteSpend)
+	s.markInputFatal(inp, tx, ErrRemoteSpend)
 
 	// Construct a map of the inputs this transaction spends.
 	inputsSpent := make(map[wire.OutPoint]struct{}, 1)

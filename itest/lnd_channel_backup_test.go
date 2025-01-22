@@ -1467,6 +1467,8 @@ func assertTimeLockSwept(ht *lntest.HarnessTest, carol, dave *node.HarnessNode,
 
 	// Mine a block to trigger the sweeps.
 	ht.AssertNumTxsInMempool(expectedTxes)
+	tx := ht.GetNumTxsFromMempool(expectedTxes)[0]
+	ht.Logf("==========>>>>> %v", tx.TxHash())
 
 	// Carol should consider the channel pending force close (since she is
 	// waiting for her sweep to confirm).
