@@ -9449,6 +9449,7 @@ func (lc *LightningChannel) CommitBalances() (btcutil.Amount, btcutil.Amount) {
 	localBalance := localCommit.LocalBalance.ToSatoshis()
 	remoteBalance := localCommit.RemoteBalance.ToSatoshis()
 
+	// Same here - not always two anchors?
 	if chanState.ChanType.HasAnchors() {
 		if chanState.IsInitiator {
 			localBalance += 2 * AnchorSize

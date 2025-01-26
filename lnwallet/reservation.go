@@ -301,6 +301,7 @@ func NewChannelReservation(capacity, localFundingAmt btcutil.Amount,
 	// addition to the two anchor outputs.
 	feeMSat := lnwire.NewMSatFromSatoshis(commitFee)
 	if req.CommitType.HasAnchors() {
+		// This is not correct according to the specs.
 		feeMSat += 2 * lnwire.NewMSatFromSatoshis(AnchorSize)
 	}
 
