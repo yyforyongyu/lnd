@@ -1043,6 +1043,8 @@ func CoopCloseBalance(chanType channeldb.ChannelType, isInitiator bool,
 
 	// Since the initiator's balance also is stored after subtracting the
 	// anchor values, add that back in case this was an anchor commitment.
+	//
+	// Not always two anchors?
 	if chanType.HasAnchors() {
 		initiatorDelta += 2 * AnchorSize
 	}
