@@ -160,9 +160,28 @@ func assertFilteredBlock(t *testing.T, fb *FilteredBlock, expectedHeight int32,
 
 }
 
-func testFilterBlockNotifications(node *rpctest.Harness,
-	chainView FilteredChainView, chainViewInit chainViewInitFunc,
-	t *testing.T) {
+func testFilterBlockNotifications(t *testing.T,
+	chainViewInit chainViewInitFunc) {
+
+	// Initialize the harness around a btcd node which will serve as our
+	// dedicated miner to generate blocks, cause re-orgs, etc. We'll set up
+	// this node with a chain length of 125, so we have plenty of BTC to
+	// play around with.
+	node := unittest.NewMiner(t, netParams, []string{"--txindex"}, true, 25)
+	rpcConfig := node.RPCConfig()
+
+	_, bestHeight, err := node.Client.GetBestBlock()
+	require.NoError(t, err)
+
+	chainView, err := chainViewInit(t, rpcConfig, node, bestHeight)
+	require.NoError(t, err)
+
+	err = chainView.Start()
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, chainView.Stop())
+	})
 
 	// To start the test, we'll create to fresh outputs paying to the
 	// private key that we generated above.
@@ -270,9 +289,26 @@ func testFilterBlockNotifications(node *rpctest.Harness,
 	}
 }
 
-func testUpdateFilterBackTrack(node *rpctest.Harness,
-	chainView FilteredChainView, chainViewInit chainViewInitFunc,
-	t *testing.T) {
+func testUpdateFilterBackTrack(t *testing.T, chainViewInit chainViewInitFunc) {
+	// Initialize the harness around a btcd node which will serve as our
+	// dedicated miner to generate blocks, cause re-orgs, etc. We'll set up
+	// this node with a chain length of 125, so we have plenty of BTC to
+	// play around with.
+	node := unittest.NewMiner(t, netParams, []string{"--txindex"}, true, 25)
+	rpcConfig := node.RPCConfig()
+
+	_, bestHeight, err := node.Client.GetBestBlock()
+	require.NoError(t, err)
+
+	chainView, err := chainViewInit(t, rpcConfig, node, bestHeight)
+	require.NoError(t, err)
+
+	err = chainView.Start()
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, chainView.Stop())
+	})
 
 	// To start, we'll create a fresh output paying to the height generated
 	// above.
@@ -345,8 +381,26 @@ func testUpdateFilterBackTrack(node *rpctest.Harness,
 	}
 }
 
-func testFilterSingleBlock(node *rpctest.Harness, chainView FilteredChainView,
-	chainViewInit chainViewInitFunc, t *testing.T) {
+func testFilterSingleBlock(t *testing.T, chainViewInit chainViewInitFunc) {
+	// Initialize the harness around a btcd node which will serve as our
+	// dedicated miner to generate blocks, cause re-orgs, etc. We'll set up
+	// this node with a chain length of 125, so we have plenty of BTC to
+	// play around with.
+	node := unittest.NewMiner(t, netParams, []string{"--txindex"}, true, 25)
+	rpcConfig := node.RPCConfig()
+
+	_, bestHeight, err := node.Client.GetBestBlock()
+	require.NoError(t, err)
+
+	chainView, err := chainViewInit(t, rpcConfig, node, bestHeight)
+	require.NoError(t, err)
+
+	err = chainView.Start()
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, chainView.Stop())
+	})
 
 	// In this test, we'll test the manual filtration of blocks, which can
 	// be used by clients to manually rescan their sub-set of the UTXO set.
@@ -445,9 +499,28 @@ func testFilterSingleBlock(node *rpctest.Harness, chainView FilteredChainView,
 // testFilterBlockDisconnected triggers a reorg all the way back to genesis,
 // and a small 5 block reorg, ensuring the chainView notifies about
 // disconnected and connected blocks in the order we expect.
-func testFilterBlockDisconnected(node *rpctest.Harness,
-	chainView FilteredChainView, chainViewInit chainViewInitFunc,
-	t *testing.T) {
+func testFilterBlockDisconnected(t *testing.T,
+	chainViewInit chainViewInitFunc) {
+
+	// Initialize the harness around a btcd node which will serve as our
+	// dedicated miner to generate blocks, cause re-orgs, etc. We'll set up
+	// this node with a chain length of 125, so we have plenty of BTC to
+	// play around with.
+	node := unittest.NewMiner(t, netParams, []string{"--txindex"}, true, 25)
+	rpcConfig := node.RPCConfig()
+
+	_, bestHeight, err := node.Client.GetBestBlock()
+	require.NoError(t, err)
+
+	chainView, err := chainViewInit(t, rpcConfig, node, bestHeight)
+	require.NoError(t, err)
+
+	err = chainView.Start()
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, chainView.Stop())
+	})
 
 	// Create a node that has a shorter chain than the main chain, so we
 	// can trigger a reorg.
@@ -455,7 +528,7 @@ func testFilterBlockDisconnected(node *rpctest.Harness,
 		t, netParams, []string{"--txindex"}, true, 5,
 	)
 
-	_, bestHeight, err := reorgNode.Client.GetBestBlock()
+	_, bestHeight, err = reorgNode.Client.GetBestBlock()
 	require.NoError(t, err, "error getting best block")
 
 	// Init a chain view that has this node as its block source.
@@ -636,8 +709,7 @@ type chainViewInitFunc func(t *testing.T, rpcInfo rpcclient.ConnConfig,
 
 type testCase struct {
 	name string
-	test func(*rpctest.Harness, FilteredChainView, chainViewInitFunc,
-		*testing.T)
+	test func(*testing.T, chainViewInitFunc)
 }
 
 var chainViewTests = []testCase{
@@ -793,41 +865,17 @@ var interfaceImpls = []struct {
 }
 
 func TestFilteredChainView(t *testing.T) {
-	// Initialize the harness around a btcd node which will serve as our
-	// dedicated miner to generate blocks, cause re-orgs, etc. We'll set up
-	// this node with a chain length of 125, so we have plenty of BTC to
-	// play around with.
-	miner := unittest.NewMiner(
-		t, netParams, []string{"--txindex"}, true, 25,
-	)
-
-	rpcConfig := miner.RPCConfig()
-
 	for _, chainViewImpl := range interfaceImpls {
 		t.Logf("Testing '%v' implementation of FilteredChainView",
 			chainViewImpl.name)
 
-		_, bestHeight, err := miner.Client.GetBestBlock()
-		if err != nil {
-			t.Fatalf("error getting best block: %v", err)
-		}
-
-		chainView, err := chainViewImpl.chainViewInit(
-			t, rpcConfig, miner, bestHeight,
-		)
-		if err != nil {
-			t.Fatalf("unable to make chain view: %v", err)
-		}
-		if err := chainView.Start(); err != nil {
-			t.Fatalf("unable to start chain view: %v", err)
-		}
 		for _, chainViewTest := range chainViewTests {
 			testName := fmt.Sprintf("%v: %v", chainViewImpl.name,
 				chainViewTest.name)
+
 			success := t.Run(testName, func(t *testing.T) {
 				chainViewTest.test(
-					miner, chainView,
-					chainViewImpl.chainViewInit, t,
+					t, chainViewImpl.chainViewInit,
 				)
 			})
 
@@ -836,8 +884,5 @@ func TestFilteredChainView(t *testing.T) {
 			}
 		}
 
-		if err := chainView.Stop(); err != nil {
-			t.Fatalf("unable to stop chain view: %v", err)
-		}
 	}
 }
