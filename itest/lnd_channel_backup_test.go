@@ -1224,14 +1224,6 @@ func testDataLossProtection(ht *lntest.HarnessTest) {
 		// payment hashes.
 		ht.CompletePaymentRequests(carol, payReqs[numInvoices/2:])
 
-		// TODO(yy): remove the sleep once the following bug is fixed.
-		//
-		// While the payment is reported as settled, the commitment
-		// dance may not be finished, which leaves several HTLCs in the
-		// commitment. Later on, when Carol force closes this channel,
-		// she would have HTLCs there and the test won't pass.
-		time.Sleep(2 * time.Second)
-
 		// Now we shutdown Dave, copying over the its temporary
 		// database state which has the *prior* channel state over his
 		// current most up to date state. With this, we essentially
