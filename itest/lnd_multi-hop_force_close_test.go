@@ -422,8 +422,7 @@ func runLocalClaimOutgoingHTLC(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, bob, numSweeps)
+	ht.AssertNumPendingSweeps(bob, numSweeps)
 
 	// We expect to see tow txns in the mempool,
 	// 1. Bob's force close tx.
@@ -779,8 +778,7 @@ func runMultiHopReceiverPreimageClaim(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, carol, numSweeps)
+	ht.AssertNumPendingSweeps(carol, numSweeps)
 
 	// We expect to see tow txns in the mempool,
 	// 1. Carol's force close tx.
@@ -2334,8 +2332,7 @@ func runLocalPreimageClaim(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, carol, numSweeps)
+	ht.AssertNumPendingSweeps(carol, numSweeps)
 
 	// We should see two txns in the mempool, we now a block to confirm,
 	// - Carol's force close tx.
@@ -2574,8 +2571,7 @@ func runLocalPreimageClaimLeased(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, carol, numSweeps)
+	ht.AssertNumPendingSweeps(carol, numSweeps)
 
 	// We should see two txns in the mempool, we now a block to confirm,
 	// - Carol's force close tx.
@@ -2982,8 +2978,7 @@ func runHtlcAggregation(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, bob, numSweeps)
+	ht.AssertNumPendingSweeps(bob, numSweeps)
 
 	// Bob's force close tx and anchor sweeping tx should now be found in
 	// the mempool.
