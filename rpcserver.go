@@ -3850,9 +3850,21 @@ func (r *rpcServer) fetchPendingOpenChannels() (pendingOpenChannels, error) {
 		commitBaseWeight := blockchain.GetTransactionWeight(utx)
 		commitWeight := commitBaseWeight + witnessWeight
 
+		// The value of waitBlocksForFundingConf is adjusted in a
+		// development environment to enhance test capabilities.
+		// Otherwise, it is set to DefaultMaxWaitNumBlocksFundingConf.
+		waitBlocksForFundingConf := uint32(
+			lncfg.DefaultMaxWaitNumBlocksFundingConf,
+		)
+
+		if lncfg.IsDevBuild() {
+			waitBlocksForFundingConf =
+				r.cfg.Dev.GetMaxWaitNumBlocksFundingConf()
+		}
+
 		// FundingExpiryBlocks is the distance from the current block
-		// height to the broadcast height + MaxWaitNumBlocksFundingConf.
-		maxFundingHeight := funding.MaxWaitNumBlocksFundingConf +
+		// height to the broadcast height + waitBlocksForFundingConf.
+		maxFundingHeight := waitBlocksForFundingConf +
 			pendingChan.BroadcastHeight()
 		fundingExpiryBlocks := int32(maxFundingHeight) - currentHeight
 
@@ -4777,6 +4789,14 @@ func createRPCOpenChannel(r *rpcServer, dbChannel *channeldb.OpenChannel,
 		)
 	}
 
+	// Create a set of the HTLCs found in the remote commitment, which is
+	// used to decide whether the HTLCs from the local commitment has been
+	// locked in or not.
+	remoteHTLCs := fn.NewSet[[32]byte]()
+	for _, htlc := range dbChannel.RemoteCommitment.Htlcs {
+		remoteHTLCs.Add(htlc.RHash)
+	}
+
 	for i, htlc := range localCommit.Htlcs {
 		var rHash [32]byte
 		copy(rHash[:], htlc.RHash[:])
@@ -4828,6 +4848,7 @@ func createRPCOpenChannel(r *rpcServer, dbChannel *channeldb.OpenChannel,
 			HtlcIndex:           htlc.HtlcIndex,
 			ForwardingChannel:   forwardingChannel,
 			ForwardingHtlcIndex: forwardingHtlcIndex,
+			LockedIn:            remoteHTLCs.Contains(rHash),
 		}
 
 		// Add the Pending Htlc Amount to UnsettledBalance field.
