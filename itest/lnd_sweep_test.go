@@ -499,6 +499,7 @@ func testSweepCPFPAnchorIncomingTimeout(ht *lntest.HarnessTest) {
 	carol.RPC.SettleInvoice(preimage[:])
 
 	// Bob should have settled his outgoing HTLC with Carol.
+	flakeInconsistentHTLCView()
 	ht.AssertHTLCNotActive(bob, bcChanPoint, payHash[:])
 
 	// We'll now mine enough blocks to trigger Bob to force close channel
@@ -850,6 +851,7 @@ func testSweepHTLCs(ht *lntest.HarnessTest) {
 	carol.RPC.SettleInvoice(preimageSettled[:])
 
 	// Bob should have settled his outgoing HTLC with Carol.
+	flakeInconsistentHTLCView()
 	ht.AssertHTLCNotActive(bob, bcChanPoint, payHashSettled[:])
 
 	// Let Carol go offline so we can focus on testing Bob's sweeping
@@ -1136,6 +1138,11 @@ func testSweepHTLCs(ht *lntest.HarnessTest) {
 	// NOTE: We need to subtract 1 from the deadline as the budget must be
 	// used up before the deadline.
 	blocksLeft := outgoingHTLCDeadline - outgoingFuncPosition - 1
+
+	ht.Logf("Bob has incoming sweep tx: %v, outgoing sweep tx: %v, "+
+		"blocksLeft=%v, entering fee bumping now...",
+		incomingSweep.TxHash(), outgoingSweep.TxHash(), blocksLeft)
+
 	for i := int32(0); i < blocksLeft; i++ {
 		// Mine an empty block.
 		ht.MineEmptyBlocks(1)

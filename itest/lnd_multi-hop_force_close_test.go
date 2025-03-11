@@ -422,8 +422,7 @@ func runLocalClaimOutgoingHTLC(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, bob, numSweeps)
+	ht.AssertNumPendingSweeps(bob, numSweeps)
 
 	// We expect to see tow txns in the mempool,
 	// 1. Bob's force close tx.
@@ -744,6 +743,7 @@ func runMultiHopReceiverPreimageClaim(ht *lntest.HarnessTest,
 
 	// Stop Bob so he won't be able to settle the incoming htlc.
 	restartBob := ht.SuspendNode(bob)
+	ht.AssertPeerNotConnected(carol, bob)
 
 	// Settle invoice. This will just mark the invoice as settled, as there
 	// is no link anymore to remove the htlc from the commitment tx. For
@@ -779,8 +779,7 @@ func runMultiHopReceiverPreimageClaim(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, carol, numSweeps)
+	ht.AssertNumPendingSweeps(carol, numSweeps)
 
 	// We expect to see tow txns in the mempool,
 	// 1. Carol's force close tx.
@@ -1690,6 +1689,7 @@ func runLocalClaimIncomingHTLC(ht *lntest.HarnessTest,
 
 	// Suspend Bob to force Carol to go to chain.
 	restartBob := ht.SuspendNode(bob)
+	ht.AssertPeerNotConnected(carol, bob)
 
 	// Settle invoice. This will just mark the invoice as settled, as there
 	// is no link anymore to remove the htlc from the commitment tx. For
@@ -1967,6 +1967,7 @@ func runLocalClaimIncomingHTLCLeased(ht *lntest.HarnessTest,
 
 	// Suspend Bob to force Carol to go to chain.
 	restartBob := ht.SuspendNode(bob)
+	ht.AssertPeerNotConnected(carol, bob)
 
 	// Settle invoice. This will just mark the invoice as settled, as there
 	// is no link anymore to remove the htlc from the commitment tx. For
@@ -2307,6 +2308,7 @@ func runLocalPreimageClaim(ht *lntest.HarnessTest,
 
 	// Suspend bob, so Carol is forced to go on chain.
 	restartBob := ht.SuspendNode(bob)
+	ht.AssertPeerNotConnected(carol, bob)
 
 	// Settle invoice. This will just mark the invoice as settled, as there
 	// is no link anymore to remove the htlc from the commitment tx. For
@@ -2334,8 +2336,7 @@ func runLocalPreimageClaim(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, carol, numSweeps)
+	ht.AssertNumPendingSweeps(carol, numSweeps)
 
 	// We should see two txns in the mempool, we now a block to confirm,
 	// - Carol's force close tx.
@@ -2547,6 +2548,7 @@ func runLocalPreimageClaimLeased(ht *lntest.HarnessTest,
 
 	// Suspend bob, so Carol is forced to go on chain.
 	restartBob := ht.SuspendNode(bob)
+	ht.AssertPeerNotConnected(carol, bob)
 
 	// Settle invoice. This will just mark the invoice as settled, as there
 	// is no link anymore to remove the htlc from the commitment tx. For
@@ -2574,8 +2576,7 @@ func runLocalPreimageClaimLeased(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, carol, numSweeps)
+	ht.AssertNumPendingSweeps(carol, numSweeps)
 
 	// We should see two txns in the mempool, we now a block to confirm,
 	// - Carol's force close tx.
@@ -2964,6 +2965,7 @@ func runHtlcAggregation(ht *lntest.HarnessTest,
 	// close. However, Carol will cancel her invoices to prevent force
 	// closes, so we shut her down for now.
 	restartCarol := ht.SuspendNode(carol)
+	ht.AssertPeerNotConnected(bob, carol)
 
 	// We'll now mine enough blocks to trigger Bob's broadcast of his
 	// commitment transaction due to the fact that the Carol's HTLCs are
@@ -2982,8 +2984,7 @@ func runHtlcAggregation(ht *lntest.HarnessTest,
 	if ht.IsNeutrinoBackend() {
 		numSweeps = 2
 	}
-
-	flakeSkipPendingSweepsCheckDarwin(ht, bob, numSweeps)
+	ht.AssertNumPendingSweeps(bob, numSweeps)
 
 	// Bob's force close tx and anchor sweeping tx should now be found in
 	// the mempool.
