@@ -36,6 +36,8 @@ func MapSQLError(err error) error {
 		return nil
 	}
 
+	log.Debugf("SQL -----------> %v", err)
+
 	// Attempt to interpret the error as a sqlite error.
 	var sqliteErr *sqlite.Error
 	if errors.As(err, &sqliteErr) {

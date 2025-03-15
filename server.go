@@ -57,6 +57,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
@@ -5299,6 +5300,8 @@ func newSweepPkScriptGen(
 		if err != nil {
 			return fn.Err[lnwallet.AddrWithKey](err)
 		}
+
+		srvrLog.Infof("------> sweepAddr %v", lnutils.SpewLogClosure(sweepAddr))
 
 		addr, err := txscript.PayToAddrScript(sweepAddr)
 		if err != nil {

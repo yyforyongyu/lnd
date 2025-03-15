@@ -550,6 +550,8 @@ func (t *TxPublisher) createRBFCompliantTx(
 		// mempool acceptance.
 		sweepCtx, err := t.createAndCheckTx(r)
 
+		log.Info("created sweeping tx------------> %v", lnutils.SpewLogClosure(sweepCtx))
+
 		switch {
 		case err == nil:
 			// The tx is valid, store it.
@@ -1329,6 +1331,8 @@ func (t *TxPublisher) createAndPublishTx(
 	// directly here.
 	sweepCtx, err := t.createAndCheckTx(r)
 
+	log.Info("created rbf sweeping tx------------> %v", lnutils.SpewLogClosure(sweepCtx.tx))
+
 	// If there's an error creating the replacement tx, we need to abort the
 	// flow and handle it.
 	if err != nil {
@@ -1371,7 +1375,7 @@ func (t *TxPublisher) createAndPublishTx(
 		return fn.Some(*result)
 	}
 
-	log.Infof("Replaced tx=%v with new tx=%v", oldTx.TxHash(),
+	log.Debugf("Replaced tx=%v with new tx=%v", oldTx.TxHash(),
 		sweepCtx.tx.TxHash())
 
 	// Otherwise, it's a successful RBF, set the event and return.

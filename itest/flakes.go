@@ -1,7 +1,6 @@
 package itest
 
 import (
-	"runtime"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
@@ -35,19 +34,6 @@ func flakePreimageSettlement(ht *lntest.HarnessTest) {
 	time.Sleep(2 * time.Second)
 }
 
-// flakeFundExtraUTXO documents a flake found when testing the sweeping behavior
-// of the given node, which would fail due to no wallet UTXO available, while
-// there should be enough.
-//
-// TODO(yy): remove it once the issue is resolved.
-func flakeFundExtraUTXO(ht *lntest.HarnessTest, node *node.HarnessNode) {
-	// The node should have enough wallet UTXOs here to sweep the HTLC in
-	// the end of this test. However, due to a known issue, the node's
-	// wallet may report there's no UTXO available. For details,
-	// - https://github.com/lightningnetwork/lnd/issues/8786
-	ht.FundCoins(btcutil.SatoshiPerBitcoin, node)
-}
-
 // flakeTxNotifierNeutrino documents a flake found when running force close
 // tests using neutrino backend, which is a race between two notifications - one
 // for the spending notification, the other for the block which contains the
@@ -72,35 +58,86 @@ func flakeTxNotifierNeutrino(ht *lntest.HarnessTest) {
 	}
 }
 
-// flakeSkipPendingSweepsCheckDarwin documents a flake found only in macOS
-// build. When running in macOS, we might see three anchor sweeps - one from the
-// local, one from the remote, and one from the pending remote:
-//   - the local one will be swept.
-//   - the remote one will be marked as failed due to `testmempoolaccept` check.
-//   - the pending remote one will not be attempted due to it being uneconomical
-//     since it was not used for CPFP.
+// flakeInconsistentHTLCView documents a flake found that the `ListChannels` RPC
+// can give inaccurate HTLC states, which is found when we call
+// `AssertHTLCNotActive` after a commitment dance is finished. Suppose Carol is
+// settling an invoice with Bob, from Bob's PoV, a typical healthy settlement
+// flow goes like this:
 //
-// The anchor from the pending remote may or may not appear, which is a bug
-// found only in macOS - when updating the commitments, the channel state
-// machine somehow thinks we still have a pending remote commitment, causing it
-// to sweep the anchor from that version.
+//	[DBG] PEER brontide.go:2412: Peer([Carol]): Received UpdateFulfillHTLC
+//	[DBG] HSWC switch.go:1315: Closed completed SETTLE circuit for ...
+//	[INF] HSWC switch.go:3044: Forwarded HTLC...
+//	[DBG] PEER brontide.go:2412: Peer([Carol]): Received CommitSig
+//	[DBG] PEER brontide.go:2412: Peer([Carol]): Sending RevokeAndAck
+//	[DBG] PEER brontide.go:2412: Peer([Carol]): Sending CommitSig
+//	[DBG] PEER brontide.go:2412: Peer([Carol]): Received RevokeAndAck
+//	[DBG] HSWC link.go:3617: ChannelLink([ChanPoint: Bob=>Carol]): settle-fail-filter: count=1, filter=[0]
+//	[DBG] HSWC switch.go:3001: Circuit is closing for packet...
 //
-// TODO(yy): fix the above bug in the channel state machine.
-func flakeSkipPendingSweepsCheckDarwin(ht *lntest.HarnessTest,
-	node *node.HarnessNode, num int) {
-
-	// Skip the assertion below if it's on macOS.
-	if isDarwin() {
-		ht.Logf("Skipped AssertNumPendingSweeps for node %s",
-			node.Name())
-
-		return
-	}
-
-	ht.AssertNumPendingSweeps(node, num)
+// Bob receives the preimage, closes the circuit, and exchanges commit sig and
+// revoke msgs with Carol. Once Bob receives the `CommitSig` from Carol, the
+// HTLC should be removed from his `LocalCommitment` via
+// `RevokeCurrentCommitment`.
+//
+// However, in the test where `AssertHTLCNotActive` is called, although the
+// above process is finished, the `ListChannels“ still finds the HTLC. Also note
+// that the RPC makes direct call to the channeldb without any locks, which
+// should be fine as the struct `OpenChannel.LocalCommitment` is passed by
+// value, although we need to double check.
+//
+// TODO(yy): In order to fix it, we should make the RPC share the same view of
+// our channel state machine. Instead of making DB queries, it should instead
+// use `lnwallet.LightningChannel` instead to stay consistent.
+//
+//nolint:ll
+func flakeInconsistentHTLCView() {
+	// Perform a sleep so the commiment dance can be finished before we call
+	// the ListChannels.
+	time.Sleep(2 * time.Second)
 }
 
-// isDarwin returns true if the test is running on a macOS.
-func isDarwin() bool {
-	return runtime.GOOS == "darwin"
+// flakePaymentStreamReturnEarly documents a flake found in the test which
+// relies on a given payment to be settled before testing other state changes.
+// The issue comes from the payment stream created from the RPC `SendPaymentV2`
+// gives premature settled event for a given payment, which is found in,
+//   - if we force close the channel immediately, we may get an error because
+//     the commitment dance is not finished.
+//   - if we subscribe HTLC events immediately, we may get extra events, which
+//     is also related to the above unfinished commitment dance.
+//
+// TODO(yy): Make sure we only mark the payment being settled once the
+// commitment dance is finished. In addition, we should also fix the exit hop
+// logic in the invoice settlement flow to make sure the invoice is only marked
+// as settled after the commitment dance is finished.
+func flakePaymentStreamReturnEarly() {
+	// Sleep 2 seconds so the pending HTLCs will be removed from the
+	// commitment.
+	time.Sleep(2 * time.Second)
+}
+
+// flakeRaceInBitcoinClientNotifications documents a bug found that the
+// `ListUnspent` gives inaccurate results. In specific,
+//   - an output is confirmed in block X, which is under the process of being
+//     credited to our wallet.
+//   - `ListUnspent` is called inbetween the above process, returning an
+//     inaccurate result, causing the sweeper to think there's no wallet utxo.
+//   - the sweeping will fail at block X due to not enough inputs.
+//
+// Under the hood, the RPC client created for handling wallet txns and handling
+// block notifications are independent. For the block notification, which is
+// registered via `RegisterBlockEpochNtfn`, is managed by the `chainntnfs`,
+// which is hooked to a bitcoind client created at startup. For the wallet, it
+// uses another bitcoind client to receive online events. Although they share
+// the same bitcoind RPC conn, these two clients are act independently.
+// With this setup, it means there's no coordination between the two system -
+// `lnwallet` and `chainntnfs` can disagree on the latest onchain state for a
+// short period, causing an inconsistent state which leads to the failed
+// sweeping attempt.
+//
+// TODO(yy): We need to adhere to the SSOT principle, and make the effort to
+// ensure the whole system only uses one bitcoind client.
+func flakeRaceInBitcoinClientNotifications(ht *lntest.HarnessTest,
+	hn *node.HarnessNode) {
+
+	ht.FundCoins(btcutil.SatoshiPerBitcoin, hn)
 }
