@@ -476,14 +476,13 @@ func TestAddWalletInputNotEnoughInputs(t *testing.T) {
 	// Initialize an input set with the pending input.
 	set := BudgetInputSet{inputs: []*SweeperInput{pi}}
 
-	// Add wallet inputs to the input set, which should give us an error as
-	// the wallet cannot cover the budget.
+	// Add wallet inputs to the input set, which should return no error
+	// although the wallet cannot cover the budget.
 	err := set.AddWalletInputs(wallet)
-	require.ErrorIs(t, err, ErrNotEnoughInputs)
+	require.NoError(t, err)
 
-	// Check that the budget set is reverted to its initial state.
-	require.Len(t, set.inputs, 1)
-	require.Equal(t, pi, set.inputs[0])
+	// Check that the budget set is updated.
+	require.Len(t, set.inputs, 2)
 }
 
 // TestAddWalletInputSuccess checks that when there are enough wallet utxos,
