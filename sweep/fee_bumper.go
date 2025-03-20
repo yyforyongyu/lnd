@@ -1122,6 +1122,16 @@ func (t *TxPublisher) handleInitialTxError(r *monitorRecord, err error) {
 
 		result.Event = TxFailed
 
+		// Calculate the starting fee rate to be used when retry
+		// sweeping these inputs.
+		feeRate, err := t.calculateRetryFeeRate(r)
+		if err != nil {
+			result.Event = TxFatal
+		}
+
+		// Attach the new fee rate.
+		result.FeeRate = feeRate
+
 	// When there are missing inputs, we'll create a TxUnknownSpend bump
 	// result here so the rest of the inputs can be retried.
 	case errors.Is(err, ErrInputMissing):
@@ -1832,18 +1842,32 @@ func (t *TxPublisher) handleReplacementTxError(r *monitorRecord,
 		return fn.Some(*bumpResult)
 	}
 
-	// If the error is not fee related, we will return a `TxFailed` event
-	// so this input can be retried.
+	// Return a failed event to retry the sweep.
+	event := TxFailed
+
+	// Calculate the next fee rate for the retry.
+	feeRate, ferr := t.calculateRetryFeeRate(r)
+	if ferr != nil {
+		// If there's an error with the fee calculation, we need to
+		// abort the sweep.
+		event = TxFatal
+	}
+
+	// If the error is not fee related, we will return a `TxFailed` event so
+	// this input can be retried.
 	result := fn.Some(BumpResult{
-		Event:     TxFailed,
+		Event:     event,
 		Tx:        oldTx,
 		Err:       err,
 		requestID: r.requestID,
+		FeeRate:   feeRate,
 	})
 
 	// If the tx doesn't not have enought budget, we will return a result so
 	// the sweeper can handle it by re-clustering the utxos.
-	if errors.Is(err, ErrNotEnoughBudget) {
+	if errors.Is(err, ErrNotEnoughBudget) ||
+		errors.Is(err, ErrNotEnoughInputs) {
+
 		log.Warnf("Fail to fee bump tx %v: %v", oldTx.TxHash(), err)
 		return result
 	}
