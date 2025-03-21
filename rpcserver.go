@@ -3165,15 +3165,6 @@ func (r *rpcServer) abandonChan(chanPoint *wire.OutPoint,
 		return err
 	}
 
-	// If this channel was in the process of being closed, but didn't fully
-	// close, then it's possible that the nursery is hanging on to some
-	// state. To err on the side of caution, we'll now attempt to wipe any
-	// state for this channel from the nursery.
-	err = r.server.utxoNursery.RemoveChannel(chanPoint)
-	if err != nil && err != contractcourt.ErrContractNotFound {
-		return err
-	}
-
 	// Finally, notify the backup listeners that the channel can be removed
 	// from any channel backups.
 	r.server.channelNotifier.NotifyClosedChannelEvent(*chanPoint)
@@ -4061,21 +4052,7 @@ func (r *rpcServer) fetchPendingForceCloseChannels() (pendingForceClose,
 				ClosingTxid: closeTXID,
 			}
 
-			// Fetch reports from both nursery and resolvers. At the
-			// moment this is not an atomic snapshot. This is
-			// planned to be resolved when the nursery is removed
-			// and channel arbitrator will be the single source for
-			// these kind of reports.
-			err := r.nurseryPopulateForceCloseResp(
-				&chanPoint, currentHeight, forceClose,
-			)
-			if err != nil {
-				rpcsLog.Errorf("unable to populate nursery "+
-					"force close resp:%s, %v",
-					chanPoint, err)
-				return nil, 0, err
-			}
-
+			// Fetch reports from resolvers.
 			err = r.arbitratorPopulateForceCloseResp(
 				&chanPoint, currentHeight, forceClose,
 			)
@@ -4398,56 +4375,6 @@ func (r *rpcServer) arbitratorPopulateForceCloseResp(chanPoint *wire.OutPoint,
 
 		forceClose.LimboBalance += int64(report.LimboBalance)
 		forceClose.RecoveredBalance += int64(report.RecoveredBalance)
-	}
-
-	return nil
-}
-
-// nurseryPopulateForceCloseResp populates the pending channels response
-// message with contract resolution information from utxonursery.
-func (r *rpcServer) nurseryPopulateForceCloseResp(chanPoint *wire.OutPoint,
-	currentHeight int32,
-	forceClose *lnrpc.PendingChannelsResponse_ForceClosedChannel) error {
-
-	// Query for the maturity state for this force closed channel. If we
-	// didn't have any time-locked outputs, then the nursery may not know of
-	// the contract.
-	nurseryInfo, err := r.server.utxoNursery.NurseryReport(chanPoint)
-	if err == contractcourt.ErrContractNotFound {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("unable to obtain "+
-			"nursery report for ChannelPoint(%v): %v",
-			chanPoint, err)
-	}
-
-	// If the nursery knows of this channel, then we can populate
-	// information detailing exactly how much funds are time locked and also
-	// the height in which we can ultimately sweep the funds into the
-	// wallet.
-	forceClose.LimboBalance = int64(nurseryInfo.LimboBalance)
-	forceClose.RecoveredBalance = int64(nurseryInfo.RecoveredBalance)
-
-	for _, htlcReport := range nurseryInfo.Htlcs {
-		// TODO(conner) set incoming flag appropriately after handling
-		// incoming incubation
-		htlc := &lnrpc.PendingHTLC{
-			Incoming:       false,
-			Amount:         int64(htlcReport.Amount),
-			Outpoint:       htlcReport.Outpoint.String(),
-			MaturityHeight: htlcReport.MaturityHeight,
-			Stage:          htlcReport.Stage,
-		}
-
-		if htlc.MaturityHeight != 0 {
-			htlc.BlocksTilMaturity =
-				int32(htlc.MaturityHeight) -
-					currentHeight
-		}
-
-		forceClose.PendingHtlcs = append(forceClose.PendingHtlcs,
-			htlc)
 	}
 
 	return nil
