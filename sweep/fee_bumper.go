@@ -177,7 +177,7 @@ type BumpRequest struct {
 // request. It calculates the feerate using the supplied budget and the weight,
 // compares it with the specified MaxFeeRate, and returns the smaller of the
 // two.
-func (r *BumpRequest) MaxFeeRateAllowed() (chainfee.SatPerKWeight, error) {
+func (r *BumpRequest) MaxFeeRateAllowed() chainfee.SatPerKWeight {
 	// We'll want to know if we have any blobs, as we need to factor this
 	// into the max fee rate for this bump request.
 	hasBlobs := fn.Any(r.Inputs, func(i input.Input) bool {
@@ -203,12 +203,7 @@ func (r *BumpRequest) MaxFeeRateAllowed() (chainfee.SatPerKWeight, error) {
 
 	// Get the size of the sweep tx, which will be used to calculate the
 	// budget fee rate.
-	size, err := calcSweepTxWeight(
-		r.Inputs, sweepAddrs,
-	)
-	if err != nil {
-		return 0, err
-	}
+	size := calcSweepTxWeight(r.Inputs, sweepAddrs)
 
 	// Use the budget and MaxFeeRate to decide the max allowed fee rate.
 	// This is needed as, when the input has a large value and the user
@@ -221,19 +216,19 @@ func (r *BumpRequest) MaxFeeRateAllowed() (chainfee.SatPerKWeight, error) {
 			"MaxFeeRate instead, txWeight=%v", maxFeeRateAllowed,
 			r.MaxFeeRate, size)
 
-		return r.MaxFeeRate, nil
+		return r.MaxFeeRate
 	}
 
 	log.Debugf("Budget feerate %v below MaxFeeRate %v, use budget feerate "+
 		"instead, txWeight=%v", maxFeeRateAllowed, r.MaxFeeRate, size)
 
-	return maxFeeRateAllowed, nil
+	return maxFeeRateAllowed
 }
 
 // calcSweepTxWeight calculates the weight of the sweep tx. It assumes a
 // sweeping tx always has a single output(change).
 func calcSweepTxWeight(inputs []input.Input,
-	outputPkScript [][]byte) (lntypes.WeightUnit, error) {
+	outputPkScript [][]byte) lntypes.WeightUnit {
 
 	// Use a const fee rate as we only use the weight estimator to
 	// calculate the size.
@@ -243,17 +238,11 @@ func calcSweepTxWeight(inputs []input.Input,
 	// - nil outputs as we only have one single change output.
 	// - const fee rate as we don't care about the fees here.
 	// - 0 maxfeerate as we don't care about fees here.
-	//
-	// TODO(yy): we should refactor the weight estimator to not require a
-	// fee rate and max fee rate and make it a pure tx weight calculator.
-	_, estimator, err := getWeightEstimate(
+	_, estimator := getWeightEstimate(
 		inputs, nil, feeRate, 0, outputPkScript,
 	)
-	if err != nil {
-		return 0, err
-	}
 
-	return estimator.weight(), nil
+	return estimator.weight()
 }
 
 // BumpResult is used by the Bumper to send updates about the tx being
@@ -513,10 +502,7 @@ func (t *TxPublisher) initializeFeeFunction(
 	req *BumpRequest) (FeeFunction, error) {
 
 	// Get the max allowed feerate.
-	maxFeeRateAllowed, err := req.MaxFeeRateAllowed()
-	if err != nil {
-		return nil, err
-	}
+	maxFeeRateAllowed := req.MaxFeeRateAllowed()
 
 	// Get the initial conf target.
 	confTarget := calcCurrentConfTarget(
@@ -1670,12 +1656,9 @@ func prepareSweepTx(inputs []input.Input, changePkScript lnwallet.AddrWithKey,
 	// Creating a weight estimator with nil outputs and zero max fee rate.
 	// We don't allow adding customized outputs in the sweeping tx, and the
 	// fee rate is already being managed before we get here.
-	inputs, estimator, err := getWeightEstimate(
+	inputs, estimator := getWeightEstimate(
 		inputs, nil, feeRate, 0, changePkScripts,
 	)
-	if err != nil {
-		return 0, noChange, noLocktime, err
-	}
 
 	txFee := estimator.fee()
 
@@ -1899,13 +1882,6 @@ func (t *TxPublisher) calculateRetryFeeRate(
 	// the fee rate data so the sweeper can pick up where we left off.
 	if feeFunc == nil {
 		f, err := t.initializeFeeFunction(r.req)
-
-		// TODO(yy): The only error we would receive here is when the
-		// pkScript is not recognized by the weightEstimator. What we
-		// should do instead is to check the pkScript immediately after
-		// receiving a sweep request so we don't need to check it again,
-		// which will also save us from error checking from several
-		// callsites.
 		if err != nil {
 			log.Errorf("Failed to create fee func for record %v: "+
 				"%v", r.requestID, err)
