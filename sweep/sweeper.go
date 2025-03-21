@@ -8,6 +8,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainio"
@@ -832,6 +833,12 @@ func (s *UtxoSweeper) sweep(set InputSet) error {
 	sweepAddr, err := s.currentOutputScript.UnwrapOrErr(
 		fmt.Errorf("none sweep script"),
 	)
+	if err != nil {
+		return err
+	}
+
+	// Check the pkScript is known to the weight estimator.
+	err = validatePkScript(sweepAddr.DeliveryAddress)
 	if err != nil {
 		return err
 	}
@@ -2017,4 +2024,21 @@ func (s *UtxoSweeper) handleBumpEventTxUnknownSpend(r *bumpResp) {
 	// also include more inputs in the new sweeping tx if new ones with the
 	// same deadline are offered.
 	s.sweepPendingInputs(inputs)
+}
+
+// validatePkScript checks that the address is using a pkScript known to us.
+func validatePkScript(pkScript []byte) error {
+	switch {
+	case txscript.IsPayToTaproot(pkScript):
+	case txscript.IsPayToWitnessScriptHash(pkScript):
+	case txscript.IsPayToWitnessPubKeyHash(pkScript):
+	case txscript.IsPayToPubKeyHash(pkScript):
+	case txscript.IsPayToScriptHash(pkScript):
+
+	default:
+		// Unknown script type.
+		return fmt.Errorf("unknown script type: %x", pkScript)
+	}
+
+	return nil
 }
