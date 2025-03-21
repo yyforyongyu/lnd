@@ -375,14 +375,6 @@ func createTestChannelArbitrator(t *testing.T, log ArbitratorLog,
 			SpendChan: make(chan *chainntnfs.SpendDetail),
 			ConfChan:  make(chan *chainntnfs.TxConfirmation),
 		},
-		IncubateOutputs: func(wire.OutPoint,
-			fn.Option[lnwallet.OutgoingHtlcResolution],
-			fn.Option[lnwallet.IncomingHtlcResolution],
-			uint32, fn.Option[int32]) error {
-
-			incubateChan <- struct{}{}
-			return nil
-		},
 		OnionProcessor: &mockOnionProcessor{},
 		IsForwardedHTLC: func(chanID lnwire.ShortChannelID,
 			htlcIndex uint64) bool {

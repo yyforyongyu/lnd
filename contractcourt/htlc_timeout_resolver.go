@@ -15,6 +15,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/labels"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -493,15 +494,19 @@ func (h *htlcTimeoutResolver) sweepTimeoutTx() error {
 // resolveSecondLevelTxLegacy sends a second level timeout transaction to the
 // utxo nursery. This transaction uses the legacy SIGHASH_ALL flag.
 func (h *htlcTimeoutResolver) resolveSecondLevelTxLegacy() error {
-	h.log.Debug("incubating htlc output")
+	timeoutTx := h.htlcResolution.SignedTimeoutTx
 
-	// The utxo nursery will take care of broadcasting the second-level
-	// timeout tx and sweeping its output once it confirms.
-	err := h.IncubateOutputs(
-		h.ChanPoint, fn.Some(h.htlcResolution),
-		fn.None[lnwallet.IncomingHtlcResolution](),
-		h.broadcastHeight, h.incomingHTLCExpiryHeight,
+	// Otherwise we'll publish the second-level transaction directly and
+	// offer the resolution to the sweeper to handle.
+	h.log.Infof("broadcasting legacy second-level timeout tx: %v",
+		timeoutTx.TxHash())
+
+	// We'll now broadcast the second layer transaction so we can kick off
+	// the claiming process.
+	label := labels.MakeLabel(
+		labels.LabelTypeChannelClose, &h.ShortChanID,
 	)
+	err := h.PublishTx(timeoutTx, label)
 	if err != nil {
 		return err
 	}
@@ -1297,8 +1302,6 @@ func (h *htlcTimeoutResolver) Launch() error {
 
 	// If this is an output on our own commitment using pre-anchor channel
 	// type, we will let the utxo nursery handle it via Resolve.
-	//
-	// TODO(yy): handle the legacy output by offering it to the sweeper.
 	default:
 		return nil
 	}

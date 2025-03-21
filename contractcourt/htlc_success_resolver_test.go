@@ -78,13 +78,6 @@ func newHtlcResolverTestContext(t *testing.T,
 				return nil
 			},
 			Sweeper: newMockSweeper(),
-			IncubateOutputs: func(wire.OutPoint,
-				fn.Option[lnwallet.OutgoingHtlcResolution],
-				fn.Option[lnwallet.IncomingHtlcResolution],
-				uint32, fn.Option[int32]) error {
-
-				return nil
-			},
 			DeliverResolutionMsg: func(msgs ...ResolutionMsg) error {
 				if len(msgs) != 1 {
 					return fmt.Errorf("expected 1 "+
