@@ -284,7 +284,9 @@ func actionDecorator(f func(*cli.Context) error) func(*cli.Context) error {
 		// means that lnd is running, but the RPC server is not active
 		// yet (only WalletUnlocker server active) and most likely this
 		// is because of an encrypted wallet.
-		if s.Code() == codes.Unknown {
+		if s.Code() == codes.Unknown &&
+			strings.Contains(s.Message(), "wallet locked") {
+
 			return errors.New("wallet is encrypted - please " +
 				"unlock using 'lncli unlock', or set " +
 				"password using 'lncli create' if this is " +
