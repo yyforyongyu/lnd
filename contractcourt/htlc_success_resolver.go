@@ -515,13 +515,23 @@ func (h *htlcSuccessResolver) sweepSuccessTxOutput() error {
 	h.log.Debugf("sweeping output %v from 2nd-level HTLC success tx",
 		h.htlcResolution.ClaimOutpoint)
 
+	// Find the pkScript based on whether this is a zero-fee HTLC output or
+	// not.
+	var pkScript []byte
+
+	res := h.htlcResolution
+	if h.isZeroFeeOutput() {
+		pkScript = res.SignDetails.SignDesc.Output.PkScript
+	} else {
+		pkScript = res.SweepSignDesc.Output.PkScript
+	}
+
 	// This should be non-blocking as we will only attempt to sweep the
 	// output when the second level tx has already been confirmed. In other
 	// words, waitForSpend will return immediately.
 	commitSpend, err := waitForSpend(
-		&h.htlcResolution.SignedSuccessTx.TxIn[0].PreviousOutPoint,
-		h.htlcResolution.SignDetails.SignDesc.Output.PkScript,
-		h.broadcastHeight, h.Notifier, h.quit,
+		&res.SignedSuccessTx.TxIn[0].PreviousOutPoint,
+		pkScript, h.broadcastHeight, h.Notifier, h.quit,
 	)
 	if err != nil {
 		return err
@@ -605,14 +615,12 @@ func (h *htlcSuccessResolver) sweepSuccessTxOutput() error {
 // by broadcasting the second-level success transaction.
 func (h *htlcSuccessResolver) resolveLegacySuccessTx() error {
 	// Otherwise we'll publish the second-level transaction directly and
-	// offer the resolution to the nursery to handle.
+	// offer the resolution to the sweeper to handle.
 	h.log.Infof("broadcasting legacy second-level success tx: %v",
 		h.htlcResolution.SignedSuccessTx.TxHash())
 
 	// We'll now broadcast the second layer transaction so we can kick off
 	// the claiming process.
-	//
-	// TODO(yy): offer it to the sweeper instead.
 	label := labels.MakeLabel(
 		labels.LabelTypeChannelClose, &h.ShortChanID,
 	)
@@ -622,26 +630,16 @@ func (h *htlcSuccessResolver) resolveLegacySuccessTx() error {
 	}
 
 	// Fast-forward to resolve the output from the success tx if the it has
-	// already been sent to the UtxoNursery.
+	// already been sent to the sweeper.
 	if h.outputIncubating {
 		return h.resolveSuccessTxOutput(h.htlcResolution.ClaimOutpoint)
 	}
 
-	h.log.Infof("incubating incoming htlc output")
+	h.log.Infof("sweeping incoming htlc output")
 
-	// Send the output to the incubator.
-	err = h.IncubateOutputs(
-		h.ChanPoint, fn.None[lnwallet.OutgoingHtlcResolution](),
-		fn.Some(h.htlcResolution),
-		h.broadcastHeight, fn.Some(int32(h.htlc.RefundTimeout)),
-	)
+	// Send the output to the sweeper.
+	err = h.sweepSuccessTxOutput()
 	if err != nil {
-		return err
-	}
-
-	// Mark the output as incubating and checkpoint it.
-	h.outputIncubating = true
-	if err := h.Checkpoint(h); err != nil {
 		return err
 	}
 

@@ -350,8 +350,6 @@ type server struct {
 
 	localChanMgr *localchans.Manager
 
-	utxoNursery *contractcourt.UtxoNursery
-
 	sweeper *sweep.UtxoSweeper
 
 	chainArb *contractcourt.ChainArbitrator
@@ -1239,14 +1237,6 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		},
 	}
 
-	utxnStore, err := contractcourt.NewNurseryStore(
-		s.cfg.ActiveNetParams.GenesisHash, dbs.ChanStateDB,
-	)
-	if err != nil {
-		srvrLog.Errorf("unable to create nursery store: %v", err)
-		return nil, err
-	}
-
 	sweeperStore, err := sweep.NewSweeperStore(
 		dbs.ChanStateDB, s.cfg.ActiveNetParams.GenesisHash,
 	)
@@ -1283,18 +1273,6 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		Aggregator:           aggregator,
 		Publisher:            s.txPublisher,
 		NoDeadlineConfTarget: cfg.Sweeper.NoDeadlineConfTarget,
-	})
-
-	s.utxoNursery = contractcourt.NewUtxoNursery(&contractcourt.NurseryConfig{
-		ChainIO:             cc.ChainIO,
-		ConfDepth:           1,
-		FetchClosedChannels: s.chanStateDB.FetchClosedChannels,
-		FetchClosedChannel:  s.chanStateDB.FetchClosedChannel,
-		Notifier:            cc.ChainNotifier,
-		PublishTransaction:  cc.Wallet.PublishTransaction,
-		Store:               utxnStore,
-		SweepInput:          s.sweeper.SweepInput,
-		Budget:              s.cfg.Sweeper.Budget,
 	})
 
 	// Construct a closure that wraps the htlcswitch's CloseLink method.
@@ -1358,17 +1336,6 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 				}
 			}
 			return nil
-		},
-		IncubateOutputs: func(chanPoint wire.OutPoint,
-			outHtlcRes fn.Option[lnwallet.OutgoingHtlcResolution],
-			inHtlcRes fn.Option[lnwallet.IncomingHtlcResolution],
-			broadcastHeight uint32,
-			deadlineHeight fn.Option[int32]) error {
-
-			return s.utxoNursery.IncubateOutputs(
-				chanPoint, outHtlcRes, inHtlcRes,
-				broadcastHeight, deadlineHeight,
-			)
 		},
 		PreimageDB:   s.witnessBeacon,
 		Notifier:     cc.ChainNotifier,
@@ -2334,12 +2301,6 @@ func (s *server) Start() error {
 			return
 		}
 
-		cleanup = cleanup.add(s.utxoNursery.Stop)
-		if err := s.utxoNursery.Start(); err != nil {
-			startErr = err
-			return
-		}
-
 		cleanup = cleanup.add(s.breachArbitrator.Stop)
 		if err := s.breachArbitrator.Start(); err != nil {
 			startErr = err
@@ -2719,9 +2680,6 @@ func (s *server) Stop() error {
 		if err := s.breachArbitrator.Stop(); err != nil {
 			srvrLog.Warnf("failed to stop breachArbitrator: %v",
 				err)
-		}
-		if err := s.utxoNursery.Stop(); err != nil {
-			srvrLog.Warnf("failed to stop utxoNursery: %v", err)
 		}
 		if err := s.authGossiper.Stop(); err != nil {
 			srvrLog.Warnf("failed to stop authGossiper: %v", err)

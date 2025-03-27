@@ -296,14 +296,6 @@ func testHtlcTimeoutResolver(t *testing.T, testCase htlcTimeoutTestCase) {
 			Notifier:   notifier,
 			Sweeper:    newMockSweeper(),
 			PreimageDB: witnessBeacon,
-			IncubateOutputs: func(wire.OutPoint,
-				fn.Option[lnwallet.OutgoingHtlcResolution],
-				fn.Option[lnwallet.IncomingHtlcResolution],
-				uint32, fn.Option[int32]) error {
-
-				incubateChan <- struct{}{}
-				return nil
-			},
 			DeliverResolutionMsg: func(msgs ...ResolutionMsg) error {
 				if len(msgs) != 1 {
 					return fmt.Errorf("expected 1 "+
