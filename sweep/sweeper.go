@@ -8,6 +8,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainio"
@@ -836,6 +837,12 @@ func (s *UtxoSweeper) sweep(set InputSet) error {
 		return err
 	}
 
+	// Check the pkScript is known to the weight estimator.
+	err = validatePkScript(sweepAddr.DeliveryAddress)
+	if err != nil {
+		return err
+	}
+
 	// Create a fee bump request and ask the publisher to broadcast it. The
 	// publisher will then take over and start monitoring the tx for
 	// potential fee bump.
@@ -951,7 +958,9 @@ func (s *UtxoSweeper) markInputsPublished(tr *TxRecord, set InputSet) error {
 }
 
 // markInputsPublishFailed marks the list of inputs as failed to be published.
-func (s *UtxoSweeper) markInputsPublishFailed(set InputSet) {
+func (s *UtxoSweeper) markInputsPublishFailed(set InputSet,
+	feeRate chainfee.SatPerKWeight) {
+
 	// Reschedule sweep.
 	for _, inp := range set.Inputs() {
 		op := inp.OutPoint()
@@ -978,6 +987,15 @@ func (s *UtxoSweeper) markInputsPublishFailed(set InputSet) {
 
 		// Update the input's state.
 		pi.state = PublishFailed
+
+		log.Debugf("Input(%v): updating params: starting fee rate "+
+			"[%v -> %v]", op, pi.params.StartingFeeRate,
+			feeRate)
+
+		// Update the input using the fee rate specified from the
+		// BumpResult, which should be the starting fee rate to use for
+		// the next sweeping attempt.
+		pi.params.StartingFeeRate = fn.Some(feeRate)
 	}
 }
 
@@ -1699,7 +1717,7 @@ func (s *UtxoSweeper) handleBumpEventTxFailed(resp *bumpResp) {
 	// the inputs specified by the set.
 	//
 	// TODO(yy): should we also remove the failed tx from db?
-	s.markInputsPublishFailed(resp.set)
+	s.markInputsPublishFailed(resp.set, resp.result.FeeRate)
 }
 
 // handleBumpEventTxReplaced handles the case where the sweeping tx has been
@@ -1948,7 +1966,7 @@ func (s *UtxoSweeper) handleUnknownSpendTx(inp *SweeperInput, tx *wire.MsgTx) {
 func (s *UtxoSweeper) handleBumpEventTxUnknownSpend(r *bumpResp) {
 	// Mark the inputs as publish failed, which means they will be retried
 	// later.
-	s.markInputsPublishFailed(r.set)
+	s.markInputsPublishFailed(r.set, r.result.FeeRate)
 
 	// Get all the inputs that are not spent in the current sweeping tx.
 	spentInputs := r.result.SpentInputs
@@ -1982,15 +2000,9 @@ func (s *UtxoSweeper) handleBumpEventTxUnknownSpend(r *bumpResp) {
 			continue
 		}
 
-		log.Debugf("Input(%v): updating params: starting fee rate "+
-			"[%v -> %v], immediate [%v -> true]", op,
-			input.params.StartingFeeRate, r.result.FeeRate,
-			input.params.Immediate)
+		log.Debugf("Input(%v): updating params: immediate [%v -> true]",
+			op, r.result.FeeRate, input.params.Immediate)
 
-		// Update the input using the fee rate specified from the
-		// BumpResult, which should be the starting fee rate to use for
-		// the next sweeping attempt.
-		input.params.StartingFeeRate = fn.Some(r.result.FeeRate)
 		input.params.Immediate = true
 		inputsToRetry = append(inputsToRetry, input)
 	}
@@ -2012,4 +2024,21 @@ func (s *UtxoSweeper) handleBumpEventTxUnknownSpend(r *bumpResp) {
 	// also include more inputs in the new sweeping tx if new ones with the
 	// same deadline are offered.
 	s.sweepPendingInputs(inputs)
+}
+
+// validatePkScript checks that the address is using a pkScript known to us.
+func validatePkScript(pkScript []byte) error {
+	switch {
+	case txscript.IsPayToTaproot(pkScript):
+	case txscript.IsPayToWitnessScriptHash(pkScript):
+	case txscript.IsPayToWitnessPubKeyHash(pkScript):
+	case txscript.IsPayToPubKeyHash(pkScript):
+	case txscript.IsPayToScriptHash(pkScript):
+
+	default:
+		// Unknown script type.
+		return fmt.Errorf("unknown script type: %x", pkScript)
+	}
+
+	return nil
 }

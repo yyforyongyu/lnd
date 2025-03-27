@@ -37,12 +37,9 @@ func createSweepTx(inputs []input.Input, outputs []*wire.TxOut,
 	feeRate, maxFeeRate chainfee.SatPerKWeight,
 	signer input.Signer) (*wire.MsgTx, btcutil.Amount, error) {
 
-	inputs, estimator, err := getWeightEstimate(
+	inputs, estimator := getWeightEstimate(
 		inputs, outputs, feeRate, maxFeeRate, [][]byte{changePkScript},
 	)
-	if err != nil {
-		return nil, 0, err
-	}
 
 	txFee := estimator.feeWithParent()
 
@@ -221,7 +218,7 @@ func createSweepTx(inputs []input.Input, outputs []*wire.TxOut,
 // Additionally, it returns counts for the number of csv and cltv inputs.
 func getWeightEstimate(inputs []input.Input, outputs []*wire.TxOut,
 	feeRate, maxFeeRate chainfee.SatPerKWeight,
-	outputPkScripts [][]byte) ([]input.Input, *weightEstimator, error) {
+	outputPkScripts [][]byte) ([]input.Input, *weightEstimator) {
 
 	// We initialize a weight estimator so we can accurately asses the
 	// amount of fees we need to pay for this sweep transaction.
@@ -261,9 +258,7 @@ func getWeightEstimate(inputs []input.Input, outputs []*wire.TxOut,
 			weightEstimate.estimator.AddP2SHOutput()
 
 		default:
-			// Unknown script type.
-			return nil, nil, fmt.Errorf("unknown script "+
-				"type: %x", outputPkScript)
+			panic("unknown script type")
 		}
 	}
 
@@ -296,7 +291,7 @@ func getWeightEstimate(inputs []input.Input, outputs []*wire.TxOut,
 		sweepInputs = append(sweepInputs, inp)
 	}
 
-	return sweepInputs, weightEstimate, nil
+	return sweepInputs, weightEstimate
 }
 
 // inputSummary returns a string containing a human readable summary about the
