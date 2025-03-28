@@ -246,12 +246,9 @@ func calcSweepTxWeight(inputs []input.Input,
 	//
 	// TODO(yy): we should refactor the weight estimator to not require a
 	// fee rate and max fee rate and make it a pure tx weight calculator.
-	_, estimator, err := getWeightEstimate(
+	_, estimator := getWeightEstimate(
 		inputs, nil, feeRate, 0, outputPkScript,
 	)
-	if err != nil {
-		return 0, err
-	}
 
 	return estimator.weight(), nil
 }
@@ -1671,12 +1668,9 @@ func prepareSweepTx(inputs []input.Input, changePkScript lnwallet.AddrWithKey,
 	// Creating a weight estimator with nil outputs and zero max fee rate.
 	// We don't allow adding customized outputs in the sweeping tx, and the
 	// fee rate is already being managed before we get here.
-	inputs, estimator, err := getWeightEstimate(
+	inputs, estimator := getWeightEstimate(
 		inputs, nil, feeRate, 0, changePkScripts,
 	)
-	if err != nil {
-		return 0, noChange, noLocktime, err
-	}
 
 	txFee := estimator.fee()
 
