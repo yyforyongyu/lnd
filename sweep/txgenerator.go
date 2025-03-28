@@ -293,7 +293,7 @@ func getWeightEstimate(inputs []input.Input, outputs []*wire.TxOut,
 		sweepInputs = append(sweepInputs, inp)
 	}
 
-	return sweepInputs, weightEstimate, nil
+	return sweepInputs, weightEstimate
 }
 
 // inputSummary returns a string containing a human readable summary about the
