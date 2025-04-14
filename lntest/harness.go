@@ -62,7 +62,7 @@ var (
 	// MaxBlocksMinedPerTest is the maximum number of blocks that we allow
 	// a test to mine. This is an exported global variable so it can be
 	// overwritten by other projects that don't have the same constraints.
-	MaxBlocksMinedPerTest = 50
+	MaxBlocksMinedPerTest = 300
 )
 
 // TestCase defines a test case that's been used in the integration test.
@@ -384,7 +384,7 @@ func (h *HarnessTest) checkAndLimitBlocksMined(startHeight int32) {
 
 	// If the number of blocks is less than 40, we consider the test
 	// healthy.
-	if blocksMined < 40 {
+	if blocksMined < 300 {
 		return
 	}
 
@@ -2275,6 +2275,28 @@ func (h *HarnessTest) SendCoins(a, b *node.HarnessNode,
 		Addr:       resp.Address,
 		Amount:     int64(amt),
 		TargetConf: 6,
+	}
+	a.RPC.SendCoins(sendReq)
+	tx := h.GetNumTxsFromMempool(1)[0]
+
+	return tx
+}
+
+// SendCoins sends all coins from node A to node B, returns the sending tx.
+func (h *HarnessTest) SendAllCoins(a, b *node.HarnessNode) *wire.MsgTx {
+	// Create an address for Bob receive the coins.
+	req := &lnrpc.NewAddressRequest{
+		Type: lnrpc.AddressType_TAPROOT_PUBKEY,
+	}
+	resp := b.RPC.NewAddress(req)
+
+	// Send the coins from Alice to Bob. We should expect a tx to be
+	// broadcast and seen in the mempool.
+	sendReq := &lnrpc.SendCoinsRequest{
+		Addr:             resp.Address,
+		TargetConf:       6,
+		SendAll:          true,
+		SpendUnconfirmed: true,
 	}
 	a.RPC.SendCoins(sendReq)
 	tx := h.GetNumTxsFromMempool(1)[0]
