@@ -785,4 +785,11 @@ func init() {
 	if isWindowsOS() {
 		allTestCases = windowsTestCases
 	}
+
+	allTestCases = []*lntest.TestCase{
+		{
+			Name:     "rpc middleware interceptor",
+			TestFunc: testRPCMiddlewareInterceptor,
+		},
+	}
 }

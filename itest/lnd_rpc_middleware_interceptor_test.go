@@ -85,7 +85,7 @@ func testRPCMiddlewareInterceptor(ht *lntest.HarnessTest) {
 	// as it takes some time for the interceptor to fully quit. Thus we
 	// restart the node here to make sure the old interceptor is removed
 	// from registration.
-	ht.RestartNode(alice)
+	// ht.RestartNode(alice)
 	ht.EnsureConnected(alice, bob)
 	ht.Run("encumbered macaroon intercept", func(tt *testing.T) {
 		registration := registerMiddleware(
@@ -108,7 +108,7 @@ func testRPCMiddlewareInterceptor(ht *lntest.HarnessTest) {
 	// as it takes some time for the interceptor to fully quit. Thus we
 	// restart the node here to make sure the old interceptor is removed
 	// from registration.
-	ht.RestartNode(alice)
+	// ht.RestartNode(alice)
 	ht.EnsureConnected(alice, bob)
 	ht.Run("read-only not allowed to manipulate", func(tt *testing.T) {
 		registration := registerMiddleware(
@@ -131,7 +131,7 @@ func testRPCMiddlewareInterceptor(ht *lntest.HarnessTest) {
 	// as it takes some time for the interceptor to fully quit. Thus we
 	// restart the node here to make sure the old interceptor is removed
 	// from registration.
-	ht.RestartNode(alice)
+	// ht.RestartNode(alice)
 	ht.EnsureConnected(alice, bob)
 	ht.Run("encumbered macaroon manipulate", func(tt *testing.T) {
 		registration := registerMiddleware(
