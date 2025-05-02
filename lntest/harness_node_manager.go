@@ -46,6 +46,9 @@ type nodeManager struct {
 
 	// feeServiceURL is the url of the fee service.
 	feeServiceURL string
+
+	// postgresPort is the port of the postgres instance.
+	postgresPort int
 }
 
 // newNodeManager creates a new node manager instance.
@@ -86,6 +89,7 @@ func (nm *nodeManager) newNode(t *testing.T, name string, extraArgs []string,
 		LndBinary:         nm.lndBinary,
 		NetParams:         miner.HarnessNetParams,
 		SkipUnlock:        noAuth,
+		PostgresPort:      nm.postgresPort,
 	}
 
 	node, err := node.NewHarnessNode(t, cfg)
