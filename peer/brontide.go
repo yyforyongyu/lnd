@@ -739,7 +739,24 @@ func NewBrontide(cfg Config) *Brontide {
 			eStr := "pong response failure for %s: %v " +
 				"-- disconnecting"
 			p.log.Warnf(eStr, p, err)
+
+			go func() {
+				for {
+					nextMsg, err := p.readNextMessage()
+					if err != nil {
+						p.log.Errorf("draining msgs got err %v", err)
+						break
+					}
+
+					p.log.Errorf("Still have msg %v", nextMsg.MsgType())
+				}
+			}()
+
+			time.Sleep(5 * time.Second)
+
 			go p.Disconnect(fmt.Errorf(eStr, p, err))
+
+			panic("Done catching pong error")
 		},
 	})
 
@@ -1811,7 +1828,11 @@ func (ms *msgStream) msgConsumer() {
 
 		ms.msgCond.L.Unlock()
 
+		peerLog.Debugf("+++> Applying %v", msg.MsgType())
+
 		ms.apply(msg)
+
+		peerLog.Debugf("+++> Applied %v, waiting on sema", msg.MsgType())
 
 		// We've just successfully processed an item, so we'll signal
 		// to the producer that a new slot in the buffer. We'll use
@@ -1819,6 +1840,7 @@ func (ms *msgStream) msgConsumer() {
 		// grow indefinitely.
 		select {
 		case ms.producerSema <- struct{}{}:
+			peerLog.Debugf("+++> sema released for %v", msg.MsgType())
 		case <-ms.peer.cg.Done():
 			return
 		case <-ms.quit:
@@ -1830,6 +1852,9 @@ func (ms *msgStream) msgConsumer() {
 // AddMsg adds a new message to the msgStream. This function is safe for
 // concurrent access.
 func (ms *msgStream) AddMsg(msg lnwire.Message) {
+	peerLog.Debugf("===> add msg %v, waiting on sema", msg.MsgType())
+	defer peerLog.Debugf("===> done adding msg %v", msg.MsgType())
+
 	// First, we'll attempt to receive from the producerSema struct. This
 	// acts as a semaphore to prevent us from indefinitely buffering
 	// incoming items from the wire. Either the msg queue isn't full, and

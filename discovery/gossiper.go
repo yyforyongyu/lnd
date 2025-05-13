@@ -579,7 +579,7 @@ func New(cfg Config, selfKeyDesc *keychain.KeyDescriptor) *AuthenticatedGossiper
 		banman:                newBanman(),
 	}
 
-	gossiper.vb = NewValidationBarrier(1000, gossiper.quit)
+	gossiper.vb = NewValidationBarrier(10, gossiper.quit)
 
 	gossiper.syncMgr = newSyncManager(&SyncManagerCfg{
 		ChainHash:                cfg.ChainHash,
