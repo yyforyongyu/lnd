@@ -629,6 +629,11 @@ type Brontide struct {
 
 	// log is a peer-specific logging instance.
 	log btclog.Logger
+
+	// idleTimer is used to disconnect a stale connection. When there are no
+	// read/write after idleTimeout, the connection is considered stale and
+	// will be removed.
+	idleTimer *time.Timer
 }
 
 // A compile-time check to ensure that Brontide satisfies the lnpeer.Peer
@@ -889,6 +894,13 @@ func (p *Brontide) Start() error {
 	if err != nil {
 		return fmt.Errorf("could not start ping manager %w", err)
 	}
+
+	// Initialize a new idle timer to watch for read and write.
+	p.idleTimer = time.AfterFunc(idleTimeout, func() {
+		err := fmt.Errorf("peer %s no activity for %s -- disconnecting",
+			p, idleTimeout)
+		p.Disconnect(err)
+	})
 
 	p.cg.WgAdd(4)
 	go p.queueHandler()
@@ -1990,14 +2002,6 @@ func newDiscMsgStream(p *Brontide) *msgStream {
 func (p *Brontide) readHandler() {
 	defer p.cg.WgDone()
 
-	// We'll stop the timer after a new messages is received, and also
-	// reset it after we process the next message.
-	idleTimer := time.AfterFunc(idleTimeout, func() {
-		err := fmt.Errorf("peer %s no answer for %s -- disconnecting",
-			p, idleTimeout)
-		p.Disconnect(err)
-	})
-
 	// Initialize our negotiated gossip sync method before reading messages
 	// off the wire. When using gossip queries, this ensures a gossip
 	// syncer is active by the time query messages arrive.
@@ -2012,9 +2016,9 @@ func (p *Brontide) readHandler() {
 out:
 	for atomic.LoadInt32(&p.disconnect) == 0 {
 		nextMsg, err := p.readNextMessage()
-		if !idleTimer.Stop() {
+		if !p.idleTimer.Stop() {
 			select {
-			case <-idleTimer.C:
+			case <-p.idleTimer.C:
 			default:
 			}
 		}
@@ -2032,7 +2036,7 @@ out:
 			// compatible manner.
 			case *lnwire.UnknownMessage:
 				p.storeError(e)
-				idleTimer.Reset(idleTimeout)
+				p.idleTimer.Reset(idleTimeout)
 				continue
 
 			// If they sent us an address type that we don't yet
@@ -2041,7 +2045,7 @@ out:
 			// messages.
 			case *lnwire.ErrUnknownAddrType:
 				p.storeError(e)
-				idleTimer.Reset(idleTimeout)
+				p.idleTimer.Reset(idleTimeout)
 				continue
 
 			// If the NodeAnnouncement has an invalid alias, then
@@ -2050,7 +2054,7 @@ out:
 			// store this error because it is of little debugging
 			// value.
 			case *lnwire.ErrInvalidNodeAlias:
-				idleTimer.Reset(idleTimeout)
+				p.idleTimer.Reset(idleTimeout)
 				continue
 
 			// If the error we encountered wasn't just a message we
@@ -2204,7 +2208,7 @@ out:
 			p.sendLinkUpdateMsg(targetChan, nextMsg)
 		}
 
-		idleTimer.Reset(idleTimeout)
+		p.idleTimer.Reset(idleTimeout)
 	}
 
 	p.Disconnect(errors.New("read handler closed"))
@@ -2629,14 +2633,6 @@ func (p *Brontide) writeMessage(msg lnwire.Message) error {
 //
 // NOTE: This method MUST be run as a goroutine.
 func (p *Brontide) writeHandler() {
-	// We'll stop the timer after a new messages is sent, and also reset it
-	// after we process the next message.
-	idleTimer := time.AfterFunc(idleTimeout, func() {
-		err := fmt.Errorf("peer %s no write for %s -- disconnecting",
-			p, idleTimeout)
-		p.Disconnect(err)
-	})
-
 	var exitErr error
 
 out:
@@ -2673,13 +2669,13 @@ out:
 
 			// The write succeeded, reset the idle timer to prevent
 			// us from disconnecting the peer.
-			if !idleTimer.Stop() {
+			if !p.idleTimer.Stop() {
 				select {
-				case <-idleTimer.C:
+				case <-p.idleTimer.C:
 				default:
 				}
 			}
-			idleTimer.Reset(idleTimeout)
+			p.idleTimer.Reset(idleTimeout)
 
 			// Reset the ticker to delay sending the Ping. Since
 			// we've successfully wriiten a msg to the connection,
