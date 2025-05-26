@@ -342,6 +342,13 @@ func MainRPCServerPermissions() map[string][]bakery.Op {
 			Entity: "offchain",
 			Action: "write",
 		}},
+		"/lnrpc.Lightning/UpgradeChannel": {{
+			Entity: "onchain",
+			Action: "write",
+		}, {
+			Entity: "offchain",
+			Action: "write",
+		}},
 		"/lnrpc.Lightning/GetInfo": {{
 			Entity: "info",
 			Action: "read",
@@ -9242,4 +9249,77 @@ func (r *rpcServer) getChainSyncInfo() (*chainSyncInfo, error) {
 	}
 
 	return info, nil
+}
+
+func (r *rpcServer) UpgradeChannel(in *lnrpc.UpgradeChannelRequest,
+	updateStream lnrpc.Lightning_UpgradeChannelServer) error {
+
+	if !r.server.Started() {
+		return ErrServerNotActive
+	}
+
+	// Validate params.
+	//
+	// If the user didn't specify a channel point, then we'll reject this
+	// request all together.
+	if in.GetChannelPoint() == nil {
+		return fmt.Errorf("must specify channel point")
+	}
+
+	// TODO(yy): validate the rest of the params.
+
+	index := in.ChannelPoint.OutputIndex
+	txid, err := lnrpc.GetChanPointFundingTxid(in.GetChannelPoint())
+	if err != nil {
+		rpcsLog.Errorf("unable to get funding txid: %v", err)
+		return err
+	}
+
+	cp := wire.NewOutPoint(txid, index)
+	rpcsLog.Tracef("[upgradechannel] request for ChannelPoint(%v)", cp)
+
+	// TODO(yy): Validate the channel is active, move them into a method. We
+	// don't care whether the channel has active HTLCs or not as long as
+	// it's active, meaning, it must has an active link, not a pending
+	// channel from either closing or opening.
+	//
+	// Check the channel status flag here.
+	// channel, err := r.server.chanStateDB.FetchChannel(*cp)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// if channel.HasChanStatus(channeldb.ChanStatusRestored) ||
+	// 	channel.HasChanStatus(channeldb.ChanStatusLocalDataLoss) {
+	//
+	// 	return fmt.Errorf("cannot update channel with state: %v",
+	// 		channel.ChanStatus())
+	// }
+
+	chanID := lnwire.NewChanIDFromOutPoint(*cp)
+	respChan := r.server.htlcSwitch.UpgradeLink(chanID)
+
+	for {
+		select {
+		case resp := <-respChan:
+			rpcsLog.Errorf("[upgradechannel] received update for "+
+				"ChannelPoint(%v): %v", cp, resp)
+
+			upd := &lnrpc.UpgradeChannelResponse{
+				Status: resp.Status.String(),
+				Error:  resp.Err.Error(),
+			}
+
+			if err := updateStream.Send(upd); err != nil {
+				return err
+			}
+
+			if resp.Status.IsFinal() {
+				return nil
+			}
+
+		case <-r.quit:
+			return nil
+		}
+	}
 }
