@@ -262,6 +262,11 @@ service Lightning {
     */
     rpc AbandonChannel (AbandonChannelRequest) returns (AbandonChannelResponse);
 
+    // TODO(yy): add docs.
+    // TODO(yy): move channel-related RPCs into one file/subserver.
+    rpc UpgradeChannel (UpgradeChannelRequest)
+        returns (stream UpgradeChannelResponse);
+
     /* lncli: `sendpayment`
     Deprecated, use routerrpc.SendPaymentV2. SendPayment dispatches a
     bi-directional streaming RPC for sending payments through the Lightning
@@ -2187,6 +2192,49 @@ message InstantUpdate {
     // These HTLCs need to be resolved before the channel can be closed
     // cooperatively.
     int32 num_pending_htlcs = 1;
+}
+
+// TODO(yy): add docs.
+message UpgradeChannelRequest {
+    ChannelPoint channel_point = 1;
+
+    // The dust limit of the initiator's commitment tx.
+    optional uint64 dust_limit = 2;
+
+    // The maximum amount of coins in millisatoshis that can be pending in this
+    // channel.
+    optional uint64 max_value_in_flight = 3;
+
+    // The minimum amount of satoshis the initiator requires us to have at all
+    // times.
+    optional uint64 channel_reserve = 4;
+
+    // The smallest HTLC in millisatoshis that the initiator will accept.
+    optional uint64 min_htlc = 5;
+
+    /*
+    The number of blocks to use for the relative time lock in the
+    pay-to-self output of both commitment transactions.
+    */
+    optional uint32 csv_delay = 6;
+
+    // The total number of incoming HTLC's that the initiator will accept.
+    optional uint32 max_accepted_htlcs = 7;
+
+    // The commitment type used by this channel.
+    optional CommitmentType commitment_type = 8;
+
+    optional bytes extra_opaque_data = 9;
+}
+
+// Message for updating channel stream status.
+message UpgradeChannelResponse {
+    // Status of the channel stream
+    string status = 1;
+
+    // Optional: error message if status is FAILED
+    // This field should only be populated if the status indicates an error.
+    string error = 2;
 }
 
 message ReadyForPsbtFunding {
