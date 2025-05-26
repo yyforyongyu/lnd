@@ -1700,3 +1700,14 @@ func (c *Error) RandTestMessage(t *rapid.T) Message {
 
 	return msg
 }
+
+// RandTestMessage populates the message with random data suitable for testing.
+// It uses the rapid testing framework to generate random values.
+//
+// This is part of the TestMessage interface.
+//
+// TODO(yy): implement.
+func (d *DynCommit) RandTestMessage(t *rapid.T) Message {
+	msg := &DynCommit{}
+	return msg
+}
