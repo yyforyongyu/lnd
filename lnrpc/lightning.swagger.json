@@ -7795,6 +7795,20 @@
       ],
       "default": "UPDATE_FAILURE_UNKNOWN"
     },
+    "lnrpcUpgradeChannelResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "title": "Status of the channel stream"
+        },
+        "error": {
+          "type": "string",
+          "description": "Optional: error message if status is FAILED\nThis field should only be populated if the status indicates an error."
+        }
+      },
+      "description": "Message for updating channel stream status."
+    },
     "lnrpcUtxo": {
       "type": "object",
       "properties": {

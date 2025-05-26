@@ -185,6 +185,9 @@ type LightningClient interface {
 	// never broadcast. Only available for non-externally funded channels in dev
 	// build.
 	AbandonChannel(ctx context.Context, in *AbandonChannelRequest, opts ...grpc.CallOption) (*AbandonChannelResponse, error)
+	// TODO(yy): add docs.
+	// TODO(yy): move channel-related RPCs into one file/subserver.
+	UpgradeChannel(ctx context.Context, in *UpgradeChannelRequest, opts ...grpc.CallOption) (Lightning_UpgradeChannelClient, error)
 	// Deprecated: Do not use.
 	// lncli: `sendpayment`
 	// Deprecated, use routerrpc.SendPaymentV2. SendPayment dispatches a
@@ -829,9 +832,41 @@ func (c *lightningClient) AbandonChannel(ctx context.Context, in *AbandonChannel
 	return out, nil
 }
 
+func (c *lightningClient) UpgradeChannel(ctx context.Context, in *UpgradeChannelRequest, opts ...grpc.CallOption) (Lightning_UpgradeChannelClient, error) {
+	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[6], "/lnrpc.Lightning/UpgradeChannel", opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &lightningUpgradeChannelClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type Lightning_UpgradeChannelClient interface {
+	Recv() (*UpgradeChannelResponse, error)
+	grpc.ClientStream
+}
+
+type lightningUpgradeChannelClient struct {
+	grpc.ClientStream
+}
+
+func (x *lightningUpgradeChannelClient) Recv() (*UpgradeChannelResponse, error) {
+	m := new(UpgradeChannelResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // Deprecated: Do not use.
 func (c *lightningClient) SendPayment(ctx context.Context, opts ...grpc.CallOption) (Lightning_SendPaymentClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[6], "/lnrpc.Lightning/SendPayment", opts...)
+	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[7], "/lnrpc.Lightning/SendPayment", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -873,7 +908,7 @@ func (c *lightningClient) SendPaymentSync(ctx context.Context, in *SendRequest, 
 
 // Deprecated: Do not use.
 func (c *lightningClient) SendToRoute(ctx context.Context, opts ...grpc.CallOption) (Lightning_SendToRouteClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[7], "/lnrpc.Lightning/SendToRoute", opts...)
+	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[8], "/lnrpc.Lightning/SendToRoute", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -941,7 +976,7 @@ func (c *lightningClient) LookupInvoice(ctx context.Context, in *PaymentHash, op
 }
 
 func (c *lightningClient) SubscribeInvoices(ctx context.Context, in *InvoiceSubscription, opts ...grpc.CallOption) (Lightning_SubscribeInvoicesClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[8], "/lnrpc.Lightning/SubscribeInvoices", opts...)
+	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[9], "/lnrpc.Lightning/SubscribeInvoices", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1072,7 +1107,7 @@ func (c *lightningClient) StopDaemon(ctx context.Context, in *StopRequest, opts 
 }
 
 func (c *lightningClient) SubscribeChannelGraph(ctx context.Context, in *GraphTopologySubscription, opts ...grpc.CallOption) (Lightning_SubscribeChannelGraphClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[9], "/lnrpc.Lightning/SubscribeChannelGraph", opts...)
+	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[10], "/lnrpc.Lightning/SubscribeChannelGraph", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1176,7 +1211,7 @@ func (c *lightningClient) RestoreChannelBackups(ctx context.Context, in *Restore
 }
 
 func (c *lightningClient) SubscribeChannelBackups(ctx context.Context, in *ChannelBackupSubscription, opts ...grpc.CallOption) (Lightning_SubscribeChannelBackupsClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[10], "/lnrpc.Lightning/SubscribeChannelBackups", opts...)
+	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[11], "/lnrpc.Lightning/SubscribeChannelBackups", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1253,7 +1288,7 @@ func (c *lightningClient) CheckMacaroonPermissions(ctx context.Context, in *Chec
 }
 
 func (c *lightningClient) RegisterRPCMiddleware(ctx context.Context, opts ...grpc.CallOption) (Lightning_RegisterRPCMiddlewareClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[11], "/lnrpc.Lightning/RegisterRPCMiddleware", opts...)
+	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[12], "/lnrpc.Lightning/RegisterRPCMiddleware", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1293,7 +1328,7 @@ func (c *lightningClient) SendCustomMessage(ctx context.Context, in *SendCustomM
 }
 
 func (c *lightningClient) SubscribeCustomMessages(ctx context.Context, in *SubscribeCustomMessagesRequest, opts ...grpc.CallOption) (Lightning_SubscribeCustomMessagesClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[12], "/lnrpc.Lightning/SubscribeCustomMessages", opts...)
+	stream, err := c.cc.NewStream(ctx, &Lightning_ServiceDesc.Streams[13], "/lnrpc.Lightning/SubscribeCustomMessages", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1513,6 +1548,9 @@ type LightningServer interface {
 	// never broadcast. Only available for non-externally funded channels in dev
 	// build.
 	AbandonChannel(context.Context, *AbandonChannelRequest) (*AbandonChannelResponse, error)
+	// TODO(yy): add docs.
+	// TODO(yy): move channel-related RPCs into one file/subserver.
+	UpgradeChannel(*UpgradeChannelRequest, Lightning_UpgradeChannelServer) error
 	// Deprecated: Do not use.
 	// lncli: `sendpayment`
 	// Deprecated, use routerrpc.SendPaymentV2. SendPayment dispatches a
@@ -1842,6 +1880,9 @@ func (UnimplementedLightningServer) CloseChannel(*CloseChannelRequest, Lightning
 }
 func (UnimplementedLightningServer) AbandonChannel(context.Context, *AbandonChannelRequest) (*AbandonChannelResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AbandonChannel not implemented")
+}
+func (UnimplementedLightningServer) UpgradeChannel(*UpgradeChannelRequest, Lightning_UpgradeChannelServer) error {
+	return status.Errorf(codes.Unimplemented, "method UpgradeChannel not implemented")
 }
 func (UnimplementedLightningServer) SendPayment(Lightning_SendPaymentServer) error {
 	return status.Errorf(codes.Unimplemented, "method SendPayment not implemented")
@@ -2516,6 +2557,27 @@ func _Lightning_AbandonChannel_Handler(srv interface{}, ctx context.Context, dec
 		return srv.(LightningServer).AbandonChannel(ctx, req.(*AbandonChannelRequest))
 	}
 	return interceptor(ctx, in, info, handler)
+}
+
+func _Lightning_UpgradeChannel_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(UpgradeChannelRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LightningServer).UpgradeChannel(m, &lightningUpgradeChannelServer{stream})
+}
+
+type Lightning_UpgradeChannelServer interface {
+	Send(*UpgradeChannelResponse) error
+	grpc.ServerStream
+}
+
+type lightningUpgradeChannelServer struct {
+	grpc.ServerStream
+}
+
+func (x *lightningUpgradeChannelServer) Send(m *UpgradeChannelResponse) error {
+	return x.ServerStream.SendMsg(m)
 }
 
 func _Lightning_SendPayment_Handler(srv interface{}, stream grpc.ServerStream) error {
@@ -3514,6 +3576,11 @@ var Lightning_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "CloseChannel",
 			Handler:       _Lightning_CloseChannel_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "UpgradeChannel",
+			Handler:       _Lightning_UpgradeChannel_Handler,
 			ServerStreams: true,
 		},
 		{
