@@ -183,6 +183,11 @@ type ChannelUpdateHandler interface {
 	// quiescence is a holdover until we have downstream protocols that use
 	// it.
 	InitStfu() <-chan fn.Result[lntypes.ChannelParty]
+
+	// IsQuiescent returns true if the state machine has been driven all the
+	// way to completion. If this returns true, processes that depend on
+	// channel quiescence may proceed.
+	IsQuiescent() bool
 }
 
 // CommitHookID is a value that is used to uniquely identify hooks in the

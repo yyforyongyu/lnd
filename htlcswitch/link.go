@@ -4573,3 +4573,10 @@ func (l *channelLink) CommitmentCustomBlob() fn.Option[tlv.Blob] {
 
 	return l.channel.LocalCommitmentBlob()
 }
+
+// IsQuiescent returns true if the state machine has been driven all the way to
+// completion. If this returns true, processes that depend on channel quiescence
+// may proceed.
+func (l *channelLink) IsQuiescent() bool {
+	return l.quiescer.IsQuiescent()
+}
