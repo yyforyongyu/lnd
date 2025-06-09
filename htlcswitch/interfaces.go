@@ -190,6 +190,10 @@ type ChannelUpdateHandler interface {
 	IsQuiescent() bool
 }
 
+type ChannelUpgradeHandler interface {
+	Upgrade(r UpgradeLinkRequest) <-chan UpgradeLinkResponse
+}
+
 // CommitHookID is a value that is used to uniquely identify hooks in the
 // ChannelUpdateHandler's commitment update lifecycle. You should never need to
 // construct one of these by hand, nor should you try.
@@ -252,6 +256,8 @@ type ChannelLink interface {
 
 	// Embed the ChannelUpdateHandler interface.
 	ChannelUpdateHandler
+
+	ChannelUpgradeHandler
 
 	// Embed the dustHandler interface.
 	dustHandler

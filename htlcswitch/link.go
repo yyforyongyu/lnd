@@ -411,6 +411,8 @@ type channelLink struct {
 	// the result.
 	quiescenceReqs chan StfuReq
 
+	upgradeReqs chan dynReq
+
 	// cg is a helper that encapsulates a wait group and quit channel and
 	// allows contexts that either block or cancel on those depending on
 	// the use case.
@@ -508,6 +510,9 @@ func NewChannelLink(cfg ChannelLinkConfig,
 	quiescenceReqs := make(
 		chan fn.Req[fn.Unit, fn.Result[lntypes.ChannelParty]], 1,
 	)
+	upgradeReqs := make(
+		chan fn.Req[UpgradeLinkRequest, UpgradeLinkResponse], 1,
+	)
 
 	return &channelLink{
 		cfg:                 cfg,
@@ -520,6 +525,7 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		incomingCommitHooks: newHookMap(),
 		quiescer:            qsm,
 		quiescenceReqs:      quiescenceReqs,
+		upgradeReqs:         upgradeReqs,
 		cg:                  fn.NewContextGuard(),
 	}
 }
@@ -1548,6 +1554,9 @@ func (l *channelLink) htlcManager(ctx context.Context) {
 					qReq.Resolve(res)
 				}
 			}
+
+		case req := <-l.upgradeReqs:
+			l.handleUpgradeReq(req)
 
 		case <-l.cg.Done():
 			return
@@ -4579,4 +4588,138 @@ func (l *channelLink) CommitmentCustomBlob() fn.Option[tlv.Blob] {
 // may proceed.
 func (l *channelLink) IsQuiescent() bool {
 	return l.quiescer.IsQuiescent()
+}
+
+type UpdateLinkStatus uint8
+
+const (
+	UpdateLinkStatusInitialized UpdateLinkStatus = iota
+
+	UpdateLinkStatusPending
+	UpdateLinkStatusSucceeded
+	UpdateLinkStatusFailed
+)
+
+func (u UpdateLinkStatus) IsFinal() bool {
+	if u == UpdateLinkStatusFailed || u == UpdateLinkStatusSucceeded {
+		return true
+	}
+
+	return false
+}
+
+func (u UpdateLinkStatus) String() string {
+	switch u {
+	case UpdateLinkStatusInitialized:
+		return "Initialized"
+
+	case UpdateLinkStatusPending:
+		return "Pending"
+
+	case UpdateLinkStatusSucceeded:
+		return "Succeeded"
+
+	case UpdateLinkStatusFailed:
+		return "Failed"
+
+	default:
+		return "Unknown"
+	}
+}
+
+type dynReq = fn.Req[UpgradeLinkRequest, UpgradeLinkResponse]
+
+type UpgradeLinkRequest struct {
+	ChanID lnwire.ChannelID
+
+	// DustLimit is the threshold (in satoshis) below which any outputs
+	// should be trimmed. When an output is trimmed, it isn't materialized
+	// as an actual output, but is instead burned to miner's fees.
+	DustLimit fn.Option[btcutil.Amount]
+
+	// MaxPendingAmount is the maximum pending HTLC value that the
+	// owner of these constraints can offer the remote node at a
+	// particular time.
+	MaxPendingAmount fn.Option[lnwire.MilliSatoshi]
+
+	// ChanReserve is an absolute reservation on the channel for the
+	// owner of this set of constraints. This means that the current
+	// settled balance for this node CANNOT dip below the reservation
+	// amount. This acts as a defense against costless attacks when
+	// either side no longer has any skin in the game.
+	ChanReserve fn.Option[btcutil.Amount]
+
+	// MinHTLC is the minimum HTLC value that the owner of these
+	// constraints can offer the remote node. If any HTLCs below this
+	// amount are offered, then the HTLC will be rejected. This, in
+	// tandem with the dust limit allows a node to regulate the
+	// smallest HTLC that it deems economically relevant.
+	MinHTLC fn.Option[lnwire.MilliSatoshi]
+
+	// CsvDelay is the relative time lock delay expressed in blocks. Any
+	// settled outputs that pay to the owner of this channel configuration
+	// MUST ensure that the delay branch uses this value as the relative
+	// time lock. Similarly, any HTLC's offered by this node should use
+	// this value as well.
+	CsvDelay fn.Option[uint16]
+
+	// MaxAcceptedHtlcs is the maximum number of HTLCs that the owner of
+	// this set of constraints can offer the remote node. This allows each
+	// node to limit their over all exposure to HTLCs that may need to be
+	// acted upon in the case of a unilateral channel closure or a contract
+	// breach.
+	MaxAcceptedHtlcs fn.Option[uint16]
+
+	// ChannelType represents a specific channel type as a set of feature
+	// bits that comprise it.
+	ChanType fn.Option[lnwire.ChannelType]
+}
+
+type UpgradeLinkResponse struct {
+	Err    error
+	Status UpdateLinkStatus
+}
+
+func (l *channelLink) Upgrade(r UpgradeLinkRequest) <-chan UpgradeLinkResponse {
+	req, respChan := fn.NewReq[UpgradeLinkRequest, UpgradeLinkResponse](r)
+
+	resp := UpgradeLinkResponse{
+		Status: UpdateLinkStatusInitialized,
+	}
+
+	select {
+	case l.upgradeReqs <- req:
+		req.Resolve(resp)
+
+	case <-l.cg.Done():
+	}
+
+	return respChan
+}
+
+func (l *channelLink) handleUpgradeReq(req dynReq) {
+	// If the channel is not quiescent yet, we need to start the stfu flow
+	// here.
+	if !l.quiescer.IsQuiescent() {
+		l.log.Infof("Starting the stfu flow...")
+
+		l.waitUntilQuiescent()
+	}
+
+	// The channel is in quiescence, we can now proceed the request to the
+	// link upgrader.
+}
+
+func (l *channelLink) waitUntilQuiescent() {
+	// Start the quiescence flow.
+	respChan := l.InitStfu()
+
+	// Block until the channel becomes quiescent.
+	select {
+	case resp := <-respChan:
+		l.log.Infof("Channel is now quiescent: %v", resp)
+
+	case <-l.cg.Done():
+		l.log.Debugf("Link shutting down")
+	}
 }

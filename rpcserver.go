@@ -9251,6 +9251,93 @@ func (r *rpcServer) getChainSyncInfo() (*chainSyncInfo, error) {
 	return info, nil
 }
 
+func validateUpgradeChannelRequest(
+	req *lnrpc.UpgradeChannelRequest) (htlcswitch.UpgradeLinkRequest,
+	error) {
+
+	var upgradeReq htlcswitch.UpgradeLinkRequest
+
+	// Validate params.
+	//
+	// If the user didn't specify a channel point, then we'll reject this
+	// request all together.
+	if req.GetChannelPoint() == nil {
+		return upgradeReq, fmt.Errorf("must specify channel point")
+	}
+
+	// TODO(yy): validate the rest of the params.
+	index := req.ChannelPoint.OutputIndex
+	txid, err := lnrpc.GetChanPointFundingTxid(req.GetChannelPoint())
+	if err != nil {
+		rpcsLog.Errorf("unable to get funding txid: %v", err)
+		return upgradeReq, err
+	}
+
+	cp := wire.NewOutPoint(txid, index)
+	chanID := lnwire.NewChanIDFromOutPoint(*cp)
+	upgradeReq.ChanID = chanID
+
+	// TODO(yy): assert at least one field is set to reject empty request.
+	if req.GetCommitmentType() !=
+		lnrpc.CommitmentType_UNKNOWN_COMMITMENT_TYPE {
+
+		// TODO(yy): need to determine the existing channel flags and
+		// configs.
+		//
+		// TODO(yy): allow convert from public to private channel? Or
+		// private to public channel?
+		convertReq := convertCommitmentTypeReq{
+			commitmentType: *req.CommitmentType,
+
+			// TODO(yy): find the actual values.
+			private:   false,
+			zeroConf:  false,
+			scidAlias: false,
+		}
+
+		ct, err := commitmentTypeToChanType(convertReq)
+		if err != nil {
+			return upgradeReq, err
+		}
+
+		upgradeReq.ChanType = fn.Some(ct)
+	}
+
+	// TODO(yy): it seems it's unnecessary to make these fields optional as
+	// zero values are not valid anyway - we can use zero values to signal
+	// that the user doesn't want to change these fields.
+	//
+	// TODO(yy): check the values are sane.
+	if amt := req.GetDustLimit(); amt != 0 {
+		upgradeReq.DustLimit = fn.Some(btcutil.Amount(amt))
+	}
+
+	if v := req.GetMaxValueInFlight(); v != 0 {
+		maxValue := lnwire.MilliSatoshi(v)
+		upgradeReq.MaxPendingAmount = fn.Some(maxValue)
+	}
+
+	if v := req.GetChannelReserve(); v != 0 {
+		upgradeReq.ChanReserve = fn.Some(btcutil.Amount(v))
+
+	}
+
+	if v := req.GetMinHtlc(); v != 0 {
+		minValue := lnwire.MilliSatoshi(v)
+		upgradeReq.MinHTLC = fn.Some(minValue)
+	}
+
+	if v := req.GetCsvDelay(); v != 0 {
+		upgradeReq.CsvDelay = fn.Some(uint16(v))
+	}
+
+	if v := req.GetMaxAcceptedHtlcs(); v != 0 {
+		upgradeReq.MaxAcceptedHtlcs = fn.Some(uint16(v))
+	}
+
+	return upgradeReq, nil
+}
+
 func (r *rpcServer) UpgradeChannel(in *lnrpc.UpgradeChannelRequest,
 	updateStream lnrpc.Lightning_UpgradeChannelServer) error {
 
@@ -9258,25 +9345,15 @@ func (r *rpcServer) UpgradeChannel(in *lnrpc.UpgradeChannelRequest,
 		return ErrServerNotActive
 	}
 
+	// Check feature bits.
+
 	// Validate params.
-	//
-	// If the user didn't specify a channel point, then we'll reject this
-	// request all together.
-	if in.GetChannelPoint() == nil {
-		return fmt.Errorf("must specify channel point")
-	}
-
-	// TODO(yy): validate the rest of the params.
-
-	index := in.ChannelPoint.OutputIndex
-	txid, err := lnrpc.GetChanPointFundingTxid(in.GetChannelPoint())
+	req, err := validateUpgradeChannelRequest(in)
 	if err != nil {
-		rpcsLog.Errorf("unable to get funding txid: %v", err)
 		return err
 	}
 
-	cp := wire.NewOutPoint(txid, index)
-	rpcsLog.Tracef("[upgradechannel] request for ChannelPoint(%v)", cp)
+	rpcsLog.Tracef("[upgradechannel] request for channel(%v)", req.ChanID)
 
 	// TODO(yy): Validate the channel is active, move them into a method. We
 	// don't care whether the channel has active HTLCs or not as long as
@@ -9296,14 +9373,16 @@ func (r *rpcServer) UpgradeChannel(in *lnrpc.UpgradeChannelRequest,
 	// 		channel.ChanStatus())
 	// }
 
-	chanID := lnwire.NewChanIDFromOutPoint(*cp)
-	respChan := r.server.htlcSwitch.UpgradeLink(chanID)
+	respChan, err := r.server.htlcSwitch.UpgradeLink(req)
+	if err != nil {
+		return err
+	}
 
 	for {
 		select {
 		case resp := <-respChan:
 			rpcsLog.Errorf("[upgradechannel] received update for "+
-				"ChannelPoint(%v): %v", cp, resp)
+				"channel(%v): %v", req.ChanID, resp)
 
 			upd := &lnrpc.UpgradeChannelResponse{
 				Status: resp.Status.String(),
