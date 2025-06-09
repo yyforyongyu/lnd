@@ -2,6 +2,7 @@ package htlcswitch
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/btcsuite/btclog/v2"
 	"github.com/lightningnetwork/lnd/fn/v2"
@@ -51,6 +52,8 @@ func (u upgraderStatus) canAcceptReq() bool {
 }
 
 type DynUpgrader struct {
+	wg sync.WaitGroup
+
 	// log is a link-specific logging instance.
 	log btclog.Logger
 
@@ -76,10 +79,16 @@ func NewDynUpgrader(logger btclog.Logger) *DynUpgrader {
 
 func (d *DynUpgrader) Start() {
 	d.status = upgraderStatusReady
+
+	d.wg.Add(1)
+	go d.mainLoop()
 }
 
 func (d *DynUpgrader) Stop() {
 	d.status = upgraderStatusStopped
+
+	close(d.quit)
+	d.wg.Wait()
 }
 
 func (d *DynUpgrader) InitDyn(r dynReq) {
@@ -88,6 +97,7 @@ func (d *DynUpgrader) InitDyn(r dynReq) {
 	if !d.status.canAcceptReq() {
 		err := fmt.Errorf("upgrade now allow due to status(%v)",
 			d.status)
+
 		resp := UpgradeLinkResponse{
 			Status: UpdateLinkStatusFailed,
 			Err:    err,
@@ -105,4 +115,21 @@ func (d *DynUpgrader) InitDyn(r dynReq) {
 
 	// Send the request to the internal loop.
 	fn.SendOrQuit(d.upgradeReqs, r, d.quit)
+}
+
+func (d *DynUpgrader) mainLoop() {
+	defer d.wg.Done()
+
+	for {
+		select {
+		case <-d.quit:
+			d.log.Debugf("DynUpgrader shutting down...")
+
+		case req := <-d.upgradeReqs:
+			d.handleUpgradeReq(req)
+		}
+	}
+}
+
+func (d *DynUpgrader) handleUpgradeReq(req dynReq) {
 }
