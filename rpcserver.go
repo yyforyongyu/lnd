@@ -2044,6 +2044,132 @@ func (r *rpcServer) canOpenChannel() error {
 	return nil
 }
 
+// convertCommitmentTypeReq is a helper struct to wrap the params needed to
+// convert a commitmentType to lnwire.ChannelType.
+type convertCommitmentTypeReq struct {
+	// commitmentType is the commitment type that we want to convert into a
+	// wire ChannelType.
+	commitmentType lnrpc.CommitmentType
+
+	// private specifies whether this is a private channel or not.
+	private bool
+
+	// zeroConf specifies whether this is a zero-conf channel.
+	zeroConf bool
+
+	// scidAlias specifies whether this channel supports scid alias.
+	scidAlias bool
+}
+
+// commitmentTypeToChanType take a commitment type and converts it to a wire
+// channel type.
+func commitmentTypeToChanType(r convertCommitmentTypeReq) (
+	lnwire.ChannelType, error) {
+
+	var ct lnwire.ChannelType
+
+	switch r.commitmentType {
+	case lnrpc.CommitmentType_UNKNOWN_COMMITMENT_TYPE:
+		if r.zeroConf {
+			return ct, fmt.Errorf("use anchors for zero-conf")
+		}
+
+	case lnrpc.CommitmentType_LEGACY:
+		ct = lnwire.ChannelType(*lnwire.NewRawFeatureVector())
+
+	case lnrpc.CommitmentType_STATIC_REMOTE_KEY:
+		ct = lnwire.ChannelType(*lnwire.NewRawFeatureVector(
+			lnwire.StaticRemoteKeyRequired,
+		))
+
+	case lnrpc.CommitmentType_ANCHORS:
+		fv := lnwire.NewRawFeatureVector(
+			lnwire.StaticRemoteKeyRequired,
+			lnwire.AnchorsZeroFeeHtlcTxRequired,
+		)
+
+		if r.zeroConf {
+			fv.Set(lnwire.ZeroConfRequired)
+		}
+
+		if r.scidAlias {
+			fv.Set(lnwire.ScidAliasRequired)
+		}
+
+		ct = lnwire.ChannelType(*fv)
+
+	case lnrpc.CommitmentType_SCRIPT_ENFORCED_LEASE:
+		fv := lnwire.NewRawFeatureVector(
+			lnwire.StaticRemoteKeyRequired,
+			lnwire.AnchorsZeroFeeHtlcTxRequired,
+			lnwire.ScriptEnforcedLeaseRequired,
+		)
+
+		if r.zeroConf {
+			fv.Set(lnwire.ZeroConfRequired)
+		}
+
+		if r.scidAlias {
+			fv.Set(lnwire.ScidAliasRequired)
+		}
+
+		ct = lnwire.ChannelType(*fv)
+
+	case lnrpc.CommitmentType_SIMPLE_TAPROOT:
+		// If the taproot channel type is being set, then the channel
+		// MUST be private (unadvertised) for now.
+		if !r.private {
+			return ct, fmt.Errorf("taproot channels must be " +
+				"private")
+		}
+
+		fv := lnwire.NewRawFeatureVector(
+			lnwire.SimpleTaprootChannelsRequiredStaging,
+		)
+
+		// TODO(roasbeef): no need for the rest as they're now
+		// implicit?
+
+		if r.zeroConf {
+			fv.Set(lnwire.ZeroConfRequired)
+		}
+
+		if r.scidAlias {
+			fv.Set(lnwire.ScidAliasRequired)
+		}
+
+		ct = lnwire.ChannelType(*fv)
+
+	case lnrpc.CommitmentType_SIMPLE_TAPROOT_OVERLAY:
+		// If the taproot overlay channel type is being set, then the
+		// channel MUST be private.
+		if !r.private {
+			return ct, fmt.Errorf("taproot overlay channels " +
+				"must be private")
+		}
+
+		fv := lnwire.NewRawFeatureVector(
+			lnwire.SimpleTaprootOverlayChansRequired,
+		)
+
+		if r.zeroConf {
+			fv.Set(lnwire.ZeroConfRequired)
+		}
+
+		if r.scidAlias {
+			fv.Set(lnwire.ScidAliasRequired)
+		}
+
+		ct = lnwire.ChannelType(*fv)
+
+	default:
+		return ct, fmt.Errorf("unhandled request channel type %v",
+			r.commitmentType)
+	}
+
+	return ct, nil
+}
+
 // parseOpenChannelReq parses an OpenChannelRequest message into an InitFundingMsg
 // struct. The logic is abstracted so that it can be shared between OpenChannel
 // and OpenChannelSync.
@@ -2244,110 +2370,14 @@ func (r *rpcServer) parseOpenChannelReq(in *lnrpc.OpenChannelRequest,
 			err)
 	}
 
-	var channelType *lnwire.ChannelType
-	switch in.CommitmentType {
-	case lnrpc.CommitmentType_UNKNOWN_COMMITMENT_TYPE:
-		if in.ZeroConf {
-			return nil, fmt.Errorf("use anchors for zero-conf")
-		}
-
-	case lnrpc.CommitmentType_LEGACY:
-		channelType = new(lnwire.ChannelType)
-		*channelType = lnwire.ChannelType(*lnwire.NewRawFeatureVector())
-
-	case lnrpc.CommitmentType_STATIC_REMOTE_KEY:
-		channelType = new(lnwire.ChannelType)
-		*channelType = lnwire.ChannelType(*lnwire.NewRawFeatureVector(
-			lnwire.StaticRemoteKeyRequired,
-		))
-
-	case lnrpc.CommitmentType_ANCHORS:
-		channelType = new(lnwire.ChannelType)
-		fv := lnwire.NewRawFeatureVector(
-			lnwire.StaticRemoteKeyRequired,
-			lnwire.AnchorsZeroFeeHtlcTxRequired,
-		)
-
-		if in.ZeroConf {
-			fv.Set(lnwire.ZeroConfRequired)
-		}
-
-		if in.ScidAlias {
-			fv.Set(lnwire.ScidAliasRequired)
-		}
-
-		*channelType = lnwire.ChannelType(*fv)
-
-	case lnrpc.CommitmentType_SCRIPT_ENFORCED_LEASE:
-		channelType = new(lnwire.ChannelType)
-		fv := lnwire.NewRawFeatureVector(
-			lnwire.StaticRemoteKeyRequired,
-			lnwire.AnchorsZeroFeeHtlcTxRequired,
-			lnwire.ScriptEnforcedLeaseRequired,
-		)
-
-		if in.ZeroConf {
-			fv.Set(lnwire.ZeroConfRequired)
-		}
-
-		if in.ScidAlias {
-			fv.Set(lnwire.ScidAliasRequired)
-		}
-
-		*channelType = lnwire.ChannelType(*fv)
-
-	case lnrpc.CommitmentType_SIMPLE_TAPROOT:
-		// If the taproot channel type is being set, then the channel
-		// MUST be private (unadvertised) for now.
-		if !in.Private {
-			return nil, fmt.Errorf("taproot channels must be " +
-				"private")
-		}
-
-		channelType = new(lnwire.ChannelType)
-		fv := lnwire.NewRawFeatureVector(
-			lnwire.SimpleTaprootChannelsRequiredStaging,
-		)
-
-		// TODO(roasbeef): no need for the rest as they're now
-		// implicit?
-
-		if in.ZeroConf {
-			fv.Set(lnwire.ZeroConfRequired)
-		}
-
-		if in.ScidAlias {
-			fv.Set(lnwire.ScidAliasRequired)
-		}
-
-		*channelType = lnwire.ChannelType(*fv)
-
-	case lnrpc.CommitmentType_SIMPLE_TAPROOT_OVERLAY:
-		// If the taproot overlay channel type is being set, then the
-		// channel MUST be private.
-		if !in.Private {
-			return nil, fmt.Errorf("taproot overlay channels " +
-				"must be private")
-		}
-
-		channelType = new(lnwire.ChannelType)
-		fv := lnwire.NewRawFeatureVector(
-			lnwire.SimpleTaprootOverlayChansRequired,
-		)
-
-		if in.ZeroConf {
-			fv.Set(lnwire.ZeroConfRequired)
-		}
-
-		if in.ScidAlias {
-			fv.Set(lnwire.ScidAliasRequired)
-		}
-
-		*channelType = lnwire.ChannelType(*fv)
-
-	default:
-		return nil, fmt.Errorf("unhandled request channel type %v",
-			in.CommitmentType)
+	channelType, err := commitmentTypeToChanType(convertCommitmentTypeReq{
+		commitmentType: in.CommitmentType,
+		private:        in.Private,
+		zeroConf:       in.ZeroConf,
+		scidAlias:      in.ScidAlias,
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	// We limit the channel memo to be 500 characters long. This enforces
@@ -2390,7 +2420,7 @@ func (r *rpcServer) parseOpenChannelReq(in *lnrpc.OpenChannelRequest,
 		MaxValueInFlight:  maxValue,
 		MaxHtlcs:          maxHtlcs,
 		MaxLocalCsv:       uint16(in.MaxLocalCsv),
-		ChannelType:       channelType,
+		ChannelType:       &channelType,
 		FundUpToMaxAmt:    fundUpToMaxAmt,
 		MinFundAmt:        minFundAmt,
 		Memo:              []byte(in.Memo),
