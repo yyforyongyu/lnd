@@ -3189,77 +3189,18 @@ func (s *Switch) handlePacketFail(packet *htlcPacket,
 	return s.mailOrchestrator.Deliver(packet.incomingChanID, packet)
 }
 
-type UpdateLinkStatus uint8
+func (s *Switch) UpgradeLink(req UpgradeLinkRequest) (
+	<-chan UpgradeLinkResponse, error) {
 
-const (
-	UpdateLinkStatusInitialized UpdateLinkStatus = iota
-
-	UpdateLinkStatusPending
-	UpdateLinkStatusSucceeded
-	UpdateLinkStatusFailed
-)
-
-func (u UpdateLinkStatus) IsFinal() bool {
-	if u == UpdateLinkStatusFailed || u == UpdateLinkStatusSucceeded {
-		return true
-	}
-
-	return false
-}
-
-func (u UpdateLinkStatus) String() string {
-	switch u {
-	case UpdateLinkStatusInitialized:
-		return "Initialized"
-
-	case UpdateLinkStatusPending:
-		return "Pending"
-
-	case UpdateLinkStatusSucceeded:
-		return "Succeeded"
-
-	case UpdateLinkStatusFailed:
-		return "Failed"
-
-	default:
-		return "Unknown"
-	}
-}
-
-type UpgradeLinkRequest struct {
-	ChanID lnwire.ChannelID
-
-	ChanType fn.Option[channeldb.ChannelType]
-
-	ChanConfig fn.Option[channeldb.ChannelStateBounds]
-
-	CommitmentConfig fn.Option[channeldb.CommitmentParams]
-}
-
-type UpgradeLinkResponse struct {
-	Err    error
-	Status UpdateLinkStatus
-}
-
-func (s *Switch) UpgradeLink(chanID lnwire.ChannelID) chan *UpgradeLinkResponse {
 	s.indexMtx.RLock()
 	defer s.indexMtx.RUnlock()
 
-	resp := &UpgradeLinkResponse{
-		Status: UpdateLinkStatusInitialized,
-	}
-
-	respChan := make(chan *UpgradeLinkResponse, 1)
-
-	_, err := s.getLink(chanID)
+	link, err := s.getLink(req.ChanID)
 	if err != nil {
-		resp.Err = err
-		resp.Status = UpdateLinkStatusFailed
-
-		respChan <- resp
-
-		return respChan
+		return nil, err
 	}
 
-	return respChan
+	respChan := link.Upgrade(req)
+
+	return respChan, nil
 }
