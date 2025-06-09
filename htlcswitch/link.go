@@ -413,6 +413,8 @@ type channelLink struct {
 
 	upgradeReqs chan dynReq
 
+	dynUpgrader Upgrader
+
 	// cg is a helper that encapsulates a wait group and quit channel and
 	// allows contexts that either block or cancel on those depending on
 	// the use case.
@@ -507,6 +509,10 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		qsm = &quiescerNoop{}
 	}
 
+	// TODO(yy): build its own logger instead?
+	logger := log.WithPrefix(logPrefix)
+	upgrader := NewDynUpgrader(logger)
+
 	quiescenceReqs := make(
 		chan fn.Req[fn.Unit, fn.Result[lntypes.ChannelParty]], 1,
 	)
@@ -519,7 +525,7 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		channel:             channel,
 		hodlMap:             make(map[models.CircuitKey]hodlHtlc),
 		hodlQueue:           queue.NewConcurrentQueue(10),
-		log:                 log.WithPrefix(logPrefix),
+		log:                 logger,
 		flushHooks:          newHookMap(),
 		outgoingCommitHooks: newHookMap(),
 		incomingCommitHooks: newHookMap(),
@@ -527,6 +533,7 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		quiescenceReqs:      quiescenceReqs,
 		upgradeReqs:         upgradeReqs,
 		cg:                  fn.NewContextGuard(),
+		dynUpgrader:         upgrader,
 	}
 }
 
@@ -605,6 +612,8 @@ func (l *channelLink) Start() error {
 
 	l.updateFeeTimer = time.NewTimer(l.randomFeeUpdateTimeout())
 
+	l.dynUpgrader.Start()
+
 	l.cg.WgAdd(1)
 	go l.htlcManager(context.TODO())
 
@@ -644,6 +653,8 @@ func (l *channelLink) Stop() {
 	if l.hodlQueue != nil {
 		l.hodlQueue.Stop()
 	}
+
+	l.dynUpgrader.Stop()
 
 	l.cg.Quit()
 	l.cg.WgWait()
@@ -4701,13 +4712,18 @@ func (l *channelLink) handleUpgradeReq(req dynReq) {
 	// If the channel is not quiescent yet, we need to start the stfu flow
 	// here.
 	if !l.quiescer.IsQuiescent() {
+		// TODO(yy): return more statuses here?
 		l.log.Infof("Starting the stfu flow...")
 
 		l.waitUntilQuiescent()
 	}
 
+	// TODO: log params.
+	l.log.Infof("Starting the dynamic commitment upgrade...")
+
 	// The channel is in quiescence, we can now proceed the request to the
 	// link upgrader.
+	l.dynUpgrader.InitDyn(req)
 }
 
 func (l *channelLink) waitUntilQuiescent() {
