@@ -4699,7 +4699,9 @@ func (l *channelLink) handleUpgradeReq(req dynReq) {
 
 	// The channel is in quiescence, we can now proceed the request to the
 	// link upgrader.
-	l.dynUpgrader.InitDyn(req)
+	//
+	// TODO: redesign this.
+	l.dynUpgrader.InitDyn(req, l)
 }
 
 func (l *channelLink) waitUntilQuiescent() {

@@ -17,19 +17,31 @@ type DynPropose struct {
 
 	// DustLimit, if not nil, proposes a change to the dust_limit_satoshis
 	// for the sender's commitment transaction.
+	//
+	// TODO: use big size instead.
 	DustLimit tlv.OptionalRecordT[tlv.TlvType0, btcutil.Amount]
+	// DustLimit tlv.OptionalRecordT[tlv.TlvType0, tlv.BigSizeT[btcutil.Amount]]
 
 	// MaxValueInFlight, if not nil, proposes a change to the
 	// max_htlc_value_in_flight_msat limit of the sender.
+	//
+	// TODO: use big size instead.
 	MaxValueInFlight tlv.OptionalRecordT[tlv.TlvType2, MilliSatoshi]
+	// MaxValueInFlight tlv.OptionalRecordT[tlv.TlvType2, tlv.BigSizeT[MilliSatoshi]]
 
 	// HtlcMinimum, if not nil, proposes a change to the htlc_minimum_msat
 	// floor of the sender.
+	//
+	// TODO: use big size instead.
 	HtlcMinimum tlv.OptionalRecordT[tlv.TlvType4, MilliSatoshi]
+	// HtlcMinimum tlv.OptionalRecordT[tlv.TlvType4, tlv.BigSizeT[MilliSatoshi]]
 
 	// ChannelReserve, if not nil, proposes a change to the
 	// channel_reserve_satoshis requirement of the recipient.
+	//
+	// TODO: use big size instead.
 	ChannelReserve tlv.OptionalRecordT[tlv.TlvType6, btcutil.Amount]
+	// ChannelReserve tlv.OptionalRecordT[tlv.TlvType6, tlv.BigSizeT[btcutil.Amount]]
 
 	// CsvDelay, if not nil, proposes a change to the to_self_delay
 	// requirement of the recipient.
