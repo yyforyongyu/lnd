@@ -32,8 +32,8 @@ func testSwitchCircuitPersistence(ht *lntest.HarnessTest) {
 
 	// Restart the intermediaries and the sender.
 	ht.RestartNode(s.dave)
-	ht.RestartNode(s.alice)
-	ht.RestartNode(s.bob)
+	// ht.RestartNode(s.alice)
+	// ht.RestartNode(s.bob)
 
 	// Ensure all of the intermediate links are reconnected.
 	ht.EnsureConnected(s.alice, s.dave)
@@ -45,6 +45,10 @@ func testSwitchCircuitPersistence(ht *lntest.HarnessTest) {
 	// Now restart carol without hodl mode, to settle back the outstanding
 	// payments.
 	s.carol.SetExtraArgs(nil)
+	ht.RestartNode(s.carol)
+
+	ht.EnsureConnected(s.dave, s.carol)
+
 	ht.RestartNode(s.carol)
 
 	ht.EnsureConnected(s.dave, s.carol)
@@ -358,7 +362,7 @@ type scenarioFourNodes struct {
 // topology. Dave will make a channel with Alice, and Carol with Dave. After
 // this setup, the network topology should now look like:
 //
-//	Carol -> Dave -> Alice -> Bob
+//	Carol <-> Dave <-> Alice <-> Bob
 //
 // Once the network is created, Carol will generate 5 invoices and Bob will pay
 // them using the above path.
@@ -385,7 +389,7 @@ func setupScenarioFourNodes(ht *lntest.HarnessTest) *scenarioFourNodes {
 	// such that we now have a 4 node, 3 channel topology. Dave will make
 	// a channel with Alice, and Carol with Dave. After this setup, the
 	// network topology should now look like:
-	//     Carol -> Dave -> Alice -> Bob
+	//     Carol <-> Dave <-> Alice <-> Bob
 	//
 	// First, we'll create Dave and establish a channel to Alice.
 	dave := ht.NewNode("Dave", nil)

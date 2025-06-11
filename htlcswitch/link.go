@@ -2196,6 +2196,9 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 		go l.forwardBatch(false, settlePacket)
 
 	case *lnwire.UpdateFailMalformedHTLC:
+		l.log.Debugf("-----> received %v, holding the revoke for 10s", msg.MsgType())
+		time.Sleep(10 * time.Second)
+
 		// Convert the failure type encoded within the HTLC fail
 		// message to the proper generic lnwire error code.
 		var failure lnwire.FailureMessage
@@ -3791,6 +3794,7 @@ func (l *channelLink) processRemoteAdds(fwdPkg *channeldb.FwdPkg) {
 	// If the fwdPkg has already been processed, it means we are
 	// reforwarding the packets again, which happens only on a restart.
 	reforward := fwdPkg.State == channeldb.FwdStateProcessed
+	reforward = false
 
 	// Atomically decode the incoming htlcs, simultaneously checking for
 	// replay attempts. A particular index in the returned, spare list of
