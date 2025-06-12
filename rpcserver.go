@@ -9381,12 +9381,15 @@ func (r *rpcServer) UpgradeChannel(in *lnrpc.UpgradeChannelRequest,
 	for {
 		select {
 		case resp := <-respChan:
-			rpcsLog.Errorf("[upgradechannel] received update for "+
+			rpcsLog.Debugf("[upgradechannel] received update for "+
 				"channel(%v): %v", req.ChanID, resp)
 
 			upd := &lnrpc.UpgradeChannelResponse{
 				Status: resp.Status.String(),
-				Error:  resp.Err.Error(),
+			}
+
+			if resp.Err != nil {
+				upd.Error = resp.Err.Error()
 			}
 
 			if err := updateStream.Send(upd); err != nil {
@@ -9394,6 +9397,9 @@ func (r *rpcServer) UpgradeChannel(in *lnrpc.UpgradeChannelRequest,
 			}
 
 			if resp.Status.IsFinal() {
+				rpcsLog.Debugf("[upgradechannel] finished upgrade for "+
+					"channel(%v): %v", req.ChanID, resp)
+
 				return nil
 			}
 
