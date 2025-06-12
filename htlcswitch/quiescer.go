@@ -52,7 +52,8 @@ var (
 	)
 )
 
-const defaultQuiescenceTimeout = 30 * time.Second
+// TODO: Fix this - need to upgrade the specs to exit quiescence.
+const defaultQuiescenceTimeout = 30 * time.Minute
 
 type StfuReq = fn.Req[fn.Unit, fn.Result[lntypes.ChannelParty]]
 

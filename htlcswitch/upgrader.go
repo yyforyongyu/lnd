@@ -17,7 +17,7 @@ import (
 type Upgrader interface {
 	Start()
 	Stop()
-	InitDyn(r dynReq, l *channelLink)
+	InitDyn(r *dynReq, l *channelLink)
 	ReceiveMsg(msg lnwire.DynMsg)
 	Active() bool
 }
@@ -69,7 +69,7 @@ type DynUpgrader struct {
 	// log is a link-specific logging instance.
 	log btclog.Logger
 
-	upgradeReqs chan dynReq
+	upgradeReqs chan *dynReq
 
 	quit chan struct{}
 
@@ -79,6 +79,7 @@ type DynUpgrader struct {
 	// the existing link, then `DynUpgrader` is parallel to channelLink, and
 	// will be managed by the link machine.
 	link *channelLink
+	req  *dynReq
 
 	receiveMsgChan chan lnwire.DynMsg
 
@@ -94,7 +95,7 @@ func NewDynUpgrader(logger btclog.Logger) *DynUpgrader {
 		quit:           make(chan struct{}),
 		status:         upgraderStatusCreated,
 		receiveMsgChan: make(chan lnwire.DynMsg, 1),
-		upgradeReqs:    make(chan dynReq),
+		upgradeReqs:    make(chan *dynReq),
 	}
 
 	return du
@@ -114,7 +115,7 @@ func (d *DynUpgrader) Stop() {
 	d.wg.Wait()
 }
 
-func (d *DynUpgrader) InitDyn(r dynReq, l *channelLink) {
+func (d *DynUpgrader) InitDyn(r *dynReq, l *channelLink) {
 	d.log.Debugf("Received dyn req %v", r)
 
 	if !d.status.canAcceptReq() {
@@ -138,6 +139,7 @@ func (d *DynUpgrader) InitDyn(r dynReq, l *channelLink) {
 
 	// TODO: redesign.
 	d.link = l
+	d.req = r
 
 	// Send the request to the internal loop.
 	fn.SendOrQuit(d.upgradeReqs, r, d.quit)
@@ -158,6 +160,7 @@ func (d *DynUpgrader) mainLoop() {
 		select {
 		case <-d.quit:
 			d.log.Debugf("DynUpgrader shutting down...")
+			return
 
 		case req := <-d.upgradeReqs:
 			// TODO: rename to local init.
@@ -353,6 +356,12 @@ func (d *DynUpgrader) handleRemoteCommit(msg *lnwire.RevokeAndAck) {
 	// Since the remote has committed this change, we can now persist the
 	// new params in db and update the link configs.
 	d.link.channel.State().UpdateLocalConfig(&d.propose)
+
+	// Notify the caller this is now pending.
+	resp := UpgradeLinkResponse{
+		Status: UpdateLinkStatusSucceeded,
+	}
+	d.req.Resolve(resp)
 }
 
 func (d *DynUpgrader) handleRemoteReject(msg lnwire.DynMsg) {
@@ -391,7 +400,7 @@ func (d *DynUpgrader) handleRemoteUpgrade(msg lnwire.DynMsg) {
 	// TODO: validate the params, then accept or reject.
 }
 
-func (d *DynUpgrader) handleUpgradeReq(req dynReq) {
+func (d *DynUpgrader) handleUpgradeReq(req *dynReq) {
 	params := req.Request
 
 	// Construct the TLV to be sent.
@@ -452,7 +461,7 @@ func (d *DynUpgrader) handleChannelTypeUpgrade(msg lnwire.DynPropose) error {
 	return nil
 }
 
-func (d *DynUpgrader) dynReqToWireMsg(req dynReq) lnwire.DynPropose {
+func (d *DynUpgrader) dynReqToWireMsg(req *dynReq) lnwire.DynPropose {
 	chanID := req.Request.ChanID
 	params := req.Request
 

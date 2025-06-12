@@ -411,7 +411,7 @@ type channelLink struct {
 	// the result.
 	quiescenceReqs chan StfuReq
 
-	upgradeReqs chan dynReq
+	upgradeReqs chan *dynReq
 
 	dynUpgrader Upgrader
 
@@ -517,7 +517,7 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		chan fn.Req[fn.Unit, fn.Result[lntypes.ChannelParty]], 1,
 	)
 	upgradeReqs := make(
-		chan fn.Req[UpgradeLinkRequest, UpgradeLinkResponse], 1,
+		chan *fn.Req[UpgradeLinkRequest, UpgradeLinkResponse], 1,
 	)
 
 	return &channelLink{
@@ -1564,10 +1564,13 @@ func (l *channelLink) htlcManager(ctx context.Context) {
 					res := fn.Err[lntypes.ChannelParty](err)
 					qReq.Resolve(res)
 				}
+			} else {
+				l.log.Debugf("blocking")
 			}
 
 		case req := <-l.upgradeReqs:
-			l.handleUpgradeReq(req)
+			l.cg.WgAdd(1)
+			go l.handleUpgradeReq(req)
 
 		case <-l.cg.Done():
 			return
@@ -2670,6 +2673,14 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 			"ChannelPoint(%v): received error from peer: %v",
 			l.channel.ChannelPoint(), msg.Error(),
 		)
+
+	case *lnwire.DynAck,
+		*lnwire.DynCommit,
+		*lnwire.DynPropose,
+		*lnwire.DynReject:
+
+		l.dynUpgrader.ReceiveMsg(msg)
+
 	default:
 		l.log.Warnf("received unknown message of type %T", msg)
 	}
@@ -4704,7 +4715,7 @@ func (l *channelLink) Upgrade(r UpgradeLinkRequest) <-chan UpgradeLinkResponse {
 	}
 
 	select {
-	case l.upgradeReqs <- req:
+	case l.upgradeReqs <- &req:
 		req.Resolve(resp)
 
 	case <-l.cg.Done():
@@ -4713,12 +4724,14 @@ func (l *channelLink) Upgrade(r UpgradeLinkRequest) <-chan UpgradeLinkResponse {
 	return respChan
 }
 
-func (l *channelLink) handleUpgradeReq(req dynReq) {
+func (l *channelLink) handleUpgradeReq(req *dynReq) {
+	defer l.cg.WgDone()
+
 	// If the channel is not quiescent yet, we need to start the stfu flow
 	// here.
 	if !l.quiescer.IsQuiescent() {
 		// TODO(yy): return more statuses here?
-		l.log.Infof("Starting the stfu flow...")
+		l.log.Infof("Channel is not quiescent, starting the stfu flow...")
 
 		l.waitUntilQuiescent()
 	} else {
