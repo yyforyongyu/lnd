@@ -2038,6 +2038,9 @@ func NewBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 	auxResolver fn.Option[AuxContractResolver]) (*BreachRetribution,
 	error) {
 
+	// TODO: also find the previous config using the state num.
+	// chanState.FindPreviousConfig(stateNum)
+
 	// Query the on-disk revocation log for the snapshot which was recorded
 	// at this particular state num. Based on whether a legacy revocation
 	// log is returned or not, we will process them differently.

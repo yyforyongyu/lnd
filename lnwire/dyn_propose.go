@@ -8,6 +8,11 @@ import (
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
+// TODO: make sure all dyn msgs implement this interface.
+type DynMsg interface {
+	Message
+}
+
 // DynPropose is a message that is sent during a dynamic commitments negotiation
 // process. It is sent by both parties to propose new channel parameters.
 type DynPropose struct {

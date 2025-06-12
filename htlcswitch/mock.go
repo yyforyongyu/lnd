@@ -979,6 +979,16 @@ func (f *mockChannelLink) AuxBandwidth(lnwire.MilliSatoshi,
 	return fn.Ok(OptionalBandwidth{})
 }
 
+func (m *mockChannelLink) IsQuiescent() bool {
+	return false
+}
+
+func (m *mockChannelLink) Upgrade(
+	r UpgradeLinkRequest) <-chan UpgradeLinkResponse {
+
+	return nil
+}
+
 var _ ChannelLink = (*mockChannelLink)(nil)
 
 const testInvoiceCltvExpiry = 6
