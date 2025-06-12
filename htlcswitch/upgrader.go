@@ -1,12 +1,15 @@
 package htlcswitch
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btclog/v2"
 	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/lnutils"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/tlv"
 )
@@ -15,6 +18,8 @@ type Upgrader interface {
 	Start()
 	Stop()
 	InitDyn(r dynReq, l *channelLink)
+	ReceiveMsg(msg lnwire.DynMsg)
+	Active() bool
 }
 
 type upgraderStatus uint8
@@ -24,6 +29,10 @@ const (
 
 	upgraderStatusReady
 	upgraderStatusBusy
+	upgraderStatusLocalProposed
+	upgraderStatusLocalWaiting
+	upgraderStatusRemoteProposed
+	upgraderStatusLocalReplied
 	upgraderStatusStopped
 )
 
@@ -70,6 +79,10 @@ type DynUpgrader struct {
 	// the existing link, then `DynUpgrader` is parallel to channelLink, and
 	// will be managed by the link machine.
 	link *channelLink
+
+	receiveMsgChan chan lnwire.DynMsg
+
+	propose lnwire.DynPropose
 }
 
 // Compile-time check to ensure DynUpgrader satisfies the Upgrader interface.
@@ -77,9 +90,11 @@ var _ Upgrader = (*DynUpgrader)(nil)
 
 func NewDynUpgrader(logger btclog.Logger) *DynUpgrader {
 	du := &DynUpgrader{
-		log:    logger,
-		quit:   make(chan struct{}),
-		status: upgraderStatusCreated,
+		log:            logger,
+		quit:           make(chan struct{}),
+		status:         upgraderStatusCreated,
+		receiveMsgChan: make(chan lnwire.DynMsg, 1),
+		upgradeReqs:    make(chan dynReq),
 	}
 
 	return du
@@ -128,6 +143,14 @@ func (d *DynUpgrader) InitDyn(r dynReq, l *channelLink) {
 	fn.SendOrQuit(d.upgradeReqs, r, d.quit)
 }
 
+func (d *DynUpgrader) ReceiveMsg(msg lnwire.DynMsg) {
+	fn.SendOrQuit(d.receiveMsgChan, msg, d.quit)
+}
+
+func (d *DynUpgrader) Active() bool {
+	return d.status >= upgraderStatusBusy
+}
+
 func (d *DynUpgrader) mainLoop() {
 	defer d.wg.Done()
 
@@ -137,9 +160,235 @@ func (d *DynUpgrader) mainLoop() {
 			d.log.Debugf("DynUpgrader shutting down...")
 
 		case req := <-d.upgradeReqs:
+			// TODO: rename to local init.
 			d.handleUpgradeReq(req)
+
+		case msg := <-d.receiveMsgChan:
+			// TODO: rename to remote init.
+			d.handlePeerMsg(msg)
 		}
 	}
+}
+
+func (d *DynUpgrader) handlePeerMsg(msg lnwire.DynMsg) {
+	switch msg.MsgType() {
+	case lnwire.MsgDynPropose:
+		d.handleRemoteUpgrade(msg)
+		return
+
+	case lnwire.MsgDynAck, lnwire.MsgDynReject:
+		d.handleRemoteReply(msg)
+	}
+}
+
+func (d *DynUpgrader) handleRemoteReply(msg lnwire.DynMsg) {
+	if d.status != upgraderStatusLocalProposed {
+		// Unexpected state, Disconnect.
+		return
+	}
+
+	switch m := msg.(type) {
+	// Maybe the remote can send a commit sig instead to signal accept?
+	case *lnwire.DynAck:
+		d.handleRemoteAccept(m)
+
+	case *lnwire.DynReject:
+		d.handleRemoteReject(m)
+
+	case *lnwire.RevokeAndAck:
+		d.handleRemoteCommit(m)
+	}
+}
+
+// Accept flow:
+// 1. we propose
+// 2. they send an ACK, which has the next commit_sig.
+// 3. we send our revoke_and_ack and commit_sig.
+// 4. they send their revoke_and_ack.
+//
+// received DynAck, which has their commit_sig.
+// send our revoke_and_ack and commit_sig.
+// now expect their revoke_and_ack.
+func (d *DynUpgrader) handleRemoteAccept(msg *lnwire.DynAck) {
+	// Validate the proposed params are the same and signed.
+	//
+	// Perform a round of commitment dance <- unnecessary if csv is not
+	// changed?
+	//
+	auxSigBlob, err := msg.CustomRecords.Serialize()
+	if err != nil {
+		d.link.failf(
+			LinkFailureError{code: ErrInvalidCommitment},
+			"unable to serialize custom records: %v", err,
+		)
+
+		return
+	}
+
+	err = d.link.channel.ReceiveNewCommitment(&lnwallet.CommitSigs{
+		CommitSig:  msg.CommitSig.CommitSig,
+		HtlcSigs:   msg.HtlcSigs,
+		PartialSig: msg.PartialSig,
+		AuxSigBlob: auxSigBlob,
+	})
+	if err != nil {
+		// If we were unable to reconstruct their proposed commitment,
+		// then we'll examine the type of error. If it's an
+		// InvalidCommitSigError, then we'll send a direct error.
+		var sendData []byte
+		switch err.(type) {
+		case *lnwallet.InvalidCommitSigError:
+			sendData = []byte(err.Error())
+		case *lnwallet.InvalidHtlcSigError:
+			sendData = []byte(err.Error())
+		}
+		d.link.failf(
+			LinkFailureError{
+				code:          ErrInvalidCommitment,
+				FailureAction: LinkFailureForceClose,
+				SendData:      sendData,
+			},
+			"ChannelPoint(%v): unable to accept new "+
+				"commitment: %v",
+			d.link.channel.ChannelPoint(), err,
+		)
+		return
+	}
+
+	// Create a new commitment based on the upgraded params.
+	// As we've just accepted a new state, we'll now
+	// immediately send the remote peer a revocation for our prior
+	// state.
+	nextRevocation, _, _, err :=
+		d.link.channel.RevokeCurrentCommitment()
+	if err != nil {
+		d.link.log.Errorf("unable to revoke commitment: %v", err)
+
+		// We need to fail the channel in case revoking our
+		// local commitment does not succeed. We might have
+		// already advanced our channel state which would lead
+		// us to proceed with an unclean state.
+		//
+		// NOTE: We do not trigger a force close because this
+		// could resolve itself in case our db was just busy
+		// not accepting new transactions.
+		d.link.failf(
+			LinkFailureError{
+				code:          ErrInternalError,
+				Warning:       true,
+				FailureAction: LinkFailureDisconnect,
+			},
+			"ChannelPoint(%v): unable to accept new "+
+				"commitment: %v",
+			d.link.channel.ChannelPoint(), err,
+		)
+		return
+	}
+
+	// As soon as we are ready to send our next revocation, we can
+	// invoke the incoming commit hooks.
+	d.link.RWMutex.Lock()
+	d.link.incomingCommitHooks.invoke()
+	d.link.Unlock()
+
+	d.link.cfg.Peer.SendMessage(false, nextRevocation)
+
+	// If the remote party initiated the state transition,
+	// we'll reply with a signature to provide them with their
+	// version of the latest commitment. Otherwise, both commitment
+	// chains are fully synced from our PoV, then we don't need to
+	// reply with a signature as both sides already have a
+	// commitment with the latest accepted.
+	if d.link.channel.OweCommitment() {
+		if !d.link.updateCommitTxOrFail(context.TODO()) {
+			return
+		}
+	}
+
+	// The remote has agreed on the upgrade, we now need to wait for their
+	// revoke_and_ack before persisting the changes in db and update the
+	// link and channel structs.
+}
+
+func (d *DynUpgrader) handleRemoteCommit(msg *lnwire.RevokeAndAck) {
+	// We now process the message and advance our remote commit
+	// chain.
+	_, _, err := d.link.channel.ReceiveRevocation(msg)
+	if err != nil {
+		// TODO(halseth): force close?
+		d.link.failf(
+			LinkFailureError{
+				code:          ErrInvalidRevocation,
+				FailureAction: LinkFailureDisconnect,
+			},
+			"unable to accept revocation: %v", err,
+		)
+		return
+	}
+
+	// If we have a tower client for this channel type, we'll
+	// create a backup for the current state.
+	if d.link.cfg.TowerClient != nil {
+		state := d.link.channel.State()
+		chanID := d.link.ChanID()
+
+		err = d.link.cfg.TowerClient.BackupState(
+			&chanID, state.RemoteCommitment.CommitHeight-1,
+		)
+		if err != nil {
+			d.link.failf(LinkFailureError{
+				code: ErrInternalError,
+			}, "unable to queue breach backup: %v", err)
+			return
+		}
+	}
+
+	if d.link.channel.OweCommitment() {
+		log.Errorf("-----------------> we should not owe!!!!")
+	}
+
+	log.Debugf("Updating local config using propose %v",
+		lnutils.SpewLogClosure(d.propose))
+
+	// Since the remote has committed this change, we can now persist the
+	// new params in db and update the link configs.
+	d.link.channel.State().UpdateLocalConfig(&d.propose)
+}
+
+func (d *DynUpgrader) handleRemoteReject(msg lnwire.DynMsg) {
+
+}
+
+func (d *DynUpgrader) handleRemoteUpgrade(msg lnwire.DynMsg) {
+	if !d.status.canAcceptReq() {
+		d.log.Errorf("Rejected remote upgradde due to status(%v) not "+
+			"allowed", d.status)
+
+		// Disconnect? or Noop?
+		return
+	}
+
+	result := d.link.quiescer.QuiescenceInitiator()
+	initiator, err := result.Unpack()
+	if err != nil {
+		d.log.Errorf("%v", err)
+
+		// Disconnect? or Noop?
+		return
+	}
+
+	if initiator.IsLocal() {
+		d.log.Errorf("Remote is not the initiator, cannot start the " +
+			"dynamic commitment")
+
+		// Disconnect? or Noop?
+		return
+	}
+
+	d.log.Debugf("Upgrader status: %v => %v", d.status,
+		upgraderStatusRemoteProposed)
+
+	// TODO: validate the params, then accept or reject.
 }
 
 func (d *DynUpgrader) handleUpgradeReq(req dynReq) {
@@ -168,6 +417,8 @@ func (d *DynUpgrader) handleUpgradeReq(req dynReq) {
 		}
 		req.Resolve(resp)
 
+		d.status = upgraderStatusReady
+
 		return
 	}
 
@@ -176,6 +427,8 @@ func (d *DynUpgrader) handleUpgradeReq(req dynReq) {
 		Status: UpdateLinkStatusPending,
 	}
 	req.Resolve(resp)
+
+	d.status = upgraderStatusLocalProposed
 }
 
 // TODO: rename to sendDynPropose?
@@ -189,6 +442,8 @@ func (d *DynUpgrader) handleChannelParamsUpgrade(msg lnwire.DynPropose) error {
 	}
 
 	// Wait for the peer's reply, either accept or reject.
+
+	d.propose = msg
 
 	return nil
 }

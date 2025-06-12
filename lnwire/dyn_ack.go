@@ -39,6 +39,8 @@ type DynAck struct {
 	// fill out the full maximum transport message size. These fields can
 	// be used to specify optional data such as custom TLV fields.
 	ExtraData ExtraOpaqueData
+
+	CommitSig
 }
 
 // A compile time check to ensure DynAck implements the lnwire.Message

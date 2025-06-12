@@ -1047,6 +1047,84 @@ type OpenChannel struct {
 	sync.RWMutex
 }
 
+// TODO: move OpenChannel to a new file.
+func (c *OpenChannel) UpdateLocalConfig(msg *lnwire.DynPropose) error {
+	c.Lock()
+	defer c.Unlock()
+
+	// Temp, implement the full.
+	rec1 := msg.DustLimit.UnsafeFromSome()
+	rec2 := msg.CsvDelay.UnsafeFromSome()
+
+	// TODO: create a new nested bucket to save the old config. use the
+	// commit height as the key and the config as the value.
+
+	if err := kvdb.Update(c.Db.backend, func(tx kvdb.RwTx) error {
+		chanBucket, err := fetchChanBucketRw(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel, err := fetchOpenChannel(
+			chanBucket, &c.FundingOutpoint,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel.LocalChanCfg.DustLimit = rec1.Val
+		channel.LocalChanCfg.CsvDelay = uint16(rec2.Val)
+
+		return putOpenChannel(chanBucket, channel)
+	}, func() {}); err != nil {
+		return err
+	}
+
+	c.LocalChanCfg.DustLimit = rec1.Val
+	c.LocalChanCfg.CsvDelay = uint16(rec2.Val)
+
+	return nil
+}
+
+func (c *OpenChannel) UpdateRemoteConfig(msg *lnwire.DynPropose) error {
+	c.Lock()
+	defer c.Unlock()
+
+	// Temp, implement the full.
+	rec1 := msg.DustLimit.UnsafeFromSome()
+	rec2 := msg.CsvDelay.UnsafeFromSome()
+
+	if err := kvdb.Update(c.Db.backend, func(tx kvdb.RwTx) error {
+		chanBucket, err := fetchChanBucketRw(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel, err := fetchOpenChannel(
+			chanBucket, &c.FundingOutpoint,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel.RemoteChanCfg.DustLimit = rec1.Val
+		channel.RemoteChanCfg.CsvDelay = uint16(rec2.Val)
+
+		return putOpenChannel(chanBucket, channel)
+	}, func() {}); err != nil {
+		return err
+	}
+
+	c.RemoteChanCfg.DustLimit = rec1.Val
+	c.RemoteChanCfg.CsvDelay = uint16(rec2.Val)
+
+	return nil
+}
+
 // String returns a string representation of the channel.
 func (c *OpenChannel) String() string {
 	indexStr := "height=%v, local_htlc_index=%v, local_log_index=%v, " +
