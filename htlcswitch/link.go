@@ -2494,6 +2494,11 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 		l.RWMutex.Unlock()
 
 	case *lnwire.RevokeAndAck:
+		if l.dynUpgrader.Active() {
+			l.dynUpgrader.ReceiveMsg(msg)
+			return
+		}
+
 		// We've received a revocation from the remote chain, if valid,
 		// this moves the remote chain forward, and expands our
 		// revocation window.
@@ -4692,6 +4697,8 @@ func (l *channelLink) handleUpgradeReq(req dynReq) {
 		l.log.Infof("Starting the stfu flow...")
 
 		l.waitUntilQuiescent()
+	} else {
+		// send an error if we are not the initiator.
 	}
 
 	// TODO: log params.
