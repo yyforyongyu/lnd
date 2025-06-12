@@ -2221,6 +2221,13 @@ out:
 				p.log.Errorf("%v", err)
 			}
 
+		case *lnwire.DynAck,
+			*lnwire.DynCommit,
+			*lnwire.DynPropose,
+			*lnwire.DynReject:
+
+			isLinkUpdate = true
+
 		default:
 			// If the message we received is unknown to us, store
 			// the type to track the failure.
@@ -2535,6 +2542,13 @@ func messageSummary(msg lnwire.Message) string {
 
 	case *lnwire.Custom:
 		return fmt.Sprintf("type=%d", msg.Type)
+
+	case *lnwire.DynAck,
+		*lnwire.DynCommit,
+		*lnwire.DynPropose,
+		*lnwire.DynReject:
+
+		return fmt.Sprintf("type=%d", msg.MsgType())
 	}
 
 	return fmt.Sprintf("unknown msg type=%T", msg)
