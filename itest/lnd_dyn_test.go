@@ -12,6 +12,8 @@ func testDyn(ht *lntest.HarnessTest) {
 	// Prepare params.
 	cfg := []string{
 		"--protocol.anchors",
+		// TODO: remove this once upgrader has its own msg flow.
+		"--channel-commit-interval=1m",
 	}
 	cfgs := [][]string{cfg, cfg}
 
@@ -38,14 +40,16 @@ func testDyn(ht *lntest.HarnessTest) {
 	respChan := make(chan *lnrpc.UpgradeChannelResponse, 1)
 	errChan := make(chan error)
 	go func() {
-		// Consume one message. This will block until the message is
-		// received.
-		resp, err := stream.Recv()
-		if err != nil {
-			errChan <- err
-			return
+		for {
+			// Consume one message. This will block until the
+			// message is received.
+			resp, err := stream.Recv()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			respChan <- resp
 		}
-		respChan <- resp
 	}()
 
 	for {
