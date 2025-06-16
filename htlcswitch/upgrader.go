@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btclog/v2"
@@ -107,7 +108,7 @@ func NewDynUpgrader(logger btclog.Logger) *DynUpgrader {
 		log:            logger,
 		quit:           make(chan struct{}),
 		status:         upgraderStatusCreated,
-		receiveMsgChan: make(chan lnwire.DynMsg, 1),
+		receiveMsgChan: make(chan lnwire.DynMsg, 100),
 		upgradeReqs:    make(chan *dynReq),
 	}
 
@@ -272,6 +273,20 @@ func (d *DynUpgrader) handleRemoteAccept(msg *lnwire.DynAck) {
 		return
 	}
 
+	// If the remote party initiated the state transition,
+	// we'll reply with a signature to provide them with their
+	// version of the latest commitment. Otherwise, both commitment
+	// chains are fully synced from our PoV, then we don't need to
+	// reply with a signature as both sides already have a
+	// commitment with the latest accepted.
+	if !d.link.updateCommitTxOrFail(context.TODO()) {
+		return
+	}
+
+	// TODO: make sure to handle commit_sig and revoke_and_ack here
+	// sequentially.
+	time.Sleep(1 * time.Second)
+
 	// Create a new commitment based on the upgraded params.
 	// As we've just accepted a new state, we'll now
 	// immediately send the remote peer a revocation for our prior
@@ -308,16 +323,6 @@ func (d *DynUpgrader) handleRemoteAccept(msg *lnwire.DynAck) {
 	d.link.Unlock()
 
 	d.link.cfg.Peer.SendMessage(false, nextRevocation)
-
-	// If the remote party initiated the state transition,
-	// we'll reply with a signature to provide them with their
-	// version of the latest commitment. Otherwise, both commitment
-	// chains are fully synced from our PoV, then we don't need to
-	// reply with a signature as both sides already have a
-	// commitment with the latest accepted.
-	if !d.link.updateCommitTxOrFail(context.TODO()) {
-		return
-	}
 
 	// The remote has agreed on the upgrade, we now need to wait for their
 	// revoke_and_ack before persisting the changes in db and update the
@@ -373,7 +378,7 @@ func (d *DynUpgrader) handleRemoteCommit(msg *lnwire.RevokeAndAck) {
 }
 
 func (d *DynUpgrader) updateLocalChannelConfig() {
-	log.Debugf("Updating local config using propose %v",
+	d.log.Tracef("Updating local config using propose %v",
 		lnutils.SpewLogClosure(d.propose))
 
 	// Since the remote has committed this change, we can now persist the
@@ -388,7 +393,10 @@ func (d *DynUpgrader) updateLocalChannelConfig() {
 }
 
 func (d *DynUpgrader) updateRemoteChannelConfig() {
-	log.Debugf("Updating remote config using propose %v",
+	// TODO: Before we can revoke, we must wait for the remote's commit_sig!
+	time.Sleep(1 * time.Second)
+
+	d.log.Tracef("Updating remote config using propose %v",
 		lnutils.SpewLogClosure(d.propose))
 
 	// Since the remote has committed this change, we can now persist the

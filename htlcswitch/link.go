@@ -2399,6 +2399,12 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 			return
 		}
 
+		if l.dynUpgrader.Active() {
+			l.log.Debugf("skip sending revoke_and_ack, let " +
+				"dynUpgrader handle it")
+			return
+		}
+
 		// As we've just accepted a new state, we'll now
 		// immediately send the remote peer a revocation for our prior
 		// state.
@@ -2503,6 +2509,7 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 
 	case *lnwire.RevokeAndAck:
 		if l.dynUpgrader.Active() {
+			l.log.Debugf("routing msg to dynUpgrader")
 			l.dynUpgrader.ReceiveMsg(msg)
 			return
 		}

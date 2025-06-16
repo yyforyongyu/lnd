@@ -241,7 +241,7 @@ func (cfg *BaseNodeConfig) GenArgs() []string {
 
 	nodeArgs := []string{
 		"--nobootstrap",
-		"--debuglevel=debug,HSWC=trace",
+		"--debuglevel=debug",
 		"--bitcoin.defaultchanconfs=1",
 		"--accept-keysend",
 		"--keep-failed-payment-attempts",
