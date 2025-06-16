@@ -4012,12 +4012,12 @@ func (lc *LightningChannel) SignNextCommitment(
 		return nil, err
 	}
 
-	lc.log.Tracef("extending remote chain to height %v, "+
+	lc.log.Debugf("extending remote chain to height %v, "+
 		"local_log=%v, remote_log=%v",
 		newCommitView.height,
 		lc.updateLogs.Local.logIndex, remoteACKedIndex)
 
-	lc.log.Tracef("remote chain: our_balance=%v, "+
+	lc.log.Debugf("remote chain: our_balance=%v, "+
 		"their_balance=%v, commit_tx: %v",
 		newCommitView.ourBalance,
 		newCommitView.theirBalance,
