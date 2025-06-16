@@ -715,6 +715,10 @@ var allTestCases = []*lntest.TestCase{
 		Name:     "dyn chan params",
 		TestFunc: testDynUpgradeChanParams,
 	},
+	{
+		Name:     "dyn chan type",
+		TestFunc: testDynUpgradeChanType,
+	},
 }
 
 // appendPrefixed is used to add a prefix to each test name in the subtests
