@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func testDyn(ht *lntest.HarnessTest) {
+func testDynUpgradeChanParams(ht *lntest.HarnessTest) {
 	// Prepare params.
 	cfg := []string{
 		"--protocol.anchors",

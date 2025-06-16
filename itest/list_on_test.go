@@ -712,8 +712,8 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testPartiallySpecifiedBlindedPath,
 	},
 	{
-		Name:     "dyn",
-		TestFunc: testDyn,
+		Name:     "dyn chan params",
+		TestFunc: testDynUpgradeChanParams,
 	},
 }
 
