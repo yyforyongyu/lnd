@@ -253,3 +253,11 @@ func dynProposeRecords(dp *DynPropose) []tlv.RecordProducer {
 
 	return recordProducers
 }
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of peer.LinkUpdater interface.
+func (dp *DynPropose) TargetChanID() ChannelID {
+	return dp.ChanID
+}

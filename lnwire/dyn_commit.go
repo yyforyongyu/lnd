@@ -133,3 +133,11 @@ func (dc *DynCommit) Decode(r io.Reader, _ uint32) error {
 func (dc *DynCommit) MsgType() MessageType {
 	return MsgDynCommit
 }
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of peer.LinkUpdater interface.
+func (dc *DynCommit) TargetChanID() ChannelID {
+	return dc.DynAck.ChanID
+}
