@@ -157,3 +157,11 @@ func (da *DynAck) MsgType() MessageType {
 func (da *DynAck) SerializedSize() (uint32, error) {
 	return MessageSerializedSize(da)
 }
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of peer.LinkUpdater interface.
+func (da *DynAck) TargetChanID() ChannelID {
+	return da.ChanID
+}

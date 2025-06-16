@@ -85,3 +85,11 @@ func (dr *DynReject) MsgType() MessageType {
 func (dr *DynReject) SerializedSize() (uint32, error) {
 	return MessageSerializedSize(dr)
 }
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of peer.LinkUpdater interface.
+func (dr *DynReject) TargetChanID() ChannelID {
+	return dr.ChanID
+}
