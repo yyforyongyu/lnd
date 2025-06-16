@@ -22,6 +22,7 @@ type Upgrader interface {
 	Active() bool
 }
 
+// TODO: use structure status with code and msg instead, this is ridiculas.
 type upgraderStatus uint8
 
 const (
@@ -46,6 +47,18 @@ func (u upgraderStatus) String() string {
 
 	case upgraderStatusBusy:
 		return "busy"
+
+	case upgraderStatusLocalProposed:
+		return "local proposed"
+
+	case upgraderStatusLocalWaiting:
+		return "local waiting"
+
+	case upgraderStatusRemoteProposed:
+		return "remote proposed"
+
+	case upgraderStatusLocalReplied:
+		return "local replied"
 
 	case upgraderStatusStopped:
 		return "stopped"
@@ -167,6 +180,8 @@ func (d *DynUpgrader) mainLoop() {
 			d.handleUpgradeReq(req)
 
 		case msg := <-d.receiveMsgChan:
+			d.log.Debugf("Received msg %v", msg.MsgType())
+
 			// TODO: rename to remote init.
 			d.handlePeerMsg(msg)
 		}
@@ -174,13 +189,13 @@ func (d *DynUpgrader) mainLoop() {
 }
 
 func (d *DynUpgrader) handlePeerMsg(msg lnwire.DynMsg) {
-	switch msg.MsgType() {
-	case lnwire.MsgDynPropose:
-		d.handleRemoteUpgrade(msg)
+	switch m := msg.(type) {
+	case *lnwire.DynPropose:
+		d.handleRemoteUpgrade(m)
 		return
 
-	case lnwire.MsgDynAck, lnwire.MsgDynReject:
-		d.handleRemoteReply(msg)
+	case *lnwire.DynAck, *lnwire.DynReject:
+		d.handleRemoteReply(m)
 	}
 }
 
@@ -368,7 +383,9 @@ func (d *DynUpgrader) handleRemoteReject(msg lnwire.DynMsg) {
 
 }
 
-func (d *DynUpgrader) handleRemoteUpgrade(msg lnwire.DynMsg) {
+func (d *DynUpgrader) handleRemoteUpgrade(msg *lnwire.DynPropose) {
+	d.log.Debugf("handling remote upgrade request %v", msg)
+
 	if !d.status.canAcceptReq() {
 		d.log.Errorf("Rejected remote upgradde due to status(%v) not "+
 			"allowed", d.status)
@@ -397,7 +414,24 @@ func (d *DynUpgrader) handleRemoteUpgrade(msg lnwire.DynMsg) {
 	d.log.Debugf("Upgrader status: %v => %v", d.status,
 		upgraderStatusRemoteProposed)
 
+	d.status = upgraderStatusRemoteProposed
+
 	// TODO: validate the params, then accept or reject.
+
+	d.acceptRemoteProposal(msg)
+
+}
+
+// Accept remote's propose flow:
+// 1. they propose by sending DynPropose.
+// 2. we accept by sending an DynAck.
+// 3. they send their revoke_and_ack and commit_sig.
+// 4. we send our revoke_and_ack.
+func (d *DynUpgrader) acceptRemoteProposal(m *lnwire.DynPropose) {
+}
+
+func (d *DynUpgrader) rejectRemoteProposal(m *lnwire.DynPropose) {
+
 }
 
 func (d *DynUpgrader) handleUpgradeReq(req *dynReq) {

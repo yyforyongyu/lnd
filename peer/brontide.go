@@ -2221,13 +2221,6 @@ out:
 				p.log.Errorf("%v", err)
 			}
 
-		case *lnwire.DynAck,
-			*lnwire.DynCommit,
-			*lnwire.DynPropose,
-			*lnwire.DynReject:
-
-			isLinkUpdate = true
-
 		default:
 			// If the message we received is unknown to us, store
 			// the type to track the failure.

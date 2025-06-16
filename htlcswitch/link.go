@@ -518,7 +518,7 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		chan *fn.Req[UpgradeLinkRequest, UpgradeLinkResponse], 1,
 	)
 
-	return &channelLink{
+	l := &channelLink{
 		cfg:                 cfg,
 		channel:             channel,
 		hodlMap:             make(map[models.CircuitKey]hodlHtlc),
@@ -533,6 +533,11 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		cg:                  fn.NewContextGuard(),
 		dynUpgrader:         upgrader,
 	}
+
+	// Pass quiescer instead?
+	upgrader.link = l
+
+	return l
 }
 
 // A compile time check to ensure channelLink implements the ChannelLink
