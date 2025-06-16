@@ -28,6 +28,8 @@ type DynAck struct {
 	// that were requested in the DynPropose
 	Sig Sig
 
+	CommitSig Sig
+
 	// LocalNonce is an optional field that is transmitted when accepting
 	// a dynamic commitment upgrade to Taproot Channels. This nonce will be
 	// used to verify the first commitment transaction signature. This will
@@ -39,8 +41,6 @@ type DynAck struct {
 	// fill out the full maximum transport message size. These fields can
 	// be used to specify optional data such as custom TLV fields.
 	ExtraData ExtraOpaqueData
-
-	CommitSig
 }
 
 // A compile time check to ensure DynAck implements the lnwire.Message
@@ -56,11 +56,7 @@ var _ SizeableMessage = (*DynAck)(nil)
 //
 // This is a part of the lnwire.Message interface.
 func (da *DynAck) Encode(w *bytes.Buffer, _ uint32) error {
-	if err := WriteChannelID(w, da.ChanID); err != nil {
-		return err
-	}
-
-	if err := WriteSig(w, da.Sig); err != nil {
+	if err := WriteElements(w, da.ChanID, da.Sig, da.CommitSig); err != nil {
 		return err
 	}
 
@@ -98,7 +94,7 @@ func (da *DynAck) Encode(w *bytes.Buffer, _ uint32) error {
 // This is a part of the lnwire.Message interface.
 func (da *DynAck) Decode(r io.Reader, _ uint32) error {
 	// Parse out main message.
-	if err := ReadElements(r, &da.ChanID, &da.Sig); err != nil {
+	if err := ReadElements(r, &da.ChanID, &da.Sig, &da.CommitSig); err != nil {
 		return err
 	}
 
