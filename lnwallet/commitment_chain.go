@@ -1,8 +1,6 @@
 package lnwallet
 
 import (
-	"fmt"
-
 	"github.com/lightningnetwork/lnd/fn/v2"
 )
 
@@ -41,11 +39,6 @@ func (s *commitmentChain) addCommitment(c *commitment) {
 // the chain should be advanced once a revocation for the lowest unrevoked
 // commitment in the chain is received.
 func (s *commitmentChain) advanceTail() {
-	if s.commitments.Len() == 1 {
-		fmt.Println("------------> only single front")
-		return
-	}
-
 	s.commitments.Remove(s.commitments.Front())
 }
 
