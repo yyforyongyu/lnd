@@ -531,8 +531,6 @@ func (d *DynUpgrader) rejectRemoteProposal(m *lnwire.DynPropose) {
 }
 
 func (d *DynUpgrader) handleUpgradeReq(req *dynReq) {
-	params := req.Request
-
 	// Construct the TLV to be sent.
 	msg := d.dynReqToWireMsg(req)
 
@@ -541,7 +539,7 @@ func (d *DynUpgrader) handleUpgradeReq(req *dynReq) {
 	var err error
 	// Depending on whether we want to upgrade the channel type or not, we
 	// will go to the dedicated handlers.
-	if params.ChanType.IsSome() {
+	if msg.ChannelType.IsSome() {
 		err = d.handleChannelTypeUpgrade(msg)
 	} else {
 		err = d.handleChannelParamsUpgrade(msg)
@@ -587,7 +585,27 @@ func (d *DynUpgrader) handleChannelParamsUpgrade(msg lnwire.DynPropose) error {
 	return nil
 }
 
+// The flow, we need to spend the funding output to a new commitment tx that
+// uses taproot. We don't need the funding output to be taproot, as long as the
+// new commitment has taproot outputs. This is the main point, as we want to
+// route taproot HTLCs.
+//
+// 1. we propose in DynPropose - include our nonce.
+// 2. they ack - include their nonce and their partial sig.
+// 3.
 func (d *DynUpgrader) handleChannelTypeUpgrade(msg lnwire.DynPropose) error {
+	d.log.Debugf("Starting to upgrade channel type")
+
+	// Send the propose msg.
+	err := d.link.cfg.Peer.SendMessage(true, &msg)
+	if err != nil {
+		return fmt.Errorf("failed to send DynPropose: %w", err)
+	}
+
+	// Wait for the peer's reply, either accept or reject.
+
+	d.propose = msg
+
 	return nil
 }
 
@@ -648,7 +666,8 @@ func (d *DynUpgrader) dynReqToWireMsg(req *dynReq) lnwire.DynPropose {
 		msg.ChannelType = tlv.SomeRecordT(r)
 	})
 
-	d.log.Infof("Old cfg %v, new cfg %v", cfg, params)
+	d.log.Infof("Old cfg %v, new cfg %v", lnutils.SpewLogClosure(cfg),
+		lnutils.SpewLogClosure(params))
 
 	return msg
 }
