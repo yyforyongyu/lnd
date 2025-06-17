@@ -9295,6 +9295,9 @@ func validateUpgradeChannelRequest(
 			scidAlias: false,
 		}
 
+		// TODO: must allow converting from public to private?
+		convertReq.private = true
+
 		ct, err := commitmentTypeToChanType(convertReq)
 		if err != nil {
 			return upgradeReq, err
