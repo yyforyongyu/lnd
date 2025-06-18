@@ -300,6 +300,19 @@ var (
 			number:    33,
 			migration: migration33.MigrateMCStoreNameSpacedResults,
 		},
+		{
+			// Migration 34 is an optional migration, however it
+			// also starts disallowing downgrading in case an
+			// optional migration not known to the current version
+			// has already been applied. So we need to make sure
+			// when starting LND 19.2 which has the optional
+			// migration 34 defaulted to true, that we don't allow
+			// downgrading to a prior version, otherwise the
+			// decayed log db will not be properly cleaned up if
+			// a users has downgraded and then upgrades again.
+			number:    34,
+			migration: nil,
+		},
 	}
 
 	// optionalVersions stores all optional migrations that are applied
