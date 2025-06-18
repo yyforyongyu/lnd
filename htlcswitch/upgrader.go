@@ -8,6 +8,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btclog/v2"
+	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -504,6 +505,17 @@ func (d *DynUpgrader) validateRemoteProposal(m *lnwire.DynPropose) bool {
 // 3. they send their revoke_and_ack and commit_sig. TODO: the order matters?
 // 4. we send our revoke_and_ack.
 func (d *DynUpgrader) acceptRemoteProposal(m *lnwire.DynPropose) {
+	if m.ChannelType.IsSome() {
+		// hack the channel type - need to refactor the sign commit_sig
+		// to accept a commitment type instead.
+		var chanType channeldb.ChannelType
+		chanType |= channeldb.SingleFunderBit
+		chanType |= channeldb.AnchorOutputsBit
+		chanType |= channeldb.ZeroHtlcTxFeeBit
+		chanType |= channeldb.SimpleTaprootFeatureBit
+		d.link.channel.SetChanType(chanType)
+	}
+
 	newCommit, err := d.link.channel.SignNextCommitment(context.TODO())
 	if err != nil {
 		d.log.Errorf("failed to create new commit_sig %v", err)
@@ -605,6 +617,13 @@ func (d *DynUpgrader) handleChannelTypeUpgrade(msg lnwire.DynPropose) error {
 	// Wait for the peer's reply, either accept or reject.
 
 	d.propose = msg
+
+	var chanType channeldb.ChannelType
+	chanType |= channeldb.SingleFunderBit
+	chanType |= channeldb.AnchorOutputsBit
+	chanType |= channeldb.ZeroHtlcTxFeeBit
+	chanType |= channeldb.SimpleTaprootFeatureBit
+	d.link.channel.SetChanType(chanType)
 
 	return nil
 }

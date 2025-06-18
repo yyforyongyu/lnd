@@ -377,6 +377,8 @@ func NewChannelReservation(capacity, localFundingAmt btcutil.Amount,
 		)
 	}
 
+	// TODO: move this into a method that can be used by other callsite.
+	//
 	// Next we'll set the channel type based on what we can ascertain about
 	// the balances/push amount within the channel.
 	var chanType channeldb.ChannelType
