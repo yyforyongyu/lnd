@@ -68,6 +68,7 @@ type migration func(tx kvdb.RwTx) error
 type mandatoryVersion struct {
 	number    uint32
 	migration migration
+	db        kvdb.Backend
 }
 
 // MigrationConfig is an interface combines the config interfaces of all
@@ -311,7 +312,7 @@ var (
 			// decayed log db will not be properly cleaned up if
 			// a users has downgraded and then upgrades again.
 			number:    34,
-			migration: nil,
+			migration: migration34.MigrateDecayedLogx,
 		},
 	}
 
@@ -1722,36 +1723,51 @@ func (d *DB) syncVersions(versions []mandatoryVersion) error {
 	migrations, migrationVersions := getMigrationsToApply(
 		versions, meta.DbVersionNumber,
 	)
-	return kvdb.Update(d, func(tx kvdb.RwTx) error {
-		for i, migration := range migrations {
-			if migration == nil {
-				continue
-			}
 
-			log.Infof("Applying migration #%v",
-				migrationVersions[i])
+	for i, m := range migrations {
+		if m == nil {
+			continue
+		}
 
-			if err := migration(tx); err != nil {
+		log.Infof("Applying migration #%v",
+			migrationVersions[i])
+
+		db := m.db
+		if db == nil {
+			db = d
+		}
+
+		kvdb.Update(db, func(tx kvdb.RwTx) error {
+			if err := m.migration(tx); err != nil {
 				log.Infof("Unable to apply migration #%v",
 					migrationVersions[i])
+
 				return err
 			}
-		}
 
-		meta.DbVersionNumber = latestVersion
-		err := putMeta(meta, tx)
-		if err != nil {
-			return err
-		}
+			meta.DbVersionNumber = latestVersion
 
-		// In dry-run mode, return an error to prevent the transaction
-		// from committing.
-		if d.dryRun {
-			return ErrDryRunMigrationOK
-		}
+			// NOTE: This is putting meta in the wrong db - we only
+			// save meta in channeldb. So unless we are willing to
+			// use a second tx to save the meta info when migrating
+			// other dbs, this approach doesn't work. However for
+			// mandatory migrations we need this atomicity.
+			err := putMeta(meta, tx)
+			if err != nil {
+				return err
+			}
 
-		return nil
-	}, func() {})
+			// In dry-run mode, return an error to prevent the
+			// transaction from committing.
+			if d.dryRun {
+				return ErrDryRunMigrationOK
+			}
+
+			return nil
+		}, func() {})
+	}
+
+	return nil
 }
 
 // applyOptionalVersions applies the optional migrations to the database if
@@ -1858,19 +1874,29 @@ func getLatestDBVersion(versions []mandatoryVersion) uint32 {
 	return versions[len(versions)-1].number
 }
 
+type migrationCfg struct {
+	db        kvdb.Backend
+	migration migration
+}
+
 // getMigrationsToApply retrieves the migration function that should be
 // applied to the database.
 func getMigrationsToApply(versions []mandatoryVersion,
-	version uint32) ([]migration, []uint32) {
+	version uint32) ([]*migrationCfg, []uint32) {
 
-	migrations := make([]migration, 0, len(versions))
+	migrations := make([]*migrationCfg, 0, len(versions))
 	migrationVersions := make([]uint32, 0, len(versions))
 
 	for _, v := range versions {
 		if v.number > version {
-			migrations = append(migrations, v.migration)
+			m := &migrationCfg{
+				db:        v.db,
+				migration: v.migration,
+			}
+			migrations = append(migrations, m)
 			migrationVersions = append(migrationVersions, v.number)
 		}
+
 	}
 
 	return migrations, migrationVersions

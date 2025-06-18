@@ -74,3 +74,16 @@ func MigrateDecayedLog(db kvdb.Backend, cfg MigrationConfig) error {
 
 	return nil
 }
+
+func MigrateDecayedLogx(tx kvdb.RwTx) error {
+	log.Info("Migrating decayed log...")
+	err := tx.DeleteTopLevelBucket(batchReplayBucket)
+	if err != nil && !errors.Is(err, kvdb.ErrBucketNotFound) {
+		return fmt.Errorf("deleting top level bucket %s: %w",
+			batchReplayBucket, err)
+	}
+
+	log.Info("Decayed log migrated successfully")
+
+	return nil
+}
