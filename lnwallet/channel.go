@@ -5795,23 +5795,23 @@ func (lc *LightningChannel) ReceiveRevocation(revMsg *lnwire.RevokeAndAck) (
 
 	// Now that we have a new verification nonce from them, we can refresh
 	// our remote musig2 session which allows us to create another state.
-	if lc.channelState.ChanType.IsTaproot() {
-		localNonce, err := revMsg.LocalNonce.UnwrapOrErrV(errNoNonce)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		session, err := lc.musigSessions.RemoteSession.Refresh(
-			&musig2.Nonces{
-				PubNonce: localNonce,
-			},
-		)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		lc.musigSessions.RemoteSession = session
-	}
+	// if lc.channelState.ChanType.IsTaproot() {
+	// 	localNonce, err := revMsg.LocalNonce.UnwrapOrErrV(errNoNonce)
+	// 	if err != nil {
+	// 		return nil, nil, err
+	// 	}
+	//
+	// 	session, err := lc.musigSessions.RemoteSession.Refresh(
+	// 		&musig2.Nonces{
+	// 			PubNonce: localNonce,
+	// 		},
+	// 	)
+	// 	if err != nil {
+	// 		return nil, nil, err
+	// 	}
+	//
+	// 	lc.musigSessions.RemoteSession = session
+	// }
 
 	// At this point, the revocation has been accepted, and we've rotated
 	// the current revocation key+hash for the remote party. Therefore we

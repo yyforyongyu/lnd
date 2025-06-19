@@ -1052,6 +1052,11 @@ func (c *OpenChannel) UpdateLocalConfig(msg *lnwire.DynPropose) error {
 	c.Lock()
 	defer c.Unlock()
 
+	// Hack the chan type case.
+	if msg.ChannelType.IsSome() {
+		return nil
+	}
+
 	// Temp, implement the full.
 	rec1 := msg.DustLimit.UnsafeFromSome()
 	rec2 := msg.CsvDelay.UnsafeFromSome()
@@ -1091,6 +1096,11 @@ func (c *OpenChannel) UpdateLocalConfig(msg *lnwire.DynPropose) error {
 func (c *OpenChannel) UpdateRemoteConfig(msg *lnwire.DynPropose) error {
 	c.Lock()
 	defer c.Unlock()
+
+	// Hack the chan type case.
+	if msg.ChannelType.IsSome() {
+		return nil
+	}
 
 	// Temp, implement the full.
 	rec1 := msg.DustLimit.UnsafeFromSome()
