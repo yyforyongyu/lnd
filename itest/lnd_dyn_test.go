@@ -3,6 +3,7 @@ package itest
 import (
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/stretchr/testify/require"
@@ -72,7 +73,7 @@ func testDynUpgradeChanType(ht *lntest.HarnessTest) {
 	cfg := []string{
 		"--protocol.anchors",
 		// TODO: remove this once upgrader has its own msg flow.
-		"--channel-commit-interval=1m",
+		"--channel-commit-interval=1s",
 		"--protocol.simple-taproot-chans",
 	}
 	cfgs := [][]string{cfg, cfg}
@@ -85,8 +86,6 @@ func testDynUpgradeChanType(ht *lntest.HarnessTest) {
 	chanPoints, nodes := ht.CreateSimpleNetwork(cfgs, openChannelParams)
 	cp := chanPoints[0]
 	alice, bob := nodes[0], nodes[1]
-
-	bob.RPC.GetInfo()
 
 	newCommitType := lnrpc.CommitmentType_SIMPLE_TAPROOT
 
@@ -120,6 +119,24 @@ func testDynUpgradeChanType(ht *lntest.HarnessTest) {
 
 		case err := <-errChan:
 			ht.Logf("Received err %v", err)
+
+			time.Sleep(2 * time.Second)
+
+			alice.AddToLogf("------------------------------------------------")
+			bob.AddToLogf("--------------------------------------------------")
+
+			payAmt := btcutil.Amount(5)
+			invoice := &lnrpc.Invoice{
+				Memo:  "testing",
+				Value: int64(payAmt),
+			}
+			resp := bob.RPC.AddInvoice(invoice)
+
+			ht.CompletePaymentRequests(
+				alice, []string{resp.PaymentRequest},
+			)
+
+			return
 
 		case resp := <-respChan:
 			ht.Logf("Received resp %v", resp)

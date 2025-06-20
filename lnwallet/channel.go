@@ -9665,9 +9665,10 @@ func (lc *LightningChannel) RemoteNextRevocation() *btcec.PublicKey {
 		return lc.channelState.RemoteNextRevocation
 	}
 
-	if lc.musigSessions == nil {
-		return nil
-	}
+	// Hack!
+	// if lc.musigSessions == nil {
+	// 	return nil
+	// }
 
 	return lc.channelState.RemoteNextRevocation
 }

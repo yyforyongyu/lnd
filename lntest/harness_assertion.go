@@ -1020,7 +1020,7 @@ func (h *HarnessTest) AssertPaymentStatusFromStream(stream rpc.PaymentClient,
 	status lnrpc.Payment_PaymentStatus) *lnrpc.Payment {
 
 	return h.assertPaymentStatusWithTimeout(
-		stream, status, wait.PaymentTimeout,
+		stream, status, time.Second*5,
 	)
 }
 

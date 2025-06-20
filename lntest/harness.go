@@ -1582,7 +1582,8 @@ func (h *HarnessTest) completePaymentRequestsAssertStatus(hn *node.HarnessNode,
 	}
 
 	// Wait for all payments to report the expected status.
-	timer := time.After(wait.PaymentTimeout)
+	// timer := time.After(wait.PaymentTimeout)
+	timer := time.After(5 * time.Second)
 	select {
 	case stream := <-results:
 		h.AssertPaymentStatusFromStream(stream, status)
