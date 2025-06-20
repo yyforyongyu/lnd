@@ -721,10 +721,16 @@ func (l *channelLink) eligibleToForward() bool {
 //
 // NOTE: MUST be called from the main event loop.
 func (l *channelLink) eligibleToUpdate() bool {
-	return l.channel.RemoteNextRevocation() != nil &&
-		l.channel.ShortChanID() != hop.Source &&
-		l.isReestablished() &&
-		l.quiescer.CanSendUpdates()
+	hasNextRevoke := l.channel.RemoteNextRevocation() != nil
+	nonZeroChanID := l.channel.ShortChanID() != hop.Source
+	reestablished := l.isReestablished()
+	isQuiescent := l.quiescer.CanSendUpdates()
+
+	l.log.Debugf("eligibleToUpdate: hasNextRevoke=%v, nonZeroChanID=%v, "+
+		"reestablished=%v, isQuiescent=%v", hasNextRevoke, nonZeroChanID,
+		reestablished, isQuiescent)
+
+	return hasNextRevoke && nonZeroChanID && reestablished && isQuiescent
 }
 
 // EnableAdds sets the ChannelUpdateHandler state to allow UpdateAddHtlc's in
@@ -1499,6 +1505,8 @@ func (l *channelLink) htlcManager(ctx context.Context) {
 			return
 
 		case <-l.cfg.BatchTicker.Ticks():
+			l.log.Debugf("=====================> BatchTicker ticked")
+
 			// Attempt to extend the remote commitment chain
 			// including all the currently pending entries. If the
 			// send was unsuccessful, then abandon the update,

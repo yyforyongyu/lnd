@@ -391,6 +391,11 @@ func (d *DynUpgrader) updateLocalChannelConfig() {
 		Status: UpdateLinkStatusSucceeded,
 	}
 	d.req.Resolve(resp)
+
+	d.status = upgraderStatusReady
+
+	// TODO: need to update the specs on how we exit quiescence!
+	d.link.quiescer.Resume()
 }
 
 func (d *DynUpgrader) updateRemoteChannelConfig() {
@@ -445,6 +450,11 @@ func (d *DynUpgrader) updateRemoteChannelConfig() {
 	d.link.Unlock()
 
 	d.link.cfg.Peer.SendMessage(false, nextRevocation)
+
+	d.status = upgraderStatusReady
+
+	// TODO: need to update the specs on how we exit quiescence!
+	d.link.quiescer.Resume()
 }
 
 func (d *DynUpgrader) handleRemoteReject(msg lnwire.DynMsg) {
