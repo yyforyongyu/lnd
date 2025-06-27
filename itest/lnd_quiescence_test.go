@@ -65,7 +65,7 @@ func testQuiescence(ht *lntest.HarnessTest) {
 
 	// Alice now restarts with an extremely short quiescence timeout.
 	ht.RestartNodeWithExtraArgs(
-		alice, []string{"--htlcswitch.quiescencetimeout=1s"},
+		alice, []string{"--htlcswitch.quiescencetimeout=1ms"},
 	)
 
 	// Once restarted, the channel is no longer quiescent so Alice can
@@ -83,16 +83,14 @@ func testQuiescence(ht *lntest.HarnessTest) {
 	})
 	require.True(ht, res.Initiator)
 
-	// Sleep 2 seconds - we expect the above quiescence to timeout after 1s,
-	// then Alice and Bob will try to reconnect.
-	time.Sleep(2 * time.Second)
-
 	// The above quiescence timeout will cause Alice to disconnect with Bob.
 	// However, since the connection has an open channel, Alice and Bob will
 	// be reconnected shortly.
 	//
 	// TODO(yy): When refactoring the peer connection we need to have an RPC
 	// that reports how many times the peer has been connected.
+	//
+	// NOTE: conn race will happen when running with neutrino.
 	ht.AssertConnected(alice, bob)
 
 	// Assert that Alice can pay invoice3. This implicitly checks that the
