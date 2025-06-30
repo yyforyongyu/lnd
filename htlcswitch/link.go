@@ -1886,8 +1886,6 @@ func (l *channelLink) cleanupSpuriousResponse(pkt *htlcPacket) {
 // handleUpstreamMsg processes wire messages related to commitment state
 // updates from the upstream peer. The upstream peer is the peer whom we have a
 // direct channel with, updating our respective commitment chains.
-//
-//nolint:funlen
 func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 	msg lnwire.Message) {
 
@@ -1921,40 +1919,7 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 		l.processRemoteRevokeAndAck(ctx, msg)
 
 	case *lnwire.UpdateFee:
-		// Check and see if their proposed fee-rate would make us
-		// exceed the fee threshold.
-		fee := chainfee.SatPerKWeight(msg.FeePerKw)
-
-		isDust, err := l.exceedsFeeExposureLimit(fee)
-		if err != nil {
-			// This shouldn't typically happen. If it does, it
-			// indicates something is wrong with our channel state.
-			l.log.Errorf("Unable to determine if fee threshold " +
-				"exceeded")
-			l.failf(LinkFailureError{code: ErrInternalError},
-				"error calculating fee exposure: %v", err)
-
-			return
-		}
-
-		if isDust {
-			// The proposed fee-rate makes us exceed the fee
-			// threshold.
-			l.failf(LinkFailureError{code: ErrInternalError},
-				"fee threshold exceeded: %v", err)
-			return
-		}
-
-		// We received fee update from peer. If we are the initiator we
-		// will fail the channel, if not we will apply the update.
-		if err := l.channel.ReceiveUpdateFee(fee); err != nil {
-			l.failf(LinkFailureError{code: ErrInvalidUpdate},
-				"error receiving fee update: %v", err)
-			return
-		}
-
-		// Update the mailbox's feerate as well.
-		l.mailBox.SetFeeRate(fee)
+		l.processRemoteUpdateFee(msg)
 
 	case *lnwire.Stfu:
 		err := l.handleStfu(msg)
@@ -1970,28 +1935,11 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 			msg.Warning())
 
 	case *lnwire.Error:
-		// Error received from remote, MUST fail channel, but should
-		// only print the contents of the error message if all
-		// characters are printable ASCII.
-		l.failf(
-			LinkFailureError{
-				code: ErrRemoteError,
+		l.processRemoteError(msg)
 
-				// TODO(halseth): we currently don't fail the
-				// channel permanently, as there are some sync
-				// issues with other implementations that will
-				// lead to them sending an error message, but
-				// we can recover from on next connection. See
-				// https://github.com/ElementsProject/lightning/issues/4212
-				PermanentFailure: false,
-			},
-			"ChannelPoint(%v): received error from peer: %v",
-			l.channel.ChannelPoint(), msg.Error(),
-		)
 	default:
 		l.log.Warnf("received unknown message of type %T", msg)
 	}
-
 }
 
 // handleStfu implements the top-level logic for handling the Stfu message from
@@ -4629,4 +4577,64 @@ func (l *channelLink) processRemoteRevokeAndAck(ctx context.Context,
 		l.flushHooks.invoke()
 	}
 	l.RWMutex.Unlock()
+}
+
+// processRemoteUpdateFee takes an `UpdateFee` msg sent from the remote and
+// processes it.
+func (l *channelLink) processRemoteUpdateFee(msg *lnwire.UpdateFee) {
+	// Check and see if their proposed fee-rate would make us exceed the fee
+	// threshold.
+	fee := chainfee.SatPerKWeight(msg.FeePerKw)
+
+	isDust, err := l.exceedsFeeExposureLimit(fee)
+	if err != nil {
+		// This shouldn't typically happen. If it does, it indicates
+		// something is wrong with our channel state.
+		l.log.Errorf("Unable to determine if fee threshold " +
+			"exceeded")
+		l.failf(LinkFailureError{code: ErrInternalError},
+			"error calculating fee exposure: %v", err)
+
+		return
+	}
+
+	if isDust {
+		// The proposed fee-rate makes us exceed the fee threshold.
+		l.failf(LinkFailureError{code: ErrInternalError},
+			"fee threshold exceeded: %v", err)
+		return
+	}
+
+	// We received fee update from peer. If we are the initiator we will
+	// fail the channel, if not we will apply the update.
+	if err := l.channel.ReceiveUpdateFee(fee); err != nil {
+		l.failf(LinkFailureError{code: ErrInvalidUpdate},
+			"error receiving fee update: %v", err)
+		return
+	}
+
+	// Update the mailbox's feerate as well.
+	l.mailBox.SetFeeRate(fee)
+}
+
+// processRemoteError takes an `Error` msg sent from the remote and fails the
+// channel link.
+func (l *channelLink) processRemoteError(msg *lnwire.Error) {
+	// Error received from remote, MUST fail channel, but should only print
+	// the contents of the error message if all characters are printable
+	// ASCII.
+	l.failf(
+		// TODO(halseth): we currently don't fail the channel
+		// permanently, as there are some sync issues with other
+		// implementations that will lead to them sending an
+		// error message, but we can recover from on next
+		// connection. See
+		// https://github.com/ElementsProject/lightning/issues/4212
+		LinkFailureError{
+			code:             ErrRemoteError,
+			PermanentFailure: false,
+		},
+		"ChannelPoint(%v): received error from peer: %v",
+		l.channel.ChannelPoint(), msg.Error(),
+	)
 }
