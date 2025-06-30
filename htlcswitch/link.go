@@ -1912,42 +1912,7 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 		l.processRemoteUpdateFailMalformedHTLC(msg)
 
 	case *lnwire.UpdateFailHTLC:
-		// Verify that the failure reason is at least 256 bytes plus
-		// overhead.
-		const minimumFailReasonLength = lnwire.FailureMessageLength +
-			2 + 2 + 32
-
-		if len(msg.Reason) < minimumFailReasonLength {
-			// We've received a reason with a non-compliant length.
-			// Older nodes happily relay back these failures that
-			// may originate from a node further downstream.
-			// Therefore we can't just fail the channel.
-			//
-			// We want to be compliant ourselves, so we also can't
-			// pass back the reason unmodified. And we must make
-			// sure that we don't hit the magic length check of 260
-			// bytes in processRemoteSettleFails either.
-			//
-			// Because the reason is unreadable for the payer
-			// anyway, we just replace it by a compliant-length
-			// series of random bytes.
-			msg.Reason = make([]byte, minimumFailReasonLength)
-			_, err := crand.Read(msg.Reason[:])
-			if err != nil {
-				l.log.Errorf("Random generation error: %v", err)
-
-				return
-			}
-		}
-
-		// Add fail to the update log.
-		idx := msg.ID
-		err := l.channel.ReceiveFailHTLC(idx, msg.Reason[:])
-		if err != nil {
-			l.failf(LinkFailureError{code: ErrInvalidUpdate},
-				"unable to handle upstream fail HTLC: %v", err)
-			return
-		}
+		l.processRemoteUpdateFailHTLC(msg)
 
 	case *lnwire.CommitSig:
 		// Since we may have learned new preimages for the first time,
@@ -4613,6 +4578,45 @@ func (l *channelLink) processRemoteUpdateFailMalformedHTLC(
 	// to it, than we should transform the malformed HTLC message to the
 	// usual HTLC fail message.
 	err := l.channel.ReceiveFailHTLC(msg.ID, b.Bytes())
+	if err != nil {
+		l.failf(LinkFailureError{code: ErrInvalidUpdate},
+			"unable to handle upstream fail HTLC: %v", err)
+
+		return
+	}
+}
+
+// processRemoteUpdateFailHTLC takes an `UpdateFailHTLC` msg sent from the
+// remote and processes it.
+func (l *channelLink) processRemoteUpdateFailHTLC(msg *lnwire.UpdateFailHTLC) {
+	// Verify that the failure reason is at least 256 bytes plus overhead.
+	const minimumFailReasonLength = lnwire.FailureMessageLength + 2 + 2 + 32
+
+	if len(msg.Reason) < minimumFailReasonLength {
+		// We've received a reason with a non-compliant length. Older
+		// nodes happily relay back these failures that may originate
+		// from a node further downstream. Therefore we can't just fail
+		// the channel.
+		//
+		// We want to be compliant ourselves, so we also can't pass back
+		// the reason unmodified. And we must make sure that we don't
+		// hit the magic length check of 260 bytes in
+		// processRemoteSettleFails either.
+		//
+		// Because the reason is unreadable for the payer anyway, we
+		// just replace it by a compliant-length series of random bytes.
+		msg.Reason = make([]byte, minimumFailReasonLength)
+		_, err := crand.Read(msg.Reason[:])
+		if err != nil {
+			l.log.Errorf("Random generation error: %v", err)
+
+			return
+		}
+	}
+
+	// Add fail to the update log.
+	idx := msg.ID
+	err := l.channel.ReceiveFailHTLC(idx, msg.Reason[:])
 	if err != nil {
 		l.failf(LinkFailureError{code: ErrInvalidUpdate},
 			"unable to handle upstream fail HTLC: %v", err)
