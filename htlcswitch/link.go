@@ -1906,57 +1906,7 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 		l.processRemoteUpdateAddHTLC(msg)
 
 	case *lnwire.UpdateFulfillHTLC:
-		pre := msg.PaymentPreimage
-		idx := msg.ID
-
-		// Before we pipeline the settle, we'll check the set of active
-		// htlc's to see if the related UpdateAddHTLC has been fully
-		// locked-in.
-		var lockedin bool
-		htlcs := l.channel.ActiveHtlcs()
-		for _, add := range htlcs {
-			// The HTLC will be outgoing and match idx.
-			if !add.Incoming && add.HtlcIndex == idx {
-				lockedin = true
-				break
-			}
-		}
-
-		if !lockedin {
-			l.failf(
-				LinkFailureError{code: ErrInvalidUpdate},
-				"unable to handle upstream settle",
-			)
-			return
-		}
-
-		if err := l.channel.ReceiveHTLCSettle(pre, idx); err != nil {
-			l.failf(
-				LinkFailureError{
-					code:          ErrInvalidUpdate,
-					FailureAction: LinkFailureForceClose,
-				},
-				"unable to handle upstream settle HTLC: %v", err,
-			)
-			return
-		}
-
-		settlePacket := &htlcPacket{
-			outgoingChanID: l.ShortChanID(),
-			outgoingHTLCID: idx,
-			htlc: &lnwire.UpdateFulfillHTLC{
-				PaymentPreimage: pre,
-			},
-		}
-
-		// Add the newly discovered preimage to our growing list of
-		// uncommitted preimage. These will be written to the witness
-		// cache just before accepting the next commitment signature
-		// from the remote peer.
-		l.uncommittedPreimages = append(l.uncommittedPreimages, pre)
-
-		// Pipeline this settle, send it to the switch.
-		go l.forwardBatch(false, settlePacket)
+		l.processRemoteUpdateFulfillHTLC(msg)
 
 	case *lnwire.UpdateFailMalformedHTLC:
 		// Convert the failure type encoded within the HTLC fail
@@ -4605,4 +4555,62 @@ func (l *channelLink) processRemoteUpdateAddHTLC(msg *lnwire.UpdateAddHTLC) {
 
 	l.log.Tracef("receive upstream htlc with payment hash(%x), "+
 		"assigning index: %v", msg.PaymentHash[:], index)
+}
+
+// processRemoteUpdateFulfillHTLC takes an `UpdateFulfillHTLC` msg sent from the
+// remote and processes it.
+func (l *channelLink) processRemoteUpdateFulfillHTLC(
+	msg *lnwire.UpdateFulfillHTLC) {
+
+	pre := msg.PaymentPreimage
+	idx := msg.ID
+
+	// Before we pipeline the settle, we'll check the set of active htlc's
+	// to see if the related UpdateAddHTLC has been fully locked-in.
+	var lockedin bool
+	htlcs := l.channel.ActiveHtlcs()
+	for _, add := range htlcs {
+		// The HTLC will be outgoing and match idx.
+		if !add.Incoming && add.HtlcIndex == idx {
+			lockedin = true
+			break
+		}
+	}
+
+	if !lockedin {
+		l.failf(
+			LinkFailureError{code: ErrInvalidUpdate},
+			"unable to handle upstream settle",
+		)
+
+		return
+	}
+
+	if err := l.channel.ReceiveHTLCSettle(pre, idx); err != nil {
+		l.failf(
+			LinkFailureError{
+				code:          ErrInvalidUpdate,
+				FailureAction: LinkFailureForceClose,
+			},
+			"unable to handle upstream settle HTLC: %v", err,
+		)
+
+		return
+	}
+
+	settlePacket := &htlcPacket{
+		outgoingChanID: l.ShortChanID(),
+		outgoingHTLCID: idx,
+		htlc: &lnwire.UpdateFulfillHTLC{
+			PaymentPreimage: pre,
+		},
+	}
+
+	// Add the newly discovered preimage to our growing list of uncommitted
+	// preimage. These will be written to the witness cache just before
+	// accepting the next commitment signature from the remote peer.
+	l.uncommittedPreimages = append(l.uncommittedPreimages, pre)
+
+	// Pipeline this settle, send it to the switch.
+	go l.forwardBatch(false, settlePacket)
 }
