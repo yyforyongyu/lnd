@@ -1510,30 +1510,7 @@ func (l *channelLink) htlcManager(ctx context.Context) {
 		// A htlc resolution is received. This means that we now have a
 		// resolution for a previously accepted htlc.
 		case hodlItem := <-l.hodlQueue.ChanOut():
-			htlcResolution := hodlItem.(invoices.HtlcResolution)
-			err := l.processHodlQueue(ctx, htlcResolution)
-			switch err {
-			// No error, success.
-			case nil:
-
-			// If the duplicate keystone error was encountered,
-			// fail back gracefully.
-			case ErrDuplicateKeystone:
-				l.failf(LinkFailureError{
-					code: ErrCircuitError,
-				}, "process hodl queue: "+
-					"temporary circuit error: %v",
-					err,
-				)
-
-			// Send an Error message to the peer.
-			default:
-				l.failf(LinkFailureError{
-					code: ErrInternalError,
-				}, "process hodl queue: unable to update "+
-					"commitment: %v", err,
-				)
-			}
+			l.handleHtlcResolution(ctx, hodlItem)
 
 		case qReq := <-l.quiescenceReqs:
 			l.quiescer.InitStfu(qReq)
@@ -4572,4 +4549,41 @@ func (l *channelLink) CommitmentCustomBlob() fn.Option[tlv.Blob] {
 	}
 
 	return l.channel.LocalCommitmentBlob()
+}
+
+// handleHtlcResolution takes an HTLC resolution and processes it by draining
+// the hodlQueue. Once processed, a commit_sig is sent to the remote to update
+// their commitment.
+func (l *channelLink) handleHtlcResolution(ctx context.Context, hodlItem any) {
+	htlcResolution, ok := hodlItem.(invoices.HtlcResolution)
+	if !ok {
+		l.log.Errorf("expect HtlcResolution, got %T", hodlItem)
+		return
+	}
+
+	err := l.processHodlQueue(ctx, htlcResolution)
+	switch err {
+	// No error, success.
+	case nil:
+
+	// If the duplicate keystone error was encountered, fail back
+	// gracefully.
+	case ErrDuplicateKeystone:
+		l.failf(
+			LinkFailureError{
+				code: ErrCircuitError,
+			},
+			"process hodl queue: temporary circuit error: %v", err,
+		)
+
+	// Send an Error message to the peer.
+	default:
+		l.failf(
+			LinkFailureError{
+				code: ErrInternalError,
+			},
+			"process hodl queue: unable to update commitment: %v",
+			err,
+		)
+	}
 }
