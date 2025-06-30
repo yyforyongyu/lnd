@@ -1896,13 +1896,13 @@ func (l *channelLink) ackDownStreamPackets() error {
 // the link.
 func (l *channelLink) updateCommitTxOrFail(ctx context.Context) bool {
 	err := l.updateCommitTx(ctx)
-	switch err {
+	switch {
 	// No error encountered, success.
-	case nil:
+	case err == nil:
 
 	// A duplicate keystone error should be resolved and is not fatal, so
 	// we won't send an Error message to the peer.
-	case ErrDuplicateKeystone:
+	case errors.Is(err, ErrDuplicateKeystone):
 		l.failf(LinkFailureError{code: ErrCircuitError},
 			"temporary circuit error: %v", err)
 		return false
@@ -3725,13 +3725,13 @@ func (l *channelLink) handleHtlcResolution(ctx context.Context, hodlItem any) {
 	}
 
 	err := l.processHodlQueue(ctx, htlcResolution)
-	switch err {
+	switch {
 	// No error, success.
-	case nil:
+	case err == nil:
 
 	// If the duplicate keystone error was encountered, fail back
 	// gracefully.
-	case ErrDuplicateKeystone:
+	case errors.Is(err, ErrDuplicateKeystone):
 		l.failf(
 			LinkFailureError{
 				code: ErrCircuitError,
@@ -3887,13 +3887,13 @@ func (l *channelLink) resumeLink(ctx context.Context) {
 	// reforward.
 	if l.ShortChanID() != hop.Source {
 		err := l.resolveFwdPkgs(ctx)
-		switch err {
+		switch {
 		// No error was encountered, success.
-		case nil:
+		case err == nil:
 
 		// If the duplicate keystone error was encountered, we'll fail
 		// without sending an Error message to the peer.
-		case ErrDuplicateKeystone:
+		case errors.Is(err, ErrDuplicateKeystone):
 			l.failf(LinkFailureError{code: ErrCircuitError},
 				"temporary circuit error: %v", err)
 			return
@@ -4207,10 +4207,10 @@ func (l *channelLink) processRemoteCommitSig(ctx context.Context,
 		// then we'll examine the type of error. If it's an
 		// InvalidCommitSigError, then we'll send a direct error.
 		var sendData []byte
-		switch err.(type) {
-		case *lnwallet.InvalidCommitSigError:
+		switch {
+		case lnutils.ErrorAs[*lnwallet.InvalidCommitSigError](err):
 			sendData = []byte(err.Error())
-		case *lnwallet.InvalidHtlcSigError:
+		case lnutils.ErrorAs[*lnwallet.InvalidHtlcSigError](err):
 			sendData = []byte(err.Error())
 		}
 		l.failf(
@@ -4258,9 +4258,9 @@ func (l *channelLink) processRemoteCommitSig(ctx context.Context,
 
 	// As soon as we are ready to send our next revocation, we can invoke
 	// the incoming commit hooks.
-	l.RWMutex.Lock()
+	l.Lock()
 	l.incomingCommitHooks.invoke()
-	l.RWMutex.Unlock()
+	l.Unlock()
 
 	err = l.cfg.Peer.SendMessage(false, nextRevocation)
 	if err != nil {
@@ -4322,12 +4322,11 @@ func (l *channelLink) processRemoteCommitSig(ctx context.Context,
 	// Now that we have finished processing the incoming CommitSig and sent
 	// out our RevokeAndAck, we invoke the flushHooks if the channel state
 	// is clean.
-	l.RWMutex.Lock()
+	l.Lock()
 	if l.channel.IsChannelClean() {
 		l.flushHooks.invoke()
 	}
-	l.RWMutex.Unlock()
-
+	l.Unlock()
 }
 
 // processRemoteRevokeAndAck takes a `RevokeAndAck` msg sent from the remote and
@@ -4427,11 +4426,11 @@ func (l *channelLink) processRemoteRevokeAndAck(ctx context.Context,
 
 	// Now that we have finished processing the RevokeAndAck, we can invoke
 	// the flushHooks if the channel state is clean.
-	l.RWMutex.Lock()
+	l.Lock()
 	if l.channel.IsChannelClean() {
 		l.flushHooks.invoke()
 	}
-	l.RWMutex.Unlock()
+	l.Unlock()
 }
 
 // processRemoteUpdateFee takes an `UpdateFee` msg sent from the remote and
@@ -4524,7 +4523,7 @@ func (l *channelLink) processLocalUpdateFulfillHTLC(ctx context.Context,
 		// commitment state, it has already been cleaned up by a prior
 		// response. We'll thus try to clean up any lingering state to
 		// ensure we don't continue reforwarding.
-		if _, ok := err.(lnwallet.ErrUnknownHtlcIndex); ok {
+		if lnutils.ErrorAs[lnwallet.ErrUnknownHtlcIndex](err) {
 			l.cleanupSpuriousResponse(pkt)
 		}
 
@@ -4591,7 +4590,7 @@ func (l *channelLink) processLocalUpdateFaillHTLC(ctx context.Context,
 		// commitment state, it has already been cleaned up by a prior
 		// response. We'll thus try to clean up any lingering state to
 		// ensure we don't continue reforwarding.
-		if _, ok := err.(lnwallet.ErrUnknownHtlcIndex); ok {
+		if lnutils.ErrorAs[lnwallet.ErrUnknownHtlcIndex](err) {
 			l.cleanupSpuriousResponse(pkt)
 		}
 
