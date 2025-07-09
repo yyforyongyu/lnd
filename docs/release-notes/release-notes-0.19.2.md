@@ -37,6 +37,15 @@
   could lead to a memory issues due to a goroutine leak in the peer/gossiper
   code.
 
+- [Fixed](https://github.com/lightningnetwork/lnd/pull/10035) a deadlock (writer starvation) in the switch.
+
+- Fixed a [case](https://github.com/lightningnetwork/lnd/pull/10045) that a
+  panic may happen which prevents the node from starting up.
+
+- Fixed a [case](https://github.com/lightningnetwork/lnd/pull/10048) where we
+  would not be able to decode persisted data in the utxo nursery and therefore
+  would fail to start up.
+
 # New Features
 
 ## Functional Enhancements
