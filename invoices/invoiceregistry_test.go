@@ -169,9 +169,17 @@ func TestInvoiceRegistry(t *testing.T) {
 		test := test
 
 		t.Run(test.name+"_KV", func(t *testing.T) {
+			t.Parallel()
 			test.test(t, makeKeyValueDB)
 		})
 
+		// For SQLite, it has significant limitations with concurrent
+		// writes. When combining a highly parallel test runner with a
+		// database that has limited write concurrency. Many tests start
+		// simultaneously, and each one tries to get a write lock on the
+		// same SQLite database file. This creates a "thundering herd"
+		// problem, leading to massive lock contention. Thus, for SQLite
+		// tests, we will skip calling `t.Parallel()`.
 		t.Run(test.name+"_SQLite", func(t *testing.T) {
 			test.test(t,
 				func(t *testing.T) (
@@ -182,6 +190,7 @@ func TestInvoiceRegistry(t *testing.T) {
 		})
 
 		t.Run(test.name+"_Postgres", func(t *testing.T) {
+			t.Parallel()
 			test.test(t,
 				func(t *testing.T) (
 					invpkg.InvoiceDB, *clock.TestClock) {
@@ -195,8 +204,6 @@ func TestInvoiceRegistry(t *testing.T) {
 // testSettleInvoice tests settling of an invoice and related notifications.
 func testSettleInvoice(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
-
-	t.Parallel()
 
 	ctx := newTestContext(t, nil, makeDB)
 
@@ -380,8 +387,6 @@ func testSettleInvoice(t *testing.T,
 func testCancelInvoiceImpl(t *testing.T, gc bool,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
-
 	cfg := defaultRegistryConfig()
 
 	// If set to true, then also delete the invoice from the DB after
@@ -514,8 +519,6 @@ func testCancelInvoiceImpl(t *testing.T, gc bool,
 func testCancelInvoice(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
-
 	// Test cancellation both with garbage collection (meaning that canceled
 	// invoice will be deleted) and without (meaning it'll be kept).
 	t.Run("garbage collect", func(t *testing.T) {
@@ -532,7 +535,6 @@ func testCancelInvoice(t *testing.T,
 func testSettleHoldInvoice(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	defer timeout()()
 
 	idb, clock := makeDB(t)
@@ -702,7 +704,6 @@ func testSettleHoldInvoice(t *testing.T,
 func testCancelHoldInvoice(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	defer timeout()()
 
 	idb, testClock := makeDB(t)
@@ -784,7 +785,6 @@ func testCancelHoldInvoice(t *testing.T,
 func testUnknownInvoice(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	ctx := newTestContext(t, nil, makeDB)
 
 	// Notify arrival of a new htlc paying to this invoice. This should
@@ -807,8 +807,6 @@ func testUnknownInvoice(t *testing.T,
 func testKeySend(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
-
 	t.Run("enabled", func(t *testing.T) {
 		testKeySendImpl(t, true, makeDB)
 	})
@@ -822,7 +820,6 @@ func testKeySend(t *testing.T,
 func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	defer timeout()()
 
 	cfg := defaultRegistryConfig()
@@ -941,8 +938,6 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 func testHoldKeysend(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
-
 	t.Run("settle", func(t *testing.T) {
 		testHoldKeysendImpl(t, false, makeDB)
 	})
@@ -955,7 +950,6 @@ func testHoldKeysend(t *testing.T,
 func testHoldKeysendImpl(t *testing.T, timeoutKeysend bool,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	defer timeout()()
 
 	const holdDuration = time.Minute
@@ -1049,7 +1043,6 @@ func testHoldKeysendImpl(t *testing.T, timeoutKeysend bool,
 func testMppPayment(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	defer timeout()()
 
 	ctx := newTestContext(t, nil, makeDB)
@@ -1147,8 +1140,6 @@ func testMppPayment(t *testing.T,
 func testMppPaymentWithOverpayment(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
-
 	ctxb := context.Background()
 	f := func(overpaymentRand uint64) bool {
 		ctx := newTestContext(t, nil, makeDB)
@@ -1225,7 +1216,6 @@ func testMppPaymentWithOverpayment(t *testing.T,
 func testInvoiceExpiryWithRegistry(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	idb, testClock := makeDB(t)
 
 	cfg := invpkg.RegistryConfig{
@@ -1335,7 +1325,6 @@ func testInvoiceExpiryWithRegistry(t *testing.T,
 func testOldInvoiceRemovalOnStart(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	idb, testClock := makeDB(t)
 
 	cfg := invpkg.RegistryConfig{
@@ -1414,8 +1403,6 @@ func testOldInvoiceRemovalOnStart(t *testing.T,
 func testHeightExpiryWithRegistry(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
-
 	t.Run("single shot settled before expiry", func(t *testing.T) {
 		testHeightExpiryWithRegistryImpl(t, 1, true, makeDB)
 	})
@@ -1436,7 +1423,6 @@ func testHeightExpiryWithRegistry(t *testing.T,
 func testHeightExpiryWithRegistryImpl(t *testing.T, numParts int, settle bool,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	defer timeout()()
 
 	ctx := newTestContext(t, nil, makeDB)
@@ -1552,7 +1538,6 @@ func testHeightExpiryWithRegistryImpl(t *testing.T, numParts int, settle bool,
 func testMultipleSetHeightExpiry(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	defer timeout()()
 
 	ctx := newTestContext(t, nil, makeDB)
@@ -1649,8 +1634,6 @@ func testMultipleSetHeightExpiry(t *testing.T,
 func testSettleInvoicePaymentAddrRequired(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
-
 	ctx := newTestContext(t, nil, makeDB)
 	ctxb := context.Background()
 
@@ -1740,8 +1723,6 @@ func testSettleInvoicePaymentAddrRequired(t *testing.T,
 // payload. This ensures we don't break payment for any invoices in the wild.
 func testSettleInvoicePaymentAddrRequiredOptionalGrace(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
-
-	t.Parallel()
 
 	ctx := newTestContext(t, nil, makeDB)
 	ctxb := context.Background()
@@ -1855,7 +1836,6 @@ func testSettleInvoicePaymentAddrRequiredOptionalGrace(t *testing.T,
 func testAMPWithoutMPPPayload(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	defer timeout()()
 
 	cfg := defaultRegistryConfig()
@@ -1889,8 +1869,6 @@ func testAMPWithoutMPPPayload(t *testing.T,
 // valid and invalid reconstructions.
 func testSpontaneousAmpPayment(t *testing.T,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
-
-	t.Parallel()
 
 	tests := []struct {
 		name               string
@@ -1946,7 +1924,6 @@ func testSpontaneousAmpPaymentImpl(
 	t *testing.T, ampEnabled, failReconstruction bool, numShards int,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
-	t.Parallel()
 	defer timeout()()
 
 	cfg := defaultRegistryConfig()
