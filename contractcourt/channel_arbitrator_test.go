@@ -27,6 +27,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1054,10 +1055,6 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 		StateWaitingFullResolution,
 	)
 
-	supplement, err := chanArbCtx.log.FetchResolverSupplement()
-	require.NoError(t, err)
-	require.NotNil(t, supplement)
-
 	// We'll grab the old notifier here as our resolvers are still holding
 	// a reference to this instance, and a new one will be created when we
 	// restart the channel arb below.
@@ -1077,8 +1074,16 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	require.Equal(t, expectedFinalHtlcs, chanArbCtx.finalHtlcs)
 
 	// We'll now re-create the resolver, notice that we use the existing
-	// arbLog so it carries over the same on-disk state.
-	chanArbCtxNew, err := chanArbCtx.Restart(nil)
+	// arbLog so it carries over the same on-disk state. Historical channel
+	// state is intentionally unavailable here so restart recovery must rely
+	// on the persisted resolver supplement.
+	chanArbCtxNew, err := chanArbCtx.Restart(func(c *chanArbTestCtx) {
+		c.chanArb.cfg.FetchHistoricalChannel = func() (*channeldb.OpenChannel,
+			error) {
+
+			return nil, channeldb.ErrChannelNotFound
+		}
+	})
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb = chanArbCtxNew.chanArb
 	defer chanArbCtxNew.CleanUp()
@@ -1180,6 +1185,194 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	case <-time.After(defaultTimeout):
 		t.Fatalf("contract was not resolved")
 	}
+}
+
+func TestChannelArbitratorRelaunchAnchorFromResolverSupplement(t *testing.T) {
+	t.Parallel()
+
+	taprootChanType := channeldb.AnchorOutputsBit |
+		channeldb.SimpleTaprootFeatureBit
+	taprootPkScript := append([]byte{0x51, 0x20}, make([]byte, 32)...)
+
+	log := &mockArbitratorLog{
+		newStates: make(chan ArbitratorState, 1),
+		resolutions: &ContractResolutions{
+			AnchorResolution: &lnwallet.AnchorResolution{
+				CommitAnchor: testChanPoint1,
+				AnchorSignDescriptor: input.SignDescriptor{
+					Output: &wire.TxOut{
+						Value:    330,
+						PkScript: taprootPkScript,
+					},
+				},
+			},
+		},
+		resolverSupplement: &ResolverSupplement{
+			ChanType: taprootChanType,
+		},
+	}
+
+	chanArbCtx, err := createTestChannelArbitrator(t, log)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, chanArbCtx.chanArb.Stop())
+	})
+
+	fetches := 0
+	chanArbCtx.chanArb.cfg.FetchHistoricalChannel = func() (*channeldb.OpenChannel,
+		error) {
+
+		fetches++
+		return nil, channeldb.ErrChannelNotFound
+	}
+
+	require.NoError(t, chanArbCtx.chanArb.relaunchResolvers(nil, 1))
+	require.Zero(t, fetches)
+
+	select {
+	case sweptInput := <-chanArbCtx.sweeper.sweptInputs:
+		require.Equal(t, input.TaprootAnchorSweepSpend,
+			sweptInput.WitnessType())
+	case <-time.After(defaultTimeout):
+		t.Fatal("anchor resolver did not sweep input")
+	}
+}
+
+func TestChannelArbitratorBackfillsResolverSupplement(t *testing.T) {
+	t.Parallel()
+
+	taprootChanType := channeldb.AnchorOutputsBit |
+		channeldb.SimpleTaprootFeatureBit
+	taprootPkScript := append([]byte{0x51, 0x20}, make([]byte, 32)...)
+
+	log := &mockArbitratorLog{
+		newStates: make(chan ArbitratorState, 1),
+		resolutions: &ContractResolutions{
+			AnchorResolution: &lnwallet.AnchorResolution{
+				CommitAnchor: testChanPoint1,
+				AnchorSignDescriptor: input.SignDescriptor{
+					Output: &wire.TxOut{
+						Value:    330,
+						PkScript: taprootPkScript,
+					},
+				},
+			},
+		},
+	}
+
+	chanArbCtx, err := createTestChannelArbitrator(t, log)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, chanArbCtx.chanArb.Stop())
+	})
+
+	fetches := 0
+	chanArbCtx.chanArb.cfg.FetchHistoricalChannel = func() (*channeldb.OpenChannel,
+		error) {
+
+		fetches++
+		return &channeldb.OpenChannel{
+			ChanType: taprootChanType,
+		}, nil
+	}
+
+	require.NoError(t, chanArbCtx.chanArb.relaunchResolvers(nil, 1))
+	require.Equal(t, 1, fetches)
+	require.NotNil(t, log.resolverSupplement)
+	require.Equal(t, taprootChanType, log.resolverSupplement.ChanType)
+
+	select {
+	case sweptInput := <-chanArbCtx.sweeper.sweptInputs:
+		require.Equal(t, input.TaprootAnchorSweepSpend,
+			sweptInput.WitnessType())
+	case <-time.After(defaultTimeout):
+		t.Fatal("anchor resolver did not sweep input")
+	}
+}
+
+func TestChannelArbitratorRelaunchTaprootHtlcUsesResolverSupplement(
+	t *testing.T) {
+
+	t.Parallel()
+
+	taprootChanType := channeldb.AnchorOutputsBit |
+		channeldb.SimpleTaprootFeatureBit
+	commitHash := chainhash.Hash{1, 2, 3}
+	htlcPoint := wire.OutPoint{Hash: commitHash, Index: 0}
+	htlc := channeldb.HTLC{
+		Amt:         1000,
+		HtlcIndex:   11,
+		OutputIndex: 0,
+	}
+
+	oldResolution := lnwallet.OutgoingHtlcResolution{
+		Expiry:        20,
+		ClaimOutpoint: htlcPoint,
+		SweepSignDesc: input.SignDescriptor{
+			Output: &wire.TxOut{PkScript: []byte{0x51, 0x20}},
+		},
+	}
+
+	newBlob := tlv.Blob{1, 2, 3}
+	updatedResolution := oldResolution
+	updatedResolution.ResolutionBlob = fn.Some(newBlob)
+
+	log := &mockArbitratorLog{
+		newStates: make(chan ArbitratorState, 1),
+		resolutions: &ContractResolutions{
+			CommitHash: commitHash,
+			HtlcResolutions: lnwallet.HtlcResolutions{
+				OutgoingHTLCs: []lnwallet.OutgoingHtlcResolution{
+					updatedResolution,
+				},
+			},
+		},
+		resolverSupplement: &ResolverSupplement{
+			ChanType: taprootChanType,
+		},
+		resolvers: make(map[ContractResolver]struct{}),
+	}
+
+	chanArbCtx, err := createTestChannelArbitrator(t, log)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, chanArbCtx.chanArb.Stop())
+	})
+
+	resolverCfg := ResolverConfig{
+		ChannelArbitratorConfig: chanArbCtx.chanArb.cfg,
+		Checkpoint: func(ContractResolver,
+			...*channeldb.ResolverReport) error {
+
+			return nil
+		},
+	}
+	resolver := newTimeoutResolver(oldResolution, 1, htlc, resolverCfg)
+	resolver.markResolved()
+	log.resolvers[resolver] = struct{}{}
+
+	fetches := 0
+	chanArbCtx.chanArb.cfg.FetchHistoricalChannel = func() (*channeldb.OpenChannel,
+		error) {
+
+		fetches++
+		return nil, channeldb.ErrChannelNotFound
+	}
+
+	commitSet := &CommitSet{
+		ConfCommitKey: fn.Some(LocalHtlcSet),
+		HtlcSets: map[HtlcSetKey][]channeldb.HTLC{
+			LocalHtlcSet: {htlc},
+		},
+	}
+
+	require.NoError(t, chanArbCtx.chanArb.relaunchResolvers(commitSet, 1))
+	require.Zero(t, fetches)
+	require.True(t, resolver.htlcResolution.ResolutionBlob.IsSome())
+	require.Equal(
+		t, newBlob,
+		resolver.htlcResolution.ResolutionBlob.UnwrapOrFail(t),
+	)
 }
 
 // TestChannelArbitratorLocalForceCloseRemoteConfiremd tests that the

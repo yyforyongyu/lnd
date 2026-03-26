@@ -685,6 +685,41 @@ func (c *ChannelArbitrator) fetchHistoricalState() (*channeldb.OpenChannel,
 	return chanState, nil
 }
 
+// loadOrBackfillResolverSupplement loads the persisted resolver supplement.
+// For older logs that don't have it yet, the supplement is derived from the
+// historical channel state and then written back to the arbitrator log.
+func (c *ChannelArbitrator) loadOrBackfillResolverSupplement() (
+	*ResolverSupplement, error) {
+
+	supplement, err := c.log.FetchResolverSupplement()
+	switch {
+	case err == nil:
+		return supplement, nil
+
+	case err != errNoResolverSupplement && err != errScopeBucketNoExist:
+		return nil, err
+	}
+
+	chanState, err := c.fetchHistoricalState()
+	if err != nil {
+		return nil, err
+	}
+	if chanState == nil {
+		return nil, fmt.Errorf("missing resolver supplement and historical channel state")
+	}
+
+	supplement = deriveResolverSupplement(chanState)
+	if supplement == nil {
+		return nil, fmt.Errorf("unable to derive resolver supplement")
+	}
+
+	if err := c.log.PersistResolverSupplement(supplement); err != nil {
+		return nil, err
+	}
+
+	return supplement, nil
+}
+
 // relauchResolvers relaunches the set of resolvers for unresolved contracts in
 // order to provide them with information that's not immediately available upon
 // starting the ChannelArbitrator. This information should ideally be stored in
@@ -753,14 +788,9 @@ func (c *ChannelArbitrator) relaunchResolvers(commitSet *CommitSet,
 		htlcMap[outpoint] = &htlc
 	}
 
-	chanState, err := c.fetchHistoricalState()
+	supplement, err := c.loadOrBackfillResolverSupplement()
 	if err != nil {
 		return err
-	}
-
-	var supplement *ResolverSupplement
-	if chanState != nil {
-		supplement = deriveResolverSupplement(chanState)
 	}
 
 	log.Infof("ChannelArbitrator(%v): relaunching %v contract "+
@@ -769,15 +799,13 @@ func (c *ChannelArbitrator) relaunchResolvers(commitSet *CommitSet,
 	for i := range unresolvedContracts {
 		resolver := unresolvedContracts[i]
 
-		if supplement != nil {
-			resolver.ApplySupplement(supplement)
+		resolver.ApplySupplement(supplement)
 
-			// For taproot channels, we'll need to also make sure the
-			// control block information was set properly.
-			maybeAugmentTaprootResolvers(
-				supplement.ChanType, resolver, contractResolutions,
-			)
-		}
+		// For taproot channels, we'll need to also make sure the control
+		// block information was set properly.
+		maybeAugmentTaprootResolvers(
+			supplement.ChanType, resolver, contractResolutions,
+		)
 
 		unresolvedContracts[i] = resolver
 
@@ -816,9 +844,7 @@ func (c *ChannelArbitrator) relaunchResolvers(commitSet *CommitSet,
 			},
 		)
 
-		if supplement != nil {
-			anchorResolver.ApplySupplement(supplement)
-		}
+		anchorResolver.ApplySupplement(supplement)
 
 		unresolvedContracts = append(unresolvedContracts, anchorResolver)
 
@@ -2378,12 +2404,17 @@ func (c *ChannelArbitrator) prepContractResolutions(
 	if err != nil {
 		return nil, err
 	}
-	var supplement *ResolverSupplement
-	if chanState != nil {
-		supplement = deriveResolverSupplement(chanState)
-		if err := c.log.PersistResolverSupplement(supplement); err != nil {
-			return nil, err
-		}
+	if chanState == nil {
+		return nil, fmt.Errorf("missing historical channel state for resolver supplement")
+	}
+
+	supplement := deriveResolverSupplement(chanState)
+	if supplement == nil {
+		return nil, fmt.Errorf("unable to derive resolver supplement")
+	}
+
+	if err := c.log.PersistResolverSupplement(supplement); err != nil {
+		return nil, err
 	}
 
 	incomingResolutions := contractResolutions.HtlcResolutions.IncomingHTLCs
@@ -2425,9 +2456,7 @@ func (c *ChannelArbitrator) prepContractResolutions(
 			contractResolutions.AnchorResolution.CommitAnchor,
 			height, c.cfg.ChanPoint, resolverCfg,
 		)
-		if supplement != nil {
-			anchorResolver.ApplySupplement(supplement)
-		}
+		anchorResolver.ApplySupplement(supplement)
 
 		htlcResolvers = append(htlcResolvers, anchorResolver)
 	}
@@ -2437,9 +2466,7 @@ func (c *ChannelArbitrator) prepContractResolutions(
 	// steps taken for non-breach-closes do not matter for breach-closes.
 	if contractResolutions.BreachResolution != nil {
 		breachResolver := newBreachResolver(resolverCfg)
-		if supplement != nil {
-			breachResolver.ApplySupplement(supplement)
-		}
+		breachResolver.ApplySupplement(supplement)
 		htlcResolvers = append(htlcResolvers, breachResolver)
 
 		return htlcResolvers, nil
@@ -2473,9 +2500,7 @@ func (c *ChannelArbitrator) prepContractResolutions(
 				resolver := newSuccessResolver(
 					resolution, height, htlc, resolverCfg,
 				)
-				if supplement != nil {
-					resolver.ApplySupplement(supplement)
-				}
+				resolver.ApplySupplement(supplement)
 				htlcResolvers = append(htlcResolvers, resolver)
 			}
 
@@ -2501,9 +2526,7 @@ func (c *ChannelArbitrator) prepContractResolutions(
 				resolver := newTimeoutResolver(
 					resolution, height, htlc, resolverCfg,
 				)
-				if supplement != nil {
-					resolver.ApplySupplement(supplement)
-				}
+				resolver.ApplySupplement(supplement)
 
 				// For outgoing HTLCs, we will also need to
 				// supplement the resolver with the expiry
@@ -2542,9 +2565,7 @@ func (c *ChannelArbitrator) prepContractResolutions(
 					resolution, height, htlc,
 					resolverCfg,
 				)
-				if supplement != nil {
-					resolver.ApplySupplement(supplement)
-				}
+				resolver.ApplySupplement(supplement)
 				htlcResolvers = append(htlcResolvers, resolver)
 			}
 
@@ -2573,9 +2594,7 @@ func (c *ChannelArbitrator) prepContractResolutions(
 				resolver := newOutgoingContestResolver(
 					resolution, height, htlc, resolverCfg,
 				)
-				if supplement != nil {
-					resolver.ApplySupplement(supplement)
-				}
+				resolver.ApplySupplement(supplement)
 
 				// For outgoing HTLCs, we will also need to
 				// supplement the resolver with the expiry
@@ -2597,9 +2616,7 @@ func (c *ChannelArbitrator) prepContractResolutions(
 			*contractResolutions.CommitResolution, height,
 			c.cfg.ChanPoint, resolverCfg,
 		)
-		if supplement != nil {
-			resolver.ApplySupplement(supplement)
-		}
+		resolver.ApplySupplement(supplement)
 		htlcResolvers = append(htlcResolvers, resolver)
 	}
 
