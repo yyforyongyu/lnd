@@ -2381,6 +2381,9 @@ func (c *ChannelArbitrator) prepContractResolutions(
 	var supplement *ResolverSupplement
 	if chanState != nil {
 		supplement = deriveResolverSupplement(chanState)
+		if err := c.log.PersistResolverSupplement(supplement); err != nil {
+			return nil, err
+		}
 	}
 
 	incomingResolutions := contractResolutions.HtlcResolutions.IncomingHTLCs

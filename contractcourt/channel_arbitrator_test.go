@@ -1054,6 +1054,10 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 		StateWaitingFullResolution,
 	)
 
+	supplement, err := chanArbCtx.log.FetchResolverSupplement()
+	require.NoError(t, err)
+	require.NotNil(t, supplement)
+
 	// We'll grab the old notifier here as our resolvers are still holding
 	// a reference to this instance, and a new one will be created when we
 	// restart the channel arb below.
