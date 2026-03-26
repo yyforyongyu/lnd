@@ -37,14 +37,15 @@ const (
 )
 
 type mockArbitratorLog struct {
-	state           ArbitratorState
-	newStates       chan ArbitratorState
-	failLog         bool
-	failFetch       error
-	failCommit      bool
-	failCommitState ArbitratorState
-	resolutions     *ContractResolutions
-	resolvers       map[ContractResolver]struct{}
+	state              ArbitratorState
+	newStates          chan ArbitratorState
+	failLog            bool
+	failFetch          error
+	failCommit         bool
+	failCommitState    ArbitratorState
+	resolutions        *ContractResolutions
+	resolverSupplement *ResolverSupplement
+	resolvers          map[ContractResolver]struct{}
 
 	commitSet *CommitSet
 
@@ -133,6 +134,23 @@ func (b *mockArbitratorLog) FetchContractResolutions() (*ContractResolutions, er
 	}
 
 	return b.resolutions, nil
+}
+
+func (b *mockArbitratorLog) PersistResolverSupplement(
+	supplement *ResolverSupplement) error {
+
+	b.resolverSupplement = supplement
+	return nil
+}
+
+func (b *mockArbitratorLog) FetchResolverSupplement() (*ResolverSupplement,
+	error) {
+
+	if b.resolverSupplement == nil {
+		return nil, errNoResolverSupplement
+	}
+
+	return b.resolverSupplement, nil
 }
 
 func (b *mockArbitratorLog) FetchChainActions() (ChainActionMap, error) {

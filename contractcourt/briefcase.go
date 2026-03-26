@@ -100,6 +100,12 @@ type ArbitratorLog interface {
 	// contract resolutions from persistent storage.
 	FetchContractResolutions() (*ContractResolutions, error)
 
+	// PersistResolverSupplement stores channel-scoped resolver restart data.
+	PersistResolverSupplement(*ResolverSupplement) error
+
+	// FetchResolverSupplement retrieves channel-scoped resolver restart data.
+	FetchResolverSupplement() (*ResolverSupplement, error)
+
 	// InsertConfirmedCommitSet stores the known set of active HTLCs at the
 	// time channel closure. We'll use this to reconstruct our set of chain
 	// actions anew based on the confirmed and pending commitment state.
@@ -377,6 +383,9 @@ var (
 	// taprootDataKey is the key we'll use to store taproot specific data
 	// for the set of channels we'll need to sweep/claim.
 	taprootDataKey = []byte("taproot-data")
+
+	// resolverSupplementKey stores channel-scoped resolver restart data.
+	resolverSupplementKey = []byte("resolver-supplement")
 )
 
 var (
@@ -400,6 +409,10 @@ var (
 	// This can happen if the channel hasn't closed yet, or a client is
 	// running an older version that didn't yet write this state.
 	errNoCommitSet = fmt.Errorf("no commit set exists")
+
+	// errNoResolverSupplement is returned when no resolver supplement has
+	// been stored for the arbitrator.
+	errNoResolverSupplement = fmt.Errorf("no resolver supplement exists")
 )
 
 // boltArbitratorLog is an implementation of the ArbitratorLog interface backed
@@ -1012,6 +1025,56 @@ func (b *boltArbitratorLog) FetchContractResolutions() (*ContractResolutions, er
 	return c, err
 }
 
+// PersistResolverSupplement stores channel-scoped resolver restart state.
+func (b *boltArbitratorLog) PersistResolverSupplement(
+	supplement *ResolverSupplement) error {
+
+	return kvdb.Batch(b.db, func(tx kvdb.RwTx) error {
+		scopeBucket, err := tx.CreateTopLevelBucket(b.scopeKey[:])
+		if err != nil {
+			return err
+		}
+
+		var buf bytes.Buffer
+		if err := encodeResolverSupplement(&buf, supplement); err != nil {
+			return err
+		}
+
+		return scopeBucket.Put(resolverSupplementKey, buf.Bytes())
+	})
+}
+
+// FetchResolverSupplement retrieves channel-scoped resolver restart state.
+func (b *boltArbitratorLog) FetchResolverSupplement() (*ResolverSupplement,
+	error) {
+
+	var supplement *ResolverSupplement
+	err := kvdb.View(b.db, func(tx kvdb.RTx) error {
+		scopeBucket := tx.ReadBucket(b.scopeKey[:])
+		if scopeBucket == nil {
+			return errScopeBucketNoExist
+		}
+
+		supplementBytes := scopeBucket.Get(resolverSupplementKey)
+		if supplementBytes == nil {
+			return errNoResolverSupplement
+		}
+
+		var err error
+		supplement, err = decodeResolverSupplement(
+			bytes.NewReader(supplementBytes),
+		)
+		return err
+	}, func() {
+		supplement = nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return supplement, nil
+}
+
 // FetchChainActions attempts to fetch the set of previously stored chain
 // actions. We'll use this upon restart to properly advance our state machine
 // forward.
@@ -1152,6 +1215,11 @@ func (b *boltArbitratorLog) WipeHistory() error {
 		}
 
 		err = scopeBucket.Delete(resolutionsSignDetailsKey)
+		if err != nil {
+			return err
+		}
+
+		err = scopeBucket.Delete(resolverSupplementKey)
 		if err != nil {
 			return err
 		}
