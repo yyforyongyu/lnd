@@ -448,8 +448,10 @@ func testRevokedCloseRetributionAltruistWatchtowerCase(ht *lntest.HarnessTest,
 	// backup.
 	ht.EnsureConnected(dave, carol)
 
-	// Once connected, give Dave some time to enable the channel again.
+	// Once connected, wait for both channel links to be active again.
 	ht.AssertChannelInGraph(dave, chanPoint)
+	ht.AssertChannelActive(dave, chanPoint)
+	ht.AssertChannelActive(carol, chanPoint)
 
 	// Finally, send payments from Dave to Carol, consuming Carol's
 	// remaining payment hashes.
