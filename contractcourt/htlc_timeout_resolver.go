@@ -113,6 +113,14 @@ func (h *htlcTimeoutResolver) ResolverKey() []byte {
 	return key[:]
 }
 
+// ApplySupplement restores channel-scoped state required to resolve the HTLC.
+func (h *htlcTimeoutResolver) ApplySupplement(
+	supplement *ResolverSupplement) {
+
+	h.contractResolverKit.ApplySupplement(supplement)
+	h.htlcLeaseResolver.setLeaseFields(supplement)
+}
+
 const (
 	// expectedRemoteWitnessSuccessSize is the expected size of the witness
 	// on the remote commitment transaction for an outgoing HTLC that is

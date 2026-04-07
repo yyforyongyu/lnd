@@ -104,6 +104,14 @@ func (h *htlcSuccessResolver) ResolverKey() []byte {
 	return key[:]
 }
 
+// ApplySupplement restores channel-scoped state required to resolve the HTLC.
+func (h *htlcSuccessResolver) ApplySupplement(
+	supplement *ResolverSupplement) {
+
+	h.contractResolverKit.ApplySupplement(supplement)
+	h.htlcLeaseResolver.setLeaseFields(supplement)
+}
+
 // Resolve attempts to resolve an unresolved incoming HTLC that we know the
 // preimage to. If the HTLC is on the commitment of the remote party, then we'll
 // simply sweep it directly. Otherwise, we'll hand this off to the utxo nursery
