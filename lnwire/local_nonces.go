@@ -162,6 +162,11 @@ func decodeLocalNoncesData(r io.Reader, val any, _ *[8]byte,
 			return err
 		}
 
+		err := ValidateMusig2Nonce(nonce)
+		if err != nil {
+			return err
+		}
+
 		if _, exists := l.NoncesMap[txid]; exists {
 			return tlv.NewTypeForDecodingErr(
 				l, "lnwire.LocalNoncesData (duplicate txid)",

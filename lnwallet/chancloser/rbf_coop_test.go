@@ -64,7 +64,7 @@ var (
 
 	closeTx = wire.NewMsgTx(2)
 
-	defaultTimeout = 500 * time.Millisecond
+	defaultTimeout = wait.DefaultTimeout
 )
 
 func sigMustParse(sigBytes []byte) ecdsa.Signature {
@@ -127,13 +127,6 @@ func assertStateTransitions[Event any, Env protofsm.Environment](
 		require.NoError(t, err, "expected state: %T", expectedState)
 
 		require.IsType(t, expectedState, newState)
-	}
-
-	// We should have no more states.
-	select {
-	case newState := <-stateSub.NewItemCreated.ChanOut():
-		t.Fatalf("unexpected state transition: %v", newState)
-	default:
 	}
 }
 
@@ -279,6 +272,10 @@ func (r *rbfCloserTestHarness) stopAndAssert() {
 
 	defer r.chanCloser.RemoveStateSub(r.stateSub)
 	r.chanCloser.Stop()
+
+	// After Stop(), no further state transitions should be produced.
+	// Wait for a short quiet window to catch any unexpected stragglers.
+	r.assertNoStateTransitions()
 
 	r.assertExpectations()
 }
@@ -577,7 +574,7 @@ func (d dustExpectation) String() string {
 // message to the remote party, and all the other intermediate steps.
 func (r *rbfCloserTestHarness) expectHalfSignerIteration(
 	initEvent ProtocolEvent, balanceAfterClose, absoluteFee btcutil.Amount,
-	dustExpect dustExpectation, iteration bool) {
+	dustExpect dustExpectation, expectExtraTransition bool) {
 
 	ctx := context.Background()
 	numFeeCalls := 2
@@ -667,9 +664,10 @@ func (r *rbfCloserTestHarness) expectHalfSignerIteration(
 	case *SendOfferEvent:
 		expectedStates = []RbfState{&ClosingNegotiation{}}
 
-		// If we're in the middle of an iteration, then we expect a
-		// transition from ClosePending -> LocalCloseStart.
-		if iteration {
+		// If we expect an extra transition (e.g. restarting from
+		// ClosePending or CloseErr), then we'll see an additional
+		// ClosingNegotiation emission from the internal requeue.
+		if expectExtraTransition {
 			expectedStates = append(
 				expectedStates, &ClosingNegotiation{},
 			)
@@ -726,7 +724,7 @@ func (r *rbfCloserTestHarness) expectHalfSignerIteration(
 
 func (r *rbfCloserTestHarness) assertSingleRbfIteration(
 	initEvent ProtocolEvent, balanceAfterClose, absoluteFee btcutil.Amount,
-	dustExpect dustExpectation, iteration bool) {
+	dustExpect dustExpectation, expectExtraTransition bool) {
 
 	ctx := context.Background()
 
@@ -734,7 +732,7 @@ func (r *rbfCloserTestHarness) assertSingleRbfIteration(
 	// the RBF loop, ending us in the LocalOfferSent state.
 	r.expectHalfSignerIteration(
 		initEvent, balanceAfterClose, absoluteFee, noDustExpect,
-		iteration,
+		expectExtraTransition,
 	)
 
 	// Now that we're in the local offer sent state, we'll send the
@@ -791,7 +789,7 @@ func newPartialSigWithNonceTlv[T tlv.TlvType](psn lnwire.PartialSigWithNonce,
 // that includes nonce handling for taproot channels.
 func (r *rbfCloserTestHarness) assertSingleRbfIterationWithNonce(
 	initEvent ProtocolEvent, balanceAfterClose, absoluteFee btcutil.Amount,
-	dustExpect dustExpectation, iteration bool,
+	dustExpect dustExpectation, expectExtraTransition bool,
 	nextCloseeNonce lnwire.Musig2Nonce) {
 
 	ctx := context.Background()
@@ -800,7 +798,7 @@ func (r *rbfCloserTestHarness) assertSingleRbfIterationWithNonce(
 	// the RBF loop, ending us in the LocalOfferSent state.
 	r.expectHalfSignerIteration(
 		initEvent, balanceAfterClose, absoluteFee, noDustExpect,
-		iteration,
+		expectExtraTransition,
 	)
 
 	// Now that we're in the local offer sent state, we'll send the response
@@ -835,8 +833,8 @@ func (r *rbfCloserTestHarness) assertSingleRbfIterationWithNonce(
 
 func (r *rbfCloserTestHarness) assertSingleRemoteRbfIteration(
 	initEvent *OfferReceivedEvent, balanceAfterClose,
-	absoluteFee btcutil.Amount, sequence uint32, iteration bool,
-	sendInit bool) {
+	absoluteFee btcutil.Amount, sequence uint32,
+	expectExtraTransition bool, sendInit bool) {
 
 	ctx := context.Background()
 
@@ -853,11 +851,10 @@ func (r *rbfCloserTestHarness) assertSingleRemoteRbfIteration(
 	}
 
 	// Our outer state should transition to ClosingNegotiation state.
-	// If this is an iteration, we go ClosePending -> RemoteCloseStart ->
-	// ClosePending, producing two ClosingNegotiation transitions. We
-	// consume them in a single call to avoid the "no more states" check
-	// draining the second transition before we can assert it.
-	if iteration {
+	// When restarting from ClosePending or CloseErr, the internal
+	// requeue produces two ClosingNegotiation transitions. We consume
+	// them in a single call to keep assertions deterministic.
+	if expectExtraTransition {
 		r.assertStateTransitions(
 			&ClosingNegotiation{}, &ClosingNegotiation{},
 		)
@@ -1039,9 +1036,12 @@ func newRbfCloserTestHarness(t *testing.T,
 	).Return(nil)
 
 	chanCloser := protofsm.NewStateMachine(protoCfg)
-	chanCloser.Start(ctx)
 
+	// Register the state subscriber before Start() to avoid racing
+	// with the initial state notification emitted by driveMachine.
 	harness.stateSub = chanCloser.RegisterStateEvents()
+
+	chanCloser.Start(ctx)
 
 	harness.chanCloser = &chanCloser
 
@@ -2962,16 +2962,13 @@ func TestRbfCloseErr(t *testing.T) {
 			TargetFeeRate: rbfFeeBump,
 		}
 
-		// Now we expect that another full RBF iteration takes place (we
-		// initiate a new local sig).
+		// Now we expect that another full RBF iteration takes place
+		// (we initiate a new local sig). Restarting from CloseErr
+		// produces an extra ClosingNegotiation transition from the
+		// internal requeue, same as a regular iteration.
 		closeHarness.assertSingleRbfIteration(
 			localOffer, balanceAfterClose, absoluteFee,
-			noDustExpect, false,
-		)
-
-		// We should terminate in the negotiation state.
-		closeHarness.assertStateTransitions(
-			&ClosingNegotiation{},
+			noDustExpect, true,
 		)
 	})
 
@@ -3010,12 +3007,14 @@ func TestRbfCloseErr(t *testing.T) {
 
 		sequence := uint32(mempool.MaxRBFSequence)
 
-		// As we're already in the negotiation phase, we'll now trigger
-		// a new iteration by having the remote party send a new offer
-		// sig.
+		// As we're already in the negotiation phase, we'll now
+		// trigger a new iteration by having the remote party send
+		// a new offer sig. Restarting from CloseErr produces an
+		// extra ClosingNegotiation transition from the internal
+		// requeue, same as a regular iteration.
 		closeHarness.assertSingleRemoteRbfIteration(
 			feeOffer, balanceAfterClose, absoluteFee, sequence,
-			false, true,
+			true, true,
 		)
 	})
 

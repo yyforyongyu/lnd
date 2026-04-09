@@ -8,16 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// makeTestNonce creates a Musig2Nonce for testing.
-func makeTestNonce(val byte) Musig2Nonce {
-	var nonce Musig2Nonce
-	for i := range nonce {
-		nonce[i] = val
-	}
-
-	return nonce
-}
-
 // makeTestTxId creates a chainhash.Hash for testing.
 func makeTestTxId(val byte) chainhash.Hash {
 	var txid chainhash.Hash
@@ -29,10 +19,10 @@ func makeTestTxId(val byte) chainhash.Hash {
 }
 
 // makeEncodedEntry encodes a single txid/nonce pair for testing.
-func makeEncodedEntry(txidVal, nonceVal byte) []byte {
+func makeEncodedEntry(txidVal byte) []byte {
 	entry := make([]byte, chainhash.HashSize+len(Musig2Nonce{}))
 	txid := makeTestTxId(txidVal)
-	nonce := makeTestNonce(nonceVal)
+	nonce := makeNonce()
 
 	copy(entry[:chainhash.HashSize], txid[:])
 	copy(entry[chainhash.HashSize:], nonce[:])
@@ -61,7 +51,7 @@ func TestLocalNoncesDataEncodeDecodeValue(t *testing.T) {
 			name: "one entry",
 			inputData: &LocalNoncesData{
 				NoncesMap: map[chainhash.Hash]Musig2Nonce{
-					makeTestTxId(1): makeTestNonce(1),
+					makeTestTxId(1): makeNonce(),
 				},
 			},
 		},
@@ -69,9 +59,9 @@ func TestLocalNoncesDataEncodeDecodeValue(t *testing.T) {
 			name: "multiple entries unsorted",
 			inputData: &LocalNoncesData{
 				NoncesMap: map[chainhash.Hash]Musig2Nonce{
-					makeTestTxId(3): makeTestNonce(3),
-					makeTestTxId(1): makeTestNonce(1),
-					makeTestTxId(2): makeTestNonce(2),
+					makeTestTxId(3): makeNonce(),
+					makeTestTxId(1): makeNonce(),
+					makeTestTxId(2): makeNonce(),
 				},
 			},
 		},
@@ -79,9 +69,9 @@ func TestLocalNoncesDataEncodeDecodeValue(t *testing.T) {
 			name: "multiple entries already sorted by key",
 			inputData: &LocalNoncesData{
 				NoncesMap: map[chainhash.Hash]Musig2Nonce{
-					makeTestTxId(1): makeTestNonce(1),
-					makeTestTxId(2): makeTestNonce(2),
-					makeTestTxId(3): makeTestNonce(3),
+					makeTestTxId(1): makeNonce(),
+					makeTestTxId(2): makeNonce(),
+					makeTestTxId(3): makeNonce(),
 				},
 			},
 		},
@@ -149,9 +139,26 @@ func TestLocalNoncesDataDecodeFailuresValue(t *testing.T) {
 		},
 		{
 			name:        "one complete entry",
-			valueBytes:  make([]byte, 98),
+			valueBytes:  makeEncodedEntry(2),
 			length:      98,
 			expectError: false,
+		},
+		{
+			name: "malformed nonce",
+			valueBytes: func() []byte {
+				entry := make([]byte,
+					chainhash.HashSize+len(Musig2Nonce{}))
+				txid := makeTestTxId(1)
+				// An invalid nonce (e.g., all zeros).
+				var nonce Musig2Nonce
+				copy(entry[:chainhash.HashSize], txid[:])
+				copy(entry[chainhash.HashSize:], nonce[:])
+
+				return entry
+			}(),
+			length:        98,
+			expectError:   true,
+			errorContains: "invalid first nonce point",
 		},
 		{
 			name:        "empty value",
@@ -162,8 +169,8 @@ func TestLocalNoncesDataDecodeFailuresValue(t *testing.T) {
 		{
 			name: "duplicate txid",
 			valueBytes: append(
-				makeEncodedEntry(1, 2),
-				makeEncodedEntry(1, 3)...,
+				makeEncodedEntry(1),
+				makeEncodedEntry(1)...,
 			),
 			length: uint64(
 				2 * (chainhash.HashSize + len(Musig2Nonce{})),
