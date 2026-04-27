@@ -839,6 +839,11 @@ type mockMPPayment struct {
 
 var _ paymentsdb.DBMPPayment = (*mockMPPayment)(nil)
 
+func (m *mockMPPayment) GetSequenceNum() uint64 {
+	args := m.Called()
+	return args.Get(0).(uint64)
+}
+
 func (m *mockMPPayment) GetState() *paymentsdb.MPPaymentState {
 	args := m.Called()
 	return args.Get(0).(*paymentsdb.MPPaymentState)

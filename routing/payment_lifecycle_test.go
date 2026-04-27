@@ -96,7 +96,7 @@ func newTestPaymentLifecycle(t *testing.T) (*paymentLifecycle, *mockers) {
 
 	// Create a test payment lifecycle with no fee limit and no timeout.
 	p := newPaymentLifecycle(
-		rt, noFeeLimit, paymentHash, mockPaymentSession,
+		rt, noFeeLimit, paymentHash, 0, mockPaymentSession,
 		mockShardTracker, 0, nil,
 	)
 

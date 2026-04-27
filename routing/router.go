@@ -903,7 +903,7 @@ func (l *LightningPayment) Identifier() [32]byte {
 func (r *ChannelRouter) SendPayment(ctx context.Context,
 	payment *LightningPayment) ([32]byte, *route.Route, error) {
 
-	paySession, shardTracker, err := r.PreparePayment(payment)
+	paySession, shardTracker, generation, err := r.PreparePayment(payment)
 	if err != nil {
 		return [32]byte{}, nil, err
 	}
@@ -914,14 +914,15 @@ func (r *ChannelRouter) SendPayment(ctx context.Context,
 	return r.sendPayment(
 		ctx, payment.FeeLimit, payment.Identifier(),
 		payment.PayAttemptTimeout, paySession, shardTracker,
-		payment.FirstHopCustomRecords,
+		payment.FirstHopCustomRecords, generation,
 	)
 }
 
 // SendPaymentAsync is the non-blocking version of SendPayment. The payment
 // result needs to be retrieved via the control tower.
 func (r *ChannelRouter) SendPaymentAsync(ctx context.Context,
-	payment *LightningPayment, ps PaymentSession, st shards.ShardTracker) {
+	payment *LightningPayment, ps PaymentSession, st shards.ShardTracker,
+	generation uint64) {
 
 	// Since this is the first time this payment is being made, we pass nil
 	// for the existing attempt.
@@ -935,7 +936,7 @@ func (r *ChannelRouter) SendPaymentAsync(ctx context.Context,
 		_, _, err := r.sendPayment(
 			ctx, payment.FeeLimit, payment.Identifier(),
 			payment.PayAttemptTimeout, ps, st,
-			payment.FirstHopCustomRecords,
+			payment.FirstHopCustomRecords, generation,
 		)
 		if err != nil {
 			log.Errorf("Payment %x failed: %v",
@@ -969,7 +970,7 @@ func spewPayment(payment *LightningPayment) lnutils.LogClosure {
 // PreparePayment creates the payment session and registers the payment with the
 // control tower.
 func (r *ChannelRouter) PreparePayment(payment *LightningPayment) (
-	PaymentSession, shards.ShardTracker, error) {
+	PaymentSession, shards.ShardTracker, uint64, error) {
 
 	ctx := context.TODO()
 
@@ -977,13 +978,14 @@ func (r *ChannelRouter) PreparePayment(payment *LightningPayment) (
 	var firstHopData fn.Option[tlv.Blob]
 	if len(payment.FirstHopCustomRecords) > 0 {
 		if err := payment.FirstHopCustomRecords.Validate(); err != nil {
-			return nil, nil, fmt.Errorf("invalid first hop custom "+
-				"records: %w", err)
+			return nil, nil, 0, fmt.Errorf(
+				"invalid first hop custom records: %w", err,
+			)
 		}
 
 		firstHopBlob, err := payment.FirstHopCustomRecords.Serialize()
 		if err != nil {
-			return nil, nil, fmt.Errorf("unable to serialize "+
+			return nil, nil, 0, fmt.Errorf("unable to serialize "+
 				"first hop custom records: %w", err)
 		}
 
@@ -997,7 +999,7 @@ func (r *ChannelRouter) PreparePayment(payment *LightningPayment) (
 		payment, firstHopData, r.cfg.TrafficShaper,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 
 	// Record this payment hash with the ControlTower, ensuring it is not
@@ -1032,12 +1034,14 @@ func (r *ChannelRouter) PreparePayment(payment *LightningPayment) (
 		)
 	}
 
-	_, err = r.cfg.Control.InitPayment(ctx, payment.Identifier(), info)
+	generation, err := r.cfg.Control.InitPayment(
+		ctx, payment.Identifier(), info,
+	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 
-	return paySession, shardTracker, nil
+	return paySession, shardTracker, generation, nil
 }
 
 // SendToRoute sends a payment using the provided route and fails the payment
@@ -1145,12 +1149,31 @@ func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 		FirstHopCustomRecords: firstHopCustomRecords,
 	}
 
-	_, err := r.cfg.Control.InitPayment(ctx, paymentIdentifier, info)
+	generation, err := r.cfg.Control.InitPayment(
+		ctx, paymentIdentifier, info,
+	)
 	switch {
 	// If this is an MPP attempt and the hash is already registered with
 	// the database, we can go on to launch the shard.
 	case mpp != nil && errors.Is(err, paymentsdb.ErrPaymentInFlight):
+		payment, err := r.cfg.Control.FetchPayment(
+			ctx, paymentIdentifier,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		generation = payment.GetSequenceNum()
+
 	case mpp != nil && errors.Is(err, paymentsdb.ErrPaymentExists):
+		payment, err := r.cfg.Control.FetchPayment(
+			ctx, paymentIdentifier,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		generation = payment.GetSequenceNum()
 
 	// Any other error is not tolerated.
 	case err != nil:
@@ -1173,7 +1196,7 @@ func (r *ChannelRouter) sendToRoute(htlcHash lntypes.Hash, rt *route.Route,
 	// - no payment timeout.
 	// - no current block height.
 	p := newPaymentLifecycle(
-		r, 0, paymentIdentifier, nil, shardTracker, 0,
+		r, 0, paymentIdentifier, generation, nil, shardTracker, 0,
 		firstHopCustomRecords,
 	)
 
@@ -1264,8 +1287,8 @@ func (r *ChannelRouter) sendPayment(ctx context.Context,
 	feeLimit lnwire.MilliSatoshi, identifier lntypes.Hash,
 	paymentAttemptTimeout time.Duration, paySession PaymentSession,
 	shardTracker shards.ShardTracker,
-	firstHopCustomRecords lnwire.CustomRecords) ([32]byte, *route.Route,
-	error) {
+	firstHopCustomRecords lnwire.CustomRecords,
+	generation uint64) ([32]byte, *route.Route, error) {
 
 	// If the user provides a timeout, we will additionally wrap the context
 	// in a deadline.
@@ -1296,7 +1319,7 @@ func (r *ChannelRouter) sendPayment(ctx context.Context,
 	// Now set up a paymentLifecycle struct with these params, such that we
 	// can resume the payment from the current state.
 	p := newPaymentLifecycle(
-		r, feeLimit, identifier, paySession, shardTracker,
+		r, feeLimit, identifier, generation, paySession, shardTracker,
 		currentHeight, firstHopCustomRecords,
 	)
 
@@ -1514,6 +1537,7 @@ func (r *ChannelRouter) resumePayments() error {
 		_, _, err := r.sendPayment(
 			context.Background(), 0, payHash, noTimeout, paySession,
 			shardTracker, payment.Info.FirstHopCustomRecords,
+			payment.SequenceNum,
 		)
 		if err != nil {
 			log.Errorf("Resuming payment %v failed: %v", payHash,

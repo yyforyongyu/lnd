@@ -375,7 +375,8 @@ func (s *Server) SendPaymentV2(req *SendPaymentRequest,
 	payHash := payment.Identifier()
 
 	// Init the payment in db.
-	paySession, shardTracker, err := s.cfg.Router.PreparePayment(payment)
+	paySession, shardTracker, generation, err :=
+		s.cfg.Router.PreparePayment(payment)
 	if err != nil {
 		log.Errorf("SendPayment async error for payment %x: %v",
 			payment.Identifier(), err)
@@ -415,7 +416,9 @@ func (s *Server) SendPaymentV2(req *SendPaymentRequest,
 	}
 
 	// Send the payment asynchronously.
-	s.cfg.Router.SendPaymentAsync(ctx, payment, paySession, shardTracker)
+	s.cfg.Router.SendPaymentAsync(
+		ctx, payment, paySession, shardTracker, generation,
+	)
 
 	// Track the payment and return.
 	return s.trackPayment(sub, payHash, stream, req.NoInflightUpdates)

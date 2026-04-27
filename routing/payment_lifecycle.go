@@ -41,6 +41,7 @@ type paymentLifecycle struct {
 	router                *ChannelRouter
 	feeLimit              lnwire.MilliSatoshi
 	identifier            lntypes.Hash
+	generation            uint64
 	paySession            PaymentSession
 	shardTracker          shards.ShardTracker
 	currentHeight         int32
@@ -63,7 +64,7 @@ type paymentLifecycle struct {
 
 // newPaymentLifecycle initiates a new payment lifecycle and returns it.
 func newPaymentLifecycle(r *ChannelRouter, feeLimit lnwire.MilliSatoshi,
-	identifier lntypes.Hash, paySession PaymentSession,
+	identifier lntypes.Hash, generation uint64, paySession PaymentSession,
 	shardTracker shards.ShardTracker, currentHeight int32,
 	firstHopCustomRecords lnwire.CustomRecords) *paymentLifecycle {
 
@@ -71,6 +72,7 @@ func newPaymentLifecycle(r *ChannelRouter, feeLimit lnwire.MilliSatoshi,
 		router:                r,
 		feeLimit:              feeLimit,
 		identifier:            identifier,
+		generation:            generation,
 		paySession:            paySession,
 		shardTracker:          shardTracker,
 		currentHeight:         currentHeight,
