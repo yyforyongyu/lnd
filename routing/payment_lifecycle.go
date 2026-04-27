@@ -20,9 +20,15 @@ import (
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
-// ErrPaymentLifecycleExiting is used when waiting for htlc attempt result, but
-// the payment lifecycle is exiting .
-var ErrPaymentLifecycleExiting = errors.New("payment lifecycle exiting")
+var (
+	// ErrPaymentLifecycleExiting is used when waiting for htlc attempt
+	// result, but the payment lifecycle is exiting .
+	ErrPaymentLifecycleExiting = errors.New("payment lifecycle exiting")
+
+	// ErrPaymentLifecycleStale is returned when a payment lifecycle detects
+	// that its payment hash now points to a newer payment generation.
+	ErrPaymentLifecycleStale = errors.New("payment lifecycle stale")
+)
 
 // switchResult is the result sent back from the switch after processing the
 // HTLC.
@@ -216,6 +222,10 @@ func (p *paymentLifecycle) resumePayment(ctx context.Context) ([32]byte,
 		return [32]byte{}, nil, err
 	}
 
+	if err := p.checkPaymentGeneration(payment); err != nil {
+		return [32]byte{}, nil, err
+	}
+
 	// Get the payment status.
 	status := payment.GetStatus()
 
@@ -359,6 +369,26 @@ lifecycle:
 
 	// Otherwise return the payment failure reason.
 	return [32]byte{}, nil, *failure
+}
+
+// checkPaymentGeneration returns an error if the lifecycle's payment hash now
+// points to a newer payment generation. A zero generation disables the check
+// for tests that construct lifecycles without going through InitPayment.
+func (p *paymentLifecycle) checkPaymentGeneration(
+	payment paymentsdb.DBMPPayment) error {
+
+	if p.generation == 0 {
+		return nil
+	}
+
+	sequenceNum := payment.GetSequenceNum()
+	if sequenceNum == p.generation {
+		return nil
+	}
+
+	return fmt.Errorf("%w: payment %v generation changed from %d to %d",
+		ErrPaymentLifecycleStale, p.identifier, p.generation,
+		sequenceNum)
 }
 
 // checkContext checks whether the payment context has been canceled.
@@ -1173,6 +1203,9 @@ func (p *paymentLifecycle) reloadPayment(
 	// Read the db to get the latest state of the payment.
 	payment, err := p.router.cfg.Control.FetchPayment(ctx, p.identifier)
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := p.checkPaymentGeneration(payment); err != nil {
 		return nil, nil, err
 	}
 

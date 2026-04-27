@@ -801,6 +801,27 @@ func TestResumePaymentFailOnFetchPayment(t *testing.T) {
 	require.Zero(t, m.collectResultsCount)
 }
 
+// TestResumePaymentFailOnStaleGeneration checks that a lifecycle exits before
+// making more attempts when its payment hash has been recycled by a newer
+// InitPayment.
+func TestResumePaymentFailOnStaleGeneration(t *testing.T) {
+	t.Parallel()
+
+	p, m := setupTestPaymentLifecycle(t)
+	p.generation = 1
+
+	m.payment.On("GetSequenceNum").Return(uint64(1)).Once()
+	m.payment.On("GetStatus").Return(paymentsdb.StatusInFlight).Once()
+	m.control.On("FetchPayment", p.identifier).Return(m.payment, nil).Once()
+	m.payment.On("GetSequenceNum").Return(uint64(2)).Once()
+
+	sendPaymentAndAssertError(
+		t, t.Context(), p, ErrPaymentLifecycleStale,
+	)
+
+	require.Zero(t, m.collectResultsCount)
+}
+
 // TestResumePaymentFailOnTimeout checks that when timeout is reached, the
 // payment is failed.
 //
