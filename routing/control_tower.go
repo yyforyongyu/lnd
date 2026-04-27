@@ -21,7 +21,7 @@ type ControlTower interface {
 	//
 	// NOTE: Subscribers should be notified by the new state of the payment.
 	InitPayment(context.Context, lntypes.Hash,
-		*paymentsdb.PaymentCreationInfo) error
+		*paymentsdb.PaymentCreationInfo) (uint64, error)
 
 	// DeleteFailedAttempts removes all failed HTLCs from the db. It should
 	// be called for a given payment whenever all inflight htlcs are
@@ -168,11 +168,12 @@ func NewControlTower(db paymentsdb.DB) ControlTower {
 // method returns successfully, the payment is guaranteed to be in the
 // Initiated state.
 func (p *controlTower) InitPayment(ctx context.Context,
-	paymentHash lntypes.Hash, info *paymentsdb.PaymentCreationInfo) error {
+	paymentHash lntypes.Hash, info *paymentsdb.PaymentCreationInfo) (uint64,
+	error) {
 
-	err := p.db.InitPayment(ctx, paymentHash, info)
+	sequenceNum, err := p.db.InitPayment(ctx, paymentHash, info)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// Take lock before querying the db to prevent missing or duplicating
@@ -182,12 +183,12 @@ func (p *controlTower) InitPayment(ctx context.Context,
 
 	payment, err := p.db.FetchPayment(ctx, paymentHash)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	p.notifySubscribers(paymentHash, payment)
 
-	return nil
+	return sequenceNum, nil
 }
 
 // DeleteFailedAttempts deletes all failed htlcs if the payment was

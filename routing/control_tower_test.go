@@ -78,7 +78,7 @@ func TestControlTowerSubscribeSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = pControl.InitPayment(t.Context(), info.PaymentIdentifier, info)
+	_, err = pControl.InitPayment(t.Context(), info.PaymentIdentifier, info)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,9 @@ func TestKVStoreSubscribeAllSuccess(t *testing.T) {
 	info1, attempt1, preimg1, err := genInfo()
 	require.NoError(t, err)
 
-	err = pControl.InitPayment(t.Context(), info1.PaymentIdentifier, info1)
+	_, err = pControl.InitPayment(
+		t.Context(), info1.PaymentIdentifier, info1,
+	)
 	require.NoError(t, err)
 
 	// Subscription should succeed and immediately report the Initiated
@@ -221,7 +223,9 @@ func TestKVStoreSubscribeAllSuccess(t *testing.T) {
 	info2, attempt2, preimg2, err := genInfo()
 	require.NoError(t, err)
 
-	err = pControl.InitPayment(t.Context(), info2.PaymentIdentifier, info2)
+	_, err = pControl.InitPayment(
+		t.Context(), info2.PaymentIdentifier, info2,
+	)
 	require.NoError(t, err)
 
 	// Register an attempt on the second payment.
@@ -331,7 +335,7 @@ func TestKVStoreSubscribeAllImmediate(t *testing.T) {
 	info, attempt, _, err := genInfo()
 	require.NoError(t, err)
 
-	err = pControl.InitPayment(t.Context(), info.PaymentIdentifier, info)
+	_, err = pControl.InitPayment(t.Context(), info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Register a payment update.
@@ -385,7 +389,7 @@ func TestKVStoreUnsubscribeSuccess(t *testing.T) {
 	info, attempt, _, err := genInfo()
 	require.NoError(t, err)
 
-	err = pControl.InitPayment(t.Context(), info.PaymentIdentifier, info)
+	_, err = pControl.InitPayment(t.Context(), info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Assert all subscriptions receive the update.
@@ -454,7 +458,7 @@ func testKVStoreSubscribeFail(t *testing.T, registerAttempt bool) {
 		t.Fatal(err)
 	}
 
-	err = pControl.InitPayment(t.Context(), info.PaymentIdentifier, info)
+	_, err = pControl.InitPayment(t.Context(), info.PaymentIdentifier, info)
 	if err != nil {
 		t.Fatal(err)
 	}

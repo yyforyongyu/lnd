@@ -268,6 +268,7 @@ type failPaymentArgs struct {
 }
 
 type testPayment struct {
+	sequence uint64
 	info     paymentsdb.PaymentCreationInfo
 	attempts []paymentsdb.HTLCAttempt
 }
@@ -283,6 +284,7 @@ type mockControlTowerOld struct {
 	failAttempt     chan failAttemptArgs
 	failPayment     chan failPaymentArgs
 	fetchInFlight   chan struct{}
+	sequence        uint64
 
 	sync.Mutex
 }
@@ -298,7 +300,7 @@ func makeMockControlTower() *mockControlTowerOld {
 }
 
 func (m *mockControlTowerOld) InitPayment(_ context.Context,
-	phash lntypes.Hash, c *paymentsdb.PaymentCreationInfo) error {
+	phash lntypes.Hash, c *paymentsdb.PaymentCreationInfo) (uint64, error) {
 
 	if m.init != nil {
 		m.init <- initArgs{c}
@@ -309,7 +311,7 @@ func (m *mockControlTowerOld) InitPayment(_ context.Context,
 
 	// Don't allow re-init a successful payment.
 	if _, ok := m.successful[phash]; ok {
-		return paymentsdb.ErrAlreadyPaid
+		return 0, paymentsdb.ErrAlreadyPaid
 	}
 
 	_, failed := m.failed[phash]
@@ -317,15 +319,17 @@ func (m *mockControlTowerOld) InitPayment(_ context.Context,
 
 	// If the payment is known, only allow re-init if failed.
 	if ok && !failed {
-		return paymentsdb.ErrPaymentInFlight
+		return 0, paymentsdb.ErrPaymentInFlight
 	}
 
+	m.sequence++
 	delete(m.failed, phash)
 	m.payments[phash] = &testPayment{
-		info: *c,
+		sequence: m.sequence,
+		info:     *c,
 	}
 
-	return nil
+	return m.sequence, nil
 }
 
 func (m *mockControlTowerOld) DeleteFailedAttempts(_ context.Context,
@@ -531,7 +535,8 @@ func (m *mockControlTowerOld) fetchPayment(phash lntypes.Hash) (
 	}
 
 	mp := &paymentsdb.MPPayment{
-		Info: &p.info,
+		SequenceNum: p.sequence,
+		Info:        &p.info,
 	}
 
 	reason, ok := m.failed[phash]
@@ -738,10 +743,10 @@ type mockControlTower struct {
 var _ ControlTower = (*mockControlTower)(nil)
 
 func (m *mockControlTower) InitPayment(_ context.Context, phash lntypes.Hash,
-	c *paymentsdb.PaymentCreationInfo) error {
+	c *paymentsdb.PaymentCreationInfo) (uint64, error) {
 
 	args := m.Called(phash, c)
-	return args.Error(0)
+	return args.Get(0).(uint64), args.Error(1)
 }
 
 func (m *mockControlTower) DeleteFailedAttempts(_ context.Context,

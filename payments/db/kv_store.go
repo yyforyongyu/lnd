@@ -182,19 +182,19 @@ func initKVStore(db kvdb.Backend) error {
 // method returns successfully, the payment is guaranteed to be in the InFlight
 // state.
 func (p *KVStore) InitPayment(_ context.Context, paymentHash lntypes.Hash,
-	info *PaymentCreationInfo) error {
+	info *PaymentCreationInfo) (uint64, error) {
 
 	// Obtain a new sequence number for this payment. This is used
 	// to sort the payments in order of creation, and also acts as
 	// a unique identifier for each payment.
 	sequenceNum, err := p.nextPaymentSequence()
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	var b bytes.Buffer
 	if err := serializePaymentCreationInfo(&b, info); err != nil {
-		return err
+		return 0, err
 	}
 	infoBytes := b.Bytes()
 
@@ -277,10 +277,13 @@ func (p *KVStore) InitPayment(_ context.Context, paymentHash lntypes.Hash,
 		return bucket.Delete(paymentFailInfoKey)
 	})
 	if err != nil {
-		return fmt.Errorf("unable to init payment: %w", err)
+		return 0, fmt.Errorf("unable to init payment: %w", err)
+	}
+	if updateErr != nil {
+		return 0, updateErr
 	}
 
-	return updateErr
+	return binary.BigEndian.Uint64(sequenceNum), nil
 }
 
 // DeleteFailedAttempts deletes all failed htlcs for a payment.

@@ -1204,9 +1204,10 @@ func (s *SQLStore) DeletePayment(ctx context.Context, paymentHash lntypes.Hash,
 // the PaymentWriter interface and ultimately the DB interface, representing
 // the first step in the payment lifecycle control flow.
 func (s *SQLStore) InitPayment(ctx context.Context, paymentHash lntypes.Hash,
-	paymentCreationInfo *PaymentCreationInfo) error {
+	paymentCreationInfo *PaymentCreationInfo) (uint64, error) {
 
 	// Create the payment in the database.
+	var paymentID int64
 	err := s.db.ExecTx(ctx, sqldb.WriteTxOpt(), func(db SQLQueries) error {
 		existingPayment, err := db.FetchPayment(ctx, paymentHash[:])
 		switch {
@@ -1249,7 +1250,7 @@ func (s *SQLStore) InitPayment(ctx context.Context, paymentHash lntypes.Hash,
 		}
 
 		// Insert the payment first to get its ID.
-		paymentID, err := db.InsertPayment(
+		paymentID, err = db.InsertPayment(
 			ctx, sqlc.InsertPaymentParams{
 				AmountMsat: int64(
 					paymentCreationInfo.Value,
@@ -1303,10 +1304,10 @@ func (s *SQLStore) InitPayment(ctx context.Context, paymentHash lntypes.Hash,
 		return nil
 	}, sqldb.NoOpReset)
 	if err != nil {
-		return fmt.Errorf("failed to initialize payment: %w", err)
+		return 0, fmt.Errorf("failed to initialize payment: %w", err)
 	}
 
-	return nil
+	return uint64(paymentID), nil
 }
 
 // insertRouteHops inserts all route hop data for a given set of hops.

@@ -60,8 +60,10 @@ type PaymentControl interface {
 	// InitPayment checks that no other payment with the same payment hash
 	// exists in the database before creating a new payment. However, it
 	// should allow the user making a subsequent payment if the payment is
-	// in a Failed state.
-	InitPayment(context.Context, lntypes.Hash, *PaymentCreationInfo) error
+	// in a Failed state. The returned sequence number identifies the newly
+	// initialized payment record.
+	InitPayment(context.Context, lntypes.Hash, *PaymentCreationInfo) (
+		uint64, error)
 
 	// RegisterAttempt atomically records the provided HTLCAttemptInfo.
 	//

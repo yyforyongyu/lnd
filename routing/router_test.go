@@ -2219,7 +2219,9 @@ func TestSendToRouteSkipTempErrSuccess(t *testing.T) {
 	}}
 
 	// Register mockers with the expected method calls.
-	controlTower.On("InitPayment", payHash, mock.Anything).Return(nil)
+	controlTower.On("InitPayment", payHash, mock.Anything).Return(
+		uint64(0), nil,
+	)
 	controlTower.On("RegisterAttempt", payHash, mock.Anything).Return(nil)
 	controlTower.On("SettleAttempt",
 		payHash, mock.Anything, mock.Anything,
@@ -2365,7 +2367,9 @@ func TestSendToRouteSkipTempErrTempFailure(t *testing.T) {
 	)
 
 	// Register mockers with the expected method calls.
-	controlTower.On("InitPayment", payHash, mock.Anything).Return(nil)
+	controlTower.On("InitPayment", payHash, mock.Anything).Return(
+		uint64(0), nil,
+	)
 	controlTower.On("RegisterAttempt", payHash, mock.Anything).Return(nil)
 	controlTower.On("FailAttempt",
 		payHash, mock.Anything, mock.Anything,
@@ -2445,7 +2449,9 @@ func TestSendToRouteSkipTempErrPermanentFailure(t *testing.T) {
 	)
 
 	// Register mockers with the expected method calls.
-	controlTower.On("InitPayment", payHash, mock.Anything).Return(nil)
+	controlTower.On("InitPayment", payHash, mock.Anything).Return(
+		uint64(0), nil,
+	)
 	controlTower.On("RegisterAttempt", payHash, mock.Anything).Return(nil)
 
 	controlTower.On("FailAttempt",
@@ -2531,7 +2537,9 @@ func TestSendToRouteTempFailure(t *testing.T) {
 	)
 
 	// Register mockers with the expected method calls.
-	controlTower.On("InitPayment", payHash, mock.Anything).Return(nil)
+	controlTower.On("InitPayment", payHash, mock.Anything).Return(
+		uint64(0), nil,
+	)
 	controlTower.On("RegisterAttempt", payHash, mock.Anything).Return(nil)
 	controlTower.On("FailAttempt",
 		payHash, mock.Anything, mock.Anything,

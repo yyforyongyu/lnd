@@ -42,7 +42,7 @@ func TestKVStoreDeleteDuplicatePayments(t *testing.T) {
 	attempt := genAttemptWithHash(t, 0, genSessionKey(t), rhash)
 
 	// Init and settle the payment.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err, "unable to init payment")
 
 	_, err = paymentDB.RegisterAttempt(
@@ -280,7 +280,7 @@ func TestFetchPaymentWithSequenceNumber(t *testing.T) {
 	noDuplicates, _ := genInfo(t)
 
 	// Create a new payment entry in the database.
-	err := paymentDB.InitPayment(
+	_, err := paymentDB.InitPayment(
 		ctx, noDuplicates.PaymentIdentifier, noDuplicates,
 	)
 	require.NoError(t, err)
@@ -295,7 +295,7 @@ func TestFetchPaymentWithSequenceNumber(t *testing.T) {
 	hasDuplicates, preimg := genInfo(t)
 
 	// Create a new payment entry in the database.
-	err = paymentDB.InitPayment(
+	_, err = paymentDB.InitPayment(
 		ctx, hasDuplicates.PaymentIdentifier, hasDuplicates,
 	)
 	require.NoError(t, err)
@@ -598,7 +598,7 @@ func TestKVStoreQueryPaymentsDuplicates(t *testing.T) {
 				info.CreationTime = time.Unix(int64(i+1), 0)
 
 				// Create a new payment entry in the database.
-				err = paymentDB.InitPayment(
+				_, err = paymentDB.InitPayment(
 					ctx, info.PaymentIdentifier, info,
 				)
 				require.NoError(t, err)

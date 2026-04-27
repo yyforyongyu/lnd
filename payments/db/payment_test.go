@@ -149,7 +149,7 @@ func createTestPayments(t *testing.T, p DB, payments []*payment) {
 		attemptID++
 
 		// Init the payment.
-		err := p.InitPayment(ctx, info.PaymentIdentifier, info)
+		_, err := p.InitPayment(ctx, info.PaymentIdentifier, info)
 		require.NoError(t, err, "unable to send htlc message")
 
 		// Register and fail the first attempt for all payments.
@@ -541,7 +541,7 @@ func TestMPPRecordValidation(t *testing.T) {
 	)
 
 	// Init the payment.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err, "unable to send htlc message")
 
 	// Create three unique attempts we'll use for the test, and
@@ -600,7 +600,7 @@ func TestMPPRecordValidation(t *testing.T) {
 		t, attemptID, genSessionKey(t), rhash,
 	)
 
-	err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err, "unable to send htlc message")
 
 	attempt.Route.FinalHop().MPP = nil
@@ -1731,7 +1731,9 @@ func TestDeleteNonInFlight(t *testing.T) {
 		attemptID++
 
 		// Init payment which initiates StatusInFlight.
-		err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+		_, err := paymentDB.InitPayment(
+			ctx, info.PaymentIdentifier, info,
+		)
 		require.NoError(t, err, "unable to init payment")
 
 		_, err = paymentDB.RegisterAttempt(
@@ -1863,7 +1865,7 @@ func TestSwitchDoubleSend(t *testing.T) {
 
 	// Sends base htlc message which initiate base status and move it to
 	// StatusInFlight and verifies that it was changed.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err, "unable to send htlc message")
 
 	harness.AssertPaymentIndex(t, info.PaymentIdentifier)
@@ -1877,7 +1879,7 @@ func TestSwitchDoubleSend(t *testing.T) {
 	// Try to initiate double sending of htlc message with the same
 	// payment hash, should result in error indicating that payment has
 	// already been sent.
-	err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.ErrorIs(t, err, ErrPaymentExists)
 
 	// Record an attempt.
@@ -1895,7 +1897,7 @@ func TestSwitchDoubleSend(t *testing.T) {
 	)
 
 	// Sends base htlc message which initiate StatusInFlight.
-	err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	if !errors.Is(err, ErrPaymentInFlight) {
 		t.Fatalf("payment control wrong behaviour: " +
 			"double sending must trigger ErrPaymentInFlight error")
@@ -1918,7 +1920,7 @@ func TestSwitchDoubleSend(t *testing.T) {
 		t, paymentDB, info.PaymentIdentifier, info, nil, htlc,
 	)
 
-	err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	if !errors.Is(err, ErrAlreadyPaid) {
 		t.Fatalf("unable to send htlc message: %v", err)
 	}
@@ -1940,7 +1942,7 @@ func TestSwitchFail(t *testing.T) {
 	attempt := genAttemptWithHash(t, 0, genSessionKey(t), rhash)
 
 	// Sends base htlc message which initiate StatusInFlight.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err, "unable to send htlc message")
 
 	harness.AssertPaymentIndex(t, info.PaymentIdentifier)
@@ -1972,7 +1974,7 @@ func TestSwitchFail(t *testing.T) {
 
 	// Sends the htlc again, which should succeed since the prior payment
 	// failed.
-	err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err, "unable to send htlc message")
 
 	// Check that our index has been updated, and the old index has been
@@ -2070,7 +2072,7 @@ func TestSwitchFail(t *testing.T) {
 
 	// Attempt a final payment, which should now fail since the prior
 	// payment succeed.
-	err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err = paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	if !errors.Is(err, ErrAlreadyPaid) {
 		t.Fatalf("unable to send htlc message: %v", err)
 	}
@@ -2108,7 +2110,9 @@ func TestMultiShard(t *testing.T) {
 		info := genPaymentCreationInfo(t, rhash)
 
 		// Init the payment, moving it to the StatusInFlight state.
-		err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+		_, err := paymentDB.InitPayment(
+			ctx, info.PaymentIdentifier, info,
+		)
 		require.NoError(t, err)
 
 		harness.AssertPaymentIndex(t, info.PaymentIdentifier)
@@ -2755,7 +2759,7 @@ func TestQueryPayments(t *testing.T) {
 				paymentInfos = append(paymentInfos, info)
 
 				// Create a new payment entry in the database.
-				err = paymentDB.InitPayment(
+				_, err = paymentDB.InitPayment(
 					ctx, info.PaymentIdentifier, info,
 				)
 				require.NoError(t, err)
@@ -2973,7 +2977,7 @@ func TestFetchInFlightPaymentsMultipleAttempts(t *testing.T) {
 
 	// Init payment with double the amount to allow two attempts.
 	info.Value *= 2
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Register two attempts for the same payment.
@@ -3022,7 +3026,7 @@ func TestFetchInFlightPaymentsIncludesRetryablePayments(t *testing.T) {
 	rhash := sha256.Sum256(preimg[:])
 	info := genPaymentCreationInfo(t, rhash)
 
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	attempt := genAttemptWithHash(t, 0, genSessionKey(t), rhash)
@@ -3064,7 +3068,7 @@ func TestFetchInFlightPaymentsIncludesInitiatedPayments(t *testing.T) {
 	rhash := sha256.Sum256(preimg[:])
 	info := genPaymentCreationInfo(t, rhash)
 
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	payment, err := paymentDB.FetchPayment(ctx, info.PaymentIdentifier)
@@ -3097,7 +3101,7 @@ func TestRouteFirstHopData(t *testing.T) {
 	firstHopAmount := lnwire.MilliSatoshi(1234)
 
 	// Init payment.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Create an attempt with both FirstHopAmount and
@@ -3157,7 +3161,7 @@ func TestRegisterAttemptWithAMP(t *testing.T) {
 	info := genPaymentCreationInfo(t, rhash)
 
 	// Init payment.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Create a basic attempt, then modify the route to include AMP data.
@@ -3207,7 +3211,7 @@ func TestRegisterAttemptPreservesAttemptHash(t *testing.T) {
 	attemptHash := lntypes.Hash{5, 6, 7, 8}
 	info := genPaymentCreationInfo(t, setID)
 
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	attempt := genAttemptWithHash(t, 0, genSessionKey(t), attemptHash)
@@ -3250,7 +3254,7 @@ func TestRegisterAttemptWithBlindedRoute(t *testing.T) {
 	}
 
 	// Init payment.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Create a basic attempt, then replace the route with testBlindedRoute.
@@ -3309,7 +3313,7 @@ func TestFailAttemptWithoutMessage(t *testing.T) {
 	info := genPaymentCreationInfo(t, rhash)
 
 	// Init payment.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Register an attempt.
@@ -3354,7 +3358,7 @@ func TestFailAttemptWithMessage(t *testing.T) {
 	info := genPaymentCreationInfo(t, rhash)
 
 	// Init payment.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Register an attempt.
@@ -3400,7 +3404,7 @@ func TestFailAttemptOnSucceededPayment(t *testing.T) {
 	info := genPaymentCreationInfo(t, rhash)
 
 	// Init payment.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Register an attempt.
@@ -3445,7 +3449,7 @@ func TestFetchPaymentWithNoAttempts(t *testing.T) {
 	info := genPaymentCreationInfo(t, rhash)
 
 	// Init payment but don't register any attempts.
-	err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
+	_, err := paymentDB.InitPayment(ctx, info.PaymentIdentifier, info)
 	require.NoError(t, err)
 
 	// Fetch the payment - it should have no HTLCs.
