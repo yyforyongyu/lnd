@@ -116,6 +116,93 @@ func TestHtlcIncomingResolverFwdTimeout(t *testing.T) {
 	ctx.waitForResult(false)
 }
 
+func TestHtlcIncomingResolverLaunchSkipsPreimageAfterExpiry(t *testing.T) {
+	t.Parallel()
+	defer timeout()()
+
+	tests := []struct {
+		name   string
+		isExit bool
+		setup  func(*incomingResolverTestContext)
+		assert func(*testing.T, *incomingResolverTestContext)
+	}{
+		{
+			name:   "preimage db",
+			isExit: false,
+			setup: func(ctx *incomingResolverTestContext) {
+				ctx.witnessBeacon.lookupPreimage[testResHash] =
+					testResPreimage
+			},
+			assert: func(t *testing.T,
+				ctx *incomingResolverTestContext) {
+
+				require.Empty(t, ctx.registry.immediateNotify)
+			},
+		},
+		{
+			name:   "invoice registry",
+			isExit: true,
+			setup: func(ctx *incomingResolverTestContext) {
+				ctx.registry.notifyResolution =
+					invoices.NewSettleResolution(
+						testResPreimage,
+						testResCircuitKey,
+						testAcceptHeight,
+						invoices.ResultReplayToSettled,
+					)
+			},
+			assert: func(t *testing.T,
+				ctx *incomingResolverTestContext) {
+
+				require.Empty(t, ctx.registry.immediateNotify)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Arrange.
+			ctx := newIncomingResolverTestContext(t, test.isExit)
+			ctx.resolver.htlcExpiry = testInitialBlockHeight
+			test.setup(ctx)
+
+			// Act.
+			require.NoError(t, ctx.resolver.Launch())
+
+			// Assert.
+			require.False(t, ctx.resolver.isLaunched())
+			require.Equal(
+				t, [32]byte{},
+				ctx.resolver.htlcResolution.Preimage,
+			)
+			test.assert(t, ctx)
+		})
+	}
+}
+
+func TestHtlcIncomingResolverLaunchUsesCurrentHeight(t *testing.T) {
+	t.Parallel()
+	defer timeout()()
+
+	// Arrange.
+	ctx := newIncomingResolverTestContext(t, true)
+	ctx.chainIO.BestHeight = testInitialBlockHeight + 1
+	ctx.registry.notifyResolution = invoices.NewSettleResolution(
+		testResPreimage, testResCircuitKey, testAcceptHeight,
+		invoices.ResultReplayToSettled,
+	)
+
+	// Act.
+	require.NoError(t, ctx.resolver.Launch())
+
+	// Assert.
+	require.Len(t, ctx.registry.immediateNotify, 1)
+	require.Equal(
+		t, ctx.chainIO.BestHeight,
+		ctx.registry.immediateNotify[0].currentHeight,
+	)
+}
+
 // TestHtlcIncomingResolverExitSettle tests resolution of an exit hop htlc for
 // which the invoice has already been settled when the resolver starts.
 func TestHtlcIncomingResolverExitSettle(t *testing.T) {
@@ -306,6 +393,7 @@ type incomingResolverTestContext struct {
 	witnessBeacon          *mockWitnessBeacon
 	resolver               *htlcIncomingContestResolver
 	notifier               *mock.ChainNotifier
+	chainIO                *mock.ChainIO
 	onionProcessor         *mockOnionProcessor
 	resolveErr             chan error
 	nextResolver           ContractResolver
@@ -320,6 +408,9 @@ func newIncomingResolverTestContext(t *testing.T, isExit bool) *incomingResolver
 		ConfChan:  make(chan *chainntnfs.TxConfirmation),
 	}
 	witnessBeacon := newMockWitnessBeacon()
+	chainIO := &mock.ChainIO{
+		BestHeight: testInitialBlockHeight,
+	}
 	registry := &mockRegistry{
 		notifyChan: make(chan notifyExitHopData, 1),
 	}
@@ -332,6 +423,7 @@ func newIncomingResolverTestContext(t *testing.T, isExit bool) *incomingResolver
 		registry:       registry,
 		witnessBeacon:  witnessBeacon,
 		notifier:       notifier,
+		chainIO:        chainIO,
 		onionProcessor: onionProcessor,
 		t:              t,
 	}
@@ -359,6 +451,7 @@ func newIncomingResolverTestContext(t *testing.T, isExit bool) *incomingResolver
 				return nil
 			},
 			Sweeper: newMockSweeper(),
+			ChainIO: chainIO,
 		},
 		PutResolverReport: func(_ kvdb.RwTx,
 			_ *channeldb.ResolverReport) error {
