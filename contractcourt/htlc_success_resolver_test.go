@@ -37,6 +37,7 @@ type htlcResolverTestContext struct {
 	resolutionChan     chan ResolutionMsg
 
 	finalHtlcOutcomeStored bool
+	finalHtlcSettled       bool
 
 	t *testing.T
 }
@@ -100,6 +101,7 @@ func newHtlcResolverTestContext(t *testing.T,
 				htlcId uint64, settled bool) error {
 
 				testCtx.finalHtlcOutcomeStored = true
+				testCtx.finalHtlcSettled = settled
 
 				return nil
 			},
@@ -532,12 +534,253 @@ func TestHtlcSuccessSecondStageResolutionSweeper(t *testing.T) {
 	testHtlcSuccess(t, twoStageResolution, checkpoints)
 }
 
+func TestHtlcSuccessResolverRejectsForeignSpend(t *testing.T) {
+	defer timeout()()
+
+	// Arrange.
+	commitOutpoint := wire.OutPoint{
+		Hash:  chainhash.Hash{0x01},
+		Index: 2,
+	}
+	resolution := newTestAnchorSuccessResolution(commitOutpoint)
+	foreignTx, foreignHash := newForeignSuccessSpend(commitOutpoint)
+	expectedReport := &channeldb.ResolverReport{
+		OutPoint:        commitOutpoint,
+		Amount:          testHtlcAmt.ToSatoshis(),
+		ResolverType:    channeldb.ResolverTypeIncomingHtlc,
+		ResolverOutcome: channeldb.ResolverOutcomeTimeout,
+		SpendTxID:       &foreignHash,
+	}
+	ctx := newTestHtlcSuccessContext(t, resolution, false)
+
+	checkpointChan := make(chan struct{}, 1)
+	ctx.checkpoint = func(resolver ContractResolver,
+		reports ...*channeldb.ResolverReport) error {
+
+		successResolver, ok := resolver.(*htlcSuccessResolver)
+		require.True(t, ok)
+
+		require.True(t, successResolver.IsResolved())
+		require.False(t, successResolver.outputIncubating)
+		require.True(t, ctx.finalHtlcOutcomeStored)
+		require.False(t, ctx.finalHtlcSettled)
+		require.Equal(t, []*channeldb.ResolverReport{
+			expectedReport,
+		}, reports)
+
+		checkpointChan <- struct{}{}
+
+		return nil
+	}
+
+	// Act.
+	ctx.resolve()
+
+	resolver := successResolverFromContext(t, ctx)
+	sweeper := mockSweeperFromResolver(t, resolver)
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, commitOutpoint, inp.OutPoint())
+	case <-time.After(time.Second):
+		t.Fatal("expected first-stage input to be swept")
+	}
+
+	ctx.notifier.SpendChan <- &chainntnfs.SpendDetail{
+		SpendingTx:        foreignTx,
+		SpenderTxHash:     &foreignHash,
+		SpenderInputIndex: 0,
+		SpendingHeight:    10,
+		SpentOutPoint:     &commitOutpoint,
+	}
+
+	select {
+	case <-checkpointChan:
+	case <-time.After(time.Second):
+		t.Fatal("expected foreign spend checkpoint")
+	}
+	ctx.waitForResult()
+
+	// Assert.
+	assertNoSweptInput(t, sweeper)
+	assertFinalHtlcFailed(t, ctx)
+}
+
+func TestHtlcSuccessResolverRejectsForeignSpendOnRestart(t *testing.T) {
+	defer timeout()()
+
+	// Arrange.
+	commitOutpoint := wire.OutPoint{
+		Hash:  chainhash.Hash{0x02},
+		Index: 3,
+	}
+	resolution := newTestAnchorSuccessResolution(commitOutpoint)
+	foreignTx, foreignHash := newForeignSuccessSpend(commitOutpoint)
+	expectedReport := &channeldb.ResolverReport{
+		OutPoint:        commitOutpoint,
+		Amount:          testHtlcAmt.ToSatoshis(),
+		ResolverType:    channeldb.ResolverTypeIncomingHtlc,
+		ResolverOutcome: channeldb.ResolverOutcomeTimeout,
+		SpendTxID:       &foreignHash,
+	}
+	ctx := newTestHtlcSuccessContext(t, resolution, true)
+
+	checkpointChan := make(chan struct{}, 1)
+	ctx.checkpoint = func(resolver ContractResolver,
+		reports ...*channeldb.ResolverReport) error {
+
+		successResolver, ok := resolver.(*htlcSuccessResolver)
+		require.True(t, ok)
+
+		require.True(t, successResolver.IsResolved())
+		require.False(t, successResolver.outputIncubating)
+		require.True(t, ctx.finalHtlcOutcomeStored)
+		require.False(t, ctx.finalHtlcSettled)
+		require.Equal(t, []*channeldb.ResolverReport{
+			expectedReport,
+		}, reports)
+
+		checkpointChan <- struct{}{}
+
+		return nil
+	}
+
+	// Act.
+	ctx.resolve()
+	ctx.notifier.SpendChan <- &chainntnfs.SpendDetail{
+		SpendingTx:        foreignTx,
+		SpenderTxHash:     &foreignHash,
+		SpenderInputIndex: 0,
+		SpendingHeight:    10,
+		SpentOutPoint:     &commitOutpoint,
+	}
+
+	select {
+	case <-checkpointChan:
+	case <-time.After(time.Second):
+		t.Fatal("expected foreign spend checkpoint")
+	}
+	ctx.waitForResult()
+
+	// Assert.
+	resolver := successResolverFromContext(t, ctx)
+	assertNoSweptInput(t, mockSweeperFromResolver(t, resolver))
+	assertFinalHtlcFailed(t, ctx)
+}
+
+func newTestHtlcSuccessContext(t *testing.T,
+	resolution lnwallet.IncomingHtlcResolution,
+	outputIncubating bool) *htlcResolverTestContext {
+
+	return newHtlcResolverTestContext(
+		t, func(htlc channeldb.HTLC,
+			cfg ResolverConfig) ContractResolver {
+
+			r := newSuccessResolver(
+				resolution, 0, htlc, 0, cfg,
+			)
+			r.outputIncubating = outputIncubating
+
+			return r
+		},
+	)
+}
+
+func successResolverFromContext(t *testing.T,
+	ctx *htlcResolverTestContext) *htlcSuccessResolver {
+
+	t.Helper()
+
+	resolver, ok := ctx.resolver.(*htlcSuccessResolver)
+	require.True(t, ok)
+
+	return resolver
+}
+
+func mockSweeperFromResolver(t *testing.T,
+	resolver *htlcSuccessResolver) *mockSweeper {
+
+	t.Helper()
+
+	sweeper, ok := resolver.Sweeper.(*mockSweeper)
+	require.True(t, ok)
+
+	return sweeper
+}
+
+func newTestAnchorSuccessResolution(
+	commitOutpoint wire.OutPoint) lnwallet.IncomingHtlcResolution {
+
+	successTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: commitOutpoint,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			cloneTxOut(testSignDesc.Output),
+		},
+	}
+	successHash := successTx.TxHash()
+
+	return lnwallet.IncomingHtlcResolution{
+		Preimage:        [32]byte{},
+		CsvDelay:        4,
+		SignedSuccessTx: successTx,
+		SignDetails: &input.SignDetails{
+			SignDesc: testSignDesc,
+			PeerSig:  testSig,
+		},
+		ClaimOutpoint: wire.OutPoint{
+			Hash:  successHash,
+			Index: 0,
+		},
+		SweepSignDesc: testSignDesc,
+	}
+}
+
+func newForeignSuccessSpend(
+	commitOutpoint wire.OutPoint) (*wire.MsgTx, chainhash.Hash) {
+
+	foreignTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: commitOutpoint,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    testSignDesc.Output.Value,
+				PkScript: []byte{0x51},
+			},
+		},
+	}
+
+	return foreignTx, foreignTx.TxHash()
+}
+
 func cloneTxOut(txOut *wire.TxOut) *wire.TxOut {
 	pkScript := append([]byte(nil), txOut.PkScript...)
 	return &wire.TxOut{
 		Value:    txOut.Value,
 		PkScript: pkScript,
 	}
+}
+
+func assertNoSweptInput(t *testing.T, sweeper *mockSweeper) {
+	t.Helper()
+
+	select {
+	case inp := <-sweeper.sweptInputs:
+		t.Fatalf("unexpected swept input: %v", inp.OutPoint())
+	default:
+	}
+}
+
+func assertFinalHtlcFailed(t *testing.T, ctx *htlcResolverTestContext) {
+	t.Helper()
+
+	require.True(t, ctx.finalHtlcOutcomeStored)
+	require.False(t, ctx.finalHtlcSettled)
 }
 
 // checkpoint holds expected data we expect the resolver to checkpoint itself
