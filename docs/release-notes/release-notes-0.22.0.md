@@ -42,6 +42,14 @@
   regardless of peer connectivity. Uptime is now seeded from the peer's
   actual connection state.
 
+* [Fixed an issue](https://github.com/lightningnetwork/lnd/issues/10840)
+  where an incoming HTLC resolver could treat a foreign spend of the
+  commitment HTLC output as its own success transaction, causing a
+  phantom second-level input to be offered to the sweeper. The resolver
+  now validates the spending transaction's expected output before
+  sweeping it, and avoids launching the success path for incoming HTLCs
+  that are already expired.
+
 # New Features
 
 ## Functional Enhancements
@@ -116,3 +124,4 @@
 * bitromortac
 * Boris Nagaev
 * Erick Cestari
+* Yong Yu
