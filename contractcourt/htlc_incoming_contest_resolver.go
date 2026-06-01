@@ -90,9 +90,20 @@ func (h *htlcIncomingContestResolver) Launch() error {
 	}
 
 	h.log.Debugf("launching contest resolver...")
+	_, bestHeight, err := h.ChainIO.GetBestBlock()
+	if err != nil {
+		return err
+	}
+
+	if uint32(bestHeight) >= h.htlcExpiry {
+		h.log.Infof("expired (height=%v, expiry=%v), leaving "+
+			"resolution to Resolve", bestHeight, h.htlcExpiry)
+
+		return nil
+	}
 
 	// Query the preimage and apply it if we already know it.
-	applied, err := h.findAndapplyPreimage()
+	applied, err := h.findAndapplyPreimage(bestHeight)
 	if err != nil {
 		return err
 	}
@@ -615,7 +626,8 @@ var _ htlcContractResolver = (*htlcIncomingContestResolver)(nil)
 //
 // NOTE: Since we have two places to query the preimage, we need to check both
 // the preimage db and the invoice db to look up the preimage.
-func (h *htlcIncomingContestResolver) findAndapplyPreimage() (bool, error) {
+func (h *htlcIncomingContestResolver) findAndapplyPreimage(
+	currentHeight int32) (bool, error) {
 	// Query to see if we already know the preimage.
 	preimage, ok := h.PreimageDB.LookupPreimage(h.htlc.RHash)
 
@@ -658,13 +670,13 @@ func (h *htlcIncomingContestResolver) findAndapplyPreimage() (bool, error) {
 	// immediately, we'll assume we don't know it yet and let the `Resolve`
 	// handle the waiting.
 	//
-	// NOTE: we use a nil subscriber here and a zero current height as we
-	// are only interested in the settle resolution.
+	// NOTE: we use a nil subscriber here as we are only interested in the
+	// settle resolution.
 	//
 	// TODO(yy): move this logic to link and let the preimage be accessed
 	// via the preimage beacon.
 	resolution, err := h.Registry.NotifyExitHopHtlc(
-		h.htlc.RHash, h.htlc.Amt, h.htlcExpiry, 0,
+		h.htlc.RHash, h.htlc.Amt, h.htlcExpiry, currentHeight,
 		circuitKey, nil, h.htlc.CustomRecords, payload,
 	)
 	if err != nil {
