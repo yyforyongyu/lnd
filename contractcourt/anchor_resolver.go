@@ -32,9 +32,6 @@ type anchorResolver struct {
 	// chanPoint is the channel point of the original contract.
 	chanPoint wire.OutPoint
 
-	// chanType denotes the type of channel the contract belongs to.
-	chanType channeldb.ChannelType
-
 	// currentReport stores the current state of the resolver for reporting
 	// over the rpc interface.
 	currentReport ContractReport
@@ -155,12 +152,10 @@ func (c *anchorResolver) Stop() {
 	close(c.quit)
 }
 
-// SupplementState allows the user of a ContractResolver to supplement it with
-// state required for the proper resolution of a contract.
-//
-// NOTE: Part of the ContractResolver interface.
-func (c *anchorResolver) SupplementState(state *channeldb.OpenChannel) {
-	c.chanType = state.ChanType
+// ApplySupplement restores channel-scoped state required to resolve the
+// anchor.
+func (c *anchorResolver) ApplySupplement(supplement *ResolverSupplement) {
+	c.contractResolverKit.ApplySupplement(supplement)
 }
 
 // report returns a report on the resolution state of the contract.

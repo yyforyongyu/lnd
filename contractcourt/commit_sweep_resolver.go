@@ -29,10 +29,13 @@ import (
 // CLTV to expire.
 // https://docs.lightning.engineering/lightning-network-tools/pool/overview
 type commitSweepResolver struct {
-	// localChanCfg is used to provide the resolver with the keys required
-	// to identify whether the commitment transaction was broadcast by the
-	// local or remote party.
-	localChanCfg channeldb.ChannelConfig
+	// localDelayPubKey stores the local delay basepoint used to identify
+	// whether a taproot commitment output belongs to our local commitment.
+	localDelayPubKey [33]byte
+
+	// localPaymentPubKey stores the local payment basepoint used to identify
+	// whether a taproot commitment output belongs to the remote commitment.
+	localPaymentPubKey [33]byte
 
 	// commitResolution contains all data required to successfully sweep
 	// this HTLC on-chain.
@@ -58,9 +61,6 @@ type commitSweepResolver struct {
 	// NOTE: This value should only be set when the contract belongs to a
 	// leased channel.
 	leaseExpiry uint32
-
-	// chanType denotes the type of channel the contract belongs to.
-	chanType channeldb.ChannelType
 
 	// currentReport stores the current state of the resolver for reporting
 	// over the rpc interface.
@@ -206,17 +206,20 @@ func (c *commitSweepResolver) Stop() {
 	close(c.quit)
 }
 
-// SupplementState allows the user of a ContractResolver to supplement it with
-// state required for the proper resolution of a contract.
-//
-// NOTE: Part of the ContractResolver interface.
-func (c *commitSweepResolver) SupplementState(state *channeldb.OpenChannel) {
-	if state.ChanType.HasLeaseExpiration() {
-		c.leaseExpiry = state.ThawHeight
+// ApplySupplement restores channel-scoped state required to resolve the
+// commitment output.
+func (c *commitSweepResolver) ApplySupplement(
+	supplement *ResolverSupplement) {
+
+	c.contractResolverKit.ApplySupplement(supplement)
+	if supplement == nil {
+		return
 	}
-	c.localChanCfg = state.LocalChanCfg
-	c.channelInitiator = state.IsInitiator
-	c.chanType = state.ChanType
+
+	c.leaseExpiry = supplement.LeaseExpiry
+	c.channelInitiator = supplement.ChannelInitiator
+	c.localDelayPubKey = supplement.LocalDelayPubKey
+	c.localPaymentPubKey = supplement.LocalPaymentPubKey
 }
 
 // hasCLTV denotes whether the resolver must wait for an additional CLTV to
@@ -436,20 +439,26 @@ func (c *commitSweepResolver) decideWitnessType() (input.WitnessType, error) {
 	// on the timelock value. For remote commitment transactions, the
 	// witness script has a timelock of 1.
 	case c.chanType.IsTaproot():
-		delayKey := c.localChanCfg.DelayBasePoint.PubKey
-		nonDelayKey := c.localChanCfg.PaymentBasePoint.PubKey
-
 		signKey := c.commitResolution.SelfOutputSignDesc.KeyDesc.PubKey
+		if signKey == nil {
+			return nil, fmt.Errorf("nil sign key")
+		}
+
+		var signKeyBytes [33]byte
+		copy(signKeyBytes[:], signKey.SerializeCompressed())
 
 		// If the key in the script is neither of these, we shouldn't
 		// proceed. This should be impossible.
-		if !signKey.IsEqual(delayKey) && !signKey.IsEqual(nonDelayKey) {
+		if signKeyBytes != c.localDelayPubKey &&
+			signKeyBytes != c.localPaymentPubKey {
+
+			c.log.Errorf("taproot commit sweep signing key matched neither stored basepoint")
 			return nil, fmt.Errorf("unknown sign key %v", signKey)
 		}
 
 		// The commitment transaction is ours iff the signing key is
 		// the delay key.
-		isLocalCommitTx = signKey.IsEqual(delayKey)
+		isLocalCommitTx = signKeyBytes == c.localDelayPubKey
 
 	// The output is on our local commitment if the script starts with
 	// OP_IF for the revocation clause. On the remote commitment it will

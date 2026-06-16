@@ -57,9 +57,9 @@ type ContractResolver interface {
 	// NOTE: This function MUST be run as a goroutine.
 	Resolve() (ContractResolver, error)
 
-	// SupplementState allows the user of a ContractResolver to supplement
-	// it with state required for the proper resolution of a contract.
-	SupplementState(*channeldb.OpenChannel)
+	// ApplySupplement allows the user of a ContractResolver to restore any
+	// channel-scoped state required for proper contract resolution.
+	ApplySupplement(*ResolverSupplement)
 
 	// IsResolved returns true if the stored state in the resolve is fully
 	// resolved. In this case the target output can be forgotten.
@@ -119,6 +119,9 @@ type ResolverConfig struct {
 type contractResolverKit struct {
 	ResolverConfig
 
+	// chanType denotes the type of channel the contract belongs to.
+	chanType channeldb.ChannelType
+
 	log btclog.Logger
 
 	quit chan struct{}
@@ -153,6 +156,17 @@ func (r *contractResolverKit) initLogger(prefix string) {
 		prefix)
 
 	r.log = log.WithPrefix(logPrefix)
+}
+
+// ApplySupplement restores the shared resolver state.
+func (r *contractResolverKit) ApplySupplement(
+	supplement *ResolverSupplement) {
+
+	if supplement == nil {
+		return
+	}
+
+	r.chanType = supplement.ChanType
 }
 
 // IsResolved returns true if the stored state in the resolve is fully

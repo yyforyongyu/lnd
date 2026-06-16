@@ -4,12 +4,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -167,6 +169,80 @@ func (s *mockSweeper) UpdateParams(input wire.OutPoint,
 }
 
 var _ UtxoSweeper = &mockSweeper{}
+
+func TestCommitSweepResolverTaprootWitnessSelectionFromSupplement(
+	t *testing.T) {
+
+	t.Parallel()
+
+	delayPriv, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	paymentPriv, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	var (
+		localDelayPubKey   [33]byte
+		localPaymentPubKey [33]byte
+	)
+	copy(localDelayPubKey[:], delayPriv.PubKey().SerializeCompressed())
+	copy(localPaymentPubKey[:], paymentPriv.PubKey().SerializeCompressed())
+
+	testCases := []struct {
+		name         string
+		signKey      *btcec.PublicKey
+		expectedType input.WitnessType
+	}{
+		{
+			name:         "local commit",
+			signKey:      delayPriv.PubKey(),
+			expectedType: input.TaprootLocalCommitSpend,
+		},
+		{
+			name:         "remote commit",
+			signKey:      paymentPriv.PubKey(),
+			expectedType: input.TaprootRemoteCommitSpend,
+		},
+	}
+
+	for _, testCase := range testCases {
+		testCase := testCase
+
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			resolution := &lnwallet.CommitOutputResolution{
+				SelfOutputSignDesc: input.SignDescriptor{
+					KeyDesc: keychain.KeyDescriptor{
+						PubKey: testCase.signKey,
+					},
+					Output: &wire.TxOut{Value: 100},
+				},
+				MaturityDelay: 1,
+			}
+
+			ctx := newCommitSweepResolverTestContext(
+				t, resolution, testCommitSweepConfHeight,
+			)
+
+			ctx.resolver.ApplySupplement(&ResolverSupplement{
+				ChanType:           channeldb.AnchorOutputsBit | channeldb.SimpleTaprootFeatureBit,
+				LocalDelayPubKey:   localDelayPubKey,
+				LocalPaymentPubKey: localPaymentPubKey,
+			})
+
+			require.NoError(t, ctx.resolver.Launch())
+
+			select {
+			case sweptInput := <-ctx.sweeper.sweptInputs:
+				require.Equal(t, testCase.expectedType,
+					sweptInput.WitnessType())
+			case <-time.After(defaultTimeout):
+				t.Fatal("resolver did not offer input to sweeper")
+			}
+		})
+	}
+}
 
 // TestCommitSweepResolverNoDelay tests resolution of a direct commitment output
 // unencumbered by a time lock.

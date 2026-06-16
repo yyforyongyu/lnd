@@ -649,6 +649,39 @@ func TestContractResolutionsStorage(t *testing.T) {
 	}
 }
 
+// TestResolverSupplementStorage tests that resolver supplements are persisted
+// independently from contract resolutions.
+func TestResolverSupplementStorage(t *testing.T) {
+	t.Parallel()
+
+	testLog, err := newTestBoltArbLog(
+		t, testChainHash, testChanPoint1,
+	)
+	require.NoError(t, err, "unable to create test log")
+
+	_, err = testLog.FetchResolverSupplement()
+	require.ErrorIs(t, err, errScopeBucketNoExist)
+
+	supplement := &ResolverSupplement{
+		ChanType:           channeldb.AnchorOutputsBit,
+		ChannelInitiator:   true,
+		LeaseExpiry:        123,
+		LocalDelayPubKey:   [33]byte{1, 2, 3},
+		LocalPaymentPubKey: [33]byte{4, 5, 6},
+	}
+
+	require.NoError(t, testLog.PersistResolverSupplement(supplement))
+
+	diskSupplement, err := testLog.FetchResolverSupplement()
+	require.NoError(t, err)
+	require.Equal(t, supplement, diskSupplement)
+
+	require.NoError(t, testLog.WipeHistory())
+
+	_, err = testLog.FetchResolverSupplement()
+	require.ErrorIs(t, err, errScopeBucketNoExist)
+}
+
 // TestStateMutation tests that we're able to properly mutate the state of the
 // log, then retrieve that same mutated state from disk.
 func TestStateMutation(t *testing.T) {
