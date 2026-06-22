@@ -811,7 +811,7 @@ func TestHtlcSuccessSecondStageResolutionSweeper(t *testing.T) {
 			successTx.TxOut[0],
 		},
 	}
-	reSignedHash := successTx.TxHash()
+	reSignedHash := reSignedSuccessTx.TxHash()
 
 	sweepTx := &wire.MsgTx{
 		TxIn: []*wire.TxIn{
