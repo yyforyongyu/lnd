@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
@@ -37,6 +38,10 @@ type htlcIncomingContestResolver struct {
 	// htlcSuccessResolver is the inner resolver that may be utilized if we
 	// learn of the preimage.
 	*htlcSuccessResolver
+
+	// preimageLock synchronizes preimage application between Launch and
+	// Resolve, which can run concurrently on blockbeats.
+	preimageLock sync.Mutex
 }
 
 // newIncomingContestResolver instantiates a new incoming htlc contest resolver.
@@ -233,6 +238,13 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 	// preimage. Otherwise the resolver could potentially stay active
 	// indefinitely and the channel will never close properly.
 	if uint32(currentHeight) >= h.htlcExpiry {
+		// Launch may have already applied a known preimage and started
+		// the inner success resolver. Continue with it before
+		// treating the HTLC as timed out.
+		if h.hasAppliedPreimage() {
+			return h.htlcSuccessResolver, nil
+		}
+
 		// TODO(roasbeef): should also somehow check if outgoing is
 		// resolved or not
 		//  * may need to hook into the circuit map
@@ -421,6 +433,11 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 			// resolved and exit.
 			newHeight := uint32(newBlock.Height)
 			if newHeight >= h.htlcExpiry {
+				// Launch can set this while Resolve waits.
+				if h.hasAppliedPreimage() {
+					return h.htlcSuccessResolver, nil
+				}
+
 				log.Infof("%T(%v): HTLC has timed out "+
 					"(expiry=%v, height=%v), abandoning", h,
 					h.htlcResolution.ClaimOutpoint,
@@ -437,6 +454,15 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 	}
 }
 
+// hasAppliedPreimage returns true if Launch or Resolve already attached the
+// HTLC preimage to the inner success resolver.
+func (h *htlcIncomingContestResolver) hasAppliedPreimage() bool {
+	h.preimageLock.Lock()
+	defer h.preimageLock.Unlock()
+
+	return h.htlcResolution.Preimage != lntypes.ZeroHash
+}
+
 // applyPreimage is a helper function that will populate our internal resolver
 // with the preimage we learn of. This should be called once the preimage is
 // revealed so the inner resolver can properly complete its duties. The error
@@ -449,6 +475,9 @@ func (h *htlcIncomingContestResolver) applyPreimage(
 	if !preimage.Matches(h.htlc.RHash) {
 		return errors.New("preimage does not match hash")
 	}
+
+	h.preimageLock.Lock()
+	defer h.preimageLock.Unlock()
 
 	// We may already have the preimage since both the `Launch` and
 	// `Resolve` methods will look for it.

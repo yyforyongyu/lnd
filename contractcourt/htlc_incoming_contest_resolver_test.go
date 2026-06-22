@@ -44,7 +44,7 @@ func TestHtlcIncomingResolverFwdPreimageKnown(t *testing.T) {
 	defer timeout()()
 
 	ctx := newIncomingResolverTestContext(t, false)
-	ctx.witnessBeacon.lookupPreimage[testResHash] = testResPreimage
+	ctx.witnessBeacon.setLookupPreimage(testResHash, testResPreimage)
 	ctx.resolve()
 	ctx.waitForResult(true)
 }
@@ -111,8 +111,7 @@ func TestHtlcIncomingResolverFwdTimeout(t *testing.T) {
 	t.Parallel()
 	defer timeout()()
 
-	ctx := newIncomingResolverTestContext(t, true)
-	ctx.witnessBeacon.lookupPreimage[testResHash] = testResPreimage
+	ctx := newIncomingResolverTestContext(t, false)
 	ctx.resolver.htlcExpiry = 90
 	ctx.resolve()
 	ctx.waitForResult(false)
@@ -264,6 +263,62 @@ func TestHtlcIncomingResolverFailCheckpointErrorSkipsFinalEvent(t *testing.T) {
 	case <-ctx.finalHtlcEvents:
 		t.Fatal("unexpected final htlc event")
 	default:
+	}
+}
+
+// TestHtlcIncomingResolverBlockEpochUsesLaunchedPreimageAfterExpiry asserts
+// that Resolve continues with the success resolver if a blockbeat Launch
+// applies the preimage while Resolve is already waiting for block epochs.
+func TestHtlcIncomingResolverBlockEpochUsesLaunchedPreimageAfterExpiry(
+	t *testing.T) {
+
+	t.Parallel()
+	defer timeout()()
+
+	ctx := newIncomingResolverTestContext(t, false)
+	ctx.resolver.htlcExpiry = testInitialBlockHeight + 1
+	lookupSignal := make(chan lntypes.Hash, 1)
+	ctx.witnessBeacon.lookupSignal = lookupSignal
+
+	resolveResultChan := make(chan resolveResult, 1)
+	go func() {
+		nextResolver, err := ctx.resolver.Resolve()
+		resolveResultChan <- resolveResult{
+			nextResolver: nextResolver,
+			err:          err,
+		}
+	}()
+	ctx.notifyEpoch(testInitialBlockHeight)
+
+	select {
+	case hash := <-lookupSignal:
+		require.Equal(t, testResHash, hash)
+	case <-time.After(time.Second):
+		t.Fatal("expected resolve preimage lookup")
+	}
+
+	ctx.witnessBeacon.setLookupPreimage(testResHash, testResPreimage)
+	require.NoError(t, ctx.resolver.Launch())
+
+	sweeper, ok := ctx.resolver.Sweeper.(*mockSweeper)
+	require.True(t, ok)
+	select {
+	case <-sweeper.sweptInputs:
+	case <-time.After(time.Second):
+		t.Fatal("expected launched preimage sweep")
+	}
+
+	ctx.notifyEpoch(testInitialBlockHeight + 1)
+
+	select {
+	case result := <-resolveResultChan:
+		require.NoError(t, result.err)
+		require.Same(
+			t, ctx.resolver.htlcSuccessResolver,
+			result.nextResolver,
+		)
+	case <-time.After(time.Second):
+		t.Fatal("expected launched success resolver")
 	}
 }
 
