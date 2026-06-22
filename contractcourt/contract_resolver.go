@@ -200,6 +200,12 @@ func (r *contractResolverKit) markLaunched() {
 	r.launched.Store(true)
 }
 
+// unlaunch marks the resolver as not launched again. Launch methods call
+// this when offering work fails so a later blockbeat can retry in-process.
+func (r *contractResolverKit) unlaunch() {
+	r.launched.Store(false)
+}
+
 var (
 	// errResolverShuttingDown is returned when the resolver stops
 	// progressing because it received the quit signal.

@@ -252,6 +252,10 @@ func (c *anchorResolver) Launch() error {
 	)
 
 	if err != nil {
+		// launchResolvers only logs this error and returns. Clearing
+		// launched lets a later blockbeat or restart retry without a
+		// tight loop.
+		c.unlaunch()
 		return err
 	}
 
