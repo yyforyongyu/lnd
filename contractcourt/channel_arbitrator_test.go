@@ -2316,7 +2316,7 @@ func TestFindCommitmentDeadlineAndValue(t *testing.T) {
 	// Add a dummy payment hash to the preimage lookup.
 	rHash := [lntypes.PreimageSize]byte{1, 2, 3}
 	mockPreimageDB := newMockWitnessBeacon()
-	mockPreimageDB.lookupPreimage[rHash] = rHash
+	mockPreimageDB.setLookupPreimage(rHash, rHash)
 
 	// Attach a mock PreimageDB and Registry to channel arbitrator.
 	chanArb := chanArbCtx.chanArb
@@ -2506,7 +2506,7 @@ func TestSweepAnchors(t *testing.T) {
 	// Add a dummy payment hash to the preimage lookup.
 	rHash := [lntypes.PreimageSize]byte{1, 2, 3}
 	mockPreimageDB := newMockWitnessBeacon()
-	mockPreimageDB.lookupPreimage[rHash] = rHash
+	mockPreimageDB.setLookupPreimage(rHash, rHash)
 
 	// Attach a mock PreimageDB and Registry to channel arbitrator.
 	chanArb := chanArbCtx.chanArb
@@ -2790,7 +2790,7 @@ func TestChannelArbitratorAnchors(t *testing.T) {
 	// Add a dummy payment hash to the preimage lookup.
 	rHash := [lntypes.PreimageSize]byte{1, 2, 3}
 	mockPreimageDB := newMockWitnessBeacon()
-	mockPreimageDB.lookupPreimage[rHash] = rHash
+	mockPreimageDB.setLookupPreimage(rHash, rHash)
 
 	// Attach a mock PreimageDB and Registry to channel arbitrator.
 	chanArb := chanArbCtx.chanArb

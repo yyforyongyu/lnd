@@ -32,9 +32,11 @@ var (
 )
 
 type mockWitnessBeacon struct {
-	preImageUpdates chan lntypes.Preimage
-	newPreimages    chan []lntypes.Preimage
-	lookupPreimage  map[lntypes.Hash]lntypes.Preimage
+	lookupPreimageLock sync.Mutex
+	preImageUpdates    chan lntypes.Preimage
+	newPreimages       chan []lntypes.Preimage
+	lookupPreimage     map[lntypes.Hash]lntypes.Preimage
+	lookupSignal       chan lntypes.Hash
 }
 
 func newMockWitnessBeacon() *mockWitnessBeacon {
@@ -57,6 +59,16 @@ func (m *mockWitnessBeacon) SubscribeUpdates(
 }
 
 func (m *mockWitnessBeacon) LookupPreimage(payhash lntypes.Hash) (lntypes.Preimage, bool) {
+	if m.lookupSignal != nil {
+		select {
+		case m.lookupSignal <- payhash:
+		default:
+		}
+	}
+
+	m.lookupPreimageLock.Lock()
+	defer m.lookupPreimageLock.Unlock()
+
 	preimage, ok := m.lookupPreimage[payhash]
 	if !ok {
 		return lntypes.Preimage{}, false
@@ -64,7 +76,22 @@ func (m *mockWitnessBeacon) LookupPreimage(payhash lntypes.Hash) (lntypes.Preima
 	return preimage, true
 }
 
+func (m *mockWitnessBeacon) setLookupPreimage(hash lntypes.Hash,
+	preimage lntypes.Preimage) {
+
+	m.lookupPreimageLock.Lock()
+	defer m.lookupPreimageLock.Unlock()
+
+	m.lookupPreimage[hash] = preimage
+}
+
 func (m *mockWitnessBeacon) AddPreimages(preimages ...lntypes.Preimage) error {
+	m.lookupPreimageLock.Lock()
+	for _, preimage := range preimages {
+		m.lookupPreimage[preimage.Hash()] = preimage
+	}
+	m.lookupPreimageLock.Unlock()
+
 	m.newPreimages <- preimages
 	return nil
 }
