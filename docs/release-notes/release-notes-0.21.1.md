@@ -29,6 +29,14 @@
   which could default new onion service creation to the retired v2
   `NEW:RSA1024` key type that modern Tor rejects with `513 Invalid key type`.
 
+* [Fixed an issue](https://github.com/lightningnetwork/lnd/issues/10840)
+  ([PR #10869](https://github.com/lightningnetwork/lnd/pull/10869))
+  where an incoming HTLC resolver could treat a foreign spend of the
+  commitment HTLC output as its own success transaction, causing a
+  phantom second-level input to be offered to the sweeper. The resolver
+  now validates the spending transaction's expected output before
+  sweeping it.
+
 # New Features
 
 ## Functional Enhancements
