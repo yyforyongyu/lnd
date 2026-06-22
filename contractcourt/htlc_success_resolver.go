@@ -523,6 +523,11 @@ func (h *htlcSuccessResolver) successTxOutpoint(
 // sweepRemoteCommitOutput creates a sweep request to sweep the HTLC output on
 // the remote commitment via the direct preimage-spend.
 func (h *htlcSuccessResolver) sweepRemoteCommitOutput() error {
+	err := h.attachPreimage()
+	if err != nil {
+		return err
+	}
+
 	// Before we can craft out sweeping transaction, we need to create an
 	// input which contains all the items required to add this input to a
 	// sweeping transaction, and generate a witness.
@@ -575,7 +580,7 @@ func (h *htlcSuccessResolver) sweepRemoteCommitOutput() error {
 		h.htlc.RefundTimeout, budget)
 
 	// We'll now offer the direct preimage HTLC to the sweeper.
-	_, err := h.Sweeper.SweepInput(
+	_, err = h.Sweeper.SweepInput(
 		inp,
 		sweep.Params{
 			Budget:         budget,
@@ -588,6 +593,11 @@ func (h *htlcSuccessResolver) sweepRemoteCommitOutput() error {
 
 // sweepSuccessTx attempts to sweep the second level success tx.
 func (h *htlcSuccessResolver) sweepSuccessTx() error {
+	err := h.attachPreimage()
+	if err != nil {
+		return err
+	}
+
 	var secondLevelInput input.HtlcSecondLevelAnchorInput
 	if h.isTaproot() {
 		secondLevelInput = input.MakeHtlcSecondLevelSuccessTaprootInput(
@@ -621,7 +631,7 @@ func (h *htlcSuccessResolver) sweepSuccessTx() error {
 		"deadline=%v, budget=%v", h.htlc.RefundTimeout, budget)
 
 	// We'll now offer the second-level transaction to the sweeper.
-	_, err := h.Sweeper.SweepInput(
+	_, err = h.Sweeper.SweepInput(
 		&secondLevelInput,
 		sweep.Params{
 			Budget:         budget,
@@ -630,6 +640,25 @@ func (h *htlcSuccessResolver) sweepSuccessTx() error {
 	)
 
 	return err
+}
+
+// attachPreimage attaches a learned preimage from the global preimage DB if a
+// restarted resolver was decoded without it. The normal contest path persists
+// invoice-learned preimages before launching the inner success resolver.
+func (h *htlcSuccessResolver) attachPreimage() error {
+	if h.htlcResolution.Preimage != [32]byte{} {
+		return nil
+	}
+
+	preimage, ok := h.PreimageDB.LookupPreimage(h.htlc.RHash)
+	if !ok {
+		return fmt.Errorf("missing preimage for incoming HTLC %v",
+			h.htlc.RHash)
+	}
+
+	h.htlcResolution.Preimage = preimage
+
+	return nil
 }
 
 // sweepSuccessTxOutput attempts to sweep the output of the second level

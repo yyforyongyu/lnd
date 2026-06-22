@@ -188,6 +188,7 @@ func TestHtlcSuccessSingleStage(t *testing.T) {
 	// singleStageResolution is a resolution for a htlc on the remote
 	// party's commitment.
 	singleStageResolution := lnwallet.IncomingHtlcResolution{
+		Preimage:      testResPreimage,
 		SweepSignDesc: testSignDesc,
 		ClaimOutpoint: htlcOutpoint,
 	}
@@ -236,6 +237,46 @@ func TestHtlcSuccessSingleStage(t *testing.T) {
 	)
 }
 
+// TestHtlcSuccessResolverLaunchRestoresPreimage asserts that Launch restores a
+// missing direct-sweep preimage from the preimage DB before offering the input.
+func TestHtlcSuccessResolverLaunchRestoresPreimage(t *testing.T) {
+	defer timeout()()
+
+	claimOutpoint := wire.OutPoint{
+		Hash:  chainhash.Hash{0x05},
+		Index: 6,
+	}
+	resolution := lnwallet.IncomingHtlcResolution{
+		SweepSignDesc: testSignDesc,
+		ClaimOutpoint: claimOutpoint,
+	}
+	ctx := newHtlcResolverTestContext(
+		t, func(htlc channeldb.HTLC,
+			cfg ResolverConfig) ContractResolver {
+
+			return newSuccessResolver(resolution, 0, htlc, 0, cfg)
+		},
+	)
+	resolver, ok := ctx.resolver.(*htlcSuccessResolver)
+	require.True(t, ok)
+	witnessBeacon, ok := resolver.PreimageDB.(*mockWitnessBeacon)
+	require.True(t, ok)
+	witnessBeacon.setLookupPreimage(testResHash, testResPreimage)
+
+	require.NoError(t, resolver.Launch())
+
+	sweeper, ok := resolver.Sweeper.(*mockSweeper)
+	require.True(t, ok)
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, claimOutpoint, inp.OutPoint())
+		preimage := inp.Preimage().UnwrapOrFail(t)
+		require.Equal(t, testResPreimage, preimage)
+	case <-time.After(time.Second):
+		t.Fatal("expected direct input to be swept")
+	}
+}
+
 // TestHtlcSuccessSecondStageResolution tests successful sweep of a second
 // stage htlc claim, going through the Nursery.
 func TestHtlcSuccessSecondStageResolution(t *testing.T) {
@@ -251,7 +292,7 @@ func TestHtlcSuccessSecondStageResolution(t *testing.T) {
 	// twoStageResolution is a resolution for htlc on our own commitment
 	// which is spent from the signed success tx.
 	twoStageResolution := lnwallet.IncomingHtlcResolution{
-		Preimage: [32]byte{},
+		Preimage: testResPreimage,
 		SignedSuccessTx: &wire.MsgTx{
 			TxIn: []*wire.TxIn{
 				{
@@ -386,7 +427,7 @@ func TestHtlcSuccessSecondStageResolutionSweeper(t *testing.T) {
 	// twoStageResolution is a resolution for htlc on our own commitment
 	// which is spent from the signed success tx.
 	twoStageResolution := lnwallet.IncomingHtlcResolution{
-		Preimage:        [32]byte{},
+		Preimage:        testResPreimage,
 		CsvDelay:        4,
 		SignedSuccessTx: successTx,
 		SignDetails: &input.SignDetails{
