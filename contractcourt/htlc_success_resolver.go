@@ -1,6 +1,7 @@
 package contractcourt
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -175,13 +176,16 @@ func (h *htlcSuccessResolver) resolveRemoteCommitOutput() error {
 	}
 
 	// Checkpoint the resolver, and write the outcome to disk.
-	return h.checkpointClaim(sweepTxDetails.SpenderTxHash)
+	return h.checkpointClaim(
+		h.htlcResolution.ClaimOutpoint, sweepTxDetails.SpenderTxHash,
+	)
 }
 
 // checkpointClaim checkpoints the success resolver with the reports it needs.
 // If this htlc was claimed two stages, it will write reports for both stages,
 // otherwise it will just write for the single htlc claim.
-func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
+func (h *htlcSuccessResolver) checkpointClaim(claimOutpoint wire.OutPoint,
+	spendTx *chainhash.Hash) error {
 
 	// Mark the htlc as final settled.
 	err := h.ChainArbitratorConfig.PutFinalHtlcOutcome(
@@ -195,7 +199,7 @@ func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
 	amt := btcutil.Amount(h.htlcResolution.SweepSignDesc.Output.Value)
 	reports := []*channeldb.ResolverReport{
 		{
-			OutPoint:        h.htlcResolution.ClaimOutpoint,
+			OutPoint:        claimOutpoint,
 			Amount:          amt,
 			ResolverType:    channeldb.ResolverTypeIncomingHtlc,
 			ResolverOutcome: channeldb.ResolverOutcomeClaimed,
@@ -508,6 +512,47 @@ func (h *htlcSuccessResolver) isTaprootFinal() bool {
 	return h.chanType.IsTaprootFinal()
 }
 
+// hasSuccessTxOutpoint returns the second-level success output outpoint if the
+// spending transaction created the output that this resolver expects to sweep.
+func (h *htlcSuccessResolver) hasSuccessTxOutpoint(
+	commitSpend *chainntnfs.SpendDetail) (wire.OutPoint, bool) {
+
+	// waitForSpend should provide the spender tx and txid. If the notifier
+	// omits either field, we cannot prove this spend is our success tx and
+	// must not derive a phantom second-level output.
+	if commitSpend == nil || commitSpend.SpendingTx == nil ||
+		commitSpend.SpenderTxHash == nil {
+
+		return wire.OutPoint{}, false
+	}
+
+	outputIndex := commitSpend.SpenderInputIndex
+
+	// The HTLC success tx uses SIGHASH_SINGLE, so the success output
+	// must be at the same index as the input spending the original HTLC.
+	// If the spender has no such output, it cannot be our success tx.
+	if outputIndex >= uint32(len(commitSpend.SpendingTx.TxOut)) {
+		return wire.OutPoint{}, false
+	}
+
+	expected := h.htlcResolution.SweepSignDesc.Output
+	actual := commitSpend.SpendingTx.TxOut[outputIndex]
+
+	// The output at the SIGHASH_SINGLE index must exactly match the output
+	// we are able to sweep. A missing descriptor or different value/script
+	// means a foreign spend, such as the remote party's timeout reclaim.
+	if expected == nil || actual.Value != expected.Value ||
+		!bytes.Equal(actual.PkScript, expected.PkScript) {
+
+		return wire.OutPoint{}, false
+	}
+
+	return wire.OutPoint{
+		Hash:  *commitSpend.SpenderTxHash,
+		Index: outputIndex,
+	}, true
+}
+
 // hasDirectPreimageSpend returns true if the spending tx spends the remote
 // commitment HTLC output using our known preimage.
 func (h *htlcSuccessResolver) hasDirectPreimageSpend(
@@ -705,6 +750,13 @@ func (h *htlcSuccessResolver) sweepSuccessTxOutput() error {
 		return err
 	}
 
+	// Validate the spender before deriving the second-level output we will
+	// offer to the sweeper.
+	op, ok := h.hasSuccessTxOutpoint(commitSpend)
+	if !ok {
+		return h.checkpointForeignSpend(commitSpend)
+	}
+
 	// The HTLC success tx has a CSV lock that we must wait for, and if
 	// this is a lease enforced channel and we're the imitator, we may need
 	// to wait for longer.
@@ -715,6 +767,7 @@ func (h *htlcSuccessResolver) sweepSuccessTxOutput() error {
 	// the second level output. We report the resolver has moved the next
 	// stage.
 	h.reportLock.Lock()
+	h.currentReport.Outpoint = op
 	h.currentReport.Stage = 2
 	h.currentReport.MaturityHeight = waitHeight
 	h.reportLock.Unlock()
@@ -725,16 +778,6 @@ func (h *htlcSuccessResolver) sweepSuccessTxOutput() error {
 	} else {
 		log.Infof("%T(%x): waiting for CSV lock to expire at height %v",
 			h, h.htlc.RHash[:], waitHeight)
-	}
-
-	// We'll use this input index to determine the second-level output
-	// index on the transaction, as the signatures requires the indexes to
-	// be the same. We don't look for the second-level output script
-	// directly, as there might be more than one HTLC output to the same
-	// pkScript.
-	op := &wire.OutPoint{
-		Hash:  *commitSpend.SpenderTxHash,
-		Index: commitSpend.SpenderInputIndex,
 	}
 
 	// Let the sweeper sweep the second-level output now that the
@@ -749,7 +792,7 @@ func (h *htlcSuccessResolver) sweepSuccessTxOutput() error {
 		witType = input.HtlcAcceptedSuccessSecondLevel
 	}
 	inp := h.makeSweepInput(
-		op, witType,
+		&op, witType,
 		input.LeaseHtlcAcceptedSuccessSecondLevel,
 		&h.htlcResolution.SweepSignDesc,
 		h.htlcResolution.CsvDelay, uint32(commitSpend.SpendingHeight),
@@ -848,14 +891,11 @@ func (h *htlcSuccessResolver) resolveSuccessTx() error {
 		return err
 	}
 
-	// We'll use this input index to determine the second-level output
-	// index on the transaction, as the signatures requires the indexes to
-	// be the same. We don't look for the second-level output script
-	// directly, as there might be more than one HTLC output to the same
-	// pkScript.
-	op := wire.OutPoint{
-		Hash:  *commitSpend.SpenderTxHash,
-		Index: commitSpend.SpenderInputIndex,
+	// Validate the spender before deriving the second-level output we will
+	// wait for and offer to the sweeper.
+	op, ok := h.hasSuccessTxOutpoint(commitSpend)
+	if !ok {
+		return h.checkpointForeignSpend(commitSpend)
 	}
 
 	// If the 2nd-stage sweeping has already been started, we can
@@ -911,7 +951,7 @@ func (h *htlcSuccessResolver) resolveSuccessTxOutput(op wire.OutPoint) error {
 	h.currentReport.LimboBalance = 0
 	h.reportLock.Unlock()
 
-	return h.checkpointClaim(spend.SpenderTxHash)
+	return h.checkpointClaim(op, spend.SpenderTxHash)
 }
 
 // Launch creates an input based on the details of the incoming htlc resolution
