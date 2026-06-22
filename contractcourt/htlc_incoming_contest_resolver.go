@@ -270,7 +270,7 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		// If the htlc resolution was a settle, apply the
 		// preimage and return a success resolver.
 		case *invoices.HtlcSettleResolution:
-			err := h.applyPreimage(resolution.Preimage)
+			err := h.storeAndApplyPreimage(resolution.Preimage)
 			if err != nil {
 				return nil, err
 			}
@@ -534,6 +534,28 @@ func (h *htlcIncomingContestResolver) applyPreimage(
 	}
 
 	return nil
+}
+
+// storeAndApplyPreimage persists an invoice-learned preimage before applying it
+// to the resolver. This gives relaunched success resolvers a durable source for
+// restoring their sweep preimage.
+func (h *htlcIncomingContestResolver) storeAndApplyPreimage(
+	preimage lntypes.Preimage) error {
+
+	if !preimage.Matches(h.htlc.RHash) {
+		return errors.New("preimage does not match hash")
+	}
+
+	if !h.hasAppliedPreimage() {
+		// AddPreimages is idempotent for an existing hash: the witness
+		// cache overwrites the same key and returns nil.
+		err := h.PreimageDB.AddPreimages(preimage)
+		if err != nil {
+			return err
+		}
+	}
+
+	return h.applyPreimage(preimage)
 }
 
 // report returns a report on the resolution state of the contract.
