@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -387,6 +388,107 @@ func TestHtlcSuccessResolverTaprootAugmentMergesPreimage(t *testing.T) {
 	ctx.waitForResult()
 }
 
+// TestHtlcSuccessResolverRetriesSecondStageLaunch asserts that the success
+// resolver re-arms Launch after moving from the first-stage HTLC success tx to
+// its second-stage output.
+func TestHtlcSuccessResolverRetriesSecondStageLaunch(t *testing.T) {
+	defer timeout()()
+
+	commitOutpoint := wire.OutPoint{
+		Hash:  chainhash.Hash{0x07},
+		Index: 8,
+	}
+	resolution := newTestAnchorSuccessResolution(commitOutpoint)
+	ctx := newTestHtlcSuccessContext(t, resolution, false)
+	resolver := successResolverFromContext(t, ctx)
+	sweeper := mockSweeperFromResolver(t, resolver)
+
+	checkpointChan := make(chan struct{}, 1)
+	ctx.checkpoint = func(resolver ContractResolver,
+		reports ...*channeldb.ResolverReport) error {
+
+		successResolver, ok := resolver.(*htlcSuccessResolver)
+		require.True(t, ok)
+		require.True(t, successResolver.outputIncubating)
+		require.False(t, successResolver.isLaunched())
+		require.Empty(t, reports)
+
+		checkpointChan <- struct{}{}
+
+		return nil
+	}
+
+	// The first launch offers the first-stage HTLC success tx.
+	require.NoError(t, resolver.Launch())
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, commitOutpoint, inp.OutPoint())
+	case <-time.After(time.Second):
+		t.Fatal("expected first-stage input to be swept")
+	}
+	require.True(t, resolver.isLaunched())
+
+	// Let Resolve advance to the second stage, then fail the second-stage
+	// offer. The resolver should clear launched so a later Launch can retry
+	// the second-stage output.
+	offerErr := errors.New("stage two offer failed")
+	sweeper.sweepInputErr = offerErr
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- resolver.resolveSuccessTx()
+	}()
+
+	successTx := resolution.SignedSuccessTx
+	successHash := successTx.TxHash()
+	commitSpend := &chainntnfs.SpendDetail{
+		SpendingTx:        successTx,
+		SpenderTxHash:     &successHash,
+		SpenderInputIndex: 0,
+		SpendingHeight:    10,
+		SpentOutPoint:     &commitOutpoint,
+	}
+	ctx.notifier.SpendChan <- commitSpend
+
+	select {
+	case <-checkpointChan:
+	case <-time.After(time.Second):
+		t.Fatal("expected second-stage checkpoint")
+	}
+	ctx.notifier.SpendChan <- commitSpend
+
+	select {
+	case err := <-errChan:
+		require.ErrorIs(t, err, offerErr)
+	case <-time.After(time.Second):
+		t.Fatal("expected second-stage offer error")
+	}
+	require.True(t, resolver.outputIncubating)
+	require.False(t, resolver.isLaunched())
+
+	// A later Launch should retry the second-stage output instead of
+	// returning at the stale first-stage launched guard.
+	sweeper.sweepInputErr = nil
+	retryErr := make(chan error, 1)
+	go func() {
+		retryErr <- resolver.Launch()
+	}()
+	ctx.notifier.SpendChan <- commitSpend
+
+	select {
+	case err := <-retryErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("expected retry launch result")
+	}
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, resolution.ClaimOutpoint, inp.OutPoint())
+	case <-time.After(time.Second):
+		t.Fatal("expected second-stage input to be swept")
+	}
+	require.True(t, resolver.isLaunched())
+}
+
 // TestHtlcSuccessSecondStageResolution tests successful sweep of a second
 // stage htlc claim, going through the Nursery.
 func TestHtlcSuccessSecondStageResolution(t *testing.T) {
@@ -733,6 +835,48 @@ func mockSweeperFromResolver(t *testing.T,
 	require.True(t, ok)
 
 	return sweeper
+}
+
+// newTestAnchorSuccessResolution returns an anchor-channel success resolution
+// whose second-level output matches the shared test sign descriptor.
+func newTestAnchorSuccessResolution(
+	commitOutpoint wire.OutPoint) lnwallet.IncomingHtlcResolution {
+
+	successTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: commitOutpoint,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			cloneTxOut(testSignDesc.Output),
+		},
+	}
+	successHash := successTx.TxHash()
+
+	return lnwallet.IncomingHtlcResolution{
+		Preimage:        testResPreimage,
+		CsvDelay:        4,
+		SignedSuccessTx: successTx,
+		SignDetails: &input.SignDetails{
+			SignDesc: testSignDesc,
+			PeerSig:  testSig,
+		},
+		ClaimOutpoint: wire.OutPoint{
+			Hash:  successHash,
+			Index: 0,
+		},
+		SweepSignDesc: testSignDesc,
+	}
+}
+
+// cloneTxOut returns a copy of a transaction output.
+func cloneTxOut(txOut *wire.TxOut) *wire.TxOut {
+	pkScript := append([]byte(nil), txOut.PkScript...)
+	return &wire.TxOut{
+		Value:    txOut.Value,
+		PkScript: pkScript,
+	}
 }
 
 // checkpoint holds expected data we expect the resolver to checkpoint itself
