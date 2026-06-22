@@ -189,11 +189,9 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 	report := c.currentReport.resolverReport(
 		&sweepTxID, channeldb.ResolverTypeCommit, outcome,
 	)
-	c.markResolved()
-
 	// Checkpoint the resolver with a closure that will write the outcome
 	// of the resolver and its sweep transaction to disk.
-	return nil, c.Checkpoint(c, report)
+	return nil, c.resolve(c, report)
 }
 
 // Stop signals the resolver to cancel any current resolution processes, and

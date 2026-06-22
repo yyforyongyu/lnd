@@ -2,8 +2,10 @@ package contractcourt
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/wire"
 	sphinx "github.com/lightningnetwork/lightning-onion"
@@ -231,6 +233,40 @@ func TestHtlcIncomingResolverLaunchSkipsSuccessAfterLookupExpiry(
 	require.Len(t, ctx.registry.immediateNotify, 1)
 }
 
+// TestHtlcIncomingResolverFailCheckpointErrorSkipsFinalEvent asserts that
+// final failed HTLC events are emitted only after the terminal checkpoint is
+// durably persisted.
+func TestHtlcIncomingResolverFailCheckpointErrorSkipsFinalEvent(t *testing.T) {
+	t.Parallel()
+	defer timeout()()
+
+	checkpointErr := errors.New("checkpoint failed")
+	ctx := newIncomingResolverTestContext(t, false)
+	ctx.resolver.htlcExpiry = testInitialBlockHeight
+	ctx.resolver.Checkpoint = func(_ ContractResolver,
+		_ ...*channeldb.ResolverReport) error {
+
+		return checkpointErr
+	}
+
+	ctx.resolve()
+
+	select {
+	case err := <-ctx.resolveErr:
+		require.ErrorIs(t, err, checkpointErr)
+	case <-time.After(time.Second):
+		t.Fatal("expected checkpoint error")
+	}
+
+	require.True(t, ctx.finalHtlcOutcomeStored)
+	require.False(t, ctx.resolver.IsResolved())
+	select {
+	case <-ctx.finalHtlcEvents:
+		t.Fatal("unexpected final htlc event")
+	default:
+	}
+}
+
 // TestHtlcIncomingResolverExitSettle tests resolution of an exit hop htlc for
 // which the invoice has already been settled when the resolver starts.
 func TestHtlcIncomingResolverExitSettle(t *testing.T) {
@@ -416,6 +452,16 @@ func (o *mockOnionProcessor) ReconstructHopIterator(r io.Reader, rHash []byte,
 	return &mockHopIterator{isExit: o.isExit}, nil
 }
 
+type incomingFinalHtlcNotifier struct {
+	events chan struct{}
+}
+
+func (i *incomingFinalHtlcNotifier) NotifyFinalHtlcEvent(
+	_ models.CircuitKey, _ channeldb.FinalHtlcInfo) {
+
+	i.events <- struct{}{}
+}
+
 type incomingResolverTestContext struct {
 	registry               *mockRegistry
 	witnessBeacon          *mockWitnessBeacon
@@ -423,6 +469,7 @@ type incomingResolverTestContext struct {
 	notifier               *mock.ChainNotifier
 	chainIO                *mock.ChainIO
 	onionProcessor         *mockOnionProcessor
+	finalHtlcEvents        chan struct{}
 	resolveErr             chan error
 	nextResolver           ContractResolver
 	finalHtlcOutcomeStored bool
@@ -444,19 +491,19 @@ func newIncomingResolverTestContext(t *testing.T, isExit bool) *incomingResolver
 	}
 
 	onionProcessor := &mockOnionProcessor{isExit: isExit}
+	finalHtlcEvents := make(chan struct{}, 1)
 
 	checkPointChan := make(chan struct{}, 1)
 
 	c := &incomingResolverTestContext{
-		registry:       registry,
-		witnessBeacon:  witnessBeacon,
-		notifier:       notifier,
-		chainIO:        chainIO,
-		onionProcessor: onionProcessor,
-		t:              t,
+		registry:        registry,
+		witnessBeacon:   witnessBeacon,
+		notifier:        notifier,
+		chainIO:         chainIO,
+		onionProcessor:  onionProcessor,
+		finalHtlcEvents: finalHtlcEvents,
+		t:               t,
 	}
-
-	htlcNotifier := &mockHTLCNotifier{}
 
 	chainCfg := ChannelArbitratorConfig{
 		ChainArbitratorConfig: ChainArbitratorConfig{
@@ -471,8 +518,10 @@ func newIncomingResolverTestContext(t *testing.T, isExit bool) *incomingResolver
 
 				return nil
 			},
-			HtlcNotifier: htlcNotifier,
-			Budget:       *DefaultBudgetConfig(),
+			HtlcNotifier: &incomingFinalHtlcNotifier{
+				events: finalHtlcEvents,
+			},
+			Budget: *DefaultBudgetConfig(),
 			QueryIncomingCircuit: func(
 				circuit models.CircuitKey) *models.CircuitKey {
 

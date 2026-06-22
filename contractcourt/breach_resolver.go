@@ -59,8 +59,7 @@ func (b *breachResolver) Resolve() (ContractResolver, error) {
 		// If the breach resolution process is already complete, then
 		// we can cleanup and checkpoint the resolved state.
 		if complete {
-			b.markResolved()
-			return nil, b.Checkpoint(b)
+			return nil, b.resolve(b)
 		}
 
 		// Prevent duplicate subscriptions.
@@ -72,8 +71,7 @@ func (b *breachResolver) Resolve() (ContractResolver, error) {
 		// The replyChan has been closed, signalling that the breach
 		// has been fully resolved. Checkpoint the resolved state and
 		// exit.
-		b.markResolved()
-		return nil, b.Checkpoint(b)
+		return nil, b.resolve(b)
 
 	case <-b.quit:
 	}
