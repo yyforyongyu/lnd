@@ -643,7 +643,9 @@ func maybeAugmentTaprootResolvers(chanType channeldb.ChannelType,
 			if r.htlcResolution.ClaimOutpoint ==
 				htlcRes.ClaimOutpoint {
 
-				r.htlcResolution = htlcRes
+				augmentIncomingHtlcResolution(
+					&r.htlcResolution, htlcRes,
+				)
 			}
 		}
 	case *htlcSuccessResolver:
@@ -654,9 +656,25 @@ func maybeAugmentTaprootResolvers(chanType channeldb.ChannelType,
 			if r.htlcResolution.ClaimOutpoint ==
 				htlcRes.ClaimOutpoint {
 
-				r.htlcResolution = htlcRes
+				augmentIncomingHtlcResolution(
+					&r.htlcResolution, htlcRes,
+				)
 			}
 		}
+	}
+}
+
+// augmentIncomingHtlcResolution applies the taproot close-summary resolution
+// while preserving any preimage learned by the existing resolver. The close
+// summary can lack a preimage even when the in-memory resolver has already
+// recovered one from invoices or the witness cache.
+func augmentIncomingHtlcResolution(dst *lnwallet.IncomingHtlcResolution,
+	src lnwallet.IncomingHtlcResolution) {
+
+	preimage := dst.Preimage
+	*dst = src
+	if preimage != [32]byte{} {
+		dst.Preimage = preimage
 	}
 }
 
