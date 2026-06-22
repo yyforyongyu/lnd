@@ -10,11 +10,13 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/labels"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/sweep"
@@ -168,6 +170,10 @@ func (h *htlcSuccessResolver) resolveRemoteCommitOutput() error {
 	// TODO(yy): should also update the `RecoveredBalance` and
 	// `LimboBalance` like other paths?
 
+	if !h.hasDirectPreimageSpend(sweepTxDetails) {
+		return h.checkpointForeignSpend(sweepTxDetails)
+	}
+
 	// Checkpoint the resolver, and write the outcome to disk.
 	return h.checkpointClaim(sweepTxDetails.SpenderTxHash)
 }
@@ -176,6 +182,7 @@ func (h *htlcSuccessResolver) resolveRemoteCommitOutput() error {
 // If this htlc was claimed two stages, it will write reports for both stages,
 // otherwise it will just write for the single htlc claim.
 func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
+
 	// Mark the htlc as final settled.
 	err := h.ChainArbitratorConfig.PutFinalHtlcOutcome(
 		h.ChannelArbitratorConfig.ShortChanID, h.htlc.HtlcIndex, true,
@@ -221,16 +228,83 @@ func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
 	if err != nil {
 		return err
 	}
+	h.notifyFinalHtlcOutcome(true)
+
+	return nil
+}
+
+// notifyFinalHtlcOutcome emits the final HTLC outcome to subscribers.
+func (h *htlcSuccessResolver) notifyFinalHtlcOutcome(settled bool) {
 	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
 		models.CircuitKey{
 			ChanID: h.ShortChanID,
 			HtlcID: h.htlc.HtlcIndex,
 		},
 		channeldb.FinalHtlcInfo{
-			Settled:  true,
+			Settled:  settled,
 			Offchain: false,
 		},
 	)
+}
+
+// checkpointForeignSpend checkpoints the resolver as failed when the original
+// HTLC outpoint was spent by a transaction that did not match our expected
+// success path.
+func (h *htlcSuccessResolver) checkpointForeignSpend(
+	commitSpend *chainntnfs.SpendDetail) error {
+
+	err := h.ChainArbitratorConfig.PutFinalHtlcOutcome(
+		h.ChannelArbitratorConfig.ShortChanID, h.htlc.HtlcIndex, false,
+	)
+	if err != nil {
+		return err
+	}
+
+	var spendTxID *chainhash.Hash
+	switch {
+	// waitForSpend should always return a spend detail. If it does not,
+	// avoid deriving from incomplete data. Fail the resolver so it stops
+	// advertising a sweepable HTLC.
+	case commitSpend == nil:
+		h.log.Errorf("missing spend details for HTLC outpoint %v",
+			h.outpoint())
+
+	// A spend detail without a tx hash is malformed here. We can no
+	// longer prove this was our success tx or write a useful spend tx id
+	// into the resolver report.
+	case commitSpend.SpenderTxHash == nil:
+		h.log.Errorf("missing spender tx hash for HTLC outpoint %v",
+			h.outpoint())
+
+	// A complete spend detail lets us include the spender txid in the final
+	// resolver report.
+	default:
+		spendTxID = commitSpend.SpenderTxHash
+	}
+	h.log.Warnf("HTLC outpoint %v was spent by tx %v, which did not "+
+		"match our expected success spend", h.outpoint(),
+		spendTxID)
+
+	// A foreign spend of an incoming HTLC on our commitment means we cannot
+	// complete the success path. The known production case is the remote
+	// timeout reclaim.
+	report := &channeldb.ResolverReport{
+		OutPoint:        h.outpoint(),
+		Amount:          h.htlc.Amt.ToSatoshis(),
+		ResolverType:    channeldb.ResolverTypeIncomingHtlc,
+		ResolverOutcome: channeldb.ResolverOutcomeTimeout,
+		SpendTxID:       spendTxID,
+	}
+
+	// Even though markResolved stops future resolver progress, persist a
+	// clean terminal state without a stale stage-two flag.
+	h.outputIncubating = false
+
+	err = h.resolve(h, report)
+	if err != nil {
+		return err
+	}
+	h.notifyFinalHtlcOutcome(false)
 
 	return nil
 }
@@ -432,6 +506,44 @@ func (h *htlcSuccessResolver) isTaproot() bool {
 // channel.
 func (h *htlcSuccessResolver) isTaprootFinal() bool {
 	return h.chanType.IsTaprootFinal()
+}
+
+// hasDirectPreimageSpend returns true if the spending tx spends the remote
+// commitment HTLC output using our known preimage.
+func (h *htlcSuccessResolver) hasDirectPreimageSpend(
+	commitSpend *chainntnfs.SpendDetail) bool {
+
+	if commitSpend == nil || commitSpend.SpendingTx == nil ||
+		commitSpend.SpenderTxHash == nil {
+
+		return false
+	}
+
+	inputIndex := commitSpend.SpenderInputIndex
+	if inputIndex >= uint32(len(commitSpend.SpendingTx.TxIn)) {
+		return false
+	}
+
+	txIn := commitSpend.SpendingTx.TxIn[inputIndex]
+	if txIn.PreviousOutPoint != h.htlcResolution.ClaimOutpoint {
+		return false
+	}
+
+	// Direct legacy and taproot success spends put the preimage at witness
+	// index 1. Validate the revealed preimage by hash instead of comparing
+	// it to resolver state, because taproot restart augmentation can
+	// replace htlcResolution with one that does not carry the persisted
+	// preimage.
+	if len(txIn.Witness) <= 1 {
+		return false
+	}
+
+	preimage, err := lntypes.MakePreimage(txIn.Witness[1])
+	if err != nil {
+		return false
+	}
+
+	return preimage.Matches(h.htlc.RHash)
 }
 
 // sweepRemoteCommitOutput creates a sweep request to sweep the HTLC output on
