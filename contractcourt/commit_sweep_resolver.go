@@ -363,6 +363,7 @@ func (c *commitSweepResolver) Launch() error {
 	// Derive the witness type for this input.
 	witnessType, err := c.decideWitnessType()
 	if err != nil {
+		c.unlaunch()
 		return err
 	}
 
@@ -413,6 +414,7 @@ func (c *commitSweepResolver) Launch() error {
 	)
 	if err != nil {
 		c.log.Errorf("unable to sweep input: %v", err)
+		c.unlaunch()
 
 		return err
 	}

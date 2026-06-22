@@ -853,16 +853,16 @@ func (h *htlcSuccessResolver) Launch() error {
 	h.log.Debugf("launching resolver...")
 	h.markLaunched()
 
+	var err error
 	switch {
 	// If we're already resolved, then we can exit early.
 	case h.IsResolved():
 		h.log.Errorf("already resolved")
-		return nil
 
 	// If this is an output on the remote party's commitment transaction,
 	// use the direct-spend path.
 	case h.isRemoteCommitOutput():
-		return h.sweepRemoteCommitOutput()
+		err = h.sweepRemoteCommitOutput()
 
 	// If this is an anchor type channel, we now sweep either the
 	// second-level success tx or the output from the second-level success
@@ -871,17 +871,23 @@ func (h *htlcSuccessResolver) Launch() error {
 		// If the second-level success tx has already been swept, we
 		// can go ahead and sweep its output.
 		if h.outputIncubating {
-			return h.sweepSuccessTxOutput()
+			err = h.sweepSuccessTxOutput()
+			break
 		}
 
 		// Otherwise, sweep the second level tx.
-		return h.sweepSuccessTx()
+		err = h.sweepSuccessTx()
 
-	// If this is a legacy channel type, the output is handled by the
-	// nursery via the Resolve so we do nothing here.
-	//
-	// TODO(yy): handle the legacy output by offering it to the sweeper.
 	default:
-		return nil
+		// Legacy channel outputs are handled by the nursery through
+		// Resolve, so Launch does nothing here.
+		//
+		// TODO(yy): offer legacy output to the sweeper.
 	}
+
+	if err != nil {
+		h.unlaunch()
+	}
+
+	return err
 }

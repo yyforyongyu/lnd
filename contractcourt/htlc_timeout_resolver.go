@@ -1291,11 +1291,11 @@ func (h *htlcTimeoutResolver) Launch() error {
 	h.log.Debugf("launching resolver...")
 	h.markLaunched()
 
+	var err error
 	switch {
 	// If we're already resolved, then we can exit early.
 	case h.IsResolved():
 		h.log.Errorf("already resolved")
-		return nil
 
 	// If this is an output on the remote party's commitment transaction,
 	// use the direct timeout spend path.
@@ -1305,7 +1305,7 @@ func (h *htlcTimeoutResolver) Launch() error {
 	// stopped marking this flag for direct timeout spends (#9062). In that
 	// case, we will do nothing and let the utxo nursery handle it.
 	case h.isRemoteCommitOutput() && !h.outputIncubating:
-		return h.sweepDirectHtlcOutput()
+		err = h.sweepDirectHtlcOutput()
 
 	// If this is an anchor type channel, we now sweep either the
 	// second-level timeout tx or the output from the second-level timeout
@@ -1314,17 +1314,23 @@ func (h *htlcTimeoutResolver) Launch() error {
 		// If the second-level timeout tx has already been swept, we
 		// can go ahead and sweep its output.
 		if h.outputIncubating {
-			return h.sweepTimeoutTxOutput()
+			err = h.sweepTimeoutTxOutput()
+			break
 		}
 
 		// Otherwise, sweep the second level tx.
-		return h.sweepTimeoutTx()
+		err = h.sweepTimeoutTx()
 
-	// If this is an output on our own commitment using pre-anchor channel
-	// type, we will let the utxo nursery handle it via Resolve.
-	//
-	// TODO(yy): handle the legacy output by offering it to the sweeper.
 	default:
-		return nil
+		// Pre-anchor local commitment outputs are handled by the
+		// nursery through Resolve, so Launch does nothing here.
+		//
+		// TODO(yy): offer legacy output to the sweeper.
 	}
+
+	if err != nil {
+		h.unlaunch()
+	}
+
+	return err
 }
