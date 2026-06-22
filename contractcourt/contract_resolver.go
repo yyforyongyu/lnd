@@ -168,6 +168,28 @@ func (r *contractResolverKit) markResolved() {
 	r.resolved.Store(true)
 }
 
+// unresolve marks the resolver as unresolved again. This is used when a
+// terminal checkpoint fails after the resolver has prepared resolved state in
+// memory, but before that state is durably persisted.
+func (r *contractResolverKit) unresolve() {
+	r.resolved.Store(false)
+}
+
+// resolve persists a terminal resolver checkpoint. If persistence fails, the
+// in-memory resolved bit is cleared so callers can safely retry.
+func (r *contractResolverKit) resolve(resolver ContractResolver,
+	reports ...*channeldb.ResolverReport) error {
+
+	r.markResolved()
+	err := r.Checkpoint(resolver, reports...)
+	if err != nil {
+		r.unresolve()
+		return err
+	}
+
+	return nil
+}
+
 // isLaunched returns true if the resolver has been launched.
 func (r *contractResolverKit) isLaunched() bool {
 	return r.launched.Load()

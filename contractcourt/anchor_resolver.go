@@ -141,7 +141,13 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 	c.reportLock.Unlock()
 
 	c.markResolved()
-	return nil, c.PutResolverReport(nil, report)
+	err := c.PutResolverReport(nil, report)
+	if err != nil {
+		c.unresolve()
+		return nil, err
+	}
+
+	return nil, nil
 }
 
 // Stop signals the resolver to cancel any current resolution processes, and

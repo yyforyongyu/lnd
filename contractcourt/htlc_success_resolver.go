@@ -184,18 +184,6 @@ func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
 		return err
 	}
 
-	// Send notification.
-	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
-		models.CircuitKey{
-			ChanID: h.ShortChanID,
-			HtlcID: h.htlc.HtlcIndex,
-		},
-		channeldb.FinalHtlcInfo{
-			Settled:  true,
-			Offchain: false,
-		},
-	)
-
 	// Create a resolver report for claiming of the htlc itself.
 	amt := btcutil.Amount(h.htlcResolution.SweepSignDesc.Output.Value)
 	reports := []*channeldb.ResolverReport{
@@ -227,9 +215,24 @@ func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
 		reports = append(reports, report)
 	}
 
-	// Finally, we checkpoint the resolver with our report(s).
-	h.markResolved()
-	return h.Checkpoint(h, reports...)
+	// Finally, we checkpoint the resolver with our report(s). Notify after
+	// the checkpoint succeeds so retries do not duplicate terminal events.
+	err = h.resolve(h, reports...)
+	if err != nil {
+		return err
+	}
+	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
+		models.CircuitKey{
+			ChanID: h.ShortChanID,
+			HtlcID: h.htlc.HtlcIndex,
+		},
+		channeldb.FinalHtlcInfo{
+			Settled:  true,
+			Offchain: false,
+		},
+	)
+
+	return nil
 }
 
 // Stop signals the resolver to cancel any current resolution processes, and

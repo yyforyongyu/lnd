@@ -55,16 +55,43 @@ func newIncomingContestResolver(
 	}
 }
 
-func (h *htlcIncomingContestResolver) processFinalHtlcFail() error {
+// persistFinalHtlcFail persists that the HTLC reached a final failed outcome.
+// The corresponding notifier event is emitted only after the terminal resolver
+// checkpoint succeeds.
+func (h *htlcIncomingContestResolver) persistFinalHtlcFail() error {
 	// Mark the htlc as final failed.
 	err := h.ChainArbitratorConfig.PutFinalHtlcOutcome(
 		h.ChannelArbitratorConfig.ShortChanID, h.htlc.HtlcIndex, false,
 	)
+
+	return err
+}
+
+// checkpointFinalHtlcFail persists the failed outcome and terminal resolver
+// checkpoint, then notifies subscribers after the checkpoint is durable.
+func (h *htlcIncomingContestResolver) checkpointFinalHtlcFail(
+	outcome channeldb.ResolverOutcome) error {
+
+	err := h.persistFinalHtlcFail()
 	if err != nil {
 		return err
 	}
 
-	// Send notification.
+	report := h.report().resolverReport(
+		nil, channeldb.ResolverTypeIncomingHtlc, outcome,
+	)
+	err = h.resolve(h, report)
+	if err != nil {
+		return err
+	}
+
+	h.notifyFinalHtlcFail()
+
+	return nil
+}
+
+// notifyFinalHtlcFail emits the final failed HTLC outcome to subscribers.
+func (h *htlcIncomingContestResolver) notifyFinalHtlcFail() {
 	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
 		models.CircuitKey{
 			ChanID: h.ShortChanID,
@@ -75,8 +102,6 @@ func (h *htlcIncomingContestResolver) processFinalHtlcFail() error {
 			Offchain: false,
 		},
 	)
-
-	return nil
 }
 
 // Launch will call the inner resolver's launch method if the preimage can be
@@ -141,19 +166,10 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		// will time it out and get their funds back. This situation
 		// can present itself when we crash before processRemoteAdds in
 		// the link has ran.
-		h.markResolved()
 
-		if err := h.processFinalHtlcFail(); err != nil {
-			return nil, err
-		}
-
-		// We write a report to disk that indicates we could not decode
-		// the htlc.
-		resReport := h.report().resolverReport(
-			nil, channeldb.ResolverTypeIncomingHtlc,
+		return nil, h.checkpointFinalHtlcFail(
 			channeldb.ResolverOutcomeAbandoned,
 		)
-		return nil, h.PutResolverReport(nil, resReport)
 	}
 
 	// Register for block epochs. After registration, the current height
@@ -194,19 +210,10 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		log.Infof("%T(%v): HTLC has timed out (expiry=%v, height=%v), "+
 			"abandoning", h, h.htlcResolution.ClaimOutpoint,
 			h.htlcExpiry, currentHeight)
-		h.markResolved()
 
-		if err := h.processFinalHtlcFail(); err != nil {
-			return nil, err
-		}
-
-		// Finally, get our report and checkpoint our resolver with a
-		// timeout outcome report.
-		report := h.report().resolverReport(
-			nil, channeldb.ResolverTypeIncomingHtlc,
+		return nil, h.checkpointFinalHtlcFail(
 			channeldb.ResolverOutcomeTimeout,
 		)
-		return nil, h.Checkpoint(h, report)
 	}
 
 	// Define a closure to process htlc resolutions either directly or
@@ -235,19 +242,9 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 				h.htlcResolution.ClaimOutpoint,
 				h.htlcExpiry, currentHeight)
 
-			h.markResolved()
-
-			if err := h.processFinalHtlcFail(); err != nil {
-				return nil, err
-			}
-
-			// Checkpoint our resolver with an abandoned outcome
-			// because we take no further action on this htlc.
-			report := h.report().resolverReport(
-				nil, channeldb.ResolverTypeIncomingHtlc,
+			return nil, h.checkpointFinalHtlcFail(
 				channeldb.ResolverOutcomeAbandoned,
 			)
-			return nil, h.Checkpoint(h, report)
 
 		// Error if the resolution type is unknown, we are only
 		// expecting settles and fails.
@@ -398,18 +395,9 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 					h.htlcResolution.ClaimOutpoint,
 					h.htlcExpiry, currentHeight)
 
-				h.markResolved()
-
-				if err := h.processFinalHtlcFail(); err != nil {
-					return nil, err
-				}
-
-				report := h.report().resolverReport(
-					nil,
-					channeldb.ResolverTypeIncomingHtlc,
+				return nil, h.checkpointFinalHtlcFail(
 					channeldb.ResolverOutcomeTimeout,
 				)
-				return nil, h.Checkpoint(h, report)
 			}
 
 		case <-h.quit:

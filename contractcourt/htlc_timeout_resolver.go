@@ -236,8 +236,8 @@ func (h *htlcTimeoutResolver) claimCleanUp(
 	var pre [32]byte
 	copy(pre[:], preimage[:])
 
-	// Finally, we'll send the clean up message, mark ourselves as
-	// resolved, then exit.
+	// Finally, we'll send the clean up message, mark ourselves as resolved,
+	// checkpoint, then exit.
 	if err := h.DeliverResolutionMsg(ResolutionMsg{
 		SourceChan: h.ShortChanID,
 		HtlcIndex:  h.htlc.HtlcIndex,
@@ -245,7 +245,6 @@ func (h *htlcTimeoutResolver) claimCleanUp(
 	}); err != nil {
 		return err
 	}
-	h.markResolved()
 
 	// Checkpoint our resolver with a report which reflects the preimage
 	// claim by the remote party.
@@ -258,7 +257,7 @@ func (h *htlcTimeoutResolver) claimCleanUp(
 		SpendTxID:       commitSpend.SpenderTxHash,
 	}
 
-	return h.Checkpoint(h, report)
+	return h.resolve(h, report)
 }
 
 // chainDetailsToWatch returns the output and script which we use to watch for
@@ -1160,9 +1159,7 @@ func (h *htlcTimeoutResolver) checkpointClaim(
 	}
 
 	// Finally, we checkpoint the resolver with our report(s).
-	h.markResolved()
-
-	return h.Checkpoint(h, report)
+	return h.resolve(h, report)
 }
 
 // resolveRemoteCommitOutput handles sweeping an HTLC output on the remote
