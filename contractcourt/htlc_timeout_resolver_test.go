@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -1281,6 +1282,144 @@ func TestHtlcTimeoutSecondStageSweeper(t *testing.T) {
 	testHtlcTimeout(
 		t, twoStageResolution, checkpoints,
 	)
+}
+
+// TestHtlcTimeoutResolverRetriesSecondStageLaunch asserts that the timeout
+// resolver re-arms Launch after moving from the first-stage HTLC timeout tx to
+// its second-stage output.
+func TestHtlcTimeoutResolverRetriesSecondStageLaunch(t *testing.T) {
+	defer timeout()()
+
+	commitOutpoint := wire.OutPoint{
+		Hash:  chainhash.Hash{0x08},
+		Index: 9,
+	}
+	timeoutTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: commitOutpoint,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			cloneTxOut(testSignDesc.Output),
+		},
+	}
+	signer := &mock.DummySigner{}
+	timeoutWitness, err := input.SenderHtlcSpendTimeout(
+		&mock.DummySignature{}, txscript.SigHashAll, signer,
+		&testSignDesc, timeoutTx,
+	)
+	require.NoError(t, err)
+	timeoutTx.TxIn[0].Witness = timeoutWitness
+	timeoutHash := timeoutTx.TxHash()
+
+	resolution := lnwallet.OutgoingHtlcResolution{
+		ClaimOutpoint: wire.OutPoint{
+			Hash:  timeoutHash,
+			Index: 0,
+		},
+		CsvDelay:        4,
+		SignedTimeoutTx: timeoutTx,
+		SignDetails: &input.SignDetails{
+			SignDesc: testSignDesc,
+			PeerSig:  testSig,
+		},
+		SweepSignDesc: testSignDesc,
+	}
+	ctx := newHtlcResolverTestContext(
+		t, func(htlc channeldb.HTLC,
+			cfg ResolverConfig) ContractResolver {
+
+			return newTimeoutResolver(resolution, 0, htlc, 0, cfg)
+		},
+	)
+	resolver, ok := ctx.resolver.(*htlcTimeoutResolver)
+	require.True(t, ok)
+	sweeper, ok := resolver.Sweeper.(*mockSweeper)
+	require.True(t, ok)
+
+	checkpointChan := make(chan struct{}, 1)
+	ctx.checkpoint = func(resolver ContractResolver,
+		reports ...*channeldb.ResolverReport) error {
+
+		timeoutResolver, ok := resolver.(*htlcTimeoutResolver)
+		require.True(t, ok)
+		require.True(t, timeoutResolver.outputIncubating)
+		require.False(t, timeoutResolver.isLaunched())
+		require.Len(t, reports, 1)
+
+		checkpointChan <- struct{}{}
+
+		return nil
+	}
+
+	// The first launch offers the first-stage HTLC timeout tx.
+	require.NoError(t, resolver.Launch())
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, commitOutpoint, inp.OutPoint())
+	case <-time.After(time.Second):
+		t.Fatal("expected first-stage input to be swept")
+	}
+	require.True(t, resolver.isLaunched())
+
+	// Let Resolve advance to the second stage, then fail the second-stage
+	// offer. The resolver should clear launched so a later Launch can retry
+	// the second-stage output.
+	offerErr := errors.New("stage two offer failed")
+	sweeper.sweepInputErr = offerErr
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- resolver.resolveTimeoutTx()
+	}()
+
+	commitSpend := &chainntnfs.SpendDetail{
+		SpendingTx:        timeoutTx,
+		SpenderTxHash:     &timeoutHash,
+		SpenderInputIndex: 0,
+		SpendingHeight:    10,
+		SpentOutPoint:     &commitOutpoint,
+	}
+	ctx.notifier.SpendChan <- commitSpend
+
+	select {
+	case <-checkpointChan:
+	case <-time.After(time.Second):
+		t.Fatal("expected second-stage checkpoint")
+	}
+	ctx.notifier.SpendChan <- commitSpend
+
+	select {
+	case err := <-errChan:
+		require.ErrorIs(t, err, offerErr)
+	case <-time.After(time.Second):
+		t.Fatal("expected second-stage offer error")
+	}
+	require.True(t, resolver.outputIncubating)
+	require.False(t, resolver.isLaunched())
+
+	// A later Launch should retry the second-stage output instead of
+	// returning at the stale first-stage launched guard.
+	sweeper.sweepInputErr = nil
+	retryErr := make(chan error, 1)
+	go func() {
+		retryErr <- resolver.Launch()
+	}()
+	ctx.notifier.SpendChan <- commitSpend
+
+	select {
+	case err := <-retryErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("expected retry launch result")
+	}
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, resolution.ClaimOutpoint, inp.OutPoint())
+	case <-time.After(time.Second):
+		t.Fatal("expected second-stage input to be swept")
+	}
+	require.True(t, resolver.isLaunched())
 }
 
 // TestHtlcTimeoutSecondStageSweeperRemoteSpend tests that if a local timeout

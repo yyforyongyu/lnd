@@ -1240,18 +1240,27 @@ func (h *htlcTimeoutResolver) resolveTimeoutTx() error {
 
 	h.log.Infof("2nd-level HTLC timeout tx=%v confirmed", spenderTxid)
 
-	// Start the process to sweep the output from the timeout tx.
+	// Re-arm Launch before checkpointing the stage transition so later
+	// blockbeats can retry the second-stage output if this path fails.
 	if h.isZeroFeeOutput() {
-		err = h.sweepTimeoutTxOutput()
-		if err != nil {
-			return err
-		}
+		h.unlaunch()
 	}
 
-	// Create a checkpoint since the timeout tx is confirmed and the sweep
-	// request has been made.
-	if err := h.checkpointStageOne(spenderTxid); err != nil {
+	// Create a checkpoint since the timeout tx is confirmed and the second
+	// stage can now be swept.
+	err = h.checkpointStageOne(spenderTxid)
+	if err != nil {
 		return err
+	}
+
+	// Start the process to sweep the output from the timeout tx.
+	if h.isZeroFeeOutput() {
+		h.markLaunched()
+		err = h.sweepTimeoutTxOutput()
+		if err != nil {
+			h.unlaunch()
+			return err
+		}
 	}
 
 	// Start the resolving process for the stage two output.

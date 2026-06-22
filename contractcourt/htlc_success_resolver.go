@@ -830,7 +830,9 @@ func (h *htlcSuccessResolver) resolveSuccessTx() error {
 	// Now that the second-level transaction has confirmed, we checkpoint
 	// the state so we'll go to the next stage in case of restarts.
 	h.outputIncubating = true
-	if err := h.Checkpoint(h); err != nil {
+	h.unlaunch()
+	err = h.Checkpoint(h)
+	if err != nil {
 		log.Errorf("unable to Checkpoint: %v", err)
 		return err
 	}
@@ -839,7 +841,10 @@ func (h *htlcSuccessResolver) resolveSuccessTx() error {
 		commitSpend.SpenderTxHash)
 
 	// Send the sweep request for the output from the success tx.
-	if err := h.sweepSuccessTxOutput(); err != nil {
+	h.markLaunched()
+	err = h.sweepSuccessTxOutput()
+	if err != nil {
+		h.unlaunch()
 		return err
 	}
 
