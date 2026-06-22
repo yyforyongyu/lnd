@@ -16,6 +16,7 @@ import (
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/queue"
@@ -684,44 +685,102 @@ func (h *htlcIncomingContestResolver) findAndapplyPreimage() (bool, error) {
 		return false, nil
 	}
 
-	// Notify registry that we are potentially resolving as an exit hop
-	// on-chain. If this HTLC indeed pays to an existing invoice, the
-	// invoice registry will tell us what to do with the HTLC. This is
-	// identical to HTLC resolution in the link.
-	circuitKey := models.CircuitKey{
-		ChanID: h.ShortChanID,
-		HtlcID: h.htlc.HtlcIndex,
-	}
-
-	// Try get the resolution - if it doesn't give us a resolution
-	// immediately, we'll assume we don't know it yet and let the `Resolve`
-	// handle the waiting.
-	//
-	// NOTE: we use a nil subscriber here and a zero current height as we
-	// are only interested in the settle resolution.
-	//
-	// TODO(yy): move this logic to link and let the preimage be accessed
-	// via the preimage beacon.
-	resolution, err := h.Registry.NotifyExitHopHtlc(
-		h.htlc.RHash, h.htlc.Amt, h.htlcExpiry, 0,
-		circuitKey, nil, h.htlc.CustomRecords, payload,
-	)
+	invoicePreimage, ok, err := h.lookupReplayedInvoicePreimage(payload)
 	if err != nil {
 		return false, err
 	}
-
-	res, ok := resolution.(*invoices.HtlcSettleResolution)
-
-	// Exit early if it's not a settle resolution.
 	if !ok {
 		return false, nil
 	}
 
-	// Otherwise we have a settle resolution, apply the preimage.
-	err = h.applyPreimage(res.Preimage)
+	// Otherwise this exact HTLC was already settled, store and apply the
+	// preimage.
+	err = h.storeAndApplyPreimage(invoicePreimage)
 	if err != nil {
 		return false, err
 	}
 
 	return true, nil
+}
+
+// lookupReplayedInvoicePreimage looks up the invoice without mutating registry
+// state and returns a preimage only if this exact circuit was already settled.
+func (h *htlcIncomingContestResolver) lookupReplayedInvoicePreimage(
+	payload invoices.Payload) (lntypes.Preimage, bool, error) {
+
+	// Resolve will run NotifyExitHopHtlc with the real height. Launch only
+	// needs preimages from this exact circuit if it was already settled
+	// before this resolver started.
+	invoiceRef := invoiceRefForPayload(h.htlc.RHash, payload)
+	ctx, cancel := lnutils.ContextFromQuit(h.quit)
+	defer cancel()
+
+	invoice, err := h.Registry.LookupInvoiceByRef(
+		ctx, invoiceRef,
+	)
+	switch {
+	case err == nil:
+	case errors.Is(err, invoices.ErrInvoiceNotFound) ||
+		errors.Is(err, invoices.ErrNoInvoicesCreated):
+
+		return lntypes.Preimage{}, false, nil
+	default:
+		return lntypes.Preimage{}, false, err
+	}
+
+	circuitKey := models.CircuitKey{
+		ChanID: h.ShortChanID,
+		HtlcID: h.htlc.HtlcIndex,
+	}
+	preimage, ok := replayedInvoicePreimage(invoice, circuitKey)
+
+	return preimage, ok, nil
+}
+
+// invoiceRefForPayload returns the same invoice reference that the invoice
+// registry uses for this exit-hop payload.
+func invoiceRefForPayload(hash lntypes.Hash,
+	payload invoices.Payload) invoices.InvoiceRef {
+
+	mpp := payload.MultiPath()
+	amp := payload.AMPRecord()
+	pathID := payload.PathID()
+
+	switch {
+	case pathID != nil:
+		return invoices.InvoiceRefByHashAndAddr(hash, *pathID)
+
+	case amp != nil && mpp != nil:
+		payAddr := mpp.PaymentAddr()
+		return invoices.InvoiceRefByAddr(payAddr)
+
+	case mpp != nil:
+		payAddr := mpp.PaymentAddr()
+		return invoices.InvoiceRefByHashAndAddr(hash, payAddr)
+
+	default:
+		return invoices.InvoiceRefByHash(hash)
+	}
+}
+
+// replayedInvoicePreimage returns the preimage for this exact circuit if it was
+// already settled on the invoice.
+func replayedInvoicePreimage(invoice invoices.Invoice,
+	circuitKey models.CircuitKey) (lntypes.Preimage, bool) {
+
+	htlc, ok := invoice.Htlcs[circuitKey]
+	if !ok || htlc.State != invoices.HtlcStateSettled {
+		return lntypes.Preimage{}, false
+	}
+
+	preimage := invoice.Terms.PaymentPreimage
+	if preimage == nil {
+		if htlc.AMP == nil || htlc.AMP.Preimage == nil {
+			return lntypes.Preimage{}, false
+		}
+
+		preimage = htlc.AMP.Preimage
+	}
+
+	return *preimage, true
 }
