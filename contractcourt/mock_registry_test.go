@@ -23,6 +23,7 @@ type mockRegistry struct {
 	notifyResolution invoices.HtlcResolution
 	immediateNotify  []notifyExitHopData
 	notifyHook       func()
+	lookupHook       func()
 	lookupInvoice    invoices.Invoice
 	lookupInvoiceSet bool
 	lookupErr        error
@@ -80,6 +81,10 @@ func (r *mockRegistry) LookupInvoiceByRef(_ context.Context,
 
 func (r *mockRegistry) lookupInvoiceResult() (invoices.Invoice, error) {
 	r.lookupCount++
+	if r.lookupHook != nil {
+		r.lookupHook()
+	}
+
 	if r.lookupErr != nil {
 		return invoices.Invoice{}, r.lookupErr
 	}

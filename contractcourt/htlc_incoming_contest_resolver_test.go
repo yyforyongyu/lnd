@@ -124,46 +124,25 @@ func TestHtlcIncomingResolverFwdTimeout(t *testing.T) {
 	ctx.waitForResult(false)
 }
 
-func TestHtlcIncomingResolverLaunchSkipsPreimageAfterExpiry(t *testing.T) {
+func TestHtlcIncomingResolverLaunchSkipsUnknownPreimageAfterExpiry(
+	t *testing.T) {
+
 	t.Parallel()
 	defer timeout()()
 
 	tests := []struct {
-		name   string
-		isExit bool
-		setup  func(*incomingResolverTestContext)
-		assert func(*testing.T, *incomingResolverTestContext)
+		name         string
+		isExit       bool
+		expectLookup bool
 	}{
 		{
-			name:   "preimage db",
+			name:   "forwarded",
 			isExit: false,
-			setup: func(ctx *incomingResolverTestContext) {
-				ctx.witnessBeacon.lookupPreimage[testResHash] =
-					testResPreimage
-			},
-			assert: func(t *testing.T,
-				ctx *incomingResolverTestContext) {
-
-				require.Empty(t, ctx.registry.immediateNotify)
-			},
 		},
 		{
-			name:   "invoice registry",
-			isExit: true,
-			setup: func(ctx *incomingResolverTestContext) {
-				ctx.registry.notifyResolution =
-					invoices.NewSettleResolution(
-						testResPreimage,
-						testResCircuitKey,
-						testAcceptHeight,
-						invoices.ResultReplayToSettled,
-					)
-			},
-			assert: func(t *testing.T,
-				ctx *incomingResolverTestContext) {
-
-				require.Empty(t, ctx.registry.immediateNotify)
-			},
+			name:         "exit hop missing invoice",
+			isExit:       true,
+			expectLookup: true,
 		},
 	}
 
@@ -172,7 +151,6 @@ func TestHtlcIncomingResolverLaunchSkipsPreimageAfterExpiry(t *testing.T) {
 			// Arrange.
 			ctx := newIncomingResolverTestContext(t, test.isExit)
 			ctx.resolver.htlcExpiry = testInitialBlockHeight
-			test.setup(ctx)
 
 			// Act.
 			require.NoError(t, ctx.resolver.Launch())
@@ -183,32 +161,35 @@ func TestHtlcIncomingResolverLaunchSkipsPreimageAfterExpiry(t *testing.T) {
 				t, [32]byte{},
 				ctx.resolver.htlcResolution.Preimage,
 			)
-			test.assert(t, ctx)
+			require.Empty(t, ctx.registry.immediateNotify)
+			if test.expectLookup {
+				require.Equal(t, 1, ctx.registry.lookupCount)
+			} else {
+				require.Zero(t, ctx.registry.lookupCount)
+			}
 		})
 	}
 }
 
-func TestHtlcIncomingResolverLaunchUsesCurrentHeight(t *testing.T) {
+func TestHtlcIncomingResolverLaunchUsesSideEffectFreeLookupBeforeExpiry(
+	t *testing.T) {
+
 	t.Parallel()
 	defer timeout()()
 
 	// Arrange.
 	ctx := newIncomingResolverTestContext(t, true)
 	ctx.chainIO.BestHeight = testInitialBlockHeight + 1
-	ctx.registry.notifyResolution = invoices.NewSettleResolution(
-		testResPreimage, testResCircuitKey, testAcceptHeight,
-		invoices.ResultReplayToSettled,
-	)
+	ctx.registry.lookupInvoiceSet = true
+	ctx.registry.lookupInvoice = settledTestInvoice()
 
 	// Act.
 	require.NoError(t, ctx.resolver.Launch())
 
 	// Assert.
-	require.Len(t, ctx.registry.immediateNotify, 1)
-	require.Equal(
-		t, ctx.chainIO.BestHeight,
-		ctx.registry.immediateNotify[0].currentHeight,
-	)
+	require.Equal(t, 1, ctx.registry.lookupCount)
+	require.Empty(t, ctx.registry.immediateNotify)
+	require.True(t, ctx.resolver.isLaunched())
 }
 
 func TestHtlcIncomingResolverLaunchSkipsSuccessAfterLookupExpiry(
@@ -219,11 +200,9 @@ func TestHtlcIncomingResolverLaunchSkipsSuccessAfterLookupExpiry(
 
 	// Arrange.
 	ctx := newIncomingResolverTestContext(t, true)
-	ctx.registry.notifyResolution = invoices.NewSettleResolution(
-		testResPreimage, testResCircuitKey, testAcceptHeight,
-		invoices.ResultReplayToSettled,
-	)
-	ctx.registry.notifyHook = func() {
+	ctx.registry.lookupInvoiceSet = true
+	ctx.registry.lookupInvoice = settledTestInvoice()
+	ctx.registry.lookupHook = func() {
 		ctx.chainIO.BestHeight = testHtlcExpiry
 	}
 
@@ -236,7 +215,8 @@ func TestHtlcIncomingResolverLaunchSkipsSuccessAfterLookupExpiry(
 		t, [32]byte(testResPreimage),
 		ctx.resolver.htlcResolution.Preimage,
 	)
-	require.Len(t, ctx.registry.immediateNotify, 1)
+	require.Equal(t, 1, ctx.registry.lookupCount)
+	require.Empty(t, ctx.registry.immediateNotify)
 }
 
 // TestHtlcIncomingResolverFailCheckpointErrorSkipsFinalEvent asserts that

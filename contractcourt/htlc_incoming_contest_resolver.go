@@ -126,11 +126,11 @@ func (h *htlcIncomingContestResolver) Launch() error {
 		return err
 	}
 
-	if uint32(bestHeight) >= h.htlcExpiry {
-		h.log.Infof("expired (height=%v, expiry=%v), leaving "+
-			"resolution to Resolve", bestHeight, h.htlcExpiry)
-
-		return nil
+	startExpired := uint32(bestHeight) >= h.htlcExpiry
+	if startExpired {
+		h.log.Infof("expired (height=%v, expiry=%v), only "+
+			"launching if a preimage was already known", bestHeight,
+			h.htlcExpiry)
 	}
 
 	// Query the preimage and apply it if we already know it.
@@ -156,7 +156,7 @@ func (h *htlcIncomingContestResolver) Launch() error {
 		return err
 	}
 
-	if uint32(bestHeight) >= h.htlcExpiry {
+	if !startExpired && uint32(bestHeight) >= h.htlcExpiry {
 		h.log.Infof("expired after applying preimage (height=%v, "+
 			"expiry=%v), skipping success launch", bestHeight,
 			h.htlcExpiry)
