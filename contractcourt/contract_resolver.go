@@ -168,6 +168,11 @@ func (r *contractResolverKit) markResolved() {
 	r.resolved.Store(true)
 }
 
+// unresolve marks the resolver as unresolved.
+func (r *contractResolverKit) unresolve() {
+	r.resolved.Store(false)
+}
+
 // isLaunched returns true if the resolver has been launched.
 func (r *contractResolverKit) isLaunched() bool {
 	return r.launched.Load()

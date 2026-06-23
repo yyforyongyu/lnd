@@ -247,17 +247,6 @@ func (h *htlcSuccessResolver) checkpointForeignSpend(
 		return err
 	}
 
-	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
-		models.CircuitKey{
-			ChanID: h.ShortChanID,
-			HtlcID: h.htlc.HtlcIndex,
-		},
-		channeldb.FinalHtlcInfo{
-			Settled:  false,
-			Offchain: false,
-		},
-	)
-
 	var spendTxID *chainhash.Hash
 	if commitSpend != nil {
 		spendTxID = commitSpend.SpenderTxHash
@@ -280,7 +269,23 @@ func (h *htlcSuccessResolver) checkpointForeignSpend(
 	h.outputIncubating = false
 	h.markResolved()
 
-	return h.Checkpoint(h, report)
+	if err := h.Checkpoint(h, report); err != nil {
+		h.unresolve()
+		return err
+	}
+
+	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
+		models.CircuitKey{
+			ChanID: h.ShortChanID,
+			HtlcID: h.htlc.HtlcIndex,
+		},
+		channeldb.FinalHtlcInfo{
+			Settled:  false,
+			Offchain: false,
+		},
+	)
+
+	return nil
 }
 
 // Stop signals the resolver to cancel any current resolution processes, and

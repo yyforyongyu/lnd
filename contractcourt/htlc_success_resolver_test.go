@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -33,6 +34,7 @@ type htlcResolverTestContext struct {
 		_ ...*channeldb.ResolverReport) error
 
 	notifier           *mock.ChainNotifier
+	htlcNotifier       *mockHTLCNotifier
 	resolverResultChan chan resolveResult
 	resolutionChan     chan ResolutionMsg
 
@@ -60,15 +62,15 @@ func newHtlcResolverTestContext(t *testing.T,
 		SpendChan: make(chan *chainntnfs.SpendDetail, 1),
 		ConfChan:  make(chan *chainntnfs.TxConfirmation, 1),
 	}
+	htlcNotifier := &mockHTLCNotifier{}
 
 	testCtx := &htlcResolverTestContext{
 		checkpoint:     nil,
 		notifier:       notifier,
+		htlcNotifier:   htlcNotifier,
 		resolutionChan: make(chan ResolutionMsg, 1),
 		t:              t,
 	}
-
-	htlcNotifier := &mockHTLCNotifier{}
 
 	witnessBeacon := newMockWitnessBeacon()
 	chainCfg := ChannelArbitratorConfig{
@@ -665,6 +667,67 @@ func TestHtlcSuccessResolverRejectsForeignSpendOnRestart(t *testing.T) {
 	resolver := successResolverFromContext(t, ctx)
 	assertNoSweptInput(t, mockSweeperFromResolver(t, resolver))
 	assertFinalHtlcFailed(t, ctx)
+}
+
+func TestHtlcSuccessResolverForeignSpendCheckpointError(t *testing.T) {
+	defer timeout()()
+
+	// Arrange.
+	commitOutpoint := wire.OutPoint{
+		Hash:  chainhash.Hash{0x03},
+		Index: 4,
+	}
+	resolution := newTestAnchorSuccessResolution(commitOutpoint)
+	foreignTx, foreignHash := newForeignSuccessSpend(commitOutpoint)
+	errCheckpoint := errors.New("checkpoint failed")
+	ctx := newTestHtlcSuccessContext(t, resolution, false)
+
+	checkpointChan := make(chan struct{}, 1)
+	ctx.checkpoint = func(resolver ContractResolver,
+		reports ...*channeldb.ResolverReport) error {
+
+		successResolver, ok := resolver.(*htlcSuccessResolver)
+		require.True(t, ok)
+
+		require.True(t, successResolver.IsResolved())
+		require.Len(t, reports, 1)
+
+		checkpointChan <- struct{}{}
+
+		return errCheckpoint
+	}
+
+	// Act.
+	ctx.resolve()
+
+	resolver := successResolverFromContext(t, ctx)
+	sweeper := mockSweeperFromResolver(t, resolver)
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, commitOutpoint, inp.OutPoint())
+	case <-time.After(time.Second):
+		t.Fatal("expected first-stage input to be swept")
+	}
+
+	ctx.notifier.SpendChan <- &chainntnfs.SpendDetail{
+		SpendingTx:        foreignTx,
+		SpenderTxHash:     &foreignHash,
+		SpenderInputIndex: 0,
+		SpendingHeight:    10,
+		SpentOutPoint:     &commitOutpoint,
+	}
+
+	select {
+	case <-checkpointChan:
+	case <-time.After(time.Second):
+		t.Fatal("expected foreign spend checkpoint")
+	}
+
+	result := <-ctx.resolverResultChan
+	require.ErrorIs(t, result.err, errCheckpoint)
+	require.Nil(t, result.nextResolver)
+	require.False(t, resolver.IsResolved())
+	require.Empty(t, ctx.htlcNotifier.finalHtlcEvents)
 }
 
 func newTestHtlcSuccessContext(t *testing.T,
