@@ -117,6 +117,7 @@ type mockSweeper struct {
 	updatedInputs     chan wire.OutPoint
 	sweepTx           *wire.MsgTx
 	sweepErr          error
+	sweepInputErr     error
 	createSweepTxChan chan *wire.MsgTx
 
 	deadlines []int
@@ -134,6 +135,10 @@ func newMockSweeper() *mockSweeper {
 
 func (s *mockSweeper) SweepInput(input input.Input, params sweep.Params) (
 	chan sweep.Result, error) {
+
+	if s.sweepInputErr != nil {
+		return nil, s.sweepInputErr
+	}
 
 	s.sweptInputs <- input
 

@@ -141,7 +141,13 @@ func (c *anchorResolver) Resolve() (ContractResolver, error) {
 	c.reportLock.Unlock()
 
 	c.markResolved()
-	return nil, c.PutResolverReport(nil, report)
+	err := c.PutResolverReport(nil, report)
+	if err != nil {
+		c.unresolve()
+		return nil, err
+	}
+
+	return nil, nil
 }
 
 // Stop signals the resolver to cancel any current resolution processes, and
@@ -246,6 +252,10 @@ func (c *anchorResolver) Launch() error {
 	)
 
 	if err != nil {
+		// launchResolvers only logs this error and returns. Clearing
+		// launched lets a later blockbeat or restart retry without a
+		// tight loop.
+		c.unlaunch()
 		return err
 	}
 

@@ -23,6 +23,11 @@ type mockRegistry struct {
 	notifyResolution invoices.HtlcResolution
 	immediateNotify  []notifyExitHopData
 	notifyHook       func()
+	lookupHook       func()
+	lookupInvoice    invoices.Invoice
+	lookupInvoiceSet bool
+	lookupErr        error
+	lookupCount      int
 }
 
 func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
@@ -65,5 +70,28 @@ func (r *mockRegistry) HodlUnsubscribeAll(subscriber chan<- interface{}) {}
 func (r *mockRegistry) LookupInvoice(context.Context, lntypes.Hash) (
 	invoices.Invoice, error) {
 
-	return invoices.Invoice{}, invoices.ErrInvoiceNotFound
+	return r.lookupInvoiceResult()
+}
+
+func (r *mockRegistry) LookupInvoiceByRef(_ context.Context,
+	_ invoices.InvoiceRef) (invoices.Invoice, error) {
+
+	return r.lookupInvoiceResult()
+}
+
+func (r *mockRegistry) lookupInvoiceResult() (invoices.Invoice, error) {
+	r.lookupCount++
+	if r.lookupHook != nil {
+		r.lookupHook()
+	}
+
+	if r.lookupErr != nil {
+		return invoices.Invoice{}, r.lookupErr
+	}
+
+	if !r.lookupInvoiceSet {
+		return invoices.Invoice{}, invoices.ErrInvoiceNotFound
+	}
+
+	return r.lookupInvoice, nil
 }

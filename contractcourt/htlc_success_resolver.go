@@ -186,18 +186,6 @@ func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
 		return err
 	}
 
-	// Send notification.
-	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
-		models.CircuitKey{
-			ChanID: h.ShortChanID,
-			HtlcID: h.htlc.HtlcIndex,
-		},
-		channeldb.FinalHtlcInfo{
-			Settled:  true,
-			Offchain: false,
-		},
-	)
-
 	// Create a resolver report for claiming of the htlc itself.
 	amt := btcutil.Amount(h.htlcResolution.SweepSignDesc.Output.Value)
 	reports := []*channeldb.ResolverReport{
@@ -229,9 +217,24 @@ func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
 		reports = append(reports, report)
 	}
 
-	// Finally, we checkpoint the resolver with our report(s).
-	h.markResolved()
-	return h.Checkpoint(h, reports...)
+	// Finally, we checkpoint the resolver with our report(s). Notify after
+	// the checkpoint succeeds so retries do not duplicate terminal events.
+	err = h.resolve(h, reports...)
+	if err != nil {
+		return err
+	}
+	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
+		models.CircuitKey{
+			ChanID: h.ShortChanID,
+			HtlcID: h.htlc.HtlcIndex,
+		},
+		channeldb.FinalHtlcInfo{
+			Settled:  true,
+			Offchain: false,
+		},
+	)
+
+	return nil
 }
 
 // checkpointForeignSpend checkpoints the resolver as failed when the original
@@ -520,6 +523,11 @@ func (h *htlcSuccessResolver) successTxOutpoint(
 // sweepRemoteCommitOutput creates a sweep request to sweep the HTLC output on
 // the remote commitment via the direct preimage-spend.
 func (h *htlcSuccessResolver) sweepRemoteCommitOutput() error {
+	err := h.attachPreimage()
+	if err != nil {
+		return err
+	}
+
 	// Before we can craft out sweeping transaction, we need to create an
 	// input which contains all the items required to add this input to a
 	// sweeping transaction, and generate a witness.
@@ -572,7 +580,7 @@ func (h *htlcSuccessResolver) sweepRemoteCommitOutput() error {
 		h.htlc.RefundTimeout, budget)
 
 	// We'll now offer the direct preimage HTLC to the sweeper.
-	_, err := h.Sweeper.SweepInput(
+	_, err = h.Sweeper.SweepInput(
 		inp,
 		sweep.Params{
 			Budget:         budget,
@@ -585,6 +593,11 @@ func (h *htlcSuccessResolver) sweepRemoteCommitOutput() error {
 
 // sweepSuccessTx attempts to sweep the second level success tx.
 func (h *htlcSuccessResolver) sweepSuccessTx() error {
+	err := h.attachPreimage()
+	if err != nil {
+		return err
+	}
+
 	var secondLevelInput input.HtlcSecondLevelAnchorInput
 	if h.isTaproot() {
 		secondLevelInput = input.MakeHtlcSecondLevelSuccessTaprootInput(
@@ -618,7 +631,7 @@ func (h *htlcSuccessResolver) sweepSuccessTx() error {
 		"deadline=%v, budget=%v", h.htlc.RefundTimeout, budget)
 
 	// We'll now offer the second-level transaction to the sweeper.
-	_, err := h.Sweeper.SweepInput(
+	_, err = h.Sweeper.SweepInput(
 		&secondLevelInput,
 		sweep.Params{
 			Budget:         budget,
@@ -627,6 +640,25 @@ func (h *htlcSuccessResolver) sweepSuccessTx() error {
 	)
 
 	return err
+}
+
+// attachPreimage attaches a learned preimage from the global preimage DB if a
+// restarted resolver was decoded without it. The normal contest path persists
+// invoice-learned preimages before launching the inner success resolver.
+func (h *htlcSuccessResolver) attachPreimage() error {
+	if h.htlcResolution.Preimage != [32]byte{} {
+		return nil
+	}
+
+	preimage, ok := h.PreimageDB.LookupPreimage(h.htlc.RHash)
+	if !ok {
+		return fmt.Errorf("missing preimage for incoming HTLC %v",
+			h.htlc.RHash)
+	}
+
+	h.htlcResolution.Preimage = preimage
+
+	return nil
 }
 
 // sweepSuccessTxOutput attempts to sweep the output of the second level
@@ -798,7 +830,9 @@ func (h *htlcSuccessResolver) resolveSuccessTx() error {
 	// Now that the second-level transaction has confirmed, we checkpoint
 	// the state so we'll go to the next stage in case of restarts.
 	h.outputIncubating = true
-	if err := h.Checkpoint(h); err != nil {
+	h.unlaunch()
+	err = h.Checkpoint(h)
+	if err != nil {
 		log.Errorf("unable to Checkpoint: %v", err)
 		return err
 	}
@@ -807,7 +841,10 @@ func (h *htlcSuccessResolver) resolveSuccessTx() error {
 		commitSpend.SpenderTxHash)
 
 	// Send the sweep request for the output from the success tx.
-	if err := h.sweepSuccessTxOutput(); err != nil {
+	h.markLaunched()
+	err = h.sweepSuccessTxOutput()
+	if err != nil {
+		h.unlaunch()
 		return err
 	}
 
@@ -850,16 +887,16 @@ func (h *htlcSuccessResolver) Launch() error {
 	h.log.Debugf("launching resolver...")
 	h.markLaunched()
 
+	var err error
 	switch {
 	// If we're already resolved, then we can exit early.
 	case h.IsResolved():
 		h.log.Errorf("already resolved")
-		return nil
 
 	// If this is an output on the remote party's commitment transaction,
 	// use the direct-spend path.
 	case h.isRemoteCommitOutput():
-		return h.sweepRemoteCommitOutput()
+		err = h.sweepRemoteCommitOutput()
 
 	// If this is an anchor type channel, we now sweep either the
 	// second-level success tx or the output from the second-level success
@@ -868,17 +905,23 @@ func (h *htlcSuccessResolver) Launch() error {
 		// If the second-level success tx has already been swept, we
 		// can go ahead and sweep its output.
 		if h.outputIncubating {
-			return h.sweepSuccessTxOutput()
+			err = h.sweepSuccessTxOutput()
+			break
 		}
 
 		// Otherwise, sweep the second level tx.
-		return h.sweepSuccessTx()
+		err = h.sweepSuccessTx()
 
-	// If this is a legacy channel type, the output is handled by the
-	// nursery via the Resolve so we do nothing here.
-	//
-	// TODO(yy): handle the legacy output by offering it to the sweeper.
 	default:
-		return nil
+		// Legacy channel outputs are handled by the nursery through
+		// Resolve, so Launch does nothing here.
+		//
+		// TODO(yy): offer legacy output to the sweeper.
 	}
+
+	if err != nil {
+		h.unlaunch()
+	}
+
+	return err
 }

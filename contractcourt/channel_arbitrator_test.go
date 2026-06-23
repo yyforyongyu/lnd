@@ -3,6 +3,7 @@ package contractcourt
 import (
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -22,11 +23,12 @@ import (
 	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/kvdb"
-	"github.com/lightningnetwork/lnd/lntest/mock"
+	lntestmock "github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -149,6 +151,59 @@ func (b *mockArbitratorLog) FetchConfirmedCommitSet(kvdb.RTx) (*CommitSet, error
 }
 
 func (b *mockArbitratorLog) WipeHistory() error {
+	return nil
+}
+
+// mockResolver is a test ContractResolver backed by testify/mock.
+type mockResolver struct {
+	// Mock records expected resolver method calls.
+	testifymock.Mock
+
+	// contractResolverKit provides resolver state helpers for tests.
+	contractResolverKit
+
+	// key is the resolver key returned by ResolverKey.
+	key []byte
+}
+
+// newMockResolver returns a resolver with a stable key.
+func newMockResolver(key byte) *mockResolver {
+	return &mockResolver{
+		contractResolverKit: *newContractResolverKit(ResolverConfig{}),
+		key:                 []byte{key},
+	}
+}
+
+// ResolverKey returns the test resolver's stable key.
+func (m *mockResolver) ResolverKey() []byte {
+	return m.key
+}
+
+// Launch implements ContractResolver.
+func (m *mockResolver) Launch() error {
+	args := m.Called()
+
+	return args.Error(0)
+}
+
+// Resolve implements ContractResolver.
+func (m *mockResolver) Resolve() (ContractResolver, error) {
+	args := m.Called()
+	next, _ := args.Get(0).(ContractResolver)
+
+	return next, args.Error(1)
+}
+
+// Stop implements ContractResolver.
+func (*mockResolver) Stop() {
+}
+
+// SupplementState implements ContractResolver.
+func (*mockResolver) SupplementState(*channeldb.OpenChannel) {
+}
+
+// Encode implements ContractResolver.
+func (*mockResolver) Encode(io.Writer) error {
 	return nil
 }
 
@@ -277,6 +332,186 @@ func (c *chanArbTestCtx) AssertState(expected ArbitratorState) {
 	}
 }
 
+// TestResolveContractsRemovesLaunchResolvedContract asserts that a resolver
+// which reaches its terminal checkpoint during Launch is still removed from the
+// unresolved-contract log.
+func TestResolveContractsRemovesLaunchResolvedContract(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: install a resolver in the unresolved log that marks itself
+	// resolved during Launch.
+	arbLog := &mockArbitratorLog{
+		newStates: make(chan ArbitratorState, 5),
+		resolvers: make(map[ContractResolver]struct{}),
+	}
+	chanArbCtx, err := createTestChannelArbitrator(t, arbLog)
+	require.NoError(t, err, "unable to create ChannelArbitrator")
+
+	resolver := newMockResolver(1)
+	launchCalled := make(chan struct{})
+	resolver.On("Launch").Run(func(testifymock.Arguments) {
+		resolver.markResolved()
+		close(launchCalled)
+	}).Return(nil).Once()
+	require.NoError(t, arbLog.InsertUnresolvedContracts(nil, resolver))
+
+	// Act: resolveContracts launches the resolver before starting the
+	// resolveContract goroutine, matching the production ordering.
+	chanArbCtx.chanArb.resolveContracts([]ContractResolver{resolver})
+
+	select {
+	case <-launchCalled:
+	case <-time.After(defaultTimeout):
+		t.Fatal("resolver was not launched")
+	}
+
+	select {
+	case <-chanArbCtx.chanArb.resolutionSignal:
+	case <-time.After(defaultTimeout):
+		t.Fatal("resolved contract was not signaled")
+	}
+
+	chanArbCtx.chanArb.wg.Wait()
+
+	// Assert: the resolved resolver was deleted without calling Resolve.
+	arbLog.Lock()
+	_, ok := arbLog.resolvers[resolver]
+	arbLog.Unlock()
+	require.False(t, ok)
+
+	resolver.AssertNotCalled(t, "Resolve")
+	resolver.AssertExpectations(t)
+}
+
+// TestResolveContractsKeepsUnobservedLaunchResolvedContract asserts that a
+// resolver is not deleted if shutdown wins before its Launch result is read.
+func TestResolveContractsKeepsUnobservedLaunchResolvedContract(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: install a resolver that resolves itself during Launch, then
+	// blocks before launchResolvers can observe the result.
+	arbLog := &mockArbitratorLog{
+		newStates: make(chan ArbitratorState, 5),
+		resolvers: make(map[ContractResolver]struct{}),
+	}
+	chanArbCtx, err := createTestChannelArbitrator(t, arbLog)
+	require.NoError(t, err, "unable to create ChannelArbitrator")
+
+	resolver := newMockResolver(1)
+	launchCalled := make(chan struct{})
+	launchBlock := make(chan struct{})
+	resolver.On("Launch").Run(func(testifymock.Arguments) {
+		resolver.markResolved()
+		close(launchCalled)
+		<-launchBlock
+	}).Return(nil).Once()
+	require.NoError(t, arbLog.InsertUnresolvedContracts(nil, resolver))
+
+	done := make(chan struct{})
+
+	// Act: start resolution, wait until Launch has marked the resolver
+	// resolved, then shut down before Launch returns.
+	go func() {
+		chanArbCtx.chanArb.resolveContracts(
+			[]ContractResolver{resolver},
+		)
+		close(done)
+	}()
+
+	select {
+	case <-launchCalled:
+	case <-time.After(defaultTimeout):
+		t.Fatal("resolver was not launched")
+	}
+
+	close(chanArbCtx.chanArb.quit)
+	select {
+	case <-done:
+	case <-time.After(defaultTimeout):
+		t.Fatal("resolveContracts did not return")
+	}
+	chanArbCtx.chanArb.wg.Wait()
+	close(launchBlock)
+
+	// Assert: the resolver remains in the unresolved log because its Launch
+	// result was not observed.
+	arbLog.Lock()
+	_, ok := arbLog.resolvers[resolver]
+	arbLog.Unlock()
+	require.True(t, ok)
+
+	resolver.AssertNotCalled(t, "Resolve")
+	resolver.AssertExpectations(t)
+}
+
+// TestResolveContractsRemovesNestedLaunchResolvedContract asserts that a
+// swapped-in resolver that reaches its terminal checkpoint during Launch is
+// removed from the unresolved-contract log.
+func TestResolveContractsRemovesNestedLaunchResolvedContract(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: install a resolver that swaps to a nested one. The nested
+	// resolver resolves itself during Launch.
+	arbLog := &mockArbitratorLog{
+		newStates: make(chan ArbitratorState, 5),
+		resolvers: make(map[ContractResolver]struct{}),
+	}
+	chanArbCtx, err := createTestChannelArbitrator(t, arbLog)
+	require.NoError(t, err, "unable to create ChannelArbitrator")
+
+	nestedResolver := newMockResolver(2)
+	nestedLaunchCalled := make(chan struct{})
+	nestedResolver.On("Launch").Run(func(testifymock.Arguments) {
+		nestedResolver.markResolved()
+		close(nestedLaunchCalled)
+	}).Return(nil).Once()
+
+	resolver := newMockResolver(1)
+	resolveCalled := make(chan struct{})
+	resolver.On("Launch").Return(nil).Once()
+	resolver.On("Resolve").Run(func(testifymock.Arguments) {
+		close(resolveCalled)
+	}).Return(nestedResolver, nil).Once()
+	require.NoError(t, arbLog.InsertUnresolvedContracts(nil, resolver))
+
+	// Act: resolveContracts runs the parent resolver, swaps in the nested
+	// resolver, then launches the nested resolver.
+	chanArbCtx.chanArb.resolveContracts([]ContractResolver{resolver})
+
+	select {
+	case <-resolveCalled:
+	case <-time.After(defaultTimeout):
+		t.Fatal("parent resolver was not resolved")
+	}
+
+	select {
+	case <-nestedLaunchCalled:
+	case <-time.After(defaultTimeout):
+		t.Fatal("nested resolver was not launched")
+	}
+
+	select {
+	case <-chanArbCtx.chanArb.resolutionSignal:
+	case <-time.After(defaultTimeout):
+		t.Fatal("resolved nested contract was not signaled")
+	}
+
+	chanArbCtx.chanArb.wg.Wait()
+
+	// Assert: the parent and nested resolver were deleted from the log, and
+	// the already-resolved nested resolver did not call Resolve.
+	arbLog.Lock()
+	_, parentFound := arbLog.resolvers[resolver]
+	_, nestedFound := arbLog.resolvers[nestedResolver]
+	arbLog.Unlock()
+	require.False(t, parentFound)
+	require.False(t, nestedFound)
+
+	nestedResolver.AssertNotCalled(t, "Resolve")
+	resolver.AssertExpectations(t)
+	nestedResolver.AssertExpectations(t)
+}
+
 // Restart simulates a clean restart of the channel arbitrator, forcing it to
 // walk through it's recovery logic. If this function returns nil, then a
 // restart was successful. Note that the restart process keeps the log in
@@ -370,7 +605,7 @@ func createTestChannelArbitrator(t *testing.T, log ArbitratorLog,
 		},
 		OutgoingBroadcastDelta: 5,
 		IncomingBroadcastDelta: 5,
-		Notifier: &mock.ChainNotifier{
+		Notifier: &lntestmock.ChainNotifier{
 			EpochChan: make(chan *chainntnfs.BlockEpoch),
 			SpendChan: make(chan *chainntnfs.SpendDetail),
 			ConfChan:  make(chan *chainntnfs.TxConfirmation),
@@ -1040,7 +1275,8 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	// We'll grab the old notifier here as our resolvers are still holding
 	// a reference to this instance, and a new one will be created when we
 	// restart the channel arb below.
-	oldNotifier := chanArb.cfg.Notifier.(*mock.ChainNotifier)
+	oldNotifier, ok := chanArb.cfg.Notifier.(*lntestmock.ChainNotifier)
+	require.True(t, ok)
 
 	// At this point, in order to simulate a restart, we'll re-create the
 	// channel arbitrator. We do this to ensure that all information
@@ -2316,7 +2552,7 @@ func TestFindCommitmentDeadlineAndValue(t *testing.T) {
 	// Add a dummy payment hash to the preimage lookup.
 	rHash := [lntypes.PreimageSize]byte{1, 2, 3}
 	mockPreimageDB := newMockWitnessBeacon()
-	mockPreimageDB.lookupPreimage[rHash] = rHash
+	mockPreimageDB.setLookupPreimage(rHash, rHash)
 
 	// Attach a mock PreimageDB and Registry to channel arbitrator.
 	chanArb := chanArbCtx.chanArb
@@ -2506,7 +2742,7 @@ func TestSweepAnchors(t *testing.T) {
 	// Add a dummy payment hash to the preimage lookup.
 	rHash := [lntypes.PreimageSize]byte{1, 2, 3}
 	mockPreimageDB := newMockWitnessBeacon()
-	mockPreimageDB.lookupPreimage[rHash] = rHash
+	mockPreimageDB.setLookupPreimage(rHash, rHash)
 
 	// Attach a mock PreimageDB and Registry to channel arbitrator.
 	chanArb := chanArbCtx.chanArb
@@ -2790,7 +3026,7 @@ func TestChannelArbitratorAnchors(t *testing.T) {
 	// Add a dummy payment hash to the preimage lookup.
 	rHash := [lntypes.PreimageSize]byte{1, 2, 3}
 	mockPreimageDB := newMockWitnessBeacon()
-	mockPreimageDB.lookupPreimage[rHash] = rHash
+	mockPreimageDB.setLookupPreimage(rHash, rHash)
 
 	// Attach a mock PreimageDB and Registry to channel arbitrator.
 	chanArb := chanArbCtx.chanArb

@@ -20,6 +20,7 @@ import (
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/lntest/mock"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/stretchr/testify/require"
@@ -188,6 +189,7 @@ func TestHtlcSuccessSingleStage(t *testing.T) {
 	// singleStageResolution is a resolution for a htlc on the remote
 	// party's commitment.
 	singleStageResolution := lnwallet.IncomingHtlcResolution{
+		Preimage:      testResPreimage,
 		SweepSignDesc: testSignDesc,
 		ClaimOutpoint: htlcOutpoint,
 	}
@@ -236,6 +238,258 @@ func TestHtlcSuccessSingleStage(t *testing.T) {
 	)
 }
 
+// TestHtlcSuccessResolverLaunchRestoresPreimage asserts that Launch restores a
+// missing direct-sweep preimage from the preimage DB before offering the input.
+func TestHtlcSuccessResolverLaunchRestoresPreimage(t *testing.T) {
+	defer timeout()()
+
+	claimOutpoint := wire.OutPoint{
+		Hash:  chainhash.Hash{0x05},
+		Index: 6,
+	}
+	resolution := lnwallet.IncomingHtlcResolution{
+		SweepSignDesc: testSignDesc,
+		ClaimOutpoint: claimOutpoint,
+	}
+	ctx := newHtlcResolverTestContext(
+		t, func(htlc channeldb.HTLC,
+			cfg ResolverConfig) ContractResolver {
+
+			return newSuccessResolver(resolution, 0, htlc, 0, cfg)
+		},
+	)
+	resolver, ok := ctx.resolver.(*htlcSuccessResolver)
+	require.True(t, ok)
+	witnessBeacon, ok := resolver.PreimageDB.(*mockWitnessBeacon)
+	require.True(t, ok)
+	witnessBeacon.setLookupPreimage(testResHash, testResPreimage)
+
+	require.NoError(t, resolver.Launch())
+
+	sweeper, ok := resolver.Sweeper.(*mockSweeper)
+	require.True(t, ok)
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, claimOutpoint, inp.OutPoint())
+		preimage := inp.Preimage().UnwrapOrFail(t)
+		require.Equal(t, testResPreimage, preimage)
+	case <-time.After(time.Second):
+		t.Fatal("expected direct input to be swept")
+	}
+}
+
+// TestHtlcSuccessResolverTaprootAugmentMergesPreimage asserts that taproot
+// restart augmentation merges close-summary fields without replacing the
+// resolver's learned preimage.
+func TestHtlcSuccessResolverTaprootAugmentMergesPreimage(t *testing.T) {
+	defer timeout()()
+
+	// Arrange: set up a restarted remote-commitment resolver with a learned
+	// preimage and a close-summary resolution with taproot data but no
+	// preimage.
+	claimOutpoint := wire.OutPoint{
+		Hash:  chainhash.Hash{0x04},
+		Index: 5,
+	}
+	storedResolution := lnwallet.IncomingHtlcResolution{
+		Preimage:      testResPreimage,
+		SweepSignDesc: testSignDesc,
+		ClaimOutpoint: claimOutpoint,
+	}
+	closeSummaryResolution := storedResolution
+	closeSummaryResolution.Preimage = [32]byte{}
+	closeSummaryResolution.CsvDelay = 7
+
+	sweepTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: claimOutpoint,
+				Witness: wire.TxWitness{
+					[]byte{0x01}, testResPreimage[:],
+				},
+			},
+		},
+	}
+	sweepHash := sweepTx.TxHash()
+	expectedReport := &channeldb.ResolverReport{
+		OutPoint:        claimOutpoint,
+		Amount:          btcutil.Amount(testSignDesc.Output.Value),
+		ResolverType:    channeldb.ResolverTypeIncomingHtlc,
+		ResolverOutcome: channeldb.ResolverOutcomeClaimed,
+		SpendTxID:       &sweepHash,
+	}
+	ctx := newTestHtlcSuccessContext(t, storedResolution, false)
+	resolver := successResolverFromContext(t, ctx)
+	taprootChanType := channeldb.SimpleTaprootFeatureBit
+	resolver.SupplementState(&channeldb.OpenChannel{
+		ChanType: taprootChanType,
+	})
+	incomingResolutions := []lnwallet.IncomingHtlcResolution{
+		closeSummaryResolution,
+	}
+	maybeAugmentTaprootResolvers(
+		taprootChanType, resolver, &ContractResolutions{
+			HtlcResolutions: lnwallet.HtlcResolutions{
+				IncomingHTLCs: incomingResolutions,
+			},
+		},
+	)
+	require.Equal(
+		t, testResPreimage,
+		lntypes.Preimage(resolver.htlcResolution.Preimage),
+	)
+	require.EqualValues(t, 7, resolver.htlcResolution.CsvDelay)
+
+	checkpointChan := make(chan struct{}, 1)
+	ctx.checkpoint = func(resolver ContractResolver,
+		reports ...*channeldb.ResolverReport) error {
+
+		successResolver, ok := resolver.(*htlcSuccessResolver)
+		require.True(t, ok)
+
+		require.True(t, successResolver.IsResolved())
+		require.True(t, ctx.finalHtlcOutcomeStored)
+		require.True(t, ctx.finalHtlcSettled)
+		require.Equal(t, []*channeldb.ResolverReport{
+			expectedReport,
+		}, reports)
+
+		checkpointChan <- struct{}{}
+
+		return nil
+	}
+
+	// Act: launch the restarted resolver and inspect the direct sweep input
+	// it offers after augmentation.
+	ctx.resolve()
+
+	sweeper := mockSweeperFromResolver(t, resolver)
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, claimOutpoint, inp.OutPoint())
+		preimage := inp.Preimage().UnwrapOrFail(t)
+		require.Equal(t, testResPreimage, preimage)
+	case <-time.After(time.Second):
+		t.Fatal("expected direct input to be swept")
+	}
+
+	ctx.notifier.SpendChan <- &chainntnfs.SpendDetail{
+		SpendingTx:        sweepTx,
+		SpenderTxHash:     &sweepHash,
+		SpenderInputIndex: 0,
+		SpendingHeight:    10,
+		SpentOutPoint:     &claimOutpoint,
+	}
+
+	select {
+	case <-checkpointChan:
+	case <-time.After(time.Second):
+		t.Fatal("expected direct-spend checkpoint")
+	}
+	ctx.waitForResult()
+}
+
+// TestHtlcSuccessResolverRetriesSecondStageLaunch asserts that the success
+// resolver re-arms Launch after moving from the first-stage HTLC success tx to
+// its second-stage output.
+func TestHtlcSuccessResolverRetriesSecondStageLaunch(t *testing.T) {
+	defer timeout()()
+
+	commitOutpoint := wire.OutPoint{
+		Hash:  chainhash.Hash{0x07},
+		Index: 8,
+	}
+	resolution := newTestAnchorSuccessResolution(commitOutpoint)
+	ctx := newTestHtlcSuccessContext(t, resolution, false)
+	resolver := successResolverFromContext(t, ctx)
+	sweeper := mockSweeperFromResolver(t, resolver)
+
+	checkpointChan := make(chan struct{}, 1)
+	ctx.checkpoint = func(resolver ContractResolver,
+		reports ...*channeldb.ResolverReport) error {
+
+		successResolver, ok := resolver.(*htlcSuccessResolver)
+		require.True(t, ok)
+		require.True(t, successResolver.outputIncubating)
+		require.False(t, successResolver.isLaunched())
+		require.Empty(t, reports)
+
+		checkpointChan <- struct{}{}
+
+		return nil
+	}
+
+	// The first launch offers the first-stage HTLC success tx.
+	require.NoError(t, resolver.Launch())
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, commitOutpoint, inp.OutPoint())
+	case <-time.After(time.Second):
+		t.Fatal("expected first-stage input to be swept")
+	}
+	require.True(t, resolver.isLaunched())
+
+	// Let Resolve advance to the second stage, then fail the second-stage
+	// offer. The resolver should clear launched so a later Launch can retry
+	// the second-stage output.
+	offerErr := errors.New("stage two offer failed")
+	sweeper.sweepInputErr = offerErr
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- resolver.resolveSuccessTx()
+	}()
+
+	successTx := resolution.SignedSuccessTx
+	successHash := successTx.TxHash()
+	commitSpend := &chainntnfs.SpendDetail{
+		SpendingTx:        successTx,
+		SpenderTxHash:     &successHash,
+		SpenderInputIndex: 0,
+		SpendingHeight:    10,
+		SpentOutPoint:     &commitOutpoint,
+	}
+	ctx.notifier.SpendChan <- commitSpend
+
+	select {
+	case <-checkpointChan:
+	case <-time.After(time.Second):
+		t.Fatal("expected second-stage checkpoint")
+	}
+	ctx.notifier.SpendChan <- commitSpend
+
+	select {
+	case err := <-errChan:
+		require.ErrorIs(t, err, offerErr)
+	case <-time.After(time.Second):
+		t.Fatal("expected second-stage offer error")
+	}
+	require.True(t, resolver.outputIncubating)
+	require.False(t, resolver.isLaunched())
+
+	// A later Launch should retry the second-stage output instead of
+	// returning at the stale first-stage launched guard.
+	sweeper.sweepInputErr = nil
+	retryErr := make(chan error, 1)
+	go func() {
+		retryErr <- resolver.Launch()
+	}()
+	ctx.notifier.SpendChan <- commitSpend
+
+	select {
+	case err := <-retryErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("expected retry launch result")
+	}
+	select {
+	case inp := <-sweeper.sweptInputs:
+		require.Equal(t, resolution.ClaimOutpoint, inp.OutPoint())
+	case <-time.After(time.Second):
+		t.Fatal("expected second-stage input to be swept")
+	}
+	require.True(t, resolver.isLaunched())
+}
+
 // TestHtlcSuccessSecondStageResolution tests successful sweep of a second
 // stage htlc claim, going through the Nursery.
 func TestHtlcSuccessSecondStageResolution(t *testing.T) {
@@ -251,7 +505,7 @@ func TestHtlcSuccessSecondStageResolution(t *testing.T) {
 	// twoStageResolution is a resolution for htlc on our own commitment
 	// which is spent from the signed success tx.
 	twoStageResolution := lnwallet.IncomingHtlcResolution{
-		Preimage: [32]byte{},
+		Preimage: testResPreimage,
 		SignedSuccessTx: &wire.MsgTx{
 			TxIn: []*wire.TxIn{
 				{
@@ -386,7 +640,7 @@ func TestHtlcSuccessSecondStageResolutionSweeper(t *testing.T) {
 	// twoStageResolution is a resolution for htlc on our own commitment
 	// which is spent from the signed success tx.
 	twoStageResolution := lnwallet.IncomingHtlcResolution{
-		Preimage:        [32]byte{},
+		Preimage:        testResPreimage,
 		CsvDelay:        4,
 		SignedSuccessTx: successTx,
 		SignDetails: &input.SignDetails{
@@ -730,6 +984,8 @@ func TestHtlcSuccessResolverForeignSpendCheckpointError(t *testing.T) {
 	require.Empty(t, ctx.htlcNotifier.finalHtlcEvents)
 }
 
+// newTestHtlcSuccessContext creates a success resolver test context with the
+// supplied incoming HTLC resolution and incubation state.
 func newTestHtlcSuccessContext(t *testing.T,
 	resolution lnwallet.IncomingHtlcResolution,
 	outputIncubating bool) *htlcResolverTestContext {
@@ -748,6 +1004,8 @@ func newTestHtlcSuccessContext(t *testing.T,
 	)
 }
 
+// successResolverFromContext returns the success resolver installed in a test
+// context.
 func successResolverFromContext(t *testing.T,
 	ctx *htlcResolverTestContext) *htlcSuccessResolver {
 
@@ -759,6 +1017,8 @@ func successResolverFromContext(t *testing.T,
 	return resolver
 }
 
+// mockSweeperFromResolver returns the mock sweeper installed on a success
+// resolver.
 func mockSweeperFromResolver(t *testing.T,
 	resolver *htlcSuccessResolver) *mockSweeper {
 
@@ -770,6 +1030,8 @@ func mockSweeperFromResolver(t *testing.T,
 	return sweeper
 }
 
+// newTestAnchorSuccessResolution returns an anchor-channel success resolution
+// whose second-level output matches the shared test sign descriptor.
 func newTestAnchorSuccessResolution(
 	commitOutpoint wire.OutPoint) lnwallet.IncomingHtlcResolution {
 
@@ -786,7 +1048,7 @@ func newTestAnchorSuccessResolution(
 	successHash := successTx.TxHash()
 
 	return lnwallet.IncomingHtlcResolution{
-		Preimage:        [32]byte{},
+		Preimage:        testResPreimage,
 		CsvDelay:        4,
 		SignedSuccessTx: successTx,
 		SignDetails: &input.SignDetails{
@@ -821,6 +1083,7 @@ func newForeignSuccessSpend(
 	return foreignTx, foreignTx.TxHash()
 }
 
+// cloneTxOut returns a copy of a transaction output.
 func cloneTxOut(txOut *wire.TxOut) *wire.TxOut {
 	pkScript := append([]byte(nil), txOut.PkScript...)
 	return &wire.TxOut{

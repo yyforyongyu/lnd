@@ -236,8 +236,8 @@ func (h *htlcTimeoutResolver) claimCleanUp(
 	var pre [32]byte
 	copy(pre[:], preimage[:])
 
-	// Finally, we'll send the clean up message, mark ourselves as
-	// resolved, then exit.
+	// Finally, we'll send the clean up message, mark ourselves as resolved,
+	// checkpoint, then exit.
 	if err := h.DeliverResolutionMsg(ResolutionMsg{
 		SourceChan: h.ShortChanID,
 		HtlcIndex:  h.htlc.HtlcIndex,
@@ -245,7 +245,6 @@ func (h *htlcTimeoutResolver) claimCleanUp(
 	}); err != nil {
 		return err
 	}
-	h.markResolved()
 
 	// Checkpoint our resolver with a report which reflects the preimage
 	// claim by the remote party.
@@ -258,7 +257,7 @@ func (h *htlcTimeoutResolver) claimCleanUp(
 		SpendTxID:       commitSpend.SpenderTxHash,
 	}
 
-	return h.Checkpoint(h, report)
+	return h.resolve(h, report)
 }
 
 // chainDetailsToWatch returns the output and script which we use to watch for
@@ -1160,9 +1159,7 @@ func (h *htlcTimeoutResolver) checkpointClaim(
 	}
 
 	// Finally, we checkpoint the resolver with our report(s).
-	h.markResolved()
-
-	return h.Checkpoint(h, report)
+	return h.resolve(h, report)
 }
 
 // resolveRemoteCommitOutput handles sweeping an HTLC output on the remote
@@ -1243,18 +1240,27 @@ func (h *htlcTimeoutResolver) resolveTimeoutTx() error {
 
 	h.log.Infof("2nd-level HTLC timeout tx=%v confirmed", spenderTxid)
 
-	// Start the process to sweep the output from the timeout tx.
+	// Re-arm Launch before checkpointing the stage transition so later
+	// blockbeats can retry the second-stage output if this path fails.
 	if h.isZeroFeeOutput() {
-		err = h.sweepTimeoutTxOutput()
-		if err != nil {
-			return err
-		}
+		h.unlaunch()
 	}
 
-	// Create a checkpoint since the timeout tx is confirmed and the sweep
-	// request has been made.
-	if err := h.checkpointStageOne(spenderTxid); err != nil {
+	// Create a checkpoint since the timeout tx is confirmed and the second
+	// stage can now be swept.
+	err = h.checkpointStageOne(spenderTxid)
+	if err != nil {
 		return err
+	}
+
+	// Start the process to sweep the output from the timeout tx.
+	if h.isZeroFeeOutput() {
+		h.markLaunched()
+		err = h.sweepTimeoutTxOutput()
+		if err != nil {
+			h.unlaunch()
+			return err
+		}
 	}
 
 	// Start the resolving process for the stage two output.
@@ -1294,11 +1300,11 @@ func (h *htlcTimeoutResolver) Launch() error {
 	h.log.Debugf("launching resolver...")
 	h.markLaunched()
 
+	var err error
 	switch {
 	// If we're already resolved, then we can exit early.
 	case h.IsResolved():
 		h.log.Errorf("already resolved")
-		return nil
 
 	// If this is an output on the remote party's commitment transaction,
 	// use the direct timeout spend path.
@@ -1308,7 +1314,7 @@ func (h *htlcTimeoutResolver) Launch() error {
 	// stopped marking this flag for direct timeout spends (#9062). In that
 	// case, we will do nothing and let the utxo nursery handle it.
 	case h.isRemoteCommitOutput() && !h.outputIncubating:
-		return h.sweepDirectHtlcOutput()
+		err = h.sweepDirectHtlcOutput()
 
 	// If this is an anchor type channel, we now sweep either the
 	// second-level timeout tx or the output from the second-level timeout
@@ -1317,17 +1323,23 @@ func (h *htlcTimeoutResolver) Launch() error {
 		// If the second-level timeout tx has already been swept, we
 		// can go ahead and sweep its output.
 		if h.outputIncubating {
-			return h.sweepTimeoutTxOutput()
+			err = h.sweepTimeoutTxOutput()
+			break
 		}
 
 		// Otherwise, sweep the second level tx.
-		return h.sweepTimeoutTx()
+		err = h.sweepTimeoutTx()
 
-	// If this is an output on our own commitment using pre-anchor channel
-	// type, we will let the utxo nursery handle it via Resolve.
-	//
-	// TODO(yy): handle the legacy output by offering it to the sweeper.
 	default:
-		return nil
+		// Pre-anchor local commitment outputs are handled by the
+		// nursery through Resolve, so Launch does nothing here.
+		//
+		// TODO(yy): offer legacy output to the sweeper.
 	}
+
+	if err != nil {
+		h.unlaunch()
+	}
+
+	return err
 }

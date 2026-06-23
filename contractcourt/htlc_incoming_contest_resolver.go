@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
@@ -15,6 +16,7 @@ import (
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/queue"
@@ -37,6 +39,10 @@ type htlcIncomingContestResolver struct {
 	// htlcSuccessResolver is the inner resolver that may be utilized if we
 	// learn of the preimage.
 	*htlcSuccessResolver
+
+	// preimageLock synchronizes preimage application between Launch and
+	// Resolve, which can run concurrently on blockbeats.
+	preimageLock sync.Mutex
 }
 
 // newIncomingContestResolver instantiates a new incoming htlc contest resolver.
@@ -55,16 +61,43 @@ func newIncomingContestResolver(
 	}
 }
 
-func (h *htlcIncomingContestResolver) processFinalHtlcFail() error {
+// persistFinalHtlcFail persists that the HTLC reached a final failed outcome.
+// The corresponding notifier event is emitted only after the terminal resolver
+// checkpoint succeeds.
+func (h *htlcIncomingContestResolver) persistFinalHtlcFail() error {
 	// Mark the htlc as final failed.
 	err := h.ChainArbitratorConfig.PutFinalHtlcOutcome(
 		h.ChannelArbitratorConfig.ShortChanID, h.htlc.HtlcIndex, false,
 	)
+
+	return err
+}
+
+// checkpointFinalHtlcFail persists the failed outcome and terminal resolver
+// checkpoint, then notifies subscribers after the checkpoint is durable.
+func (h *htlcIncomingContestResolver) checkpointFinalHtlcFail(
+	outcome channeldb.ResolverOutcome) error {
+
+	err := h.persistFinalHtlcFail()
 	if err != nil {
 		return err
 	}
 
-	// Send notification.
+	report := h.report().resolverReport(
+		nil, channeldb.ResolverTypeIncomingHtlc, outcome,
+	)
+	err = h.resolve(h, report)
+	if err != nil {
+		return err
+	}
+
+	h.notifyFinalHtlcFail()
+
+	return nil
+}
+
+// notifyFinalHtlcFail emits the final failed HTLC outcome to subscribers.
+func (h *htlcIncomingContestResolver) notifyFinalHtlcFail() {
 	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
 		models.CircuitKey{
 			ChanID: h.ShortChanID,
@@ -75,8 +108,6 @@ func (h *htlcIncomingContestResolver) processFinalHtlcFail() error {
 			Offchain: false,
 		},
 	)
-
-	return nil
 }
 
 // Launch will call the inner resolver's launch method if the preimage can be
@@ -95,11 +126,11 @@ func (h *htlcIncomingContestResolver) Launch() error {
 		return err
 	}
 
-	if uint32(bestHeight) >= h.htlcExpiry {
-		h.log.Infof("expired (height=%v, expiry=%v), leaving "+
-			"resolution to Resolve", bestHeight, h.htlcExpiry)
-
-		return nil
+	startExpired := uint32(bestHeight) >= h.htlcExpiry
+	if startExpired {
+		h.log.Infof("expired (height=%v, expiry=%v), only "+
+			"launching if a preimage was already known", bestHeight,
+			h.htlcExpiry)
 	}
 
 	// Query the preimage and apply it if we already know it.
@@ -125,7 +156,7 @@ func (h *htlcIncomingContestResolver) Launch() error {
 		return err
 	}
 
-	if uint32(bestHeight) >= h.htlcExpiry {
+	if !startExpired && uint32(bestHeight) >= h.htlcExpiry {
 		h.log.Infof("expired after applying preimage (height=%v, "+
 			"expiry=%v), skipping success launch", bestHeight,
 			h.htlcExpiry)
@@ -172,19 +203,10 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		// will time it out and get their funds back. This situation
 		// can present itself when we crash before processRemoteAdds in
 		// the link has ran.
-		h.markResolved()
 
-		if err := h.processFinalHtlcFail(); err != nil {
-			return nil, err
-		}
-
-		// We write a report to disk that indicates we could not decode
-		// the htlc.
-		resReport := h.report().resolverReport(
-			nil, channeldb.ResolverTypeIncomingHtlc,
+		return nil, h.checkpointFinalHtlcFail(
 			channeldb.ResolverOutcomeAbandoned,
 		)
-		return nil, h.PutResolverReport(nil, resReport)
 	}
 
 	// Register for block epochs. After registration, the current height
@@ -217,6 +239,13 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 	// preimage. Otherwise the resolver could potentially stay active
 	// indefinitely and the channel will never close properly.
 	if uint32(currentHeight) >= h.htlcExpiry {
+		// Launch may have already applied a known preimage and started
+		// the inner success resolver. Continue with it before
+		// treating the HTLC as timed out.
+		if h.hasAppliedPreimage() {
+			return h.htlcSuccessResolver, nil
+		}
+
 		// TODO(roasbeef): should also somehow check if outgoing is
 		// resolved or not
 		//  * may need to hook into the circuit map
@@ -225,19 +254,10 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		log.Infof("%T(%v): HTLC has timed out (expiry=%v, height=%v), "+
 			"abandoning", h, h.htlcResolution.ClaimOutpoint,
 			h.htlcExpiry, currentHeight)
-		h.markResolved()
 
-		if err := h.processFinalHtlcFail(); err != nil {
-			return nil, err
-		}
-
-		// Finally, get our report and checkpoint our resolver with a
-		// timeout outcome report.
-		report := h.report().resolverReport(
-			nil, channeldb.ResolverTypeIncomingHtlc,
+		return nil, h.checkpointFinalHtlcFail(
 			channeldb.ResolverOutcomeTimeout,
 		)
-		return nil, h.Checkpoint(h, report)
 	}
 
 	// Define a closure to process htlc resolutions either directly or
@@ -251,7 +271,7 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		// If the htlc resolution was a settle, apply the
 		// preimage and return a success resolver.
 		case *invoices.HtlcSettleResolution:
-			err := h.applyPreimage(resolution.Preimage)
+			err := h.storeAndApplyPreimage(resolution.Preimage)
 			if err != nil {
 				return nil, err
 			}
@@ -266,19 +286,9 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 				h.htlcResolution.ClaimOutpoint,
 				h.htlcExpiry, currentHeight)
 
-			h.markResolved()
-
-			if err := h.processFinalHtlcFail(); err != nil {
-				return nil, err
-			}
-
-			// Checkpoint our resolver with an abandoned outcome
-			// because we take no further action on this htlc.
-			report := h.report().resolverReport(
-				nil, channeldb.ResolverTypeIncomingHtlc,
+			return nil, h.checkpointFinalHtlcFail(
 				channeldb.ResolverOutcomeAbandoned,
 			)
-			return nil, h.Checkpoint(h, report)
 
 		// Error if the resolution type is unknown, we are only
 		// expecting settles and fails.
@@ -424,29 +434,34 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 			// resolved and exit.
 			newHeight := uint32(newBlock.Height)
 			if newHeight >= h.htlcExpiry {
+				// Launch can set this while Resolve waits.
+				if h.hasAppliedPreimage() {
+					return h.htlcSuccessResolver, nil
+				}
+
 				log.Infof("%T(%v): HTLC has timed out "+
 					"(expiry=%v, height=%v), abandoning", h,
 					h.htlcResolution.ClaimOutpoint,
 					h.htlcExpiry, currentHeight)
 
-				h.markResolved()
-
-				if err := h.processFinalHtlcFail(); err != nil {
-					return nil, err
-				}
-
-				report := h.report().resolverReport(
-					nil,
-					channeldb.ResolverTypeIncomingHtlc,
+				return nil, h.checkpointFinalHtlcFail(
 					channeldb.ResolverOutcomeTimeout,
 				)
-				return nil, h.Checkpoint(h, report)
 			}
 
 		case <-h.quit:
 			return nil, errResolverShuttingDown
 		}
 	}
+}
+
+// hasAppliedPreimage returns true if Launch or Resolve already attached the
+// HTLC preimage to the inner success resolver.
+func (h *htlcIncomingContestResolver) hasAppliedPreimage() bool {
+	h.preimageLock.Lock()
+	defer h.preimageLock.Unlock()
+
+	return h.htlcResolution.Preimage != lntypes.ZeroHash
 }
 
 // applyPreimage is a helper function that will populate our internal resolver
@@ -461,6 +476,9 @@ func (h *htlcIncomingContestResolver) applyPreimage(
 	if !preimage.Matches(h.htlc.RHash) {
 		return errors.New("preimage does not match hash")
 	}
+
+	h.preimageLock.Lock()
+	defer h.preimageLock.Unlock()
 
 	// We may already have the preimage since both the `Launch` and
 	// `Resolve` methods will look for it.
@@ -517,6 +535,28 @@ func (h *htlcIncomingContestResolver) applyPreimage(
 	}
 
 	return nil
+}
+
+// storeAndApplyPreimage persists an invoice-learned preimage before applying it
+// to the resolver. This gives relaunched success resolvers a durable source for
+// restoring their sweep preimage.
+func (h *htlcIncomingContestResolver) storeAndApplyPreimage(
+	preimage lntypes.Preimage) error {
+
+	if !preimage.Matches(h.htlc.RHash) {
+		return errors.New("preimage does not match hash")
+	}
+
+	if !h.hasAppliedPreimage() {
+		// AddPreimages is idempotent for an existing hash: the witness
+		// cache overwrites the same key and returns nil.
+		err := h.PreimageDB.AddPreimages(preimage)
+		if err != nil {
+			return err
+		}
+	}
+
+	return h.applyPreimage(preimage)
 }
 
 // report returns a report on the resolution state of the contract.
@@ -677,44 +717,102 @@ func (h *htlcIncomingContestResolver) findAndapplyPreimage(
 		return false, nil
 	}
 
-	// Notify registry that we are potentially resolving as an exit hop
-	// on-chain. If this HTLC indeed pays to an existing invoice, the
-	// invoice registry will tell us what to do with the HTLC. This is
-	// identical to HTLC resolution in the link.
-	circuitKey := models.CircuitKey{
-		ChanID: h.ShortChanID,
-		HtlcID: h.htlc.HtlcIndex,
-	}
-
-	// Try get the resolution - if it doesn't give us a resolution
-	// immediately, we'll assume we don't know it yet and let the `Resolve`
-	// handle the waiting.
-	//
-	// NOTE: we use a nil subscriber here as we are only interested in the
-	// settle resolution.
-	//
-	// TODO(yy): move this logic to link and let the preimage be accessed
-	// via the preimage beacon.
-	resolution, err := h.Registry.NotifyExitHopHtlc(
-		h.htlc.RHash, h.htlc.Amt, h.htlcExpiry, currentHeight,
-		circuitKey, nil, h.htlc.CustomRecords, payload,
-	)
+	invoicePreimage, ok, err := h.lookupReplayedInvoicePreimage(payload)
 	if err != nil {
 		return false, err
 	}
-
-	res, ok := resolution.(*invoices.HtlcSettleResolution)
-
-	// Exit early if it's not a settle resolution.
 	if !ok {
 		return false, nil
 	}
 
-	// Otherwise we have a settle resolution, apply the preimage.
-	err = h.applyPreimage(res.Preimage)
+	// Otherwise this exact HTLC was already settled, store and apply the
+	// preimage.
+	err = h.storeAndApplyPreimage(invoicePreimage)
 	if err != nil {
 		return false, err
 	}
 
 	return true, nil
+}
+
+// lookupReplayedInvoicePreimage looks up the invoice without mutating registry
+// state and returns a preimage only if this exact circuit was already settled.
+func (h *htlcIncomingContestResolver) lookupReplayedInvoicePreimage(
+	payload invoices.Payload) (lntypes.Preimage, bool, error) {
+
+	// Resolve will run NotifyExitHopHtlc with the real height. Launch only
+	// needs preimages from this exact circuit if it was already settled
+	// before this resolver started.
+	invoiceRef := invoiceRefForPayload(h.htlc.RHash, payload)
+	ctx, cancel := lnutils.ContextFromQuit(h.quit)
+	defer cancel()
+
+	invoice, err := h.Registry.LookupInvoiceByRef(
+		ctx, invoiceRef,
+	)
+	switch {
+	case err == nil:
+	case errors.Is(err, invoices.ErrInvoiceNotFound) ||
+		errors.Is(err, invoices.ErrNoInvoicesCreated):
+
+		return lntypes.Preimage{}, false, nil
+	default:
+		return lntypes.Preimage{}, false, err
+	}
+
+	circuitKey := models.CircuitKey{
+		ChanID: h.ShortChanID,
+		HtlcID: h.htlc.HtlcIndex,
+	}
+	preimage, ok := replayedInvoicePreimage(invoice, circuitKey)
+
+	return preimage, ok, nil
+}
+
+// invoiceRefForPayload returns the same invoice reference that the invoice
+// registry uses for this exit-hop payload.
+func invoiceRefForPayload(hash lntypes.Hash,
+	payload invoices.Payload) invoices.InvoiceRef {
+
+	mpp := payload.MultiPath()
+	amp := payload.AMPRecord()
+	pathID := payload.PathID()
+
+	switch {
+	case pathID != nil:
+		return invoices.InvoiceRefByHashAndAddr(hash, *pathID)
+
+	case amp != nil && mpp != nil:
+		payAddr := mpp.PaymentAddr()
+		return invoices.InvoiceRefByAddr(payAddr)
+
+	case mpp != nil:
+		payAddr := mpp.PaymentAddr()
+		return invoices.InvoiceRefByHashAndAddr(hash, payAddr)
+
+	default:
+		return invoices.InvoiceRefByHash(hash)
+	}
+}
+
+// replayedInvoicePreimage returns the preimage for this exact circuit if it was
+// already settled on the invoice.
+func replayedInvoicePreimage(invoice invoices.Invoice,
+	circuitKey models.CircuitKey) (lntypes.Preimage, bool) {
+
+	htlc, ok := invoice.Htlcs[circuitKey]
+	if !ok || htlc.State != invoices.HtlcStateSettled {
+		return lntypes.Preimage{}, false
+	}
+
+	preimage := invoice.Terms.PaymentPreimage
+	if preimage == nil {
+		if htlc.AMP == nil || htlc.AMP.Preimage == nil {
+			return lntypes.Preimage{}, false
+		}
+
+		preimage = htlc.AMP.Preimage
+	}
+
+	return *preimage, true
 }
