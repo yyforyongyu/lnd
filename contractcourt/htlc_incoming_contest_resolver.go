@@ -113,6 +113,26 @@ func (h *htlcIncomingContestResolver) Launch() error {
 		return nil
 	}
 
+	if h.IsResolved() {
+		h.log.Debugf("resolver resolved after applying preimage for htlc=%x",
+			h.htlc.RHash)
+
+		return nil
+	}
+
+	_, bestHeight, err = h.ChainIO.GetBestBlock()
+	if err != nil {
+		return err
+	}
+
+	if uint32(bestHeight) >= h.htlcExpiry {
+		h.log.Infof("expired after applying preimage (height=%v, "+
+			"expiry=%v), skipping success launch", bestHeight,
+			h.htlcExpiry)
+
+		return nil
+	}
+
 	h.log.Debugf("found preimage for htlc=%x,  transforming into success "+
 		"resolver and launching it", h.htlc.RHash)
 

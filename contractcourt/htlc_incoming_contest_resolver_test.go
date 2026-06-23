@@ -203,6 +203,34 @@ func TestHtlcIncomingResolverLaunchUsesCurrentHeight(t *testing.T) {
 	)
 }
 
+func TestHtlcIncomingResolverLaunchSkipsSuccessAfterLookupExpiry(
+	t *testing.T) {
+
+	t.Parallel()
+	defer timeout()()
+
+	// Arrange.
+	ctx := newIncomingResolverTestContext(t, true)
+	ctx.registry.notifyResolution = invoices.NewSettleResolution(
+		testResPreimage, testResCircuitKey, testAcceptHeight,
+		invoices.ResultReplayToSettled,
+	)
+	ctx.registry.notifyHook = func() {
+		ctx.chainIO.BestHeight = testHtlcExpiry
+	}
+
+	// Act.
+	require.NoError(t, ctx.resolver.Launch())
+
+	// Assert.
+	require.False(t, ctx.resolver.isLaunched())
+	require.Equal(
+		t, [32]byte(testResPreimage),
+		ctx.resolver.htlcResolution.Preimage,
+	)
+	require.Len(t, ctx.registry.immediateNotify, 1)
+}
+
 // TestHtlcIncomingResolverExitSettle tests resolution of an exit hop htlc for
 // which the invoice has already been settled when the resolver starts.
 func TestHtlcIncomingResolverExitSettle(t *testing.T) {

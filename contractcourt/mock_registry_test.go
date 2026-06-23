@@ -22,6 +22,7 @@ type mockRegistry struct {
 	notifyErr        error
 	notifyResolution invoices.HtlcResolution
 	immediateNotify  []notifyExitHopData
+	notifyHook       func()
 }
 
 func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
@@ -38,6 +39,9 @@ func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
 			expiry:        expiry,
 			currentHeight: currentHeight,
 		})
+		if r.notifyHook != nil {
+			r.notifyHook()
+		}
 
 		return r.notifyResolution, r.notifyErr
 	}
@@ -48,6 +52,9 @@ func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
 		paidAmount:    paidAmount,
 		expiry:        expiry,
 		currentHeight: currentHeight,
+	}
+	if r.notifyHook != nil {
+		r.notifyHook()
 	}
 
 	return r.notifyResolution, r.notifyErr
