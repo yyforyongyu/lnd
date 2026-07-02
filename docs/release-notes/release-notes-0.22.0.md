@@ -42,6 +42,15 @@
   regardless of peer connectivity. Uptime is now seeded from the peer's
   actual connection state.
 
+* [Fixed issue #7463](https://github.com/lightningnetwork/lnd/issues/7463)
+  by keeping invoices accepted until the corresponding HTLC reaches a final
+  settle or fail outcome. This introduces a persisted `ContractPendingSettle`
+  invoice state, so operators should not downgrade to older binaries while
+  invoices may remain in that intermediate state. Restart recovery is
+  best-effort: if a restart interrupts finalization after the HTLC's final
+  outcome was reached, the invoice can remain `ContractPendingSettle` (shown
+  as `ACCEPTED` over RPC) and may require support-guided reconciliation.
+
 # New Features
 
 ## Functional Enhancements
