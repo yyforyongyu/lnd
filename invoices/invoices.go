@@ -231,6 +231,15 @@ const (
 	// ContractAccepted means the HTLC has been accepted but not settled
 	// yet.
 	ContractAccepted ContractState = 3
+
+	// ContractPendingSettle means settlement has been requested for the
+	// invoice, but the settling HTLC has not yet reached a final locked-in
+	// outcome.
+	//
+	// NOTE: This state is persisted. Do not downgrade to a binary that does
+	// not understand ContractPendingSettle while invoices may be in this
+	// state.
+	ContractPendingSettle ContractState = 4
 )
 
 // String returns a human readable identifier for the ContractState type.
@@ -247,6 +256,9 @@ func (c ContractState) String() string {
 
 	case ContractAccepted:
 		return "Accepted"
+
+	case ContractPendingSettle:
+		return "PendingSettle"
 	}
 
 	return "Unknown"
@@ -522,6 +534,10 @@ const (
 
 	// HtlcStateSettled indicates the htlc is settled.
 	HtlcStateSettled
+
+	// HtlcStatePendingSettle indicates that the htlc has a settle
+	// resolution, but the settlement is not yet locked in.
+	HtlcStatePendingSettle
 )
 
 // InvoiceHTLC contains details about an htlc paying to this invoice.
@@ -824,9 +840,11 @@ func (i *Invoice) requiresPreimage() bool {
 	return true
 }
 
-// IsPending returns true if the invoice is in ContractOpen state.
+// IsPending returns true if the invoice is in the open, accepted, or
+// pending-settle state.
 func (i *Invoice) IsPending() bool {
-	return i.State == ContractOpen || i.State == ContractAccepted
+	return i.State == ContractOpen || i.State == ContractAccepted ||
+		i.State == ContractPendingSettle
 }
 
 // copySlice allocates a new slice and copies the source into it.

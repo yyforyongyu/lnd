@@ -91,7 +91,7 @@ func CreateRPCInvoice(invoice *invoices.Invoice,
 	case invoices.ContractCanceled:
 		state = lnrpc.Invoice_CANCELED
 
-	case invoices.ContractAccepted:
+	case invoices.ContractAccepted, invoices.ContractPendingSettle:
 		state = lnrpc.Invoice_ACCEPTED
 
 	default:
@@ -103,7 +103,9 @@ func CreateRPCInvoice(invoice *invoices.Invoice,
 	for key, htlc := range invoice.Htlcs {
 		var state lnrpc.InvoiceHTLCState
 		switch htlc.State {
-		case invoices.HtlcStateAccepted:
+		case invoices.HtlcStateAccepted,
+			invoices.HtlcStatePendingSettle:
+
 			state = lnrpc.InvoiceHTLCState_ACCEPTED
 		case invoices.HtlcStateSettled:
 			state = lnrpc.InvoiceHTLCState_SETTLED
@@ -155,7 +157,9 @@ func CreateRPCInvoice(invoice *invoices.Invoice,
 		}
 
 		// Only report resolved times if htlc is resolved.
-		if htlc.State != invoices.HtlcStateAccepted {
+		if htlc.State != invoices.HtlcStateAccepted &&
+			htlc.State != invoices.HtlcStatePendingSettle {
+
 			rpcHtlc.ResolveTime = htlc.ResolveTime.Unix()
 		}
 
@@ -204,7 +208,9 @@ func CreateRPCInvoice(invoice *invoices.Invoice,
 
 		var state lnrpc.InvoiceHTLCState
 		switch ampState.State {
-		case invoices.HtlcStateAccepted:
+		case invoices.HtlcStateAccepted,
+			invoices.HtlcStatePendingSettle:
+
 			state = lnrpc.InvoiceHTLCState_ACCEPTED
 		case invoices.HtlcStateSettled:
 			state = lnrpc.InvoiceHTLCState_SETTLED
