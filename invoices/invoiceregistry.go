@@ -1870,18 +1870,40 @@ func (i *InvoiceRegistry) CancelInvoice(ctx context.Context,
 	return i.cancelInvoiceImpl(ctx, payHash, true)
 }
 
-// shouldCancel examines the state of an invoice and whether we want to
+// shouldCancel examines the invoice and whether we want to
 // cancel already accepted invoices, taking our force cancel boolean into
 // account. This is pulled out into its own function so that tests that mock
 // cancelInvoiceImpl can reuse this logic.
-func shouldCancel(state ContractState, cancelAccepted bool) bool {
-	if state != ContractAccepted {
+func shouldCancel(invoice *Invoice, cancelAccepted bool) bool {
+	if invoice.State == ContractPendingSettle {
+		return false
+	}
+
+	if hasPendingSettleHTLC(invoice) {
+		return false
+	}
+
+	if invoice.State != ContractAccepted {
 		return true
 	}
 
-	// If the invoice is accepted, we should only cancel if we want to
-	// force cancellation of accepted invoices.
+	// Accepted invoices are only canceled when callers explicitly force
+	// cancellation of HTLC-bearing invoices. Once settlement is pending,
+	// the final HTLC outcome decides whether the invoice settles or
+	// cancels.
 	return cancelAccepted
+}
+
+// hasPendingSettleHTLC returns true when any HTLC on the invoice is waiting for
+// channel finality before it can resolve.
+func hasPendingSettleHTLC(invoice *Invoice) bool {
+	for _, htlc := range invoice.Htlcs {
+		if htlc.State == HtlcStatePendingSettle {
+			return true
+		}
+	}
+
+	return false
 }
 
 // cancelInvoice attempts to cancel the invoice corresponding to the passed
@@ -1898,7 +1920,7 @@ func (i *InvoiceRegistry) cancelInvoiceImpl(ctx context.Context,
 	log.Debugf("Invoice%v: canceling invoice", ref)
 
 	updateInvoice := func(invoice *Invoice) (*InvoiceUpdateDesc, error) {
-		if !shouldCancel(invoice.State, cancelAccepted) {
+		if !shouldCancel(invoice, cancelAccepted) {
 			return nil, nil
 		}
 
@@ -1932,9 +1954,20 @@ func (i *InvoiceRegistry) cancelInvoiceImpl(ctx context.Context,
 		return err
 	}
 
-	// Return without cancellation if the invoice state is ContractAccepted.
+	// Return without cancellation once settlement is pending. At this
+	// point, the final HTLC outcome decides whether the invoice settles or
+	// cancels.
+	if invoice.State == ContractPendingSettle ||
+		hasPendingSettleHTLC(invoice) {
+
+		log.Debugf("Invoice%v: remains pending settle", ref)
+		return nil
+	}
+
+	// Return without cancellation if the invoice has accepted HTLCs and
+	// cancelAccepted wasn't set.
 	if invoice.State == ContractAccepted {
-		log.Debugf("Invoice%v: remains accepted as cancel wasn't"+
+		log.Debugf("Invoice%v: remains accepted as cancel wasn't "+
 			"explicitly requested.", ref)
 		return nil
 	}
