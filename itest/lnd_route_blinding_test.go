@@ -1000,7 +1000,8 @@ func testMPPToSingleBlindedPath(ht *lntest.HarnessTest) {
 	require.GreaterOrEqual(ht, succeeded, minExpectedShards,
 		"expected shards not reached")
 
-	// Make sure Dave show the invoice as settled for the full amount.
+	// Make sure Dave shows the invoice as settled for the full amount.
+	ht.AssertInvoiceSettled(dave, invoiceResp.PaymentAddr)
 	inv := dave.RPC.LookupInvoice(invoiceResp.RHash)
 
 	require.EqualValues(ht, paymentAmt, inv.AmtPaidSat,
@@ -1134,9 +1135,8 @@ func testBlindedRouteDummyHops(ht *lntest.HarnessTest) {
 		alice, []string{invoiceResp.PaymentRequest},
 	)
 
-	// Make sure Dave show the invoice as settled.
-	inv := dave.RPC.LookupInvoice(invoiceResp.RHash)
-	require.Equal(ht, lnrpc.Invoice_SETTLED, inv.State)
+	// Make sure Dave shows the invoice as settled.
+	ht.AssertInvoiceSettled(dave, invoiceResp.PaymentAddr)
 
 	// Let's also test the case where Dave is not the introduction node.
 	// We restart Carol so that she supports route blinding.
@@ -1176,9 +1176,8 @@ func testBlindedRouteDummyHops(ht *lntest.HarnessTest) {
 		alice, []string{invoiceResp.PaymentRequest},
 	)
 
-	// Make sure Dave show the invoice as settled.
-	inv = dave.RPC.LookupInvoice(invoiceResp.RHash)
-	require.Equal(ht, lnrpc.Invoice_SETTLED, inv.State)
+	// Make sure Dave shows the invoice as settled.
+	ht.AssertInvoiceSettled(dave, invoiceResp.PaymentAddr)
 }
 
 // testMPPToMultipleBlindedPaths tests that a two-shard MPP payment can be sent
@@ -1316,7 +1315,8 @@ func testMPPToMultipleBlindedPaths(ht *lntest.HarnessTest) {
 	require.GreaterOrEqual(ht, succeeded, minExpectedShards,
 		"expected shards not reached")
 
-	// Make sure Dave show the invoice as settled for the full amount.
+	// Make sure Dave shows the invoice as settled for the full amount.
+	ht.AssertInvoiceSettled(dave, invoiceResp.PaymentAddr)
 	inv := dave.RPC.LookupInvoice(invoiceResp.RHash)
 
 	require.EqualValues(ht, paymentAmt, inv.AmtPaidSat,

@@ -776,7 +776,8 @@ func testScidAliasRoutingHints(ht *lntest.HarnessTest) {
 	}
 
 	// Add the invoice and retrieve the payment request.
-	payReq := dave.RPC.AddInvoice(invoice).PaymentRequest
+	invoiceResp := dave.RPC.AddInvoice(invoice)
+	payReq := invoiceResp.PaymentRequest
 
 	// Now Alice will try to pay to that payment request.
 	timeout := time.Second * 15
@@ -790,9 +791,10 @@ func testScidAliasRoutingHints(ht *lntest.HarnessTest) {
 	ht.AssertPaymentSucceedWithTimeout(stream, timeout)
 
 	// Check that Dave's invoice appears as settled.
+	ht.AssertInvoiceSettled(dave, invoiceResp.PaymentAddr)
 	invoices := dave.RPC.ListInvoices(&lnrpc.ListInvoiceRequest{})
 	require.Len(ht, invoices.Invoices, 1, "expected one invoice")
-	require.Equal(ht, invoices.Invoices[0].State, lnrpc.Invoice_SETTLED,
+	require.Equal(ht, lnrpc.Invoice_SETTLED, invoices.Invoices[0].State,
 		"expected settled invoice")
 
 	// We'll now delete the alias again, but only on Carol's end. That
