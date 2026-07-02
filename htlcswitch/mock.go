@@ -1018,6 +1018,7 @@ func newMockRegistry(t testing.TB) *mockInvoiceRegistry {
 		&invoices.RegistryConfig{
 			FinalCltvRejectDelta: 5,
 			HtlcInterceptor:      modifierMock,
+			Clock:                clock.NewDefaultClock(),
 		},
 	)
 	registry.Start()
@@ -1057,6 +1058,14 @@ func (i *mockInvoiceRegistry) NotifyExitHopHtlc(rhash lntypes.Hash,
 	}
 
 	return event, nil
+}
+
+// NotifyExitHopHtlcFinalized forwards a final HTLC outcome to the invoice
+// registry.
+func (i *mockInvoiceRegistry) NotifyExitHopHtlcFinalized(ctx context.Context,
+	circuitKey models.CircuitKey, settled bool) error {
+
+	return i.registry.NotifyExitHopHtlcFinalized(ctx, circuitKey, settled)
 }
 
 func (i *mockInvoiceRegistry) CancelInvoice(ctx context.Context,
