@@ -3,7 +3,10 @@ package channeldb
 import (
 	"io"
 
+	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -286,3 +289,113 @@ func dCommitChainEpochHistory(r io.Reader, val interface{}, _ *[8]byte,
 
 // Assert that CommitChainEpochHistory implements the RecordProducer interface.
 var _ tlv.RecordProducer = (*CommitChainEpochHistory)(nil)
+
+// EpochParamChange describes a change to the script/output-rendering commitment
+// parameters (CSV and dust) that must be recorded in the commit-chain epoch
+// history. It is the epoch-affecting portion of a dynamic-commitments parameter
+// change; policy-only changes (reserve, in-flight limits, and the like) do not
+// produce one.
+type EpochParamChange struct {
+	// WhoSpecified is the party that proposed the parameter change. Its own
+	// dust limit and its counterparty's CSV are updated, per BOLT
+	// normalization (see RecordParamChange).
+	WhoSpecified lntypes.ChannelParty
+
+	// Params are the new normalized parameters. Params.DustLimit is the
+	// proposer's new dust limit and Params.CsvDelay is the counterparty's
+	// new CSV; callers must pass the current value for a field that is not
+	// changing.
+	Params CommitmentParams
+
+	// LockInHeights give the last height, inclusive, that the outgoing
+	// parameters applied to on each commitment chain (the local and remote
+	// chains lock in at different heights).
+	LockInHeights lntypes.Dual[uint64]
+}
+
+// ApplyChannelParams atomically persists a validated dynamic-commitments
+// parameter change. The per-side ChannelStateBounds (the policy parameters:
+// channel reserve, max value in flight, htlc minimum, and max accepted htlcs)
+// are replaced wholesale with localBounds and remoteBounds, and the
+// channel-wide announcement intent is set to flags.
+//
+// When paramChange is Some, the script/output-rendering parameters (CSV and
+// dust) are changed: the current epoch is closed on both commitment chains at
+// the given per-side lock-in heights and the new parameters are installed via
+// the commit-chain epoch history. The local and remote CommitmentParams are
+// then re-derived from the resulting epoch history so that they can never drift
+// from it. When paramChange is None, the epoch history and the CommitmentParams
+// are left untouched, which guarantees that policy-only changes never pollute
+// the epoch history.
+//
+// It is used by the dynamic-commitments machinery once a parameter change has
+// been agreed and locked in on each commitment chain.
+func (c *OpenChannel) ApplyChannelParams(localBounds,
+	remoteBounds ChannelStateBounds, flags lnwire.FundingFlag,
+	paramChange fn.Option[EpochParamChange]) error {
+
+	c.Lock()
+	defer c.Unlock()
+
+	// updated captures the mutated channel so the applied state can be
+	// copied back into the in-memory OpenChannel after the write succeeds.
+	var updated *OpenChannel
+	err := kvdb.Update(c.Db.backend, func(tx kvdb.RwTx) error {
+		chanBucket, err := fetchChanBucketRw(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
+		if err != nil {
+			return err
+		}
+
+		// Apply the policy-only parameters and the channel-wide flags.
+		channel.LocalChanCfg.ChannelStateBounds = localBounds
+		channel.RemoteChanCfg.ChannelStateBounds = remoteBounds
+		channel.ChannelFlags = flags
+
+		// The script/output-rendering parameters may only change through
+		// the epoch history so that historical states remain
+		// reconstructable. Record the change and re-derive the configs'
+		// CommitmentParams from the resulting current epoch, which makes
+		// the epoch history the single source of truth for them.
+		paramChange.WhenSome(func(pc EpochParamChange) {
+			channel.CommitChainEpochHistory.RecordParamChange(
+				pc.WhoSpecified, pc.Params, pc.LockInHeights,
+			)
+
+			hist := channel.CommitChainEpochHistory
+			channel.LocalChanCfg.CommitmentParams = hist.Current.Local
+			channel.RemoteChanCfg.CommitmentParams =
+				hist.Current.Remote
+		})
+
+		if err := putOpenChannel(chanBucket, channel); err != nil {
+			return err
+		}
+
+		updated = channel
+
+		return nil
+	}, func() {
+		updated = nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Mirror the persisted state into the in-memory channel.
+	c.LocalChanCfg.ChannelStateBounds = updated.LocalChanCfg.ChannelStateBounds
+	c.RemoteChanCfg.ChannelStateBounds =
+		updated.RemoteChanCfg.ChannelStateBounds
+	c.LocalChanCfg.CommitmentParams = updated.LocalChanCfg.CommitmentParams
+	c.RemoteChanCfg.CommitmentParams = updated.RemoteChanCfg.CommitmentParams
+	c.ChannelFlags = updated.ChannelFlags
+	c.CommitChainEpochHistory = updated.CommitChainEpochHistory
+
+	return nil
+}
