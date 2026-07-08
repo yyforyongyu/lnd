@@ -272,6 +272,13 @@ type openChannelTlvData struct {
 	// Note: if not set, it means either the channel has not been
 	// closed yet, or it was closed before this field was introduced.
 	closeConfirmationHeight tlv.OptionalRecordT[tlv.TlvType9, uint32]
+
+	// commitChainEpochHistory records the per-side history of the
+	// script/output-rendering commitment parameters (CSV and dust). It is
+	// only present once the channel has recorded at least one parameter
+	// change; when absent the history is defaulted at read time from the
+	// channel configs (see OpenChannel.amendTlvData).
+	commitChainEpochHistory tlv.OptionalRecordT[tlv.TlvType10, CommitChainEpochHistory] //nolint:ll
 }
 
 // encode serializes the openChannelTlvData to the given io.Writer.
@@ -299,6 +306,11 @@ func (c *openChannelTlvData) encode(w io.Writer) error {
 			tlvRecords = append(tlvRecords, h.Record())
 		},
 	)
+	c.commitChainEpochHistory.WhenSome(
+		func(h tlv.RecordT[tlv.TlvType10, CommitChainEpochHistory]) {
+			tlvRecords = append(tlvRecords, h.Record())
+		},
+	)
 
 	tlv.SortRecords(tlvRecords)
 
@@ -317,6 +329,7 @@ func (c *openChannelTlvData) decode(r io.Reader) error {
 	tapscriptRoot := c.tapscriptRoot.Zero()
 	blob := c.customBlob.Zero()
 	closeConfHeight := c.closeConfirmationHeight.Zero()
+	epochHistory := c.commitChainEpochHistory.Zero()
 
 	// Create the tlv stream.
 	tlvStream, err := tlv.NewStream(
@@ -329,6 +342,7 @@ func (c *openChannelTlvData) decode(r io.Reader) error {
 		blob.Record(),
 		c.confirmationHeight.Record(),
 		closeConfHeight.Record(),
+		epochHistory.Record(),
 	)
 	if err != nil {
 		return err
@@ -350,6 +364,9 @@ func (c *openChannelTlvData) decode(r io.Reader) error {
 	}
 	if _, ok := tlvs[closeConfHeight.TlvType()]; ok {
 		c.closeConfirmationHeight = tlv.SomeRecordT(closeConfHeight)
+	}
+	if _, ok := tlvs[epochHistory.TlvType()]; ok {
+		c.commitChainEpochHistory = tlv.SomeRecordT(epochHistory)
 	}
 
 	return nil
@@ -1051,6 +1068,16 @@ type OpenChannel struct {
 	// RemoteChanCfg is the channel configuration for the remote node.
 	RemoteChanCfg ChannelConfig
 
+	// CommitChainEpochHistory tracks, per side, the history of the
+	// script/output-rendering commitment parameters (CSV and dust) so that
+	// historical commitment and HTLC scripts can be reconstructed by their
+	// commitment height once dynamic commitments allow these parameters to
+	// change mid-channel. For channels that never renegotiate (and all
+	// channels persisted before this field existed) it is defaulted at read
+	// time to a single "epoch 0" per side derived from LocalChanCfg and
+	// RemoteChanCfg, and is only persisted once a change is recorded.
+	CommitChainEpochHistory CommitChainEpochHistory
+
 	// LocalCommitment is the current local commitment state for the local
 	// party. This is stored distinct from the state of the remote party
 	// as there are certain asymmetric parameters which affect the
@@ -1327,6 +1354,26 @@ func (c *OpenChannel) amendTlvData(auxData openChannelTlvData) {
 	auxData.closeConfirmationHeight.WhenSomeV(func(h uint32) {
 		c.CloseConfirmationHeight = fn.Some(h)
 	})
+
+	// The commit-chain epoch history is only persisted once a parameter
+	// change has been recorded. When absent (all channels persisted before
+	// this field existed, and freshly funded channels that have never
+	// renegotiated), synthesize a single "epoch 0" per side from the current
+	// channel configs, which covers all heights. This is a read-time default
+	// that avoids a destructive migration; the config reads are valid here
+	// because fetchChanInfo populates the channel configs before decoding the
+	// aux TLV data.
+	c.CommitChainEpochHistory = NewCommitChainEpochHistory(
+		lntypes.Dual[CommitmentParams]{
+			Local:  c.LocalChanCfg.CommitmentParams,
+			Remote: c.RemoteChanCfg.CommitmentParams,
+		},
+	)
+	auxData.commitChainEpochHistory.WhenSomeV(
+		func(h CommitChainEpochHistory) {
+			c.CommitChainEpochHistory = h
+		},
+	)
 }
 
 // extractTlvData creates a new openChannelTlvData from the given channel.
@@ -1370,7 +1417,68 @@ func (c *OpenChannel) extractTlvData() openChannelTlvData {
 		)
 	})
 
+	// Only persist the epoch history once it carries at least one closed
+	// epoch on either side. Until then the read-time default in amendTlvData
+	// reconstructs it from the channel configs, which keeps existing channels
+	// migration-free.
+	if len(c.CommitChainEpochHistory.Historical.Local) > 0 ||
+		len(c.CommitChainEpochHistory.Historical.Remote) > 0 {
+
+		auxData.commitChainEpochHistory = tlv.SomeRecordT(
+			tlv.NewRecordT[tlv.TlvType10](c.CommitChainEpochHistory),
+		)
+	}
+
 	return auxData
+}
+
+// CommitParamsForHeight returns the script/output-rendering commitment
+// parameters (CSV and dust) that were in effect for the given party's
+// commitment chain at the given commit height. It consults the channel's
+// per-side epoch history, falling back to the current parameters for heights
+// beyond all recorded epochs.
+func (c *OpenChannel) CommitParamsForHeight(party lntypes.ChannelParty,
+	height uint64) CommitmentParams {
+
+	c.RLock()
+	defer c.RUnlock()
+
+	return c.CommitChainEpochHistory.ParamsAt(party, height)
+}
+
+// PutCommitChainEpochHistory persists the given per-side commit-chain epoch
+// history for the channel, replacing any previously stored history. It is used
+// by the dynamic-commitments machinery to record a parameter change once it
+// locks in on each commitment chain.
+func (c *OpenChannel) PutCommitChainEpochHistory(
+	hist CommitChainEpochHistory) error {
+
+	c.Lock()
+	defer c.Unlock()
+
+	if err := kvdb.Update(c.Db.backend, func(tx kvdb.RwTx) error {
+		chanBucket, err := fetchChanBucketRw(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
+		if err != nil {
+			return err
+		}
+
+		channel.CommitChainEpochHistory = hist
+
+		return putOpenChannel(chanBucket, channel)
+	}, func() {}); err != nil {
+		return err
+	}
+
+	c.CommitChainEpochHistory = hist
+
+	return nil
 }
 
 // Refresh updates the in-memory channel state using the latest state observed
