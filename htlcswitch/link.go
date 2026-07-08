@@ -447,6 +447,13 @@ type channelLink struct {
 	// guarded on it being non-nil so non-dyn channels are unaffected.
 	updater *dyn.Updater
 
+	// dynPersister is the durable, channeldb-backed store for the
+	// accepted-proposal context of an in-flight dynamic-commitments
+	// negotiation. It is the same instance the updater persists through, and
+	// is consulted directly on reconnect (see handleDynReestablish). It is
+	// nil whenever updater is nil, so non-dyn channels never touch it.
+	dynPersister dyn.Persister
+
 	// dynProposalReqs carries locally-initiated dynamic-commitments
 	// proposal requests into the htlcManager event loop. It is only ever fed
 	// by InitDynProposal, which errors out when the feature is not enabled.
@@ -1119,6 +1126,17 @@ func (l *channelLink) syncChanStates(ctx context.Context) error {
 		if len(msgsToReSend) > 0 {
 			l.log.Infof("sending %v updates to synchronize the "+
 				"state", len(msgsToReSend))
+		}
+
+		// Apply the dynamic-commitments reconnect rules to any
+		// negotiation that was in flight across the disconnect. This is
+		// a no-op for non-dyn channels and never affects the normal
+		// commitment retransmission handled above.
+		if err := l.handleDynReestablish(
+			ctx, remoteChanSyncMsg,
+		); err != nil {
+
+			return err
 		}
 
 		// If we have any messages to retransmit, we'll do so

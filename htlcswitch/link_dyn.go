@@ -242,19 +242,18 @@ func (v *dynChannelView) HasPendingSpliceOrRBF() bool {
 }
 
 // newDynUpdater constructs the dyn.Updater for this link, wiring the concrete
-// adapters over the live link/channel/peer objects. The Persister is the
-// in-memory reference implementation for now; durable channeldb persistence and
-// the reconnect logic land in the reestablish branch.
+// adapters over the live link/channel/peer objects. It uses a durable,
+// channeldb-backed Persister so accepted-proposal context survives a restart
+// and drives the reconnect resume/forget decisions in handleDynReestablish. The
+// same Persister instance is cached on the link so the reestablish path can
+// consult it directly.
 func (l *channelLink) newDynUpdater() *dyn.Updater {
+	l.dynPersister = newDBDynPersister(l.channel.State().Db)
+
 	return dyn.NewUpdater(dyn.Config{
-		Signer:      l.cfg.DynAckSigner,
-		ChannelView: &dynChannelView{link: l},
-
-		// TODO(dyn): branch 8 replaces this with a channeldb-backed
-		// Persister so accepted-proposal context survives a restart and
-		// drives reconnect resume/forget decisions.
-		Persister: dyn.NewMemPersister(),
-
+		Signer:           l.cfg.DynAckSigner,
+		ChannelView:      &dynChannelView{link: l},
+		Persister:        l.dynPersister,
 		Sender:           &dynMessageSender{peer: l.cfg.Peer},
 		Clock:            clock.NewDefaultClock(),
 		MaxLocalCSVDelay: l.dynMaxCSVDelay(),
@@ -730,6 +729,123 @@ func (l *channelLink) applyDynParams(h dyn.CommitHandoff,
 	return l.channel.ApplyChannelParams(
 		h.Proposer, h.Params, l.dynMaxCSVDelay(), lockIn,
 	)
+}
+
+// handleDynReestablish applies the dynamic-commitments reconnect rules on
+// channel reestablishment. It consults the durable accepted-proposal context
+// and, per the locked design decisions, either forgets a stale negotiation,
+// retains a responder acceptance and waits, retransmits a persisted
+// dyn_commit_sig, or resumes a locked-in update. It is driven from
+// syncChanStates with the peer's channel_reestablish so the peer's next
+// expected commitment height is known.
+//
+// Non-dyn channels never mount an updater or a persister, so this is a
+// no-op for them and normal commitment_signed / revoke_and_ack
+// retransmission (driven by ProcessChanSyncMsg in syncChanStates) is
+// entirely unaffected.
+//
+// NOTE: MUST be called from syncChanStates before the link starts its normal
+// event loop.
+func (l *channelLink) handleDynReestablish(ctx context.Context,
+	remoteSync *lnwire.ChannelReestablish) error {
+
+	// The feature is inert for this channel: nothing was ever persisted, so
+	// there is nothing to resume or forget.
+	if l.updater == nil || l.dynPersister == nil {
+		return nil
+	}
+
+	chanID := l.ChanID()
+
+	persisted, err := l.dynPersister.FetchAcceptedProposal(ctx, chanID)
+	if err != nil {
+		return fmt.Errorf("fetch dyn proposal for ChannelID(%v): %w",
+			chanID, err)
+	}
+
+	// No negotiation was in flight across the disconnect; nothing to do.
+	if persisted.IsNone() {
+		return nil
+	}
+	p := persisted.UnsafeFromSome()
+
+	reest := dyn.ReestablishState{
+		PeerNextCommitHeight: remoteSync.NextLocalCommitHeight,
+	}
+	action := dyn.Decide(p, reest)
+
+	l.log.Infof("Dyn reconnect for ChannelID(%v): proposer=%v, height=%d, "+
+		"action=%s", chanID, p.Proposer, p.NextCommitHeight, action)
+
+	switch action {
+	// Abort and forget the negotiation: delete the persisted context and
+	// return the state machine to Idle so a fresh quiescence session can
+	// start a new negotiation later. No dyn message is retransmitted.
+	case dyn.ReconnectForget:
+		if err := l.updater.Reset(ctx); err != nil {
+			return fmt.Errorf("reset dyn updater for "+
+				"ChannelID(%v): %w", chanID, err)
+		}
+
+	// We are the responder and sent our dyn_ack before the disconnect.
+	// Retain the acceptance by rehydrating the updater to AckSent so that a
+	// subsequent dyn_commit_sig (or a superseding proposal, or a timeout) is
+	// handled correctly. We do not proactively resend the dyn_ack.
+	case dyn.ReconnectRetainAndWait:
+		if err := l.updater.Restore(ctx, p); err != nil {
+			return fmt.Errorf("restore dyn updater for "+
+				"ChannelID(%v): %w", chanID, err)
+		}
+
+	// We are the proposer and a dyn_commit_sig was persisted that the peer
+	// has not yet processed. Rehydrate the machine and retransmit the
+	// bundled dyn_commit_sig before any other update.
+	//
+	// TODO(dyn): the retransmission itself and the commitment-number
+	// accounting depend on the branch-6 commitment dance that produces and
+	// persists dyn_commit_sig, which is not complete on the branch this is
+	// stacked on. The concrete remaining sub-steps are:
+	//
+	//  1. Reconstruct the bundled lnwire.DynCommit from the persisted
+	//     context (p.Proposal, p.AckSig, p.CommitSig) and send it via
+	//     l.cfg.Peer before the normal msgsToReSend loop in syncChanStates,
+	//     so it precedes any other update even though quiescence has ended.
+	//  2. Count the sent dyn_commit_sig as the commitment_signed for the
+	//     responder's next_commitment_number so ProcessChanSyncMsg does not
+	//     also retransmit a bare commitment_signed for the same height, and
+	//     so the revocation accounting (next_revocation_number) lines up.
+	//  3. Apply the params at lock-in and clear the persisted context once
+	//     both chains have locked in (see handleDynCommitHandoff).
+	//
+	// Until the dance lands, p.CommitSig is always None in the live flow, so
+	// Decide never returns this action in production; it is exercised only by
+	// unit tests that inject a CommitSig. We still rehydrate the machine so
+	// the structure is complete and correct.
+	case dyn.ReconnectRetransmitCommitSig:
+		if err := l.updater.Restore(ctx, p); err != nil {
+			return fmt.Errorf("restore dyn updater for "+
+				"ChannelID(%v): %w", chanID, err)
+		}
+
+		l.log.Warnf("Dyn dyn_commit_sig retransmission for "+
+			"ChannelID(%v) is not yet wired to the commitment "+
+			"dance; skipping resend", chanID)
+
+	// The dyn_commit_sig has already been processed by the peer (or received
+	// by us as the responder): the update is locked in and the remainder of
+	// the dance is covered by normal commitment retransmission. Rehydrate the
+	// machine to its committing state.
+	//
+	// TODO(dyn): clearing the persisted context and applying the params at
+	// lock-in depend on the branch-6 dance (see handleDynCommitHandoff).
+	case dyn.ReconnectResume:
+		if err := l.updater.Restore(ctx, p); err != nil {
+			return fmt.Errorf("restore dyn updater for "+
+				"ChannelID(%v): %w", chanID, err)
+		}
+	}
+
+	return nil
 }
 
 // dynFailf fails the link on a dynamic-commitments protocol violation. As with
