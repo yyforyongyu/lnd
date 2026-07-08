@@ -185,3 +185,39 @@ func (c *channelNotifier) SubscribeChans(ctx context.Context,
 // A compile-time constraint to ensure channelNotifier implements
 // chanbackup.ChannelNotifier.
 var _ chanbackup.ChannelNotifier = (*channelNotifier)(nil)
+
+// updateChannelBackup re-emits a static channel backup for the given channel
+// through the sub-swapper, so the on-disk SCB reflects the channel's current
+// configuration. It is wired into the ChannelLink and invoked on the
+// dynamic-commitments apply path: once a parameter update locks in and the
+// channel's persisted config changes, a fresh backup is issued via the same
+// manual-update path used elsewhere (e.g. at shutdown).
+//
+// No SCB format change is required for params-only dynamic commitments: the
+// backup drives DLP, which only recovers the CSV-independent to_remote output,
+// so a to_self_delay/dust change never alters what the backup must encode (see
+// chanbackup.NewSingle and dyncomms-recovery-design.md §2). Errors are logged
+// rather than returned, as a failed backup refresh must not disrupt the
+// commitment dance that triggered it.
+func (s *server) updateChannelBackup(channel *channeldb.OpenChannel) {
+	// Fetch the latest known addresses for the peer so the re-emitted
+	// Single carries current connection info. On error we log and proceed
+	// with whatever addresses were returned, mirroring the open-channel
+	// backup path.
+	_, addrs, err := s.addrSource.AddrsForNode(
+		context.Background(), channel.IdentityPub,
+	)
+	if err != nil {
+		srvrLog.Errorf("Unable to fetch addrs for %x when re-emitting "+
+			"channel backup: %v",
+			channel.IdentityPub.SerializeCompressed(), err)
+	}
+
+	single := chanbackup.NewSingle(channel, addrs)
+	if err := s.chanSubSwapper.ManualUpdate(
+		[]chanbackup.Single{single},
+	); err != nil {
+		srvrLog.Warnf("Unable to re-emit channel backup for "+
+			"ChannelPoint(%v): %v", channel.FundingOutpoint, err)
+	}
+}

@@ -4586,13 +4586,14 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 
 			return s.defaultOnionActorOpts
 		},
-		ActorSystem:     s.actorSystem,
-		WitnessBeacon:   s.witnessBeacon,
-		Invoices:        s.invoices,
-		ChannelNotifier: s.channelNotifier,
-		HtlcNotifier:    s.htlcNotifier,
-		TowerClient:     towerClient,
-		DisconnectPeer:  s.DisconnectPeer,
+		ActorSystem:         s.actorSystem,
+		WitnessBeacon:       s.witnessBeacon,
+		Invoices:            s.invoices,
+		ChannelNotifier:     s.channelNotifier,
+		NotifyChannelBackup: s.updateChannelBackup,
+		HtlcNotifier:        s.htlcNotifier,
+		TowerClient:         towerClient,
+		DisconnectPeer:      s.DisconnectPeer,
 		GenNodeAnnouncement: func(...netann.NodeAnnModifier) (
 			lnwire.NodeAnnouncement1, error) {
 

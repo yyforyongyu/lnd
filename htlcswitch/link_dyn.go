@@ -764,12 +764,31 @@ func (l *channelLink) maybeFinishDynDance(ctx context.Context) {
 //
 // lockIn gives, per commitment chain, the last height the outgoing (pre-update)
 // params applied to; it is only consulted for epoch-affecting changes.
+//
+// On success it re-emits a fresh static channel backup so the on-disk SCB
+// reflects the channel's now-current configuration. No SCB format change is
+// needed for params-only dynamic commitments (the backup drives DLP, which only
+// recovers the CSV-independent to_remote output); we simply re-issue the latest
+// backup. See dyncomms-recovery-design.md §2 and the note in chanbackup.
+// NewSingle. This re-emission is on the dyn path only, so non-dyn channels are
+// unaffected.
 func (l *channelLink) applyDynParams(h dyn.CommitHandoff,
 	lockIn lntypes.Dual[uint64]) error {
 
-	return l.channel.ApplyChannelParams(
+	if err := l.channel.ApplyChannelParams(
 		h.Proposer, h.Params, l.dynMaxCSVDelay(), lockIn,
-	)
+	); err != nil {
+		return err
+	}
+
+	// The channel's persisted configuration now reflects the agreed params.
+	// Trigger a backup re-emission through the same path used elsewhere for
+	// channel-state changes so the exported/subscribed SCB is up to date.
+	if l.cfg.NotifyChannelBackup != nil {
+		l.cfg.NotifyChannelBackup(l.channel.ChannelState())
+	}
+
+	return nil
 }
 
 // handleDynReestablish applies the dynamic-commitments reconnect rules on

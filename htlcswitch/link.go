@@ -261,6 +261,15 @@ type ChannelLinkConfig struct {
 	// a channel's state has been updated.
 	NotifyChannelUpdate func(*channeldb.OpenChannel)
 
+	// NotifyChannelBackup requests a fresh static channel backup for the
+	// given channel so the on-disk SCB reflects the channel's current
+	// configuration. It is invoked only on the dynamic-commitments apply
+	// path (see applyDynParams), after a parameter update has locked in.
+	// Non-dynamic channels never reach that path, so the normal backup flow
+	// (driven by channel open/close events) is entirely unaffected. It may
+	// be nil, in which case the re-emission is simply skipped.
+	NotifyChannelBackup func(*channeldb.OpenChannel)
+
 	// HtlcNotifier is an instance of a htlcNotifier which we will pipe htlc
 	// events through.
 	HtlcNotifier htlcNotifier
