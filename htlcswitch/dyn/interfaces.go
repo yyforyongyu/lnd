@@ -117,6 +117,21 @@ type AcceptedProposal struct {
 	// responder once it signs, and on the proposer once it verifies the
 	// received dyn_ack.
 	AckSig fn.Option[lnwire.Sig]
+
+	// CommitSig is the proposer's dyn_commit_sig commitment signature. Its
+	// presence is the persisted flag that a dyn_commit_sig has crossed the
+	// wire before a disconnect: the proposer sets it when it sends the
+	// bundled dyn_commit_sig, and the responder sets it when it receives and
+	// persists one before sending its revoke_and_ack. A negotiation with a
+	// persisted CommitSig is retained and retransmitted across a reconnect;
+	// one without is forgotten (see Decide).
+	//
+	// TODO(dyn): the commitment dance that actually produces and consumes
+	// dyn_commit_sig is not complete on the branch this is stacked on, so
+	// nothing sets this in the live flow yet. The reconnect decision logic
+	// and the durable persistence handle it now so the retransmission path
+	// is ready to be wired once the dance lands.
+	CommitSig fn.Option[lnwire.Sig]
 }
 
 // Params returns the canonical channel-params view of the accepted proposal.

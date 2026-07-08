@@ -708,6 +708,14 @@ func (u *Updater) send(ctx context.Context, t *Transition,
 }
 
 // persist writes the current in-flight session as an AcceptedProposal.
+//
+// TODO(dyn): the persisted context does not yet carry a CommitSig. It is set
+// only once the commitment dance sends (proposer) or receives (responder) the
+// bundled dyn_commit_sig, and that dance is not complete on the branch this is
+// stacked on. Until then every persisted context has a None CommitSig, so a
+// disconnect always resolves to "forget" or "retain-and-wait" (never
+// "retransmit"); the retransmit path is exercised by unit tests that inject a
+// CommitSig directly.
 func (u *Updater) persist(ctx context.Context) error {
 	return u.cfg.Persister.StoreAcceptedProposal(
 		ctx, u.chanID, AcceptedProposal{
@@ -715,6 +723,7 @@ func (u *Updater) persist(ctx context.Context) error {
 			Proposal:         u.proposal,
 			NextCommitHeight: u.nextHeight,
 			AckSig:           u.ackSig,
+			CommitSig:        fn.None[lnwire.Sig](),
 		},
 	)
 }
