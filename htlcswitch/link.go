@@ -449,7 +449,7 @@ type channelLink struct {
 
 	// dynProposalReqs carries locally-initiated dynamic-commitments
 	// proposal requests into the htlcManager event loop. It is only ever fed
-	// by initDynProposal, which errors out when the feature is not enabled.
+	// by InitDynProposal, which errors out when the feature is not enabled.
 	dynProposalReqs chan dynProposalReq
 
 	// pendingDynProposal holds a locally-requested proposal that is waiting

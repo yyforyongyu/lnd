@@ -405,7 +405,7 @@ func TestChannelLinkDynProposer(t *testing.T) {
 	bobHeightBefore := bob.State().LocalCommitment.CommitHeight
 
 	// Request a local proposal. This drives quiescence first.
-	errCh := coreLink.initDynProposal(dyn.ProposalRequest{Params: params})
+	errCh := coreLink.InitDynProposal(dyn.ProposalRequest{Params: params})
 
 	// The link should send its Stfu as the quiescence initiator.
 	msg := recvLinkMsg(t, msgs)
@@ -567,7 +567,7 @@ func TestChannelLinkDynDisabled(t *testing.T) {
 
 	// A local proposal request is rejected.
 	select {
-	case err := <-coreLink.initDynProposal(dyn.ProposalRequest{}):
+	case err := <-coreLink.InitDynProposal(dyn.ProposalRequest{}):
 		require.ErrorIs(t, err, errDynDisabled)
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for proposal result")
