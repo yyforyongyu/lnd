@@ -2612,6 +2612,151 @@ var updateChannelPolicyCommand = cli.Command{
 	Action: actionDecorator(updateChannelPolicy),
 }
 
+var updateChannelParamsCommand = cli.Command{
+	Name:     "updatechannelparams",
+	Category: "Channels",
+	Usage:    "Renegotiate the parameters of an existing channel.",
+	Description: `
+	Initiate a dynamic-commitments negotiation that renegotiates the mutable
+	("static") parameters of an existing channel without an on-chain close,
+	by committing a new channel state. The channel identity, age, and graph
+	continuity are preserved.
+
+	The target channel is identified by its channel point (funding_txid and
+	output_index), which can be found in the channel_point values of the
+	listchannels output. At least one parameter flag must be set. The
+	command streams the status of the negotiation as it progresses
+	(initialized, quiescing, negotiating, executing, succeeded, failed).
+
+	NOTE: This is an experimental feature. It is disabled by default and must
+	be explicitly enabled in the node's configuration; otherwise the node
+	returns an "experimental feature disabled" error.`,
+	ArgsUsage: "funding_txid output_index",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "funding_txid",
+			Usage: "the txid of the channel's funding transaction",
+		},
+		cli.IntFlag{
+			Name: "output_index",
+			Usage: "the output index for the funding output of " +
+				"the funding transaction",
+		},
+		cli.StringFlag{
+			Name: "chan_point",
+			Usage: "(optional) the channel point. If set, " +
+				"funding_txid and output_index flags and " +
+				"positional arguments will be ignored",
+		},
+		cli.Uint64Flag{
+			Name: "dust_limit",
+			Usage: "the new dust limit of the initiator's " +
+				"commitment transaction, in satoshis",
+		},
+		cli.Uint64Flag{
+			Name: "max_value_in_flight",
+			Usage: "the new maximum amount of coins in " +
+				"millisatoshis that can be pending in the " +
+				"channel",
+		},
+		cli.Uint64Flag{
+			Name: "channel_reserve",
+			Usage: "the new channel reserve in satoshis the " +
+				"initiator requires the counterparty to keep " +
+				"at all times",
+		},
+		cli.Uint64Flag{
+			Name: "min_htlc",
+			Usage: "the new smallest HTLC in millisatoshis the " +
+				"initiator will accept",
+		},
+		cli.UintFlag{
+			Name: "csv_delay",
+			Usage: "the new to_self_delay (in blocks) for the " +
+				"pay-to-self output of both commitment " +
+				"transactions",
+		},
+		cli.UintFlag{
+			Name: "max_accepted_htlcs",
+			Usage: "the new total number of incoming HTLCs the " +
+				"initiator will accept",
+		},
+		cli.UintFlag{
+			Name: "channel_flags",
+			Usage: "the new channel-wide announcement-intent " +
+				"flags to set on the channel",
+		},
+	},
+	Action: actionDecorator(updateChannelParams),
+}
+
+func updateChannelParams(ctx *cli.Context) error {
+	ctxc := getContext()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	// Show command help if no arguments and flags were provided.
+	if ctx.NArg() == 0 && ctx.NumFlags() == 0 {
+		return cli.ShowCommandHelp(ctx, "updatechannelparams")
+	}
+
+	channelPoint, err := parseChannelPoint(ctx)
+	if err != nil {
+		return err
+	}
+
+	req := &lnrpc.UpdateChannelParamsRequest{
+		ChannelPoint: channelPoint,
+	}
+
+	// Only populate the parameters the user explicitly set; an unset
+	// parameter is left unchanged by the negotiation.
+	if ctx.IsSet("dust_limit") {
+		v := ctx.Uint64("dust_limit")
+		req.DustLimit = &v
+	}
+	if ctx.IsSet("max_value_in_flight") {
+		v := ctx.Uint64("max_value_in_flight")
+		req.MaxValueInFlight = &v
+	}
+	if ctx.IsSet("channel_reserve") {
+		v := ctx.Uint64("channel_reserve")
+		req.ChannelReserve = &v
+	}
+	if ctx.IsSet("min_htlc") {
+		v := ctx.Uint64("min_htlc")
+		req.MinHtlc = &v
+	}
+	if ctx.IsSet("csv_delay") {
+		v := uint32(ctx.Uint("csv_delay"))
+		req.CsvDelay = &v
+	}
+	if ctx.IsSet("max_accepted_htlcs") {
+		v := uint32(ctx.Uint("max_accepted_htlcs"))
+		req.MaxAcceptedHtlcs = &v
+	}
+	if ctx.IsSet("channel_flags") {
+		v := uint32(ctx.Uint("channel_flags"))
+		req.ChannelFlags = &v
+	}
+
+	stream, err := client.UpdateChannelParams(ctxc, req)
+	if err != nil {
+		return err
+	}
+
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		} else if err != nil {
+			return err
+		}
+
+		printRespJSON(resp)
+	}
+}
+
 func parseChanPoint(s string) (*lnrpc.ChannelPoint, error) {
 	split := strings.Split(s, ":")
 	if len(split) != 2 || len(split[0]) == 0 || len(split[1]) == 0 {
