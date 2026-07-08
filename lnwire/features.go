@@ -325,6 +325,18 @@ const (
 	// that the node can forward onion messages.
 	OnionMessagesOptional = 39
 
+	// DynamicCommitmentsRequired is a required feature bit that signals
+	// that the node supports the dynamic commitments protocol, which allows
+	// re-negotiating channel parameters without a new funding transaction.
+	// It depends on option_quiesce.
+	DynamicCommitmentsRequired = 64
+
+	// DynamicCommitmentsOptional is an optional feature bit that signals
+	// that the node supports the dynamic commitments protocol, which allows
+	// re-negotiating channel parameters without a new funding transaction.
+	// It depends on option_quiesce.
+	DynamicCommitmentsOptional = 65
+
 	// MaxBolt11Feature is the maximum feature bit value allowed in bolt 11
 	// invoices.
 	//
@@ -405,6 +417,8 @@ var Features = map[FeatureBit]string{
 	RbfCoopCloseRequiredStaging:          "rbf-coop-close-x",
 	OnionMessagesOptional:                "onion-messages",
 	OnionMessagesRequired:                "onion-messages",
+	DynamicCommitmentsOptional:           "dynamic-commitments",
+	DynamicCommitmentsRequired:           "dynamic-commitments",
 }
 
 // RawFeatureVector represents a set of feature bits as defined in BOLT-09.  A
