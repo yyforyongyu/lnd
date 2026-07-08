@@ -51,6 +51,7 @@ import (
 	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/htlcswitch/dyn"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
@@ -573,6 +574,10 @@ func MainRPCServerPermissions() map[string][]bakery.Op {
 		"/lnrpc.Lightning/ListAliases": {{
 			Entity: "offchain",
 			Action: "read",
+		}},
+		"/lnrpc.Lightning/UpdateChannelParams": {{
+			Entity: "offchain",
+			Action: "write",
 		}},
 	}
 }
@@ -4811,6 +4816,223 @@ func (r *rpcServer) LookupHtlcResolution(
 		Settled:  info.Settled,
 		Offchain: info.Offchain,
 	}, nil
+}
+
+// UpdateChannelParams initiates a dynamic-commitments negotiation that
+// renegotiates the mutable parameters of an existing channel, streaming status
+// updates back to the client.
+//
+// NOTE: This is an experimental feature. It is gated off by default and is not
+// production-usable: unless it is explicitly enabled via the dev/experimental
+// config it returns an Unimplemented error, and the option_dynamic_commitments
+// feature bit is never advertised. It exists so the dynamic-commitments flow is
+// itest-drivable while the remaining safety work lands.
+func (r *rpcServer) UpdateChannelParams(in *lnrpc.UpdateChannelParamsRequest,
+	updateStream lnrpc.Lightning_UpdateChannelParamsServer) error {
+
+	// The feature is not production-usable yet, so it stays behind an
+	// experimental/dev gate that is off by default.
+	if !r.cfg.Dev.GetDynCommitEnabled() {
+		return status.Error(codes.Unimplemented, "UpdateChannelParams "+
+			"is an experimental feature that is disabled by "+
+			"default")
+	}
+
+	ctx := updateStream.Context()
+
+	// Map the request to the canonical channel-params representation,
+	// rejecting a request that changes no parameter or carries an
+	// out-of-range value.
+	params, err := rpcUpdateChannelParams(in)
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	// Resolve the target channel point to the link that manages the channel
+	// in the switch.
+	if in.GetChannelPoint() == nil {
+		return status.Error(
+			codes.InvalidArgument, "channel_point is required",
+		)
+	}
+	txid, err := lnrpc.GetChanPointFundingTxid(in.GetChannelPoint())
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "unable to get "+
+			"funding txid: %v", err)
+	}
+	chanPoint := wire.NewOutPoint(txid, in.GetChannelPoint().OutputIndex)
+	chanID := lnwire.NewChanIDFromOutPoint(*chanPoint)
+
+	link, err := r.server.htlcSwitch.GetLink(chanID)
+	if err != nil {
+		return status.Errorf(codes.NotFound, "channel %v is not "+
+			"active in the switch: %v", chanPoint, err)
+	}
+
+	rpcsLog.Infof("[updatechannelparams] ChannelPoint(%v): %v", chanPoint,
+		params)
+
+	// The request is well-formed and the channel is active, so the
+	// negotiation is initialized.
+	err = updateStream.Send(&lnrpc.UpdateChannelParamsResponse{
+		Status: "initialized",
+	})
+	if err != nil {
+		return err
+	}
+
+	// Kick off the negotiation. Under the hood this drives the channel to
+	// quiescence (with us as the quiescence initiator) and, once quiescent,
+	// sends the dyn_propose, so report the channel as quiescing while we
+	// wait for that handshake to complete.
+	err = updateStream.Send(&lnrpc.UpdateChannelParamsResponse{
+		Status: "quiescing",
+	})
+	if err != nil {
+		return err
+	}
+
+	startErr := link.InitDynProposal(dyn.ProposalRequest{Params: params})
+
+	// Wait for the negotiation to be kicked off (dyn_propose sent) or to
+	// fail to start (a precondition, quiescence, or validation failure),
+	// honoring client cancellation.
+	select {
+	case err := <-startErr:
+		if err != nil {
+			// Surface the failure honestly on the stream, then
+			// return the mapped structured error.
+			sendErr := updateStream.Send(
+				&lnrpc.UpdateChannelParamsResponse{
+					Status: "failed",
+					Error:  err.Error(),
+				},
+			)
+			if sendErr != nil {
+				return sendErr
+			}
+
+			return dynProposalStatusErr(err)
+		}
+
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// The dyn_propose is on the wire, so the negotiation is now in progress.
+	err = updateStream.Send(&lnrpc.UpdateChannelParamsResponse{
+		Status: "negotiating",
+	})
+	if err != nil {
+		return err
+	}
+
+	// TODO(dyn): the terminal negotiation outcome (executing/succeeded, or a
+	// peer reject/timeout after the proposal is sent) is not observable from
+	// here yet. Branch 6's commitment dance carries a TODO(dyn), and the
+	// link exposes no negotiation-status subscription until the reestablish
+	// branch. Until then we hold the stream open so the client sees that the
+	// update is in flight, and end it when the client cancels, rather than
+	// fabricate an executing/succeeded status we cannot verify.
+	<-ctx.Done()
+
+	return ctx.Err()
+}
+
+// rpcUpdateChannelParams maps an UpdateChannelParamsRequest onto the canonical
+// lnwallet.ChannelParams. It returns an error if the request changes no
+// parameter, or if a value does not fit the internal representation.
+func rpcUpdateChannelParams(
+	in *lnrpc.UpdateChannelParamsRequest) (lnwallet.ChannelParams, error) {
+
+	var params lnwallet.ChannelParams
+
+	if in.DustLimit != nil {
+		params.DustLimit = fn.Some(btcutil.Amount(in.GetDustLimit()))
+	}
+	if in.MaxValueInFlight != nil {
+		params.MaxValueInFlight = fn.Some(
+			lnwire.MilliSatoshi(in.GetMaxValueInFlight()),
+		)
+	}
+	if in.ChannelReserve != nil {
+		params.ChannelReserve = fn.Some(
+			btcutil.Amount(in.GetChannelReserve()),
+		)
+	}
+	if in.MinHtlc != nil {
+		params.HtlcMinimum = fn.Some(
+			lnwire.MilliSatoshi(in.GetMinHtlc()),
+		)
+	}
+	if in.CsvDelay != nil {
+		if in.GetCsvDelay() > math.MaxUint16 {
+			return params, fmt.Errorf("csv_delay %d exceeds "+
+				"maximum %d", in.GetCsvDelay(), math.MaxUint16)
+		}
+		params.CsvDelay = fn.Some(uint16(in.GetCsvDelay()))
+	}
+	if in.MaxAcceptedHtlcs != nil {
+		if in.GetMaxAcceptedHtlcs() > math.MaxUint16 {
+			return params, fmt.Errorf("max_accepted_htlcs %d "+
+				"exceeds maximum %d", in.GetMaxAcceptedHtlcs(),
+				math.MaxUint16)
+		}
+		params.MaxAcceptedHtlcs = fn.Some(
+			uint16(in.GetMaxAcceptedHtlcs()),
+		)
+	}
+	if in.ChannelFlags != nil {
+		if in.GetChannelFlags() > math.MaxUint8 {
+			return params, fmt.Errorf("channel_flags %d exceeds "+
+				"maximum %d", in.GetChannelFlags(),
+				math.MaxUint8)
+		}
+		params.ChannelFlags = fn.Some(
+			lnwire.FundingFlag(in.GetChannelFlags()),
+		)
+	}
+
+	if params.IsEmpty() {
+		return params, fmt.Errorf("at least one channel parameter " +
+			"must be set")
+	}
+
+	return params, nil
+}
+
+// dynProposalStatusErr maps an error returned while starting a
+// dynamic-commitments proposal onto an appropriate gRPC status error, so the
+// caller can distinguish invalid requests from ineligible channels.
+func dynProposalStatusErr(err error) error {
+	switch {
+	// A parameter validation failure is the caller's fault.
+	case errors.Is(err, lnwallet.ErrDynParamsNoChange),
+		errors.Is(err, lnwallet.ErrDynDustLimitTooSmall),
+		errors.Is(err, lnwallet.ErrDynDustLimitTooLarge),
+		errors.Is(err, lnwallet.ErrDynReserveBelowDust),
+		errors.Is(err, lnwallet.ErrDynReserveTooLarge),
+		errors.Is(err, lnwallet.ErrDynCsvDelayTooLarge),
+		errors.Is(err, lnwallet.ErrDynMaxAcceptedTooLarge),
+		errors.Is(err, lnwallet.ErrDynHtlcMinTooLarge):
+
+		return status.Error(codes.InvalidArgument, err.Error())
+
+	// The channel is not currently eligible for a dynamic update.
+	case errors.Is(err, dyn.ErrChannelNotReady),
+		errors.Is(err, dyn.ErrNotQuiescent),
+		errors.Is(err, dyn.ErrNotQuiescenceInitiator),
+		errors.Is(err, dyn.ErrHTLCsActive),
+		errors.Is(err, dyn.ErrPendingUpdates),
+		errors.Is(err, dyn.ErrPendingShutdown),
+		errors.Is(err, dyn.ErrPendingSpliceOrRBF),
+		errors.Is(err, dyn.ErrNegotiationInProgress):
+
+		return status.Error(codes.FailedPrecondition, err.Error())
+
+	default:
+		return status.Error(codes.Aborted, err.Error())
+	}
 }
 
 // ListChannels returns a description of all the open channels that this node
