@@ -19,6 +19,7 @@ import (
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/graph/db/models"
+	"github.com/lightningnetwork/lnd/htlcswitch/dyn"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/input"
@@ -312,6 +313,23 @@ type ChannelLinkConfig struct {
 	// etc.) must finish their operations under this timeout value,
 	// otherwise the node will disconnect.
 	QuiescenceTimeout time.Duration
+
+	// DynAckSigner produces and verifies dyn_ack signatures for the dynamic
+	// commitments protocol. It is optional: when nil (or when quiescence is
+	// disabled) the link does not mount a dyn.Updater and the dynamic
+	// commitments feature is inert for this channel. Non-dyn channels are
+	// therefore byte-for-byte unaffected by this branch.
+	//
+	// NOTE: the production adapter is constructed at the point the feature
+	// is advertised/gated on (the RPC branch). This branch defines the seam
+	// and the concrete adapter (see newDynAckSigner) so the link path is
+	// complete and unit-testable ahead of activation.
+	DynAckSigner dyn.Signer
+
+	// MaxLocalCSVDelay is the maximum to_self_delay we will accept in a
+	// dynamic-commitments proposal. It bounds the CSV validation the mounted
+	// dyn.Updater performs. If zero, defaultMaxLinkCSVDelay is used.
+	MaxLocalCSVDelay uint16
 }
 
 // channelLink is the service which drives a channel's commitment update
@@ -423,6 +441,22 @@ type channelLink struct {
 	// the result.
 	quiescenceReqs chan StfuReq
 
+	// updater is the dynamic-commitments negotiation state machine mounted
+	// on this link. It is nil unless the dynamic commitments feature is
+	// enabled for this channel (see NewChannelLink). All dyn code paths are
+	// guarded on it being non-nil so non-dyn channels are unaffected.
+	updater *dyn.Updater
+
+	// dynProposalReqs carries locally-initiated dynamic-commitments
+	// proposal requests into the htlcManager event loop. It is only ever fed
+	// by initDynProposal, which errors out when the feature is not enabled.
+	dynProposalReqs chan dynProposalReq
+
+	// pendingDynProposal holds a locally-requested proposal that is waiting
+	// for the channel to reach quiescence before it can be initiated. It is
+	// only ever accessed from the htlcManager event loop.
+	pendingDynProposal fn.Option[dynProposalReq]
+
 	// cg is a helper that encapsulates a wait group and quit channel and
 	// allows contexts that either block or cancel on those depending on
 	// the use case.
@@ -521,7 +555,7 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		chan fn.Req[fn.Unit, fn.Result[lntypes.ChannelParty]], 1,
 	)
 
-	return &channelLink{
+	l := &channelLink{
 		cfg:                 cfg,
 		channel:             channel,
 		hodlMap:             make(map[models.CircuitKey]hodlHtlc),
@@ -532,8 +566,20 @@ func NewChannelLink(cfg ChannelLinkConfig,
 		incomingCommitHooks: newHookMap(),
 		quiescer:            qsm,
 		quiescenceReqs:      quiescenceReqs,
+		dynProposalReqs:     make(chan dynProposalReq, 1),
 		cg:                  fn.NewContextGuard(),
 	}
+
+	// Mount the dynamic-commitments negotiation state machine only when the
+	// feature is enabled for this channel: quiescence must be available
+	// (dyn depends on it) and a dyn_ack signer must be provided. When either
+	// is missing the updater stays nil and every dyn code path is skipped,
+	// so the link behaves identically to before this branch.
+	if !cfg.DisallowQuiescence && cfg.DynAckSigner != nil {
+		l.updater = l.newDynUpdater()
+	}
+
+	return l
 }
 
 // A compile time check to ensure channelLink implements the ChannelLink
@@ -1450,6 +1496,12 @@ func (l *channelLink) htlcManager(ctx context.Context) {
 					"req: %v", err)
 			}
 
+		// A locally-initiated dynamic-commitments proposal was
+		// requested. We drive quiescence first and initiate the
+		// negotiation once the channel is quiescent.
+		case dReq := <-l.dynProposalReqs:
+			l.handleDynProposalReq(ctx, dReq)
+
 		case <-l.cg.Done():
 			return
 		}
@@ -1852,10 +1904,22 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 		err = l.processRemoteUpdateFee(msg)
 
 	case *lnwire.Stfu:
-		err = l.handleStfu(msg)
+		err = l.handleStfu(ctx, msg)
 		if err != nil {
 			l.stfuFailf("handleStfu: %v", err)
 		}
+
+	case *lnwire.DynPropose:
+		err = l.handleDynMessage(ctx, msg)
+
+	case *lnwire.DynAck:
+		err = l.handleDynMessage(ctx, msg)
+
+	case *lnwire.DynReject:
+		err = l.handleDynMessage(ctx, msg)
+
+	case *lnwire.DynCommit:
+		err = l.handleDynMessage(ctx, msg)
 
 	// In the case where we receive a warning message from our peer, just
 	// log it and move on. We choose not to disconnect from our peer,
@@ -1879,7 +1943,8 @@ func (l *channelLink) handleUpstreamMsg(ctx context.Context,
 
 // handleStfu implements the top-level logic for handling the Stfu message from
 // our peer.
-func (l *channelLink) handleStfu(stfu *lnwire.Stfu) error {
+func (l *channelLink) handleStfu(ctx context.Context,
+	stfu *lnwire.Stfu) error {
 	if !l.noDanglingUpdates(lntypes.Remote) {
 		return ErrPendingRemoteUpdates
 	}
@@ -1890,8 +1955,14 @@ func (l *channelLink) handleStfu(stfu *lnwire.Stfu) error {
 
 	// If we can immediately send an Stfu response back, we will.
 	if l.noDanglingUpdates(lntypes.Local) {
-		return l.quiescer.SendOwedStfu()
+		if err := l.quiescer.SendOwedStfu(); err != nil {
+			return err
+		}
 	}
+
+	// Reaching quiescence may be the trigger a locally-requested dynamic
+	// commitments proposal was waiting on, so give it a chance to start.
+	l.maybeStartDynNegotiation(ctx)
 
 	return nil
 }
