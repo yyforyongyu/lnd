@@ -10104,9 +10104,11 @@ func TestCreateHtlcRetribution(t *testing.T) {
 	}
 
 	// Create the htlc retribution.
+	theirDelay := uint32(aliceChannel.channelState.RemoteChanCfg.CsvDelay)
 	hr, err := createHtlcRetribution(
 		aliceChannel.channelState, keyRing, commitHash,
-		dummyPrivate, leaseExpiry, htlc, fn.None[CommitAuxLeaves](),
+		dummyPrivate, leaseExpiry, theirDelay, htlc,
+		fn.None[CommitAuxLeaves](),
 	)
 	// Expect no error.
 	require.NoError(t, err)
@@ -10307,10 +10309,13 @@ func TestCreateBreachRetribution(t *testing.T) {
 				tx = nil
 			}
 
+			theirDelay := uint32(
+				aliceChannel.channelState.RemoteChanCfg.CsvDelay,
+			)
 			br, our, their, err := createBreachRetribution(
 				tc.revocationLog, tx,
 				aliceChannel.channelState, keyRing,
-				dummyPrivate, leaseExpiry,
+				dummyPrivate, leaseExpiry, theirDelay,
 				fn.None[CommitAuxLeaves](),
 			)
 
@@ -10367,9 +10372,12 @@ func TestCreateBreachRetributionLegacy(t *testing.T) {
 	}
 
 	// Create the breach retribution using the legacy format.
+	theirDelay := uint32(aliceChannel.channelState.RemoteChanCfg.CsvDelay)
+	dustLimit := aliceChannel.channelState.RemoteChanCfg.DustLimit
 	br, ourAmt, theirAmt, err := createBreachRetributionLegacy(
 		&revokedLog, aliceChannel.channelState, keyRing,
 		dummyPrivate, ourScript, theirScript, leaseExpiry,
+		theirDelay, dustLimit,
 	)
 	require.NoError(t, err)
 
@@ -10522,6 +10530,176 @@ func testNewBreachRetribution(t *testing.T, chanType channeldb.ChannelType) {
 		fn.Some[AuxContractResolver](&MockAuxContractResolver{}),
 	)
 	require.ErrorIs(t, err, channeldb.ErrLogEntryNotFound)
+}
+
+// TestNewBreachRetributionHistoricalCSV verifies that, once the commit-chain
+// epoch history records a mid-channel CSV change, NewBreachRetribution
+// reconstructs a revoked remote commitment with the CSV that was in effect
+// at that revoked height rather than the current one. This is the
+// funds-safety crux of dynamic commitments: a justice transaction built
+// with the wrong CSV would produce an unspendable witness script.
+func TestNewBreachRetributionHistoricalCSV(t *testing.T) {
+	t.Parallel()
+
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.ZeroHtlcTxFeeBit,
+	)
+	require.NoError(t, err)
+
+	chanState := aliceChannel.channelState
+	breachHeight := uint32(101)
+
+	// The CSV imposed on the revoked remote commitment's to_local branch is
+	// the remote party's configured CSV (the epoch-0 default). Pick a
+	// distinct new value to stand in for a dyncomms CSV change.
+	oldCSV := chanState.RemoteChanCfg.CsvDelay
+	newCSV := oldCSV + 140
+
+	// Advance the channel through two state transitions so that we have
+	// revocation logs (and revocation-store preimages) for remote heights 0
+	// and 1.
+	require.NoError(t, ForceStateTransition(aliceChannel, bobChannel))
+	require.NoError(t, ForceStateTransition(aliceChannel, bobChannel))
+
+	// Record a CSV change specified by the local party. A to_self_delay a
+	// party declares is imposed on its counterparty's commitment, so this
+	// updates the remote commitment chain's CSV. We lock the outgoing epoch
+	// in at remote height 0, so height 0 keeps the old CSV while height 1
+	// (and beyond) uses the new one.
+	hist := chanState.CommitChainEpochHistory
+	hist.RecordParamChange(
+		lntypes.Local,
+		channeldb.CommitmentParams{
+			DustLimit: chanState.LocalChanCfg.DustLimit,
+			CsvDelay:  newCSV,
+		},
+		lntypes.Dual[uint64]{Local: 0, Remote: 0},
+	)
+	chanState.CommitChainEpochHistory = hist
+
+	// Sanity check the epoch lookup itself before exercising the breach
+	// path.
+	require.EqualValues(
+		t, oldCSV,
+		chanState.CommitParamsForHeight(lntypes.Remote, 0).CsvDelay,
+	)
+	require.EqualValues(
+		t, newCSV,
+		chanState.CommitParamsForHeight(lntypes.Remote, 1).CsvDelay,
+	)
+
+	// assertBreachCSV builds a breach retribution for the given revoked
+	// state and asserts the reconstructed remote (revoked) to_local output
+	// carries the expected CSV, both in the RemoteDelay field and embedded
+	// in the actual witness script.
+	assertBreachCSV := func(stateNum uint64, wantCSV uint16) {
+		t.Helper()
+
+		br, err := NewBreachRetribution(
+			chanState, stateNum, breachHeight, nil,
+			fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
+			fn.Some[AuxContractResolver](&MockAuxContractResolver{}),
+		)
+		require.NoError(t, err)
+
+		// The delay recorded on the retribution must be the historical
+		// CSV.
+		require.EqualValues(t, wantCSV, br.RemoteDelay)
+
+		// The remote (revoked) output must have a sign descriptor whose
+		// witness script embeds the historical CSV. We independently
+		// rebuild the expected to_local script with the wanted CSV and
+		// compare the raw witness scripts byte-for-byte.
+		require.NotNil(t, br.RemoteOutputSignDesc)
+
+		expectedScript, err := CommitScriptToSelf(
+			chanState.ChanType, !chanState.IsInitiator,
+			br.KeyRing.ToLocalKey, br.KeyRing.RevocationKey,
+			uint32(wantCSV), 0, input.NoneTapLeaf(),
+		)
+		require.NoError(t, err)
+
+		expectedWitness, err := expectedScript.WitnessScriptForPath(
+			input.ScriptPathRevocation,
+		)
+		require.NoError(t, err)
+
+		require.Equal(
+			t, expectedWitness,
+			br.RemoteOutputSignDesc.WitnessScript,
+		)
+	}
+
+	// A breach of the pre-change revoked state must reconstruct with the OLD
+	// CSV...
+	assertBreachCSV(0, oldCSV)
+
+	// ...while a breach of the post-change revoked state must use the NEW
+	// CSV.
+	assertBreachCSV(1, newCSV)
+}
+
+// TestNewBreachRetributionHistoricalDust verifies that NewBreachRetribution
+// gates the revoked output sweep on the dust limit that was in effect at
+// the revoked height, so a later dyncomms dust-limit increase cannot strand
+// an output that legitimately existed on the revoked commitment.
+func TestNewBreachRetributionHistoricalDust(t *testing.T) {
+	t.Parallel()
+
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.ZeroHtlcTxFeeBit,
+	)
+	require.NoError(t, err)
+
+	chanState := aliceChannel.channelState
+	breachHeight := uint32(101)
+
+	// Advance once so that we have a revocation log at remote height 0.
+	require.NoError(t, ForceStateTransition(aliceChannel, bobChannel))
+
+	oldDust := chanState.RemoteChanCfg.DustLimit
+
+	// Simulate a dyncomms change in which the remote raised its own dust
+	// limit above its balance on the commitment (~5 BTC in a balanced test
+	// channel), while the revoked height 0 keeps the original low dust
+	// limit. A party's declared dust limit governs its own commitment, so
+	// the remote is the specifier here.
+	hugeDust := btcutil.Amount(9 * btcutil.SatoshiPerBitcoin)
+	hist := chanState.CommitChainEpochHistory
+	hist.RecordParamChange(
+		lntypes.Remote,
+		channeldb.CommitmentParams{
+			DustLimit: hugeDust,
+			CsvDelay:  chanState.LocalChanCfg.CsvDelay,
+		},
+		lntypes.Dual[uint64]{Local: 0, Remote: 0},
+	)
+	chanState.CommitChainEpochHistory = hist
+
+	// The revoked height must retain the original (low) dust limit, while
+	// the current parameters carry the raised one that would otherwise
+	// strand the output.
+	require.Equal(
+		t, oldDust,
+		chanState.CommitParamsForHeight(lntypes.Remote, 0).DustLimit,
+	)
+	require.Equal(
+		t, hugeDust,
+		chanState.CommitParamsForHeight(lntypes.Remote, 1).DustLimit,
+	)
+
+	// Breaching the revoked height-0 state must still build the sweep
+	// descriptor for the remote's output, because at that height the output
+	// was well above the (low) dust limit. Using the live raised dust limit
+	// would incorrectly skip it and strand the funds.
+	br, err := NewBreachRetribution(
+		chanState, 0, breachHeight, nil,
+		fn.Some[AuxLeafStore](&MockAuxLeafStore{}),
+		fn.Some[AuxContractResolver](&MockAuxContractResolver{}),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, br.RemoteOutputSignDesc)
+	require.NotNil(t, br.LocalOutputSignDesc)
 }
 
 // TestExtractPayDescs asserts that `extractPayDescs` can correctly turn a

@@ -974,6 +974,9 @@ func CreateCommitTx(chanType channeldb.ChannelType,
 	localAuxLeaf := fn.MapOption(func(l CommitAuxLeaves) input.AuxTapLeaf {
 		return l.LocalAuxLeaf
 	})(auxLeaves)
+	// PR 1.3 audit (dyncomms historical params): current-state site. This
+	// builds the commitment being signed now, so the live config CSV is the
+	// correct value; no epoch lookup needed.
 	toLocalScript, err := CommitScriptToSelf(
 		chanType, initiator, keyRing.ToLocalKey, keyRing.RevocationKey,
 		uint32(localChanCfg.CsvDelay), leaseExpiry,
@@ -1339,8 +1342,17 @@ func findOutputIndexesFromRemote(revocationPreimage *chainhash.Hash,
 
 	// Since it's remote commitment chain, we'd used the mirrored values.
 	//
-	// We use the remote's channel config for the csv delay.
-	theirDelay := uint32(chanState.RemoteChanCfg.CsvDelay)
+	// We use the CSV delay that governed the remote commitment chain at the
+	// height of the commitment we are locating outputs for, looked up from
+	// the per-side epoch history, rather than the live config. Once dynamic
+	// commitments can change CSV mid-channel, the live value may differ from
+	// the one this (about-to-be-revoked) commitment was built with, which
+	// would make the reconstructed to_local script fail to match and persist
+	// a wrong output index into the revocation log. For channels without
+	// epoch history this returns the current RemoteChanCfg CSV unchanged.
+	theirDelay := uint32(chanState.CommitParamsForHeight(
+		lntypes.Remote, chanCommit.CommitHeight,
+	).CsvDelay)
 
 	// If we are the initiator of this channel, then it's be false from the
 	// remote's PoV.
