@@ -582,6 +582,19 @@ service Lightning {
     */
     rpc LookupHtlcResolution (LookupHtlcResolutionRequest)
         returns (LookupHtlcResolutionResponse);
+
+    /* lncli: `updatechannelparams`
+    UpdateChannelParams initiates a dynamic-commitments negotiation that
+    renegotiates the "static" channel parameters of an existing channel without
+    an on-chain close, by committing a new channel state. It takes a request
+    specifying which param(s) to update along with the target channel, and
+    returns a stream of status updates. Under the hood the channel is first
+    driven to quiescence, the params are negotiated with the peer, the update is
+    executed, and quiescence is exited automatically. This is an experimental
+    feature that is disabled by default and must be enabled explicitly.
+    */
+    rpc UpdateChannelParams (UpdateChannelParamsRequest)
+        returns (stream UpdateChannelParamsResponse);
 }
 
 message LookupHtlcResolutionRequest {
@@ -596,6 +609,52 @@ message LookupHtlcResolutionResponse {
 
     // Offchain indicates whether the htlc was resolved off-chain or on-chain.
     bool offchain = 2;
+}
+
+// UpdateChannelParamsRequest defines a request to renegotiate the mutable
+// ("dynamic") parameters of an existing channel. All fields except the channel
+// point are optional; an unset field leaves the corresponding parameter
+// unchanged. At least one optional field must be set for the request to be
+// valid.
+message UpdateChannelParamsRequest {
+    // The channel whose parameters should be updated.
+    ChannelPoint channel_point = 1;
+
+    // The dust limit of the initiator's commitment transaction, in satoshis.
+    optional uint64 dust_limit = 2;
+
+    // The maximum amount of coins in millisatoshis that can be pending in this
+    // channel.
+    optional uint64 max_value_in_flight = 3;
+
+    // The minimum amount of satoshis the initiator requires the counterparty to
+    // keep as a channel reserve at all times.
+    optional uint64 channel_reserve = 4;
+
+    // The smallest HTLC in millisatoshis that the initiator will accept.
+    optional uint64 min_htlc = 5;
+
+    // The number of blocks to use for the relative time lock in the pay-to-self
+    // output of both commitment transactions (to_self_delay).
+    optional uint32 csv_delay = 6;
+
+    // The total number of incoming HTLC's that the initiator will accept.
+    optional uint32 max_accepted_htlcs = 7;
+
+    // The channel-wide announcement-intent flags to set on the channel.
+    optional uint32 channel_flags = 8;
+}
+
+// UpdateChannelParamsResponse is a streamed status update for an in-progress
+// dynamic-commitments negotiation.
+message UpdateChannelParamsResponse {
+    // The current status of the negotiation, e.g. "initialized", "quiescing",
+    // "negotiating", "executing", "succeeded", or "failed".
+    string status = 1;
+
+    // An error message describing why the negotiation failed. It is only
+    // populated when the status indicates a failure.
+    string error = 2;
 }
 
 message SubscribeCustomMessagesRequest {

@@ -564,6 +564,119 @@
         ]
       }
     },
+    "/v1/channels/params/{channel_point.funding_txid_str}/{channel_point.output_index}": {
+      "post": {
+        "summary": "lncli: `updatechannelparams`\nUpdateChannelParams initiates a dynamic-commitments negotiation that\nrenegotiates the \"static\" channel parameters of an existing channel without\nan on-chain close, by committing a new channel state. It takes a request\nspecifying which param(s) to update along with the target channel, and\nreturns a stream of status updates. Under the hood the channel is first\ndriven to quiescence, the params are negotiated with the peer, the update is\nexecuted, and quiescence is exited automatically. This is an experimental\nfeature that is disabled by default and must be enabled explicitly.",
+        "operationId": "Lightning_UpdateChannelParams",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/lnrpcUpdateChannelParamsResponse"
+                },
+                "error": {
+                  "$ref": "#/definitions/rpcStatus"
+                }
+              },
+              "title": "Stream result of lnrpcUpdateChannelParamsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "channel_point.funding_txid_str",
+            "description": "Hex-encoded string representing the byte-reversed hash of the funding\ntransaction.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "channel_point.output_index",
+            "description": "The index of the output of the funding transaction",
+            "in": "path",
+            "required": true,
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "name": "channel_point.funding_txid_bytes",
+            "description": "Txid of the funding transaction. When using REST, this field must be\nencoded as base64.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "byte"
+          },
+          {
+            "name": "dust_limit",
+            "description": "The dust limit of the initiator's commitment transaction, in satoshis.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "uint64"
+          },
+          {
+            "name": "max_value_in_flight",
+            "description": "The maximum amount of coins in millisatoshis that can be pending in this\nchannel.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "uint64"
+          },
+          {
+            "name": "channel_reserve",
+            "description": "The minimum amount of satoshis the initiator requires the counterparty to\nkeep as a channel reserve at all times.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "uint64"
+          },
+          {
+            "name": "min_htlc",
+            "description": "The smallest HTLC in millisatoshis that the initiator will accept.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "uint64"
+          },
+          {
+            "name": "csv_delay",
+            "description": "The number of blocks to use for the relative time lock in the pay-to-self\noutput of both commitment transactions (to_self_delay).",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "name": "max_accepted_htlcs",
+            "description": "The total number of incoming HTLC's that the initiator will accept.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "name": "channel_flags",
+            "description": "The channel-wide announcement-intent flags to set on the channel.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int64"
+          }
+        ],
+        "tags": [
+          "Lightning"
+        ]
+      }
+    },
     "/v1/channels/pending": {
       "get": {
         "summary": "lncli: `pendingchannels`\nPendingChannels returns a list of all the channels that are currently\nconsidered \"pending\". A channel is pending if it has finished the funding\nworkflow and is waiting for confirmations for the funding txn, or is in the\nprocess of closure, either initiated cooperatively or non-cooperatively.",
@@ -7816,6 +7929,20 @@
           "description": "The index of the last item in the set of returned transactions. This can be\nused to seek backwards, pagination style."
         }
       }
+    },
+    "lnrpcUpdateChannelParamsResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "The current status of the negotiation, e.g. \"initialized\", \"quiescing\",\n\"negotiating\", \"executing\", \"succeeded\", or \"failed\"."
+        },
+        "error": {
+          "type": "string",
+          "description": "An error message describing why the negotiation failed. It is only\npopulated when the status indicates a failure."
+        }
+      },
+      "description": "UpdateChannelParamsResponse is a streamed status update for an in-progress\ndynamic-commitments negotiation."
     },
     "lnrpcUpdateFailure": {
       "type": "string",
