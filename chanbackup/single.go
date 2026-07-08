@@ -294,6 +294,17 @@ func NewSingle(channel *channeldb.OpenChannel,
 		}
 	}
 
+	// NOTE(dyn): the local/remote configs captured here reflect the
+	// channel's current parameters, so re-emitting a Single after a
+	// dynamic-commitments params update automatically produces a backup
+	// with the new values. No SCB format change is needed for params-only
+	// dynamic commitments: the SCB drives DLP, and DLP only recovers the
+	// to_remote output, whose script is CSV-independent (anchor to_remote
+	// hardcodes CSV=1; legacy is a plain P2WKH). So a to_self_delay/dust
+	// change never affects what the backup must encode. Epoch history for
+	// historical breach reconstruction lives in local on-disk channel
+	// state, deliberately not in this portable, latest-only artifact. See
+	// dyncomms-recovery-design.md §2.
 	single := Single{
 		IsInitiator:      channel.IsInitiator,
 		ChainHash:        channel.ChainHash,
