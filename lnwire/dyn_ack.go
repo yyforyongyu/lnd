@@ -3,35 +3,20 @@ package lnwire
 import (
 	"bytes"
 	"io"
-
-	"github.com/lightningnetwork/lnd/tlv"
-)
-
-const (
-	// DALocalMusig2Pubnonce is the TLV type number that identifies the
-	// musig2 public nonce that we need to verify the commitment transaction
-	// signature.
-	DALocalMusig2Pubnonce tlv.Type = 14
 )
 
 // DynAck is the message used to accept the parameters of a dynamic commitment
-// negotiation. Additional optional parameters will need to be present depending
-// on the details of the dynamic commitment upgrade.
+// negotiation. It carries the responder's acceptance signature over the
+// proposed parameters (see dyn_ack_sig.go).
 type DynAck struct {
 	// ChanID is the ChannelID of the channel that is currently undergoing
-	// a dynamic commitment negotiation
+	// a dynamic commitment negotiation.
 	ChanID ChannelID
 
 	// Sig is a signature that acknowledges and approves the parameters
-	// that were requested in the DynPropose
+	// that were requested in the DynPropose. See DynAckSigDigest for the
+	// exact signed payload.
 	Sig Sig
-
-	// LocalNonce is an optional field that is transmitted when accepting
-	// a dynamic commitment upgrade to Taproot Channels. This nonce will be
-	// used to verify the first commitment transaction signature. This will
-	// only be populated if the DynPropose we are responding to specifies
-	// taproot channels in the ChannelType field.
-	LocalNonce tlv.OptionalRecordT[tlv.TlvType14, Musig2Nonce]
 
 	// ExtraData is the set of data that was appended to this message to
 	// fill out the full maximum transport message size. These fields can
@@ -47,6 +32,10 @@ var _ Message = (*DynAck)(nil)
 // interface.
 var _ SizeableMessage = (*DynAck)(nil)
 
+// A compile time check to ensure DynAck implements the lnwire.LinkUpdater
+// interface.
+var _ LinkUpdater = (*DynAck)(nil)
+
 // Encode serializes the target DynAck into the passed io.Writer. Serialization
 // will observe the rules defined by the passed protocol version.
 //
@@ -60,27 +49,7 @@ func (da *DynAck) Encode(w *bytes.Buffer, _ uint32) error {
 		return err
 	}
 
-	// Create extra data records.
-	producers, err := da.ExtraData.RecordProducers()
-	if err != nil {
-		return err
-	}
-
-	// Append the known records.
-	da.LocalNonce.WhenSome(
-		func(rec tlv.RecordT[tlv.TlvType14, Musig2Nonce]) {
-			producers = append(producers, &rec)
-		},
-	)
-
-	// Encode all records.
-	var tlvData ExtraOpaqueData
-	err = tlvData.PackRecords(producers...)
-	if err != nil {
-		return err
-	}
-
-	return WriteBytes(w, tlvData)
+	return WriteBytes(w, da.ExtraData)
 }
 
 // Decode deserializes the serialized DynAck stored in the passed io.Reader into
@@ -90,32 +59,16 @@ func (da *DynAck) Encode(w *bytes.Buffer, _ uint32) error {
 // This is a part of the lnwire.Message interface.
 func (da *DynAck) Decode(r io.Reader, _ uint32) error {
 	// Parse out main message.
-	if err := ReadElements(r, &da.ChanID, &da.Sig); err != nil {
+	if err := ReadElements(
+		r, &da.ChanID, &da.Sig, &da.ExtraData,
+	); err != nil {
 		return err
 	}
 
-	// Parse out TLV records.
-	var tlvRecords ExtraOpaqueData
-	if err := ReadElement(r, &tlvRecords); err != nil {
-		return err
+	// This is required to pass the fuzz test round trip equality check.
+	if len(da.ExtraData) == 0 {
+		da.ExtraData = nil
 	}
-
-	// Parse all known records and extra data.
-	nonce := da.LocalNonce.Zero()
-	knownRecords, extraData, err := ParseAndExtractExtraData(
-		tlvRecords, &nonce,
-	)
-	if err != nil {
-		return err
-	}
-
-	// Check the results of the TLV Stream decoding and appropriately set
-	// message fields.
-	if _, ok := knownRecords[da.LocalNonce.TlvType()]; ok {
-		da.LocalNonce = tlv.SomeRecordT(nonce)
-	}
-
-	da.ExtraData = extraData
 
 	return nil
 }
@@ -133,4 +86,12 @@ func (da *DynAck) MsgType() MessageType {
 // This is part of the lnwire.SizeableMessage interface.
 func (da *DynAck) SerializedSize() (uint32, error) {
 	return MessageSerializedSize(da)
+}
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of peer.LinkUpdater interface.
+func (da *DynAck) TargetChanID() ChannelID {
+	return da.ChanID
 }

@@ -9,7 +9,9 @@ import (
 )
 
 // DynPropose is a message that is sent during a dynamic commitments negotiation
-// process. It is sent by both parties to propose new channel parameters.
+// process. It is sent by the proposer to propose a new set of channel
+// parameters. The TLV type numbers follow the dyn_propose_tlvs stream defined
+// in the dynamic commitments extension BOLT.
 type DynPropose struct {
 	// ChanID identifies the channel whose parameters we are trying to
 	// re-negotiate.
@@ -23,29 +25,30 @@ type DynPropose struct {
 
 	// MaxValueInFlight, if not nil, proposes a change to the
 	// max_htlc_value_in_flight_msat limit of the sender.
-	MaxValueInFlight tlv.OptionalRecordT[tlv.TlvType2, MilliSatoshi]
+	MaxValueInFlight tlv.OptionalRecordT[tlv.TlvType1, MilliSatoshi]
 
 	// HtlcMinimum, if not nil, proposes a change to the htlc_minimum_msat
 	// floor of the sender.
-	HtlcMinimum tlv.OptionalRecordT[tlv.TlvType4, MilliSatoshi]
+	HtlcMinimum tlv.OptionalRecordT[tlv.TlvType2, MilliSatoshi]
 
 	// ChannelReserve, if not nil, proposes a change to the
 	// channel_reserve_satoshis requirement of the recipient.
 	ChannelReserve tlv.OptionalRecordT[
-		tlv.TlvType6, tlv.BigSizeT[btcutil.Amount],
+		tlv.TlvType3, tlv.BigSizeT[btcutil.Amount],
 	]
 
 	// CsvDelay, if not nil, proposes a change to the to_self_delay
 	// requirement of the recipient.
-	CsvDelay tlv.OptionalRecordT[tlv.TlvType8, uint16]
+	CsvDelay tlv.OptionalRecordT[tlv.TlvType4, uint16]
 
 	// MaxAcceptedHTLCs, if not nil, proposes a change to the
 	// max_accepted_htlcs limit of the sender.
-	MaxAcceptedHTLCs tlv.OptionalRecordT[tlv.TlvType10, uint16]
+	MaxAcceptedHTLCs tlv.OptionalRecordT[tlv.TlvType5, uint16]
 
-	// ChannelType, if not nil, proposes a change to the channel_type
-	// parameter.
-	ChannelType tlv.OptionalRecordT[tlv.TlvType12, ChannelType]
+	// ChannelFlags, if not nil, proposes a change to the channel_flags
+	// announcement intent for the channel. It uses the same bits as the
+	// channel_flags field of open_channel.
+	ChannelFlags tlv.OptionalRecordT[tlv.TlvType6, FundingFlag]
 
 	// ExtraData is the set of data that was appended to this message to
 	// fill out the full maximum transport message size. These fields can
@@ -64,6 +67,10 @@ var _ Message = (*DynPropose)(nil)
 // A compile time check to ensure DynPropose implements the
 // lnwire.SizeableMessage interface.
 var _ SizeableMessage = (*DynPropose)(nil)
+
+// A compile time check to ensure DynPropose implements the lnwire.LinkUpdater
+// interface.
+var _ LinkUpdater = (*DynPropose)(nil)
 
 // Encode serializes the target DynPropose into the passed io.Writer.
 // Serialization will observe the rules defined by the passed protocol version.
@@ -112,16 +119,16 @@ func (dp *DynPropose) Decode(r io.Reader, _ uint32) error {
 
 	// Prepare receiving buffers to be filled by TLV extraction.
 	var dustLimit tlv.RecordT[tlv.TlvType0, tlv.BigSizeT[btcutil.Amount]]
-	var maxValue tlv.RecordT[tlv.TlvType2, MilliSatoshi]
-	var htlcMin tlv.RecordT[tlv.TlvType4, MilliSatoshi]
-	var reserve tlv.RecordT[tlv.TlvType6, tlv.BigSizeT[btcutil.Amount]]
+	var maxValue tlv.RecordT[tlv.TlvType1, MilliSatoshi]
+	var htlcMin tlv.RecordT[tlv.TlvType2, MilliSatoshi]
+	var reserve tlv.RecordT[tlv.TlvType3, tlv.BigSizeT[btcutil.Amount]]
 	csvDelay := dp.CsvDelay.Zero()
 	maxHtlcs := dp.MaxAcceptedHTLCs.Zero()
-	chanType := dp.ChannelType.Zero()
+	chanFlags := dp.ChannelFlags.Zero()
 
 	knownRecords, extraData, err := ParseAndExtractExtraData(
 		tlvRecords, &dustLimit, &maxValue, &htlcMin, &reserve,
-		&csvDelay, &maxHtlcs, &chanType,
+		&csvDelay, &maxHtlcs, &chanFlags,
 	)
 	if err != nil {
 		return err
@@ -153,8 +160,8 @@ func (dp *DynPropose) Decode(r io.Reader, _ uint32) error {
 		dp.MaxAcceptedHTLCs = tlv.SomeRecordT(maxHtlcs)
 	}
 
-	if _, ok := knownRecords[dp.ChannelType.TlvType()]; ok {
-		dp.ChannelType = tlv.SomeRecordT(chanType)
+	if _, ok := knownRecords[dp.ChannelFlags.TlvType()]; ok {
+		dp.ChannelFlags = tlv.SomeRecordT(chanFlags)
 	}
 
 	dp.ExtraData = extraData
@@ -175,6 +182,14 @@ func (dp *DynPropose) MsgType() MessageType {
 // This is part of the lnwire.SizeableMessage interface.
 func (dp *DynPropose) SerializedSize() (uint32, error) {
 	return MessageSerializedSize(dp)
+}
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of peer.LinkUpdater interface.
+func (dp *DynPropose) TargetChanID() ChannelID {
+	return dp.ChanID
 }
 
 // SerializeTlvData takes just the TLV data of DynPropose (which covers all of
@@ -203,35 +218,35 @@ func dynProposeRecords(dp *DynPropose) []tlv.RecordProducer {
 		},
 	)
 	dp.MaxValueInFlight.WhenSome(
-		func(mvif tlv.RecordT[tlv.TlvType2, MilliSatoshi]) {
+		func(mvif tlv.RecordT[tlv.TlvType1, MilliSatoshi]) {
 			recordProducers = append(recordProducers, &mvif)
 		},
 	)
 	dp.HtlcMinimum.WhenSome(
-		func(hm tlv.RecordT[tlv.TlvType4, MilliSatoshi]) {
+		func(hm tlv.RecordT[tlv.TlvType2, MilliSatoshi]) {
 			recordProducers = append(recordProducers, &hm)
 		},
 	)
 	dp.ChannelReserve.WhenSome(
-		func(reserve tlv.RecordT[tlv.TlvType6,
+		func(reserve tlv.RecordT[tlv.TlvType3,
 			tlv.BigSizeT[btcutil.Amount]]) {
 
 			recordProducers = append(recordProducers, &reserve)
 		},
 	)
 	dp.CsvDelay.WhenSome(
-		func(wait tlv.RecordT[tlv.TlvType8, uint16]) {
+		func(wait tlv.RecordT[tlv.TlvType4, uint16]) {
 			recordProducers = append(recordProducers, &wait)
 		},
 	)
 	dp.MaxAcceptedHTLCs.WhenSome(
-		func(mah tlv.RecordT[tlv.TlvType10, uint16]) {
+		func(mah tlv.RecordT[tlv.TlvType5, uint16]) {
 			recordProducers = append(recordProducers, &mah)
 		},
 	)
-	dp.ChannelType.WhenSome(
-		func(ty tlv.RecordT[tlv.TlvType12, ChannelType]) {
-			recordProducers = append(recordProducers, &ty)
+	dp.ChannelFlags.WhenSome(
+		func(cf tlv.RecordT[tlv.TlvType6, FundingFlag]) {
+			recordProducers = append(recordProducers, &cf)
 		},
 	)
 
