@@ -396,6 +396,9 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 	// Set up a heap for htlc auto-releases.
 	autoReleaseHeap := &queue.PriorityQueue{}
 
+	// Set up a heap for failed HTLC finalization retries.
+	finalizationRetryHeap := &queue.PriorityQueue{}
+
 	for {
 		// If there is something to release, set up a release tick
 		// channel.
@@ -403,6 +406,20 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 		if autoReleaseHeap.Len() > 0 {
 			head := autoReleaseHeap.Top().(*htlcReleaseEvent)
 			nextReleaseTick = i.tickAt(head.releaseTime)
+		}
+
+		// If there is something to retry, set up a retry tick channel.
+		var nextFinalizationRetryTick <-chan time.Time
+		if finalizationRetryHeap.Len() > 0 {
+			retryItem := finalizationRetryHeap.Top()
+			head, ok := retryItem.(*htlcFinalizationRetryEvent)
+			if !ok {
+				log.Errorf("Unexpected retry event")
+				finalizationRetryHeap.Pop()
+				continue
+			}
+
+			nextFinalizationRetryTick = i.tickAt(head.retryTime)
 		}
 
 		select {
@@ -430,6 +447,14 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 			// channel is force closed.
 			autoReleaseHeap.Push(event)
 
+		// A failed final HTLC outcome needs to be retried later.
+		case event := <-i.htlcFinalizationRetryChan:
+			log.Debugf("Scheduling finalization retry for htlc: "+
+				"key=%v, settled=%v at %v",
+				event.key, event.settled, event.retryTime)
+
+			finalizationRetryHeap.Push(event)
+
 		// The htlc at the top of the heap needs to be auto-released.
 		case <-nextReleaseTick:
 			event := autoReleaseHeap.Pop().(*htlcReleaseEvent)
@@ -439,6 +464,18 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 			if err != nil {
 				log.Errorf("HTLC timer: %v", err)
 			}
+
+		// The htlc at the top of the retry heap needs to be retried.
+		case <-nextFinalizationRetryTick:
+			retryItem := finalizationRetryHeap.Pop()
+			event, ok := retryItem.(*htlcFinalizationRetryEvent)
+			if !ok {
+				log.Errorf("Unexpected retry event")
+				continue
+			}
+
+			i.wg.Add(1)
+			go i.retryHtlcFinalization(event)
 
 		case <-i.quit:
 			return
@@ -1261,7 +1298,54 @@ func (i *InvoiceRegistry) clearHtlcFinalizationRetry(
 	i.Unlock()
 }
 
-// enqueueHtlcFinalizationRetry queues a finalization retry.
+// retryHtlcFinalization retries a failed HTLC finalization from the registry
+// event loop.
+func (i *InvoiceRegistry) retryHtlcFinalization(
+	event *htlcFinalizationRetryEvent) {
+
+	defer i.wg.Done()
+	i.retryHtlcFinalizationOnce(event)
+}
+
+// retryHtlcFinalizationAfterDelay retries a failed HTLC finalization when the
+// event loop queue is full.
+func (i *InvoiceRegistry) retryHtlcFinalizationAfterDelay(
+	event *htlcFinalizationRetryEvent) {
+
+	defer i.wg.Done()
+
+	select {
+	case <-i.tickAt(event.retryTime):
+		i.retryHtlcFinalizationOnce(event)
+
+	case <-i.quit:
+		i.clearHtlcFinalizationRetry(event.key)
+	}
+}
+
+// retryHtlcFinalizationOnce applies one retry attempt and reschedules the HTLC
+// if the finalization still fails.
+func (i *InvoiceRegistry) retryHtlcFinalizationOnce(
+	event *htlcFinalizationRetryEvent) {
+
+	err := i.notifyExitHopHtlcFinalized(
+		context.Background(), event.key, event.settled,
+	)
+	if err == nil {
+		i.clearHtlcFinalizationRetry(event.key)
+		return
+	}
+
+	event.attempts++
+	delay := htlcFinalizationRetryDelay(event.attempts)
+	logHtlcFinalizationRetryError(event, delay, err)
+
+	event.retryTime = i.cfg.Clock.Now().Add(delay)
+	i.enqueueHtlcFinalizationRetry(event)
+}
+
+// enqueueHtlcFinalizationRetry queues a finalization retry with a direct
+// delayed fallback if the event loop queue is full.
 func (i *InvoiceRegistry) enqueueHtlcFinalizationRetry(
 	event *htlcFinalizationRetryEvent) {
 
@@ -1270,8 +1354,11 @@ func (i *InvoiceRegistry) enqueueHtlcFinalizationRetry(
 	case <-i.quit:
 		i.clearHtlcFinalizationRetry(event.key)
 	default:
-		log.Warnf("Finalization retry queue full for %v", event.key)
-		i.clearHtlcFinalizationRetry(event.key)
+		log.Warnf("Finalization retry queue full for %v; scheduling "+
+			"direct retry",
+			event.key)
+		i.wg.Add(1)
+		go i.retryHtlcFinalizationAfterDelay(event)
 	}
 }
 
@@ -1287,6 +1374,31 @@ func htlcFinalizationRetryDelay(attempts uint32) time.Duration {
 	}
 
 	return delay
+}
+
+// logHtlcFinalizationRetryError logs retry failures with escalation to avoid
+// repeatedly emitting errors for a persistent database issue.
+func logHtlcFinalizationRetryError(event *htlcFinalizationRetryEvent,
+	delay time.Duration, err error) {
+
+	switch {
+	case event.attempts == htlcFinalizationRetryEscalateAttempts:
+		fallthrough
+	case event.attempts > htlcFinalizationRetryEscalateAttempts &&
+		event.attempts%htlcFinalizationRetryLogInterval == 0:
+
+		log.Errorf("Unable to finalize exit-hop htlc %v after %d "+
+			"attempts: %v; retrying in %v", event.key,
+			event.attempts, err, delay)
+
+	case event.attempts == 1:
+		log.Warnf("Unable to retry exit-hop htlc finalization for %v: "+
+			"%v; retrying in %v", event.key, err, delay)
+
+	default:
+		log.Debugf("Unable to retry htlc finalization for %v: "+
+			"%v; retrying in %v", event.key, err, delay)
+	}
 }
 
 // recordPendingSettleRefsLocked indexes all pending-settle HTLCs on an invoice
@@ -1328,6 +1440,7 @@ func pendingSettleSetID(htlc *InvoiceHTLC) *SetID {
 	}
 
 	setID := SetID(htlc.AMP.Record.SetID())
+
 	return &setID
 }
 
