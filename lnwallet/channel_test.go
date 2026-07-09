@@ -1005,6 +1005,128 @@ type forceCloseTestCase struct {
 	anchorAmt            btcutil.Amount
 }
 
+// newDlpHtlcMatchTestState creates a channel state with one outgoing HTLC on
+// the remote commitment transaction.
+func newDlpHtlcMatchTestState(t *testing.T) (*channeldb.OpenChannel,
+	*wire.MsgTx, *btcec.PublicKey, channeldb.HTLC) {
+
+	t.Helper()
+
+	aliceChannel, bobChannel, err := CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err)
+
+	htlcAmount := lnwire.NewMSatFromSatoshis(20_000)
+	htlc, _ := createHTLC(0, htlcAmount)
+	addAndReceiveHTLC(t, aliceChannel, bobChannel, htlc, nil)
+
+	require.NoError(t, ForceStateTransition(aliceChannel, bobChannel))
+
+	chanState := aliceChannel.channelState
+	require.Len(t, chanState.RemoteCommitment.Htlcs, 1)
+
+	remoteHtlc := chanState.RemoteCommitment.Htlcs[0]
+
+	return chanState, chanState.RemoteCommitment.CommitTx.Copy(),
+		chanState.RemoteCurrentRevocation, remoteHtlc
+}
+
+// TestMatchDlpRemoteCommitHtlcs tests DLP HTLC output matching.
+func TestMatchDlpRemoteCommitHtlcs(t *testing.T) {
+	t.Parallel()
+
+	t.Run("stale output index", func(t *testing.T) {
+		t.Parallel()
+
+		chanState, commitTx, commitPoint, remoteHtlc :=
+			newDlpHtlcMatchTestState(t)
+		expectedIndex := remoteHtlc.OutputIndex
+		chanState.RemoteCommitment.Htlcs[0].OutputIndex =
+			channeldb.OutputIndexEmpty
+
+		matchedHtlcs, err := MatchDlpRemoteCommitHtlcs(
+			chanState, commitTx, commitPoint,
+		)
+
+		require.NoError(t, err)
+		require.Len(t, matchedHtlcs, 1)
+		require.Equal(t, expectedIndex, matchedHtlcs[0].OutputIndex)
+		require.Equal(t, remoteHtlc.RHash, matchedHtlcs[0].RHash)
+	})
+
+	t.Run("wrong commit point", func(t *testing.T) {
+		t.Parallel()
+
+		chanState, commitTx, _, _ := newDlpHtlcMatchTestState(t)
+		_, wrongCommitPoint := btcec.PrivKeyFromBytes(
+			bytes.Repeat([]byte{9}, 32),
+		)
+
+		matchedHtlcs, err := MatchDlpRemoteCommitHtlcs(
+			chanState, commitTx, wrongCommitPoint,
+		)
+
+		require.NoError(t, err)
+		require.Empty(t, matchedHtlcs)
+	})
+
+	t.Run("candidate matches multiple outputs", func(t *testing.T) {
+		t.Parallel()
+
+		chanState, commitTx, commitPoint, remoteHtlc :=
+			newDlpHtlcMatchTestState(t)
+		htlcOut := commitTx.TxOut[remoteHtlc.OutputIndex]
+		commitTx.AddTxOut(&wire.TxOut{
+			Value:    htlcOut.Value,
+			PkScript: append([]byte(nil), htlcOut.PkScript...),
+		})
+
+		matchedHtlcs, err := MatchDlpRemoteCommitHtlcs(
+			chanState, commitTx, commitPoint,
+		)
+
+		require.NoError(t, err)
+		require.Empty(t, matchedHtlcs)
+	})
+
+	t.Run("distinct candidates match same output", func(t *testing.T) {
+		t.Parallel()
+
+		chanState, commitTx, commitPoint, remoteHtlc :=
+			newDlpHtlcMatchTestState(t)
+		secondHtlc := remoteHtlc
+		secondHtlc.HtlcIndex++
+		chanState.RemoteCommitment.Htlcs = append(
+			chanState.RemoteCommitment.Htlcs, secondHtlc,
+		)
+
+		matchedHtlcs, err := MatchDlpRemoteCommitHtlcs(
+			chanState, commitTx, commitPoint,
+		)
+
+		require.NoError(t, err)
+		require.Empty(t, matchedHtlcs)
+	})
+
+	t.Run("taproot unsupported", func(t *testing.T) {
+		t.Parallel()
+
+		chanState := &channeldb.OpenChannel{
+			ChanType: channeldb.SimpleTaprootFeatureBit,
+		}
+		_, commitPoint := btcec.PrivKeyFromBytes(
+			bytes.Repeat([]byte{1}, 32),
+		)
+
+		_, err := MatchDlpRemoteCommitHtlcs(
+			chanState, wire.NewMsgTx(2), commitPoint,
+		)
+
+		require.ErrorIs(t, err, ErrDlpTaprootUnsupported)
+	})
+}
+
 func testForceClose(t *testing.T, testCase *forceCloseTestCase) {
 	t.Parallel()
 
