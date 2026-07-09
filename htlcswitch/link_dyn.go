@@ -755,6 +755,16 @@ func (l *channelLink) maybeFinishDynDance(ctx context.Context) {
 	})
 }
 
+// NOTE on forwarding during the dyn execution window: a dyn update runs only
+// while the channel is quiescent, and the quiescer already halts forwarding for
+// the duration. eligibleToUpdate() (used on the HTLC add path) requires
+// l.quiescer.CanSendUpdates(), and handleDownstreamPkt bounces channel updates
+// while quiescent, so new HTLC adds are failed back for the whole execution
+// window with no extra machinery here. Forwarding is re-enabled when quiescence
+// is resumed at the BOLT-defined termination point (l.quiescer.Resume(), step 6
+// of handleDynCommitHandoff), i.e. after success or a safe failure. No separate
+// dyn-specific enable/disable is therefore needed.
+
 // applyDynParams applies an agreed dynamic-commitments parameter update to the
 // underlying channel at the point the given commitment chains lock in. It is
 // the "apply at lock-in" step of the commitment dance: it validates and
@@ -775,6 +785,11 @@ func (l *channelLink) maybeFinishDynDance(ctx context.Context) {
 func (l *channelLink) applyDynParams(h dyn.CommitHandoff,
 	lockIn lntypes.Dual[uint64]) error {
 
+	// Capture the announcement intent (channel_flags) before the update so
+	// the gossip layer can tell which way a public<->private conversion
+	// went. This is read before ApplyChannelParams overwrites it.
+	oldFlags := l.channel.State().ChannelFlags
+
 	if err := l.channel.ApplyChannelParams(
 		h.Proposer, h.Params, l.dynMaxCSVDelay(), lockIn,
 	); err != nil {
@@ -786,6 +801,20 @@ func (l *channelLink) applyDynParams(h dyn.CommitHandoff,
 	// channel-state changes so the exported/subscribed SCB is up to date.
 	if l.cfg.NotifyChannelBackup != nil {
 		l.cfg.NotifyChannelBackup(l.channel.ChannelState())
+	}
+
+	// Reconcile the gossip/channel-announcement layer with the committed
+	// params: drive any public<->private conversion the channel_flags change
+	// requires, and realign our advertised channel_update with the new
+	// inbound HTLC limits. The hook is fire-and-forget (it logs its own
+	// errors) so a gossip hiccup never rolls back a committed, persisted
+	// parameter update. It is only set for dyn-enabled channels, so ordinary
+	// gossip is unaffected.
+	if l.cfg.NotifyDynParamsLockIn != nil {
+		l.cfg.NotifyDynParamsLockIn(
+			l.channel.ChannelPoint(), h.Proposer, oldFlags,
+			h.Params,
+		)
 	}
 
 	return nil

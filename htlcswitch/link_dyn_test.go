@@ -8,6 +8,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/htlcswitch/dyn"
@@ -592,6 +593,77 @@ func TestChannelLinkDynParamsBackupNilSafe(t *testing.T) {
 
 	_, coreLink, _ := newDynLinkHarness(t)
 	coreLink.cfg.NotifyChannelBackup = nil
+
+	handoff := dyn.CommitHandoff{
+		Proposer: lntypes.Local,
+		Params: lnwallet.ChannelParams{
+			MaxAcceptedHtlcs: fn.Some(uint16(25)),
+		},
+	}
+	lockIn := lntypes.Dual[uint64]{Local: 0, Remote: 0}
+
+	require.NoError(t, coreLink.applyDynParams(handoff, lockIn))
+	require.Equal(t, uint16(25),
+		coreLink.channel.State().RemoteChanCfg.MaxAcceptedHtlcs)
+}
+
+// TestChannelLinkDynParamsNotifiesGossip verifies that a successful
+// apply-at-lock-in invokes the gossip-reconciliation hook with the pre-update
+// channel_flags, the proposer, and the agreed params, so the netann layer can
+// drive any public<->private conversion and channel_update realignment.
+func TestChannelLinkDynParamsNotifiesGossip(t *testing.T) {
+	t.Parallel()
+
+	_, coreLink, _ := newDynLinkHarness(t)
+
+	// Capture the arguments handed to the gossip-reconciliation hook.
+	var (
+		gossipCalls int
+		gotPoint    wire.OutPoint
+		gotProposer lntypes.ChannelParty
+		gotOldFlags lnwire.FundingFlag
+		gotParams   lnwallet.ChannelParams
+	)
+	coreLink.cfg.NotifyDynParamsLockIn = func(chanPoint wire.OutPoint,
+		proposer lntypes.ChannelParty, oldFlags lnwire.FundingFlag,
+		params lnwallet.ChannelParams) {
+
+		gossipCalls++
+		gotPoint = chanPoint
+		gotProposer = proposer
+		gotOldFlags = oldFlags
+		gotParams = params
+	}
+
+	// Record the channel_flags before the update so we can assert the hook
+	// observed the pre-update value.
+	oldFlags := coreLink.channel.State().ChannelFlags
+
+	handoff := dyn.CommitHandoff{
+		Proposer: lntypes.Local,
+		Params: lnwallet.ChannelParams{
+			MaxAcceptedHtlcs: fn.Some(uint16(25)),
+		},
+	}
+	lockIn := lntypes.Dual[uint64]{Local: 0, Remote: 0}
+
+	require.NoError(t, coreLink.applyDynParams(handoff, lockIn))
+
+	// The hook must have fired exactly once with the expected arguments.
+	require.Equal(t, 1, gossipCalls)
+	require.Equal(t, coreLink.channel.ChannelPoint(), gotPoint)
+	require.Equal(t, lntypes.Local, gotProposer)
+	require.Equal(t, oldFlags, gotOldFlags)
+	require.Equal(t, uint16(25), gotParams.MaxAcceptedHtlcs.UnwrapOr(0))
+}
+
+// TestChannelLinkDynParamsGossipNilSafe ensures the apply-at-lock-in step does
+// not panic and still succeeds when no gossip-reconciliation hook is wired.
+func TestChannelLinkDynParamsGossipNilSafe(t *testing.T) {
+	t.Parallel()
+
+	_, coreLink, _ := newDynLinkHarness(t)
+	coreLink.cfg.NotifyDynParamsLockIn = nil
 
 	handoff := dyn.CommitHandoff{
 		Proposer: lntypes.Local,
