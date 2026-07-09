@@ -136,6 +136,14 @@ func UpdateInvoice(hash *lntypes.Hash, invoice *Invoice,
 			return nil, err
 		}
 
+	case FinalizeHTLCsUpdate:
+		err := finalizeHTLCs(
+			invoice, hash, updateTime, update, updater,
+		)
+		if err != nil {
+			return nil, err
+		}
+
 	case CancelInvoiceUpdate:
 		err := cancelInvoice(
 			invoice, hash, updateTime, update.State, updater,
@@ -508,6 +516,139 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 			amtPaid += htlc.Amt
 		}
 	}
+
+	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
+}
+
+// finalizeHTLCs records final HTLC outcomes and only finalizes the invoice once
+// no non-AMP HTLC is still pending finality.
+func finalizeHTLCs(invoice *Invoice, hash *lntypes.Hash,
+	updateTime time.Time, update *InvoiceUpdateDesc,
+	updater InvoiceUpdater) error {
+
+	if update == nil {
+		return fmt.Errorf("unable to finalize invoice settlement: " +
+			"nil update")
+	}
+
+	if len(update.FinalizeHtlcs) == 0 {
+		return fmt.Errorf("unable to finalize invoice settlement: " +
+			"no htlcs provided")
+	}
+
+	for key, outcome := range update.FinalizeHtlcs {
+		htlc, ok := invoice.Htlcs[key]
+		if !ok || htlc.State != HtlcStatePendingSettle {
+			continue
+		}
+
+		setID := update.SetID
+		if htlc.AMP == nil {
+			setID = nil
+		}
+
+		switch outcome {
+		case HtlcStateSettled:
+			settled, htlcState, err := getUpdatedHtlcState(
+				htlc, ContractSettled, (*[32]byte)(setID),
+			)
+			if err != nil {
+				return err
+			}
+			if !settled || htlcState != HtlcStateSettled {
+				return fmt.Errorf(
+					"unable to finalize htlc %v as "+
+						"settled", key,
+				)
+			}
+
+			err = resolveHtlc(
+				key, htlc, HtlcStateSettled, updateTime,
+				updater,
+			)
+			if err != nil {
+				return err
+			}
+
+		case HtlcStateCanceled:
+			err := resolveHtlc(
+				key, htlc, HtlcStateCanceled, updateTime,
+				updater,
+			)
+			if err != nil {
+				return err
+			}
+
+		default:
+			return fmt.Errorf(
+				"unknown final htlc outcome: %v", outcome,
+			)
+		}
+	}
+
+	if invoice.IsAMP() {
+		return nil
+	}
+
+	return finalizeInvoiceIfComplete(invoice, hash, updateTime, updater)
+}
+
+// finalizeInvoiceIfComplete derives the terminal non-AMP invoice state once all
+// pending-settle HTLCs have reported a final outcome.
+func finalizeInvoiceIfComplete(invoice *Invoice, hash *lntypes.Hash,
+	updateTime time.Time, updater InvoiceUpdater) error {
+
+	var amtPaid lnwire.MilliSatoshi
+	for _, htlc := range invoice.Htlcs {
+		switch htlc.State {
+		case HtlcStatePendingSettle:
+			return nil
+
+		case HtlcStateSettled:
+			amtPaid += htlc.Amt
+		}
+	}
+
+	paid := amtPaid > 0 && (invoice.Terms.Value == 0 ||
+		amtPaid >= invoice.Terms.Value)
+	if paid {
+		return finalizeInvoiceState(
+			invoice, hash, updateTime, ContractSettled, amtPaid,
+			updater,
+		)
+	}
+
+	return finalizeInvoiceState(
+		invoice, hash, updateTime, ContractCanceled, amtPaid, updater,
+	)
+}
+
+// finalizeInvoiceState applies the final non-AMP invoice state and amount.
+func finalizeInvoiceState(invoice *Invoice, hash *lntypes.Hash,
+	updateTime time.Time, state ContractState, amtPaid lnwire.MilliSatoshi,
+	updater InvoiceUpdater) error {
+
+	update := InvoiceStateUpdateDesc{
+		NewState: state,
+	}
+	if state == ContractSettled {
+		update.Preimage = invoice.Terms.PaymentPreimage
+	}
+
+	newState, err := getUpdatedInvoiceState(invoice, hash, update)
+	if err != nil {
+		return err
+	}
+	if newState == nil || *newState != state {
+		return fmt.Errorf("unable to finalize invoice: new computed "+
+			"state is not %v: %s", state, newState)
+	}
+
+	err = updater.UpdateInvoiceState(state, update.Preimage)
+	if err != nil {
+		return err
+	}
+	invoice.State = state
 
 	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
 }

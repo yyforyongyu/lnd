@@ -764,6 +764,9 @@ type InvoiceUpdateDesc struct {
 	// the invoice.
 	AddHtlcs map[CircuitKey]*HtlcAcceptDesc
 
+	// FinalizeHtlcs maps HTLCs to their terminal settle/cancel outcome.
+	FinalizeHtlcs map[CircuitKey]HtlcState
+
 	// SetID is an optional set ID for AMP invoices that allows operations
 	// to be more efficient by ensuring we don't need to read out the
 	// entire HTLC set each timee an HTLC is to be cancelled.
