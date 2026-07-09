@@ -878,6 +878,12 @@ func (k *kvInvoiceUpdater) Finalize(updateType invpkg.UpdateType) error {
 		// invoice. All HTLCs which were accepted are now canceled, so
 		// we persist this state.
 		return k.storeCancelHtlcsUpdate()
+
+	case invpkg.FinalizeHTLCsUpdate:
+		// Finalization converts pending-settle HTLCs into their
+		// terminal state, so persist the invoice and any updated
+		// AMP sub-invoices.
+		return k.storeAddHtlcsUpdate()
 	}
 
 	return fmt.Errorf("unknown update type: %v", updateType)
@@ -959,14 +965,10 @@ func (k *kvInvoiceUpdater) storeAddHtlcsUpdate() error {
 	return nil
 }
 
-// storeSettleHodlInvoiceUpdate updates the invoice in the database after
-// settling a hodl invoice.
+// storeSettleHodlInvoiceUpdate updates the invoice in the database after a
+// hodl invoice settlement is requested. Settle metadata is only written once
+// the HTLC outcome is final.
 func (k *kvInvoiceUpdater) storeSettleHodlInvoiceUpdate() error {
-	err := k.setSettleMetaFields(nil)
-	if err != nil {
-		return err
-	}
-
 	return k.serializeAndStoreInvoice()
 }
 

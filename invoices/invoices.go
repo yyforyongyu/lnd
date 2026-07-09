@@ -721,6 +721,10 @@ const (
 	// CancelInvoiceUpdate indicates that this update is trying to cancel
 	// an invoice.
 	CancelInvoiceUpdate
+
+	// FinalizeHTLCsUpdate indicates that this update finalizes one or more
+	// HTLCs whose settlement was previously requested.
+	FinalizeHTLCsUpdate
 )
 
 // String returns a human readable string for the UpdateType.
@@ -737,6 +741,9 @@ func (u UpdateType) String() string {
 
 	case CancelInvoiceUpdate:
 		return "CancelInvoiceUpdate"
+
+	case FinalizeHTLCsUpdate:
+		return "FinalizeHTLCsUpdate"
 
 	default:
 		return fmt.Sprintf("unknown invoice update type: %d", u)
