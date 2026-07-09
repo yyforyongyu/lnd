@@ -2,9 +2,11 @@ package invoices
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
@@ -455,4 +457,100 @@ func TestScanInvoicesOnStartIndexesPendingSettle(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, ContractSettled, db.invoice.State)
+}
+
+// TestHtlcFinalizationRetryDelay verifies retry delays back off exponentially
+// up to the configured maximum.
+func TestHtlcFinalizationRetryDelay(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(
+		t, time.Second, htlcFinalizationRetryDelay(0),
+	)
+	require.Equal(
+		t, 2*time.Second, htlcFinalizationRetryDelay(1),
+	)
+	require.Equal(
+		t, 4*time.Second, htlcFinalizationRetryDelay(2),
+	)
+	require.Equal(
+		t, DefaultHtlcFinalizationRetryMaxDelay,
+		htlcFinalizationRetryDelay(10),
+	)
+}
+
+// TestNotifyExitHopHtlcFinalizedErrorKeepsIndex verifies failed finalization
+// leaves the pending-settle index intact for retry.
+func TestNotifyExitHopHtlcFinalizedErrorKeepsIndex(t *testing.T) {
+	t.Parallel()
+
+	hash, circuitKey, invoice := newPendingSettleTestInvoice()
+	dbErr := errors.New("update failed")
+	db := &finalTestDB{
+		hash:       hash,
+		invoice:    invoice,
+		updateTime: time.Now(),
+		updateErr:  dbErr,
+	}
+	registry := NewRegistry(db, nil, &RegistryConfig{})
+	registerPendingSettleTestInvoice(registry, hash, &invoice)
+
+	err := registry.NotifyExitHopHtlcFinalized(
+		t.Context(), circuitKey, true,
+	)
+	require.ErrorIs(t, err, dbErr)
+
+	registry.Lock()
+	_, ok := registry.pendingSettleRefs[circuitKey]
+	registry.Unlock()
+	require.True(t, ok)
+}
+
+// TestNotifyExitHopHtlcFinalizedRetriesError verifies a transient finalization
+// failure is retried and clears both pending and retry indexes on success.
+func TestNotifyExitHopHtlcFinalizedRetriesError(t *testing.T) {
+	hash, circuitKey, invoice := newPendingSettleTestInvoice()
+	dbErr := errors.New("update failed")
+	db := &finalTestDB{
+		hash:         hash,
+		invoice:      invoice,
+		updateTime:   time.Now(),
+		updateErr:    dbErr,
+		updateSignal: make(chan struct{}, 1),
+	}
+	tickSignal := make(chan time.Duration, 1)
+	testClock := clock.NewTestClockWithTickSignal(
+		time.Unix(1, 0), tickSignal,
+	)
+	registry := NewRegistry(db, nil, &RegistryConfig{
+		Clock: testClock,
+	})
+	registerPendingSettleTestInvoice(registry, hash, &invoice)
+	startRegistryEventLoop(t, registry)
+
+	err := registry.NotifyExitHopHtlcFinalized(
+		t.Context(), circuitKey, true,
+	)
+	require.ErrorIs(t, err, dbErr)
+	require.Equal(t, DefaultHtlcFinalizationRetryDelay, <-tickSignal)
+
+	db.updateErr = nil
+	testClock.SetTime(
+		testClock.Now().Add(DefaultHtlcFinalizationRetryDelay),
+	)
+
+	select {
+	case <-db.updateSignal:
+	case <-time.After(time.Second):
+		t.Fatal("finalization retry not received")
+	}
+
+	require.Equal(t, ContractSettled, db.invoice.State)
+
+	registry.Lock()
+	_, pending := registry.pendingSettleRefs[circuitKey]
+	_, retrying := registry.htlcFinalizationRetries[circuitKey]
+	registry.Unlock()
+	require.False(t, pending)
+	require.False(t, retrying)
 }
