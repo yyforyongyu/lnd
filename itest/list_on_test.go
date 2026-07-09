@@ -35,6 +35,10 @@ var allTestCases = []*lntest.TestCase{
 		TestFunc: testDataLossProtection,
 	},
 	{
+		Name:     "data loss protection htlc",
+		TestFunc: testDataLossProtectionHtlcRecovery,
+	},
+	{
 		Name:     "send all coins",
 		TestFunc: testSendAllCoins,
 	},
