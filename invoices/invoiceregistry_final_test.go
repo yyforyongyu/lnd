@@ -554,3 +554,192 @@ func TestNotifyExitHopHtlcFinalizedRetriesError(t *testing.T) {
 	require.False(t, pending)
 	require.False(t, retrying)
 }
+
+// TestNotifyExitHopHtlcFinalizedAMPSettle verifies finalizing one pending AMP
+// HTLC settles the whole AMP set without double-counting the invoice amount.
+func TestNotifyExitHopHtlcFinalizedAMPSettle(t *testing.T) {
+	t.Parallel()
+
+	hash, payAddr, setID, circuitKey, invoice :=
+		newPendingSettleAMPTestInvoice()
+	secondKey := CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1),
+		HtlcID: 3,
+	}
+	secondPreimage := lntypes.Preimage{16, 17, 18}
+	secondRecord := record.NewAMP(
+		[32]byte{19, 20, 21}, [32]byte(setID), 4,
+	)
+	invoice.Htlcs[secondKey] = &InvoiceHTLC{
+		Amt:   2000,
+		State: HtlcStatePendingSettle,
+		AMP: &InvoiceHtlcAMPData{
+			Record:   *secondRecord,
+			Hash:     secondPreimage.Hash(),
+			Preimage: &secondPreimage,
+		},
+	}
+	ampState := invoice.AMPState[setID]
+	ampState.InvoiceKeys[secondKey] = struct{}{}
+	ampState.AmtPaid += 2000
+	invoice.AMPState[setID] = ampState
+
+	settledSetID := SetID{22, 23, 24}
+	settledKey := CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1),
+		HtlcID: 4,
+	}
+	settledPreimage := lntypes.Preimage{25, 26, 27}
+	settledRecord := record.NewAMP(
+		[32]byte{28, 29, 30}, [32]byte(settledSetID), 5,
+	)
+	invoice.Htlcs[settledKey] = &InvoiceHTLC{
+		Amt:   4000,
+		State: HtlcStateSettled,
+		AMP: &InvoiceHtlcAMPData{
+			Record:   *settledRecord,
+			Hash:     settledPreimage.Hash(),
+			Preimage: &settledPreimage,
+		},
+	}
+	invoice.AMPState[settledSetID] = InvoiceStateAMP{
+		State: HtlcStateSettled,
+		InvoiceKeys: map[CircuitKey]struct{}{
+			settledKey: {},
+		},
+		AmtPaid: 4000,
+	}
+	// The top-level AMP amount already includes every accepted set.
+	invoice.AmtPaid = 7000
+
+	db := &finalTestDB{
+		hash:       hash,
+		invoice:    invoice,
+		updateTime: time.Now(),
+	}
+	registry := NewRegistry(db, nil, &RegistryConfig{})
+	registerPendingSettleTestInvoice(
+		registry, hash, &invoice,
+	)
+	registry.Lock()
+	registry.pendingSettleRefs[circuitKey] = pendingSettleRef{
+		invoiceRef: InvoiceRefByAddr(payAddr),
+		eventHash:  hash,
+		setID:      &setID,
+	}
+	registry.pendingSettleRefs[secondKey] = pendingSettleRef{
+		invoiceRef: InvoiceRefByAddr(payAddr),
+		eventHash:  hash,
+		setID:      &setID,
+	}
+	registry.Unlock()
+
+	err := registry.NotifyExitHopHtlcFinalized(
+		t.Context(), circuitKey, true,
+	)
+	require.NoError(t, err)
+	require.Equal(
+		t, HtlcStateSettled, db.invoice.Htlcs[circuitKey].State,
+	)
+	require.Equal(
+		t, HtlcStatePendingSettle, db.invoice.Htlcs[secondKey].State,
+	)
+	require.Equal(
+		t, HtlcStatePendingSettle, db.invoice.AMPState[setID].State,
+	)
+	require.Equal(
+		t, HtlcStateSettled, db.invoice.AMPState[settledSetID].State,
+	)
+	require.Equal(t, ContractOpen, db.invoice.State)
+	require.Equal(t, lnwire.MilliSatoshi(7000), db.invoice.AmtPaid)
+	require.Equal(t, payAddr, *db.updateRef.payAddr)
+	require.Equal(t, setID, *db.updateSetID)
+	assertNoInvoiceEvent(t, registry)
+
+	registry.Lock()
+	_, firstPending := registry.pendingSettleRefs[circuitKey]
+	_, secondPending := registry.pendingSettleRefs[secondKey]
+	registry.Unlock()
+	require.False(t, firstPending)
+	require.True(t, secondPending)
+
+	err = registry.NotifyExitHopHtlcFinalized(
+		t.Context(), secondKey, true,
+	)
+	require.NoError(t, err)
+	require.Equal(
+		t, HtlcStateSettled, db.invoice.Htlcs[secondKey].State,
+	)
+	require.Equal(t, HtlcStateSettled, db.invoice.AMPState[setID].State)
+	require.Equal(t, ContractOpen, db.invoice.State)
+	require.Equal(t, lnwire.MilliSatoshi(7000), db.invoice.AmtPaid)
+
+	select {
+	case event := <-registry.invoiceEvents:
+		require.NotNil(t, event.setID)
+		require.Equal(t, setID, SetID(*event.setID))
+		require.False(t, event.suppressedForAllClients())
+
+	case <-time.After(time.Second):
+		t.Fatal("invoice notification not received")
+	}
+
+	registry.Lock()
+	_, ok := registry.pendingSettleRefs[secondKey]
+	registry.Unlock()
+	require.False(t, ok)
+}
+
+// TestNotifyExitHopHtlcFinalizedAMPFail verifies a failed final outcome cancels
+// the pending AMP set while leaving the base AMP invoice open.
+func TestNotifyExitHopHtlcFinalizedAMPFail(t *testing.T) {
+	t.Parallel()
+
+	hash, payAddr, setID, circuitKey, invoice :=
+		newPendingSettleAMPTestInvoice()
+	db := &finalTestDB{
+		hash:       hash,
+		invoice:    invoice,
+		updateTime: time.Now(),
+	}
+	registry := NewRegistry(db, nil, &RegistryConfig{})
+	registerPendingSettleTestInvoice(registry, hash, &invoice)
+	registry.Lock()
+	registry.pendingSettleRefs[circuitKey] = pendingSettleRef{
+		invoiceRef: InvoiceRefByAddr(payAddr),
+		eventHash:  hash,
+		setID:      &setID,
+	}
+	registry.Unlock()
+
+	err := registry.NotifyExitHopHtlcFinalized(
+		t.Context(), circuitKey, false,
+	)
+	require.NoError(t, err)
+	require.Equal(
+		t, HtlcStateCanceled, db.invoice.Htlcs[circuitKey].State,
+	)
+	require.Equal(t, HtlcStateCanceled, db.invoice.AMPState[setID].State)
+	require.Equal(
+		t, lnwire.MilliSatoshi(0), db.invoice.AMPState[setID].AmtPaid,
+	)
+	require.Zero(t, db.invoice.AmtPaid)
+	require.Equal(t, ContractOpen, db.invoice.State)
+	require.Equal(t, payAddr, *db.updateRef.payAddr)
+	require.Equal(t, setID, *db.updateSetID)
+
+	select {
+	case event := <-registry.invoiceEvents:
+		require.NotNil(t, event.setID)
+		require.Equal(t, setID, SetID(*event.setID))
+		require.True(t, event.suppressedForAllClients())
+
+	case <-time.After(time.Second):
+		t.Fatal("invoice notification not received")
+	}
+
+	registry.Lock()
+	_, ok := registry.pendingSettleRefs[circuitKey]
+	registry.Unlock()
+	require.False(t, ok)
+}
