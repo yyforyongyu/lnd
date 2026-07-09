@@ -1292,10 +1292,10 @@ func testFetchPendingInvoices(t *testing.T,
 }
 
 // testFetchPendingInvoicesAccepted verifies that FetchPendingInvoices returns
-// invoices in both ContractOpen (state 0) and ContractAccepted (state 3)
-// states, and that ContractSettled (state 1) and ContractCanceled (state 2)
-// invoices are excluded. This specifically exercises the `state IN (0, 3)`
-// predicate in the underlying SQL query.
+// invoices in ContractOpen (state 0), ContractAccepted (state 3), and
+// ContractPendingSettle (state 4), and that ContractSettled (state 1) and
+// ContractCanceled (state 2) invoices are excluded. This specifically exercises
+// the pending-state predicate in the underlying SQL query.
 func testFetchPendingInvoicesAccepted(t *testing.T,
 	makeDB func(t *testing.T) invpkg.InvoiceDB) {
 
@@ -1347,6 +1347,41 @@ func testFetchPendingInvoicesAccepted(t *testing.T,
 	require.NoError(t, err)
 	require.Equal(t, invpkg.ContractAccepted, dbAccepted.State)
 
+	// Add a third invoice and transition it to ContractPendingSettle.
+	pendingSettleInvoice, err := randInvoice(amt)
+	require.NoError(t, err)
+	pendingSettleHash := pendingSettleInvoice.Terms.PaymentPreimage.Hash()
+	_, err = db.AddInvoice(ctxb, pendingSettleInvoice, pendingSettleHash)
+	require.NoError(t, err)
+
+	pendingSettleKey := models.CircuitKey{HtlcID: 3}
+	pendingSettleRef := invpkg.InvoiceRefByHash(pendingSettleHash)
+	dbPendingSettle, err := db.UpdateInvoice(
+		ctxb, pendingSettleRef, nil,
+		func(inv *invpkg.Invoice) (*invpkg.InvoiceUpdateDesc, error) {
+			addHtlcs := make(
+				map[models.CircuitKey]*invpkg.HtlcAcceptDesc,
+			)
+			addHtlcs[pendingSettleKey] = &invpkg.HtlcAcceptDesc{
+				Amt: amt,
+				CustomRecords: make(
+					record.CustomSet,
+				),
+			}
+
+			return &invpkg.InvoiceUpdateDesc{
+				UpdateType: invpkg.AddHTLCsUpdate,
+				State: &invpkg.InvoiceStateUpdateDesc{
+					NewState: invpkg.ContractPendingSettle,
+					Preimage: inv.Terms.PaymentPreimage,
+				},
+				AddHtlcs: addHtlcs,
+			}, nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, invpkg.ContractPendingSettle, dbPendingSettle.State)
+
 	// Add a settled invoice – it must NOT appear in the pending result.
 	settledInvoice, err := randInvoice(amt)
 	require.NoError(t, err)
@@ -1361,7 +1396,7 @@ func testFetchPendingInvoicesAccepted(t *testing.T,
 
 	// Add a canceled invoice – it must also NOT appear in the pending
 	// result, verifying that state 2 (ContractCanceled) is excluded by
-	// the `state IN (0, 3)` SQL predicate.
+	// the pending-state SQL predicate.
 	canceledInvoice, err := randInvoice(amt)
 	require.NoError(t, err)
 	canceledHash := canceledInvoice.Terms.PaymentPreimage.Hash()
@@ -1380,16 +1415,21 @@ func testFetchPendingInvoicesAccepted(t *testing.T,
 	)
 	require.NoError(t, err)
 
-	// FetchPendingInvoices must return exactly the two pending invoices.
+	// FetchPendingInvoices must return exactly the three pending invoices.
 	pending, err := db.FetchPendingInvoices(ctxb)
 	require.NoError(t, err)
-	require.Len(t, pending, 2)
+	require.Len(t, pending, 3)
 
 	_, hasOpen := pending[openHash]
 	require.True(t, hasOpen, "ContractOpen invoice missing from results")
 
 	_, hasAccepted := pending[acceptedHash]
 	require.True(t, hasAccepted, "ContractAccepted invoice missing")
+
+	_, hasPendingSettle := pending[pendingSettleHash]
+	require.True(
+		t, hasPendingSettle, "ContractPendingSettle invoice missing",
+	)
 
 	require.NotContains(t, pending, settledHash,
 		"ContractSettled invoice should not appear in pending results")
@@ -1398,6 +1438,10 @@ func testFetchPendingInvoicesAccepted(t *testing.T,
 
 	require.Equal(t, invpkg.ContractOpen, pending[openHash].State)
 	require.Equal(t, invpkg.ContractAccepted, pending[acceptedHash].State)
+	require.Equal(
+		t, invpkg.ContractPendingSettle,
+		pending[pendingSettleHash].State,
+	)
 }
 
 // testDuplicateSettleInvoice tests that if we add a new invoice and settle it
