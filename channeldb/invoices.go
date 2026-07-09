@@ -830,22 +830,21 @@ func (k *kvInvoiceUpdater) UpdateAmpState(setID [32]byte,
 			)
 
 		case invpkg.HtlcStateCanceled:
-			// Only HTLCs in the accepted state, can be cancelled,
-			// but we also want to merge that with HTLCs that may be
-			// canceled as well since it can be cancelled one by
-			// one.
-			k.updatedAmpHtlcs[setID] = k.invoice.HTLCSet(
-				&setID, invpkg.HtlcStateAccepted,
+			k.updatedAmpHtlcs[setID] = ampHTLCSet(
+				k.invoice, &setID,
 			)
 
-			cancelledHtlcs := k.invoice.HTLCSet(
-				&setID, invpkg.HtlcStateCanceled,
+		case invpkg.HtlcStatePendingSettle:
+			// Pending-settle AMP HTLCs must be written through
+			// the AMP sub-invoice bucket, but they do not yet
+			// receive a settle index or resolve as final.
+			k.updatedAmpHtlcs[setID] = ampHTLCSet(
+				k.invoice, &setID,
 			)
-			maps.Copy(k.updatedAmpHtlcs[setID], cancelledHtlcs)
 
 		case invpkg.HtlcStateSettled:
-			k.updatedAmpHtlcs[setID] = make(
-				map[models.CircuitKey]*invpkg.InvoiceHTLC,
+			k.updatedAmpHtlcs[setID] = ampHTLCSet(
+				k.invoice, &setID,
 			)
 		}
 	}
@@ -859,6 +858,21 @@ func (k *kvInvoiceUpdater) UpdateAmpState(setID [32]byte,
 	k.updatedAmpHtlcs[setID][circuitKey] = k.invoice.Htlcs[circuitKey]
 
 	return nil
+}
+
+// ampHTLCSet returns all HTLCs belonging to setID, regardless of their current
+// state.
+func ampHTLCSet(invoice *invpkg.Invoice,
+	setID *[32]byte) map[models.CircuitKey]*invpkg.InvoiceHTLC {
+
+	htlcSet := make(map[models.CircuitKey]*invpkg.InvoiceHTLC)
+	for key, htlc := range invoice.Htlcs {
+		if htlc.IsInHTLCSet(setID) {
+			htlcSet[key] = htlc
+		}
+	}
+
+	return htlcSet
 }
 
 // Finalize finalizes the update before it is written to the database.
@@ -878,6 +892,12 @@ func (k *kvInvoiceUpdater) Finalize(updateType invpkg.UpdateType) error {
 		// invoice. All HTLCs which were accepted are now canceled, so
 		// we persist this state.
 		return k.storeCancelHtlcsUpdate()
+
+	case invpkg.FinalizeHTLCsUpdate:
+		// Finalization converts pending-settle HTLCs into their
+		// terminal state, so persist the invoice and any updated
+		// AMP sub-invoices.
+		return k.storeAddHtlcsUpdate()
 	}
 
 	return fmt.Errorf("unknown update type: %v", updateType)
@@ -959,14 +979,10 @@ func (k *kvInvoiceUpdater) storeAddHtlcsUpdate() error {
 	return nil
 }
 
-// storeSettleHodlInvoiceUpdate updates the invoice in the database after
-// settling a hodl invoice.
+// storeSettleHodlInvoiceUpdate updates the invoice in the database after a
+// hodl invoice settlement is requested. Settle metadata is only written once
+// the HTLC outcome is final.
 func (k *kvInvoiceUpdater) storeSettleHodlInvoiceUpdate() error {
-	err := k.setSettleMetaFields(nil)
-	if err != nil {
-		return err
-	}
-
 	return k.serializeAndStoreInvoice()
 }
 

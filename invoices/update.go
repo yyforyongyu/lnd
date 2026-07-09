@@ -127,13 +127,19 @@ func resolveReplayedHtlc(ctx *invoiceUpdateCtx, inv *Invoice) (bool,
 	case HtlcStateAccepted:
 		return true, ctx.acceptRes(resultReplayToAccepted), nil
 
-	case HtlcStateSettled:
+	// Settled and pending-settle HTLCs both replay as settle resolutions.
+	// The settled case is idempotent, while pending-settle lets forwarding
+	// replay drive the settle response back to commitment lock-in.
+	case HtlcStateSettled, HtlcStatePendingSettle:
 		pre := inv.Terms.PaymentPreimage
 
 		// Terms.PaymentPreimage will be nil for AMP invoices.
 		// Set it to the HTLCs AMP Preimage instead.
-		if pre == nil {
+		if pre == nil && htlc.AMP != nil {
 			pre = htlc.AMP.Preimage
+		}
+		if pre == nil {
+			return true, nil, errors.New("unknown preimage")
 		}
 
 		return true, ctx.settleRes(
@@ -325,7 +331,7 @@ func updateMpp(ctx *invoiceUpdateCtx, inv *Invoice) (*InvoiceUpdateDesc,
 	}
 
 	update.State = &InvoiceStateUpdateDesc{
-		NewState:      ContractSettled,
+		NewState:      ContractPendingSettle,
 		Preimage:      inv.Terms.PaymentPreimage,
 		HTLCPreimages: htlcPreimages,
 		SetID:         setID,
@@ -492,6 +498,11 @@ func updateLegacy(ctx *invoiceUpdateCtx,
 		return &update, ctx.settleRes(
 			*inv.Terms.PaymentPreimage, ResultDuplicateToSettled,
 		), nil
+
+	case ContractPendingSettle:
+		return &update, ctx.settleRes(
+			*inv.Terms.PaymentPreimage, ResultDuplicateToSettled,
+		), nil
 	}
 
 	// Check to see if we can settle or this is an hold invoice and we need
@@ -505,7 +516,7 @@ func updateLegacy(ctx *invoiceUpdateCtx,
 	}
 
 	update.State = &InvoiceStateUpdateDesc{
-		NewState: ContractSettled,
+		NewState: ContractPendingSettle,
 		Preimage: inv.Terms.PaymentPreimage,
 	}
 

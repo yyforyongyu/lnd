@@ -63,11 +63,12 @@ type Querier interface {
 	// Migration-specific batch fetch that returns payment data along with HTLC
 	// attempt counts for structural validation during KV to SQL migration.
 	FetchPaymentsByIDsMig(ctx context.Context, paymentIds []int64) ([]FetchPaymentsByIDsMigRow, error)
-	// FetchPendingInvoices returns all invoices in a pending state (open or
-	// accepted). The invoices_state_idx index on the state column makes this a
-	// fast index scan rather than a full table scan. id_cursor is an exclusive
-	// lower bound on the primary key used for cursor-based pagination; the caller
-	// must supply 0 when starting from the beginning.
+	// FetchPendingInvoices returns all invoices in a pending state (open,
+	// accepted or pending settle). The invoices_state_idx index on the state
+	// column makes this a fast index scan rather than a full table scan.
+	// id_cursor is an exclusive lower bound on the primary key used for
+	// cursor-based pagination; the caller must supply 0 when starting from the
+	// beginning.
 	FetchPendingInvoices(ctx context.Context, arg FetchPendingInvoicesParams) ([]Invoice, error)
 	FetchRouteLevelFirstHopCustomRecords(ctx context.Context, htlcAttemptIndices []int64) ([]PaymentAttemptFirstHopCustomRecord, error)
 	FetchSettledAMPSubInvoices(ctx context.Context, arg FetchSettledAMPSubInvoicesParams) ([]FetchSettledAMPSubInvoicesRow, error)

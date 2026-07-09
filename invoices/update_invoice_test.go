@@ -138,6 +138,96 @@ func TestUpdateHTLC(t *testing.T) {
 			expErr: nil,
 		},
 		{
+			name: "MPP pending settle",
+			input: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       time.Time{},
+				Expiry:            40,
+				State:             HtlcStateAccepted,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP:               nil,
+			},
+			invState: ContractPendingSettle,
+			setID:    nil,
+			output: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       testNow,
+				Expiry:            40,
+				State:             HtlcStatePendingSettle,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP:               nil,
+			},
+			expErr: nil,
+		},
+		{
+			name: "MPP finalize pending settle",
+			input: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       testAlreadyNow,
+				Expiry:            40,
+				State:             HtlcStatePendingSettle,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP:               nil,
+			},
+			invState: ContractSettled,
+			setID:    nil,
+			output: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       testNow,
+				Expiry:            40,
+				State:             HtlcStateSettled,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP:               nil,
+			},
+			expErr: nil,
+		},
+		{
+			name: "MPP cancel pending settle",
+			input: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       testAlreadyNow,
+				Expiry:            40,
+				State:             HtlcStatePendingSettle,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP:               nil,
+			},
+			invState: ContractCanceled,
+			setID:    nil,
+			output: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       testNow,
+				Expiry:            40,
+				State:             HtlcStateCanceled,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP:               nil,
+			},
+			expErr: nil,
+		},
+		{
 			name: "MPP cancel",
 			input: InvoiceHTLC{
 				Amt:               5000,
@@ -405,6 +495,82 @@ func TestUpdateHTLC(t *testing.T) {
 				ResolveTime:       time.Time{},
 				Expiry:            40,
 				State:             HtlcStateAccepted,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP: &InvoiceHtlcAMPData{
+					Record:   *ampRecord,
+					Hash:     hash,
+					Preimage: &preimage,
+				},
+			},
+			invState: ContractSettled,
+			setID:    &setID,
+			output: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       testNow,
+				Expiry:            40,
+				State:             HtlcStateSettled,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP: &InvoiceHtlcAMPData{
+					Record:   *ampRecord,
+					Hash:     hash,
+					Preimage: &preimage,
+				},
+			},
+			expErr: nil,
+		},
+		{
+			name: "AMP pending settle valid preimage",
+			input: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       time.Time{},
+				Expiry:            40,
+				State:             HtlcStateAccepted,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP: &InvoiceHtlcAMPData{
+					Record:   *ampRecord,
+					Hash:     hash,
+					Preimage: &preimage,
+				},
+			},
+			invState: ContractPendingSettle,
+			setID:    &setID,
+			output: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       testNow,
+				Expiry:            40,
+				State:             HtlcStatePendingSettle,
+				CustomRecords:     make(record.CustomSet),
+				WireCustomRecords: make(lnwire.CustomRecords),
+				AMP: &InvoiceHtlcAMPData{
+					Record:   *ampRecord,
+					Hash:     hash,
+					Preimage: &preimage,
+				},
+			},
+			expErr: nil,
+		},
+		{
+			name: "AMP finalize pending settle",
+			input: InvoiceHTLC{
+				Amt:               5000,
+				MppTotalAmt:       5000,
+				AcceptHeight:      100,
+				AcceptTime:        testNow,
+				ResolveTime:       testAlreadyNow,
+				Expiry:            40,
+				State:             HtlcStatePendingSettle,
 				CustomRecords:     make(record.CustomSet),
 				WireCustomRecords: make(lnwire.CustomRecords),
 				AMP: &InvoiceHtlcAMPData{
@@ -748,6 +914,207 @@ func TestUpdateHTLC(t *testing.T) {
 			testUpdateHTLC(t, test, testNow)
 		})
 	}
+}
+
+// TestUpdateInvoiceAMPPendingSettleState verifies AMP settle requests move the
+// AMP set to pending-settle without changing the amount already counted at
+// acceptance.
+func TestUpdateInvoiceAMPPendingSettleState(t *testing.T) {
+	t.Parallel()
+
+	setID := SetID{1, 2, 3}
+	preimage := lntypes.Preimage{4, 5, 6}
+	hash := preimage.Hash()
+	ampRecord := record.NewAMP([32]byte{7, 8, 9}, [32]byte(setID), 4)
+	circuitKey := CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1),
+		HtlcID: 2,
+	}
+
+	invoice := &Invoice{
+		Terms: ContractTerm{
+			Features: lnwire.NewFeatureVector(
+				lnwire.NewRawFeatureVector(lnwire.AMPRequired),
+				lnwire.Features,
+			),
+		},
+		State:   ContractOpen,
+		AmtPaid: 1000,
+		AMPState: AMPInvoiceState{
+			setID: {
+				State: HtlcStateAccepted,
+				InvoiceKeys: map[CircuitKey]struct{}{
+					circuitKey: {},
+				},
+				AmtPaid: 1000,
+			},
+		},
+		Htlcs: map[CircuitKey]*InvoiceHTLC{
+			circuitKey: {
+				Amt:   1000,
+				State: HtlcStateAccepted,
+				AMP: &InvoiceHtlcAMPData{
+					Record: *ampRecord,
+					Hash:   hash,
+				},
+			},
+		},
+	}
+	updater := &ampStateTestUpdater{}
+	updateTime := time.Now()
+	htlcPreimages := map[CircuitKey]lntypes.Preimage{
+		circuitKey: preimage,
+	}
+
+	updatedInvoice, err := UpdateInvoice(
+		&hash, invoice, updateTime, func(*Invoice) (*InvoiceUpdateDesc,
+			error) {
+
+			return &InvoiceUpdateDesc{
+				UpdateType: AddHTLCsUpdate,
+				State: &InvoiceStateUpdateDesc{
+					NewState:      ContractPendingSettle,
+					HTLCPreimages: htlcPreimages,
+					SetID:         (*[32]byte)(&setID),
+				},
+			}, nil
+		}, updater,
+	)
+	require.NoError(t, err)
+
+	require.Equal(
+		t, HtlcStatePendingSettle,
+		updatedInvoice.Htlcs[circuitKey].State,
+	)
+	require.Equal(
+		t, HtlcStatePendingSettle, updatedInvoice.AMPState[setID].State,
+	)
+	require.Equal(t, lnwire.MilliSatoshi(1000), updatedInvoice.AmtPaid)
+	require.Equal(t, lnwire.MilliSatoshi(1000), updater.ampState.AmtPaid)
+	require.Equal(t, HtlcStatePendingSettle, updater.ampState.State)
+}
+
+// TestUpdateLegacyPendingSettleDuplicate verifies legacy/keysend duplicate
+// HTLCs can still receive the known preimage while an invoice is
+// pending-settle.
+func TestUpdateLegacyPendingSettleDuplicate(t *testing.T) {
+	t.Parallel()
+
+	preimage := lntypes.Preimage{1, 2, 3}
+	hash := preimage.Hash()
+	existingKey := CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1),
+		HtlcID: 2,
+	}
+	duplicateKey := CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1),
+		HtlcID: 3,
+	}
+	invoice := &Invoice{
+		Terms: ContractTerm{
+			PaymentPreimage: &preimage,
+			Features:        lnwire.EmptyFeatureVector(),
+			Value:           1000,
+			FinalCltvDelta:  4,
+		},
+		State: ContractPendingSettle,
+		Htlcs: map[CircuitKey]*InvoiceHTLC{
+			existingKey: {
+				Amt:   1000,
+				State: HtlcStatePendingSettle,
+			},
+		},
+	}
+	ctx := &invoiceUpdateCtx{
+		hash:                 hash,
+		circuitKey:           duplicateKey,
+		amtPaid:              1500,
+		expiry:               100,
+		currentHeight:        10,
+		finalCltvRejectDelta: 5,
+		customRecords:        record.CustomSet{},
+		wireCustomRecords:    lnwire.CustomRecords{},
+	}
+
+	update, resolution, err := updateInvoice(ctx, invoice)
+	require.NoError(t, err)
+	require.NotNil(t, update)
+	require.Nil(t, update.State)
+	require.Contains(t, update.AddHtlcs, duplicateKey)
+
+	settleResolution, ok := resolution.(*HtlcSettleResolution)
+	require.True(t, ok)
+	require.Equal(t, ResultDuplicateToSettled, settleResolution.Outcome)
+	require.Equal(t, preimage, settleResolution.Preimage)
+}
+
+// finalTestUpdater is a no-op InvoiceUpdater for tests that exercise in-memory
+// invoice transitions.
+type finalTestUpdater struct{}
+
+// AddHtlc satisfies InvoiceUpdater. The in-memory invoice is updated directly.
+func (f finalTestUpdater) AddHtlc(CircuitKey, *InvoiceHTLC) error {
+	return nil
+}
+
+// ResolveHtlc satisfies InvoiceUpdater. The in-memory invoice is updated
+// directly.
+func (f finalTestUpdater) ResolveHtlc(CircuitKey, HtlcState,
+	time.Time) error {
+
+	return nil
+}
+
+// AddAmpHtlcPreimage satisfies InvoiceUpdater. The in-memory invoice is
+// updated directly.
+func (f finalTestUpdater) AddAmpHtlcPreimage([32]byte, CircuitKey,
+	lntypes.Preimage) error {
+
+	return nil
+}
+
+// UpdateInvoiceState satisfies InvoiceUpdater. The in-memory invoice is updated
+// directly.
+func (f finalTestUpdater) UpdateInvoiceState(ContractState,
+	*lntypes.Preimage) error {
+
+	return nil
+}
+
+// UpdateInvoiceAmtPaid satisfies InvoiceUpdater. The in-memory invoice is
+// updated directly.
+func (f finalTestUpdater) UpdateInvoiceAmtPaid(lnwire.MilliSatoshi) error {
+	return nil
+}
+
+// UpdateAmpState satisfies InvoiceUpdater. The in-memory invoice is updated
+// directly.
+func (f finalTestUpdater) UpdateAmpState([32]byte, InvoiceStateAMP,
+	CircuitKey) error {
+
+	return nil
+}
+
+// Finalize satisfies InvoiceUpdater. No flush is needed for the in-memory test
+// updater.
+func (f finalTestUpdater) Finalize(UpdateType) error {
+	return nil
+}
+
+// ampStateTestUpdater records the latest AMP state update for assertions.
+type ampStateTestUpdater struct {
+	finalTestUpdater
+
+	ampState InvoiceStateAMP
+}
+
+// UpdateAmpState records the AMP state that UpdateInvoice writes through the
+// updater.
+func (u *ampStateTestUpdater) UpdateAmpState(_ [32]byte,
+	newState InvoiceStateAMP, _ CircuitKey) error {
+
+	u.ampState = newState
+	return nil
 }
 
 func testUpdateHTLC(t *testing.T, test updateHTLCTest, now time.Time) {

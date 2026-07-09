@@ -186,7 +186,12 @@ func TestHtlcSuccessSingleStage(t *testing.T) {
 	htlcOutpoint := wire.OutPoint{Index: 3}
 
 	sweepTx := &wire.MsgTx{
-		TxIn:  []*wire.TxIn{{}},
+		TxIn: []*wire.TxIn{{
+			Witness: wire.TxWitness{
+				[]byte{1}, []byte{1}, []byte{1},
+				make([]byte, 32), []byte{1},
+			},
+		}},
 		TxOut: []*wire.TxOut{{}},
 	}
 

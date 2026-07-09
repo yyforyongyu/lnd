@@ -91,6 +91,25 @@ func settleHtlcsAmp(invoice *Invoice, circuitKey models.CircuitKey,
 	return updater.UpdateAmpState(setID, newAmpState, circuitKey)
 }
 
+// pendingSettleHtlcsAmp marks an AMP HTLC set as pending settle without
+// changing the set's accepted amount.
+func pendingSettleHtlcsAmp(invoice *Invoice, circuitKey models.CircuitKey,
+	htlc *InvoiceHTLC, updater InvoiceUpdater) error {
+
+	setID := htlc.AMP.Record.SetID()
+
+	newAmpState, err := getUpdatedInvoiceAmpState(
+		invoice, setID, circuitKey, HtlcStatePendingSettle, 0,
+	)
+	if err != nil {
+		return err
+	}
+
+	invoice.AMPState[setID] = newAmpState
+
+	return updater.UpdateAmpState(setID, newAmpState, circuitKey)
+}
+
 // UpdateInvoice fetches the invoice, obtains the update descriptor from the
 // callback and applies the updates in a single db transaction.
 func UpdateInvoice(hash *lntypes.Hash, invoice *Invoice,
@@ -131,6 +150,14 @@ func UpdateInvoice(hash *lntypes.Hash, invoice *Invoice,
 	case SettleHodlInvoiceUpdate:
 		err := settleHodlInvoice(
 			invoice, hash, updateTime, update.State, updater,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+	case FinalizeHTLCsUpdate:
+		err := finalizeHTLCs(
+			invoice, hash, updateTime, update, updater,
 		)
 		if err != nil {
 			return nil, err
@@ -333,8 +360,8 @@ func addHTLCs(invoice *Invoice, hash *lntypes.Hash, updateTime time.Time,
 		// while the contract state (on disk) is still in the accept
 		// state.
 		htlcContextState := invoice.State
-		if settleEligibleAMP {
-			htlcContextState = ContractSettled
+		if settleEligibleAMP && update.State != nil {
+			htlcContextState = update.State.NewState
 		}
 		htlcStateChanged, htlcState, err := getUpdatedHtlcState(
 			htlc, htlcContextState, setID,
@@ -365,9 +392,26 @@ func addHTLCs(invoice *Invoice, hash *lntypes.Hash, updateTime time.Time,
 			}
 		}
 
+		// Pending-settle HTLCs passed settle validation, but are
+		// not final until the link or resolver reports the committed
+		// outcome.
+		htlcPendingSettle := htlcStateChanged &&
+			htlcState == HtlcStatePendingSettle
+
+		// AMP HTLCs also need their per-set state updated because
+		// settlement metadata is stored separately from the invoice
+		// HTLC map.
+		if htlcPendingSettle && invoiceIsAMP {
+			err = pendingSettleHtlcsAmp(invoice, key, htlc, updater)
+			if err != nil {
+				return err
+			}
+		}
+
 		accepted := htlc.State == HtlcStateAccepted
+		pendingSettle := htlc.State == HtlcStatePendingSettle
 		settled := htlc.State == HtlcStateSettled
-		invoiceStateReady := accepted || settled
+		invoiceStateReady := accepted || pendingSettle || settled
 
 		if !invoiceIsAMP {
 			// Update the running amount paid to this invoice. We
@@ -434,7 +478,7 @@ func updateInvoiceAmtPaid(invoice *Invoice, amt lnwire.MilliSatoshi,
 	return nil
 }
 
-// settleHodlInvoice marks a hodl invoice as settled.
+// settleHodlInvoice marks a hodl invoice as pending settle.
 //
 // NOTE: Currently it is not possible to have HODL AMP invoices.
 func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
@@ -446,13 +490,14 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 			"not a hodl invoice", invoice.AddIndex)
 	}
 
-	// TODO(positiveblue): because NewState can only be ContractSettled we
-	// can remove it from the API and set it here directly.
+	// TODO(positiveblue): hodl settlement can only transition to
+	// ContractPendingSettle now, so remove NewState from the API and set it
+	// here directly.
 	switch {
 	case update == nil:
 		fallthrough
 
-	case update.NewState != ContractSettled:
+	case update.NewState != ContractPendingSettle:
 		return fmt.Errorf("unable to settle hodl invoice: "+
 			"not valid InvoiceUpdateDesc.State: %v", update)
 
@@ -468,26 +513,27 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 		return err
 	}
 
-	if newState == nil || *newState != ContractSettled {
+	if newState == nil || *newState != ContractPendingSettle {
 		return fmt.Errorf("unable to settle hodl invoice: "+
-			"new computed state is not settled: %s", newState)
+			"new computed state is not pending settle: "+
+			"%s", newState)
 	}
 
 	err = updater.UpdateInvoiceState(
-		ContractSettled, update.Preimage,
+		ContractPendingSettle, update.Preimage,
 	)
 	if err != nil {
 		return err
 	}
 
-	invoice.State = ContractSettled
+	invoice.State = ContractPendingSettle
 	invoice.Terms.PaymentPreimage = update.Preimage
 
 	// TODO(positiveblue): this logic can be further simplified.
 	var amtPaid lnwire.MilliSatoshi
 	for key, htlc := range invoice.Htlcs {
 		settled, _, err := getUpdatedHtlcState(
-			htlc, ContractSettled, nil,
+			htlc, ContractPendingSettle, nil,
 		)
 		if err != nil {
 			return err
@@ -495,7 +541,7 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 
 		if settled {
 			err = resolveHtlc(
-				key, htlc, HtlcStateSettled, updateTime,
+				key, htlc, HtlcStatePendingSettle, updateTime,
 				updater,
 			)
 			if err != nil {
@@ -507,6 +553,210 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 	}
 
 	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
+}
+
+// finalizeHTLCs records final HTLC outcomes and only finalizes the invoice or
+// AMP set once no HTLC in the set is still pending finality.
+func finalizeHTLCs(invoice *Invoice, hash *lntypes.Hash,
+	updateTime time.Time, update *InvoiceUpdateDesc,
+	updater InvoiceUpdater) error {
+
+	if update == nil {
+		return fmt.Errorf("unable to finalize invoice settlement: " +
+			"nil update")
+	}
+
+	if len(update.FinalizeHtlcs) == 0 {
+		return fmt.Errorf("unable to finalize invoice settlement: " +
+			"no htlcs provided")
+	}
+
+	for key, outcome := range update.FinalizeHtlcs {
+		htlc, ok := invoice.Htlcs[key]
+		if !ok || htlc.State != HtlcStatePendingSettle {
+			continue
+		}
+
+		setID := update.SetID
+		if htlc.AMP == nil {
+			setID = nil
+		}
+
+		switch outcome {
+		case HtlcStateSettled:
+			settled, htlcState, err := getUpdatedHtlcState(
+				htlc, ContractSettled, (*[32]byte)(setID),
+			)
+			if err != nil {
+				return err
+			}
+			if !settled || htlcState != HtlcStateSettled {
+				return fmt.Errorf(
+					"unable to finalize htlc %v as "+
+						"settled", key,
+				)
+			}
+
+			err = resolveHtlc(
+				key, htlc, HtlcStateSettled, updateTime,
+				updater,
+			)
+			if err != nil {
+				return err
+			}
+
+		case HtlcStateCanceled:
+			err := resolveHtlc(
+				key, htlc, HtlcStateCanceled, updateTime,
+				updater,
+			)
+			if err != nil {
+				return err
+			}
+
+		default:
+			return fmt.Errorf(
+				"unknown final htlc outcome: %v", outcome,
+			)
+		}
+
+		if htlc.AMP != nil {
+			err := finalizeAmpSetIfComplete(
+				invoice, htlc.AMP.Record.SetID(), key, updater,
+			)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if invoice.IsAMP() {
+		return nil
+	}
+
+	return finalizeInvoiceIfComplete(invoice, hash, updateTime, updater)
+}
+
+// finalizeAmpSetIfComplete updates an AMP sub-invoice after one HTLC finalizes.
+func finalizeAmpSetIfComplete(invoice *Invoice, setID SetID,
+	circuitKey models.CircuitKey, updater InvoiceUpdater) error {
+
+	ampState := invoice.AMPState[setID]
+	set := invoiceHTLCSet(invoice, (*[32]byte)(&setID))
+	allSettled := len(set) > 0
+	for _, htlc := range set {
+		switch htlc.State {
+		case HtlcStatePendingSettle:
+			ampState.State = HtlcStatePendingSettle
+			invoice.AMPState[setID] = ampState
+
+			return updater.UpdateAmpState(
+				setID, ampState, circuitKey,
+			)
+
+		case HtlcStateSettled:
+
+		default:
+			allSettled = false
+		}
+	}
+
+	if allSettled {
+		ampState.State = HtlcStateSettled
+	} else {
+		failedAmt := ampState.AmtPaid
+		amtPaid := lnwire.MilliSatoshi(0)
+		if invoice.AmtPaid > failedAmt {
+			amtPaid = invoice.AmtPaid - failedAmt
+		}
+
+		ampState.State = HtlcStateCanceled
+		ampState.AmtPaid = 0
+
+		err := updateInvoiceAmtPaid(invoice, amtPaid, updater)
+		if err != nil {
+			return err
+		}
+	}
+
+	invoice.AMPState[setID] = ampState
+
+	return updater.UpdateAmpState(setID, ampState, circuitKey)
+}
+
+// finalizeInvoiceIfComplete derives the terminal non-AMP invoice state once all
+// pending-settle HTLCs have reported a final outcome.
+func finalizeInvoiceIfComplete(invoice *Invoice, hash *lntypes.Hash,
+	updateTime time.Time, updater InvoiceUpdater) error {
+
+	var amtPaid lnwire.MilliSatoshi
+	for _, htlc := range invoiceHTLCSet(invoice, nil) {
+		switch htlc.State {
+		case HtlcStatePendingSettle:
+			return nil
+
+		case HtlcStateSettled:
+			amtPaid += htlc.Amt
+		}
+	}
+
+	paid := amtPaid > 0 && (invoice.Terms.Value == 0 ||
+		amtPaid >= invoice.Terms.Value)
+	if paid {
+		return finalizeInvoiceState(
+			invoice, hash, updateTime, ContractSettled, amtPaid,
+			updater,
+		)
+	}
+
+	return finalizeInvoiceState(
+		invoice, hash, updateTime, ContractCanceled, amtPaid, updater,
+	)
+}
+
+// finalizeInvoiceState applies the final non-AMP invoice state and amount.
+func finalizeInvoiceState(invoice *Invoice, hash *lntypes.Hash,
+	updateTime time.Time, state ContractState, amtPaid lnwire.MilliSatoshi,
+	updater InvoiceUpdater) error {
+
+	update := InvoiceStateUpdateDesc{
+		NewState: state,
+	}
+	if state == ContractSettled {
+		update.Preimage = invoice.Terms.PaymentPreimage
+	}
+
+	newState, err := getUpdatedInvoiceState(invoice, hash, update)
+	if err != nil {
+		return err
+	}
+	if newState == nil || *newState != state {
+		return fmt.Errorf("unable to finalize invoice: new computed "+
+			"state is not %v: %s", state, newState)
+	}
+
+	err = updater.UpdateInvoiceState(state, update.Preimage)
+	if err != nil {
+		return err
+	}
+	invoice.State = state
+
+	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
+}
+
+// invoiceHTLCSet returns all HTLCs that belong to a non-AMP or AMP set,
+// regardless of their current state.
+func invoiceHTLCSet(invoice *Invoice,
+	setID *[32]byte) map[models.CircuitKey]*InvoiceHTLC {
+
+	set := make(map[models.CircuitKey]*InvoiceHTLC)
+	for key, htlc := range invoice.Htlcs {
+		if htlc.IsInHTLCSet(setID) {
+			set[key] = htlc
+		}
+	}
+
+	return set
 }
 
 // cancelInvoice attempts to cancel the given invoice. That includes changing
@@ -603,6 +853,29 @@ func getUpdatedInvoiceState(invoice *Invoice, hash *lntypes.Hash,
 	}
 
 	switch invoice.State {
+	// Once settlement is pending, only the final HTLC outcome may move the
+	// invoice to settled or canceled.
+	case ContractPendingSettle:
+		if update.NewState == ContractPendingSettle {
+			return nil, ErrInvoiceCannotAccept
+		}
+
+		if update.NewState == ContractCanceled {
+			return &update.NewState, nil
+		}
+
+		if update.NewState == ContractSettled {
+			if update.SetID == nil &&
+				invoice.Terms.PaymentPreimage == nil {
+
+				return nil, errors.New("unknown preimage")
+			}
+
+			return &update.NewState, nil
+		}
+
+		return nil, errors.New("unknown state transition")
+
 	// Once a contract is accepted, we can only transition to settled or
 	// canceled. Forbid transitioning back into this state. Otherwise this
 	// state is identical to ContractOpen, so we fallthrough to apply the
@@ -614,9 +887,10 @@ func getUpdatedInvoiceState(invoice *Invoice, hash *lntypes.Hash,
 
 		fallthrough
 
-	// If a contract is open, permit a state transition to accepted, settled
-	// or canceled. The only restriction is on transitioning to settled
-	// where we ensure the preimage is valid.
+		// If a contract is open, permit a state transition to accepted,
+		// pending-settle, settled or canceled. The only restriction is
+		// on transitioning to a settle state where we ensure the
+		// preimage is valid.
 	case ContractOpen:
 		if update.NewState == ContractCanceled {
 			return &update.NewState, nil
@@ -625,6 +899,11 @@ func getUpdatedInvoiceState(invoice *Invoice, hash *lntypes.Hash,
 		// Sanity check that the user isn't trying to settle or accept a
 		// non-existent HTLC set.
 		set := invoice.HTLCSet(update.SetID, HtlcStateAccepted)
+		if len(set) == 0 && update.NewState == ContractSettled {
+			set = invoice.HTLCSet(
+				update.SetID, HtlcStatePendingSettle,
+			)
+		}
 		if len(set) == 0 {
 			return nil, ErrEmptyHTLCSet
 		}
@@ -660,7 +939,8 @@ func getUpdatedInvoiceState(invoice *Invoice, hash *lntypes.Hash,
 
 		// Fail if we still don't have a preimage when transitioning to
 		// settle the non-AMP invoice.
-		case update.NewState == ContractSettled &&
+		case (update.NewState == ContractSettled ||
+			update.NewState == ContractPendingSettle) &&
 			invoice.Terms.PaymentPreimage == nil:
 
 			return nil, errors.New("unknown preimage")
@@ -719,6 +999,11 @@ func getUpdatedInvoiceAmpState(invoice *Invoice, setID SetID,
 		ampState.State = HtlcStateCanceled
 		ampState.AmtPaid -= amt
 
+	// Pending-settle means the AMP set has released child preimages, but
+	// the final HTLC outcome is not known yet. Do not alter AmtPaid here.
+	case HtlcStatePendingSettle:
+		ampState.State = HtlcStatePendingSettle
+
 	case HtlcStateSettled:
 		ampState.State = HtlcStateSettled
 	}
@@ -740,7 +1025,9 @@ func canCancelSingleHtlc(htlc *InvoiceHTLC,
 	}
 
 	// It is only possible if the htlc is still pending.
-	if htlc.State != HtlcStateAccepted {
+	if htlc.State != HtlcStateAccepted &&
+		htlc.State != HtlcStatePendingSettle {
+
 		return fmt.Errorf("htlc canceled in state %v", htlc.State)
 	}
 
@@ -754,8 +1041,10 @@ func getUpdatedHtlcState(htlc *InvoiceHTLC,
 	invoiceState ContractState, setID *[32]byte) (
 	bool, HtlcState, error) {
 
-	trySettle := func(persist bool) (bool, HtlcState, error) {
-		if htlc.State != HtlcStateAccepted {
+	trySettle := func(newState HtlcState) (bool, HtlcState, error) {
+		if htlc.State != HtlcStateAccepted &&
+			htlc.State != HtlcStatePendingSettle {
+
 			return false, htlc.State, nil
 		}
 
@@ -794,27 +1083,21 @@ func getUpdatedHtlcState(htlc *InvoiceHTLC,
 			settled = true
 		}
 
-		// Only persist the changes if the invoice is moving to the
-		// settled state, and we're actually updating the state to
-		// settled.
-		newState := htlc.State
-		if settled {
-			newState = HtlcStateSettled
+		if !settled || htlc.State == newState {
+			return false, htlc.State, nil
 		}
 
-		return persist && settled, newState, nil
+		return true, newState, nil
 	}
 
 	if invoiceState == ContractSettled {
 		// Check that we can settle the HTLCs. For legacy and MPP HTLCs
 		// this will be a NOP, but for AMP HTLCs this asserts that we
-		// have a valid hash/preimage pair. Passing true permits the
-		// method to update the HTLC to HtlcStateSettled.
-		return trySettle(true)
+		// have a valid hash/preimage pair.
+		return trySettle(HtlcStateSettled)
 	}
 
-	// We should never find a settled HTLC on an invoice that isn't in
-	// ContractSettled.
+	// We should never find a settled HTLC on an invoice that isn't final.
 	if htlc.State == HtlcStateSettled {
 		return false, htlc.State, ErrHTLCAlreadySettled
 	}
@@ -824,14 +1107,22 @@ func getUpdatedHtlcState(htlc *InvoiceHTLC,
 		htlcAlreadyCanceled := htlc.State == HtlcStateCanceled
 		return !htlcAlreadyCanceled, HtlcStateCanceled, nil
 
-	// TODO(roasbeef): never fully passed thru now?
+	// Pending-settle validates settle eligibility but keeps HTLCs in a
+	// non-final state until the link or resolver reports the outcome.
+	case ContractPendingSettle:
+		return trySettle(HtlcStatePendingSettle)
+
 	case ContractAccepted:
-		// Check that we can settle the HTLCs. For legacy and MPP HTLCs
-		// this will be a NOP, but for AMP HTLCs this asserts that we
-		// have a valid hash/preimage pair. Passing false prevents the
-		// method from putting the HTLC in HtlcStateSettled, leaving it
-		// in HtlcStateAccepted.
-		return trySettle(false)
+		if htlc.State == HtlcStatePendingSettle {
+			return false, htlc.State, nil
+		}
+
+		// Check that we can settle the HTLCs. For legacy and MPP
+		// HTLCs this will be a NOP, but for AMP HTLCs this asserts
+		// that we have a valid hash/preimage pair. The method is
+		// called with the current state, leaving the HTLC in
+		// HtlcStateAccepted.
+		return trySettle(HtlcStateAccepted)
 
 	case ContractOpen:
 		return false, htlc.State, nil

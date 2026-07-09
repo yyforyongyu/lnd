@@ -1395,13 +1395,23 @@ func TestUpdateForwardingPolicy(t *testing.T) {
 
 	// Carol's invoice should now be shown as settled as the payment
 	// succeeded.
-	invoice, err := n.carolServer.registry.LookupInvoice(
-		t.Context(), payResp,
-	)
-	require.NoError(t, err, "unable to get invoice")
-	if invoice.State != invpkg.ContractSettled {
-		t.Fatal("carol invoice haven't been settled")
-	}
+	err = wait.NoError(func() error {
+		invoice, err := n.carolServer.registry.LookupInvoice(
+			t.Context(), payResp,
+		)
+		if err != nil {
+			return fmt.Errorf("unable to get invoice: %w", err)
+		}
+
+		if invoice.State != invpkg.ContractSettled {
+			return fmt.Errorf(
+				"carol invoice state: %v", invoice.State,
+			)
+		}
+
+		return nil
+	}, time.Minute)
+	require.NoError(t, err)
 
 	expectedAliceBandwidth := aliceBandwidthBefore - htlcAmt
 	if expectedAliceBandwidth != n.aliceChannelLink.Bandwidth() {

@@ -278,12 +278,30 @@ func testSettleInvoice(t *testing.T,
 	)
 	require.Equal(t, invpkg.ResultSettled, settleResolution.Outcome)
 
-	// We expect the settled state to be sent to the single invoice
+	// Try to settle again with a new higher-valued HTLC before the first
+	// HTLC finalizes. This payment should be accepted as a duplicate, just
+	// like duplicates to settled invoices.
+	duplicatePendingAmt := amtPaid + 600
+	resolution, err = ctx.registry.NotifyExitHopHtlc(
+		testInvoicePaymentHash, duplicatePendingAmt, testHtlcExpiry,
+		testCurrentHeight, getCircuitKey(1), hodlChan,
+		nil, testPayload,
+	)
+	require.NoError(t, err, "unexpected NotifyExitHopHtlc error")
+	require.NotNil(t, resolution)
+	settleResolution = checkSettleResolution(
+		t, resolution, testInvoicePreimage,
+	)
+	require.Equal(
+		t, invpkg.ResultDuplicateToSettled, settleResolution.Outcome,
+	)
+
+	// We expect the pending-settle state to be sent to the single invoice
 	// subscriber.
 	select {
 	case update := <-subscription.Updates:
-		if update.State != invpkg.ContractSettled {
-			t.Fatalf("expected state ContractOpen, but got %v",
+		if update.State != invpkg.ContractPendingSettle {
+			t.Fatalf("expected state PendingSettle, but got %v",
 				update.State)
 		}
 		if update.AmtPaid != amtPaid {
@@ -293,11 +311,31 @@ func testSettleInvoice(t *testing.T,
 		t.Fatal("no update received")
 	}
 
-	// We expect a settled notification to be sent out.
+	// The invoice is only reported as settled once the HTLC settle is
+	// final.
+	err = ctx.registry.NotifyExitHopHtlcFinalized(
+		ctxb, getCircuitKey(0), true,
+	)
+	require.NoError(t, err)
+
+	// We expect the settled state to be sent to the single invoice
+	// subscriber.
+	select {
+	case update := <-subscription.Updates:
+		if update.State != invpkg.ContractSettled {
+			t.Fatalf("expected state ContractSettled, but got %v",
+				update.State)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("no update received")
+	}
+
+	// We expect a settled notification to be sent out for all invoice
+	// subscribers.
 	select {
 	case settledInvoice := <-allSubscriptions.SettledInvoices:
 		if settledInvoice.State != invpkg.ContractSettled {
-			t.Fatalf("expected state ContractOpen, but got %v",
+			t.Fatalf("expected state ContractSettled, but got %v",
 				settledInvoice.State)
 		}
 	case <-time.After(testTimeout):
@@ -321,9 +359,10 @@ func testSettleInvoice(t *testing.T,
 	// Try to settle again with a new higher-valued htlc. This payment
 	// should also be accepted, to prevent any change in behaviour for a
 	// paid invoice that may open up a probe vector.
+	duplicateSettledAmt := amtPaid + 700
 	resolution, err = ctx.registry.NotifyExitHopHtlc(
-		testInvoicePaymentHash, amtPaid+600, testHtlcExpiry,
-		testCurrentHeight, getCircuitKey(1), hodlChan,
+		testInvoicePaymentHash, duplicateSettledAmt, testHtlcExpiry,
+		testCurrentHeight, getCircuitKey(2), hodlChan,
 		nil, testPayload,
 	)
 	require.NoError(t, err, "unexpected NotifyExitHopHtlc error")
@@ -339,7 +378,7 @@ func testSettleInvoice(t *testing.T,
 	// would have failed if it were the first payment.
 	resolution, err = ctx.registry.NotifyExitHopHtlc(
 		testInvoicePaymentHash, amtPaid-600, testHtlcExpiry,
-		testCurrentHeight, getCircuitKey(2), hodlChan,
+		testCurrentHeight, getCircuitKey(3), hodlChan,
 		nil, testPayload,
 	)
 	require.NoError(t, err, "unexpected NotifyExitHopHtlc error")
@@ -347,14 +386,15 @@ func testSettleInvoice(t *testing.T,
 	checkFailResolution(t, resolution, invpkg.ResultAmountTooLow)
 
 	// Check that settled amount is equal to the sum of values of the htlcs
-	// 0 and 1.
+	// 0, 1 and 2.
 	inv, err := ctx.registry.LookupInvoice(ctxb, testInvoicePaymentHash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inv.AmtPaid != amtPaid+amtPaid+600 {
+	expectedAmtPaid := amtPaid + duplicatePendingAmt + duplicateSettledAmt
+	if inv.AmtPaid != expectedAmtPaid {
 		t.Fatalf("amount incorrect: expected %v got %v",
-			amtPaid+amtPaid+600, inv.AmtPaid)
+			expectedAmtPaid, inv.AmtPaid)
 	}
 
 	// Try to cancel.
@@ -660,6 +700,21 @@ func testSettleHoldInvoice(t *testing.T,
 	require.Equal(t, testCurrentHeight, settleResolution.AcceptHeight)
 	require.Equal(t, invpkg.ResultSettled, settleResolution.Outcome)
 
+	// We expect a pending-settle notification for the single invoice
+	// subscriber. All invoice subscribers are only notified after finality.
+	update = <-subscription.Updates
+	if update.State != invpkg.ContractPendingSettle {
+		t.Fatalf("expected state ContractPendingSettle, but got %v",
+			update.State)
+	}
+
+	// Idempotency.
+	err = registry.SettleHodlInvoice(ctxb, testInvoicePreimage)
+	require.ErrorIs(t, err, invpkg.ErrInvoiceAlreadySettled)
+
+	err = registry.NotifyExitHopHtlcFinalized(ctxb, getCircuitKey(0), true)
+	require.NoError(t, err)
+
 	// We expect a settled notification to be sent out for both all and
 	// single invoice subscribers.
 	settledInvoice := <-allSubscriptions.SettledInvoices
@@ -677,10 +732,6 @@ func testSettleHoldInvoice(t *testing.T,
 		t.Fatalf("expected state ContractSettled, but got %v",
 			update.State)
 	}
-
-	// Idempotency.
-	err = registry.SettleHodlInvoice(ctxb, testInvoicePreimage)
-	require.ErrorIs(t, err, invpkg.ErrInvoiceAlreadySettled)
 
 	// Try to cancel.
 	err = registry.CancelInvoice(ctxb, testInvoicePaymentHash)
@@ -820,9 +871,10 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	cfg := defaultRegistryConfig()
 	cfg.AcceptKeySend = keySendEnabled
 	ctx := newTestContext(t, &cfg, makeDB)
+	ctxb := t.Context()
 
 	allSubscriptions, err := ctx.registry.SubscribeNotifications(
-		t.Context(), 0, 0,
+		ctxb, 0, 0,
 	)
 	require.NoError(t, err)
 	defer allSubscriptions.Cancel()
@@ -880,10 +932,15 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 		return
 	}
 
-	checkSubscription := func() {
+	checkSubscription := func(circuitKey invpkg.CircuitKey) {
 		// We expect a new invoice notification to be sent out.
 		newInvoice := <-allSubscriptions.NewInvoices
 		require.Equal(t, newInvoice.State, invpkg.ContractOpen)
+
+		// The settled notification is only sent after HTLC finality.
+		require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+			ctxb, circuitKey, true,
+		))
 
 		// We expect a settled notification to be sent out.
 		settledInvoice := <-allSubscriptions.SettledInvoices
@@ -891,7 +948,7 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	}
 
 	checkSettleResolution(t, resolution, preimage)
-	checkSubscription()
+	checkSubscription(getCircuitKey(10))
 
 	// Replay the same keysend payment. We expect an identical resolution,
 	// but no event should be generated.
@@ -926,7 +983,7 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	require.Nil(t, err)
 
 	checkSettleResolution(t, resolution, preimage2)
-	checkSubscription()
+	checkSubscription(getCircuitKey(20))
 }
 
 // testHoldKeysend tests receiving a spontaneous payment that is held.
@@ -1030,7 +1087,19 @@ func testHoldKeysendImpl(t *testing.T, timeoutKeysend bool,
 		ctxb, *newInvoice.Terms.PaymentPreimage,
 	))
 
-	// We expect a settled notification to be sent out.
+	htlcResolution, _ := (<-hodlChan).(invpkg.HtlcResolution)
+	require.NotNil(t, htlcResolution)
+	checkSettleResolution(t, htlcResolution, preimage)
+
+	inv, err := ctx.registry.LookupInvoice(ctxb, hash)
+	require.NoError(t, err)
+	require.Equal(t, invpkg.ContractPendingSettle, inv.State)
+
+	require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+		ctxb, getCircuitKey(10), true,
+	))
+
+	// We expect a settled notification to be sent out after finality.
 	settledInvoice := <-allSubscriptions.SettledInvoices
 	require.Equal(t, settledInvoice.State, invpkg.ContractSettled)
 }
@@ -1120,6 +1189,10 @@ func testMppPayment(t *testing.T,
 			settleResolution.Outcome)
 	}
 
+	require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+		ctxb, getCircuitKey(12), true,
+	))
+
 	// Check that settled amount is equal to the sum of values of the htlcs
 	// 2 and 3.
 	inv, err := ctx.registry.LookupInvoice(ctxb, testInvoicePaymentHash)
@@ -1194,6 +1267,10 @@ func testMppPaymentWithOverpayment(t *testing.T,
 			t.Fatalf("expected result settled, got: %v",
 				settleResolution.Outcome)
 		}
+
+		require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+			ctxb, getCircuitKey(12), true,
+		))
 
 		// Check that settled amount is equal to the sum of values of
 		// the htlcs 1 and 2.
@@ -1518,7 +1595,7 @@ func testHeightExpiryWithRegistryImpl(t *testing.T, numParts int, settle bool,
 
 	// If we did not settle the invoice before its expiry, we now expect
 	// a cancellation.
-	expectedState := invpkg.ContractSettled
+	expectedState := invpkg.ContractPendingSettle
 	if !settle {
 		expectedState = invpkg.ContractCanceled
 
@@ -1815,12 +1892,12 @@ func testSettleInvoicePaymentAddrRequiredOptionalGrace(t *testing.T,
 	}
 	require.Equal(t, settleResolution.Outcome, invpkg.ResultSettled)
 
-	// We expect the settled state to be sent to the single invoice
+	// We expect the pending-settle state to be sent to the single invoice
 	// subscriber.
 	select {
 	case update := <-subscription.Updates:
-		if update.State != invpkg.ContractSettled {
-			t.Fatalf("expected state ContractOpen, but got %v",
+		if update.State != invpkg.ContractPendingSettle {
+			t.Fatalf("expected state PendingSettle, but got %v",
 				update.State)
 		}
 		if update.AmtPaid != invoice.Terms.Value {
@@ -1830,11 +1907,27 @@ func testSettleInvoicePaymentAddrRequiredOptionalGrace(t *testing.T,
 		t.Fatal("no update received")
 	}
 
+	require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+		ctxb, getCircuitKey(10), true,
+	))
+
+	// We expect the settled state to be sent to the single invoice
+	// subscriber.
+	select {
+	case update := <-subscription.Updates:
+		if update.State != invpkg.ContractSettled {
+			t.Fatalf("expected state ContractSettled, but got %v",
+				update.State)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("no update received")
+	}
+
 	// We expect a settled notification to be sent out.
 	select {
 	case settledInvoice := <-allSubscriptions.SettledInvoices:
 		if settledInvoice.State != invpkg.ContractSettled {
-			t.Fatalf("expected state ContractOpen, but got %v",
+			t.Fatalf("expected state ContractSettled, but got %v",
 				settledInvoice.State)
 		}
 	case <-time.After(testTimeout):
@@ -2076,7 +2169,7 @@ func testSpontaneousAmpPaymentImpl(
 
 		// Assert the behavior of the Open and Settle notifications.
 		// There should always be an open (keysend is enabled) followed
-		// by settle for valid AMP payments.
+		// by settle for valid AMP payments after finality.
 		//
 		// NOTE: The cases are split in separate if conditions, rather
 		// than else-if, to properly handle the case when there is only
@@ -2088,6 +2181,12 @@ func testSpontaneousAmpPaymentImpl(
 			if failReconstruction {
 				checkNoSettleSubscription()
 			} else {
+				circuitKey := getCircuitKey(uint64(i))
+				require.NoError(t,
+					ctx.registry.NotifyExitHopHtlcFinalized(
+						ctxb, circuitKey, true,
+					),
+				)
 				checkSettleSubscription()
 			}
 		}

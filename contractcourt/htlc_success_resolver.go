@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -114,9 +115,9 @@ func (h *htlcSuccessResolver) ResolverKey() []byte {
 // Resolve attempts to resolve an unresolved incoming HTLC that we know the
 // preimage to. If the HTLC is on the commitment of the remote party, then we'll
 // simply sweep it directly. Otherwise, we'll hand this off to the utxo nursery
-// to do its duty. There is no need to make a call to the invoice registry
-// anymore. Every HTLC has already passed through the incoming contest resolver
-// and in there the invoice was already marked as settled.
+// to do its duty. Every HTLC has already passed through the incoming contest
+// resolver and requested settlement from the invoice registry. The invoice is
+// finalized once this resolver determines the on-chain outcome.
 //
 // NOTE: Part of the ContractResolver interface.
 //
@@ -166,6 +167,12 @@ func (h *htlcSuccessResolver) resolveRemoteCommitOutput() error {
 	if err != nil {
 		return err
 	}
+	if !isPreimageSpend(
+		h.isTaproot(), sweepTxDetails, !h.isRemoteCommitOutput(),
+	) {
+
+		return h.checkpointForeignSpend(sweepTxDetails)
+	}
 
 	// TODO(yy): should also update the `RecoveredBalance` and
 	// `LimboBalance` like other paths?
@@ -184,6 +191,11 @@ func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
 	)
 	if err != nil {
 		return err
+	}
+
+	err = h.notifyInvoiceHtlcFinalized(true)
+	if err != nil {
+		h.log.Warnf("Unable to finalize invoice HTLC outcome: %v", err)
 	}
 
 	// Send notification.
@@ -234,6 +246,21 @@ func (h *htlcSuccessResolver) checkpointClaim(spendTx *chainhash.Hash) error {
 	return h.Checkpoint(h, reports...)
 }
 
+// notifyInvoiceHtlcFinalized marks the invoice settlement outcome final if the
+// HTLC belongs to an exit-hop invoice.
+func (h *htlcSuccessResolver) notifyInvoiceHtlcFinalized(settled bool) error {
+	if h.Registry == nil {
+		return nil
+	}
+
+	return h.Registry.NotifyExitHopHtlcFinalized(
+		context.Background(), models.CircuitKey{
+			ChanID: h.ShortChanID,
+			HtlcID: h.htlc.HtlcIndex,
+		}, settled,
+	)
+}
+
 // checkpointForeignSpend checkpoints the resolver as failed when the original
 // HTLC outpoint was spent by a transaction that did not create our expected
 // second-level success output.
@@ -245,6 +272,11 @@ func (h *htlcSuccessResolver) checkpointForeignSpend(
 	)
 	if err != nil {
 		return err
+	}
+
+	err = h.notifyInvoiceHtlcFinalized(false)
+	if err != nil {
+		h.log.Warnf("Unable to finalize invoice HTLC outcome: %v", err)
 	}
 
 	var spendTxID *chainhash.Hash
@@ -326,6 +358,7 @@ func (h *htlcSuccessResolver) report() *ContractReport {
 	h.reportLock.Lock()
 	defer h.reportLock.Unlock()
 	cpy := h.currentReport
+
 	return &cpy
 }
 
