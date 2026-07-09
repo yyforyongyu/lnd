@@ -1142,7 +1142,12 @@ func (i *InvoiceRegistry) NotifyExitHopHtlc(rHash lntypes.Hash,
 func (i *InvoiceRegistry) NotifyExitHopHtlcFinalized(ctx context.Context,
 	circuitKey CircuitKey, settled bool) error {
 
-	return i.notifyExitHopHtlcFinalized(ctx, circuitKey, settled)
+	err := i.notifyExitHopHtlcFinalized(ctx, circuitKey, settled)
+	if err != nil {
+		i.queueHtlcFinalizationRetry(circuitKey, settled)
+	}
+
+	return err
 }
 
 // notifyExitHopHtlcFinalized applies the final outcome of a pending-settle
@@ -1216,6 +1221,72 @@ func (i *InvoiceRegistry) notifyExitHopHtlcFinalized(ctx context.Context,
 	}
 
 	return nil
+}
+
+// queueHtlcFinalizationRetry queues a retry for an exit-hop HTLC finalization
+// that failed after the HTLC outcome was already known.
+func (i *InvoiceRegistry) queueHtlcFinalizationRetry(circuitKey CircuitKey,
+	settled bool) {
+
+	// Retries are processed by the invoice event loop, so there is nothing
+	// to queue before startup or after shutdown has begun.
+	if !i.started.Load() || i.stopped.Load() {
+		return
+	}
+
+	i.Lock()
+	if _, ok := i.htlcFinalizationRetries[circuitKey]; ok {
+		i.Unlock()
+		return
+	}
+	i.htlcFinalizationRetries[circuitKey] = struct{}{}
+	i.Unlock()
+
+	event := &htlcFinalizationRetryEvent{
+		key:       circuitKey,
+		settled:   settled,
+		retryTime: i.cfg.Clock.Now().Add(htlcFinalizationRetryDelay(0)),
+	}
+
+	i.enqueueHtlcFinalizationRetry(event)
+}
+
+// clearHtlcFinalizationRetry removes an HTLC from the retry de-duplication
+// index.
+func (i *InvoiceRegistry) clearHtlcFinalizationRetry(
+	circuitKey CircuitKey) {
+
+	i.Lock()
+	delete(i.htlcFinalizationRetries, circuitKey)
+	i.Unlock()
+}
+
+// enqueueHtlcFinalizationRetry queues a finalization retry.
+func (i *InvoiceRegistry) enqueueHtlcFinalizationRetry(
+	event *htlcFinalizationRetryEvent) {
+
+	select {
+	case i.htlcFinalizationRetryChan <- event:
+	case <-i.quit:
+		i.clearHtlcFinalizationRetry(event.key)
+	default:
+		log.Warnf("Finalization retry queue full for %v", event.key)
+		i.clearHtlcFinalizationRetry(event.key)
+	}
+}
+
+// htlcFinalizationRetryDelay returns the exponential backoff delay for a
+// failed finalization retry.
+func htlcFinalizationRetryDelay(attempts uint32) time.Duration {
+	delay := DefaultHtlcFinalizationRetryDelay
+	for ; attempts > 0; attempts-- {
+		delay *= 2
+		if delay >= DefaultHtlcFinalizationRetryMaxDelay {
+			return DefaultHtlcFinalizationRetryMaxDelay
+		}
+	}
+
+	return delay
 }
 
 // recordPendingSettleRefsLocked indexes all pending-settle HTLCs on an invoice
