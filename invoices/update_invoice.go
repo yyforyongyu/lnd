@@ -520,8 +520,8 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
 }
 
-// finalizeHTLCs records final HTLC outcomes and only finalizes the invoice once
-// no non-AMP HTLC is still pending finality.
+// finalizeHTLCs records final HTLC outcomes and only finalizes the invoice or
+// AMP set once no HTLC in the set is still pending finality.
 func finalizeHTLCs(invoice *Invoice, hash *lntypes.Hash,
 	updateTime time.Time, update *InvoiceUpdateDesc,
 	updater InvoiceUpdater) error {
@@ -584,6 +584,15 @@ func finalizeHTLCs(invoice *Invoice, hash *lntypes.Hash,
 				"unknown final htlc outcome: %v", outcome,
 			)
 		}
+
+		if htlc.AMP != nil {
+			err := finalizeAmpSetIfComplete(
+				invoice, htlc.AMP.Record.SetID(), key, updater,
+			)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	if invoice.IsAMP() {
@@ -593,13 +602,60 @@ func finalizeHTLCs(invoice *Invoice, hash *lntypes.Hash,
 	return finalizeInvoiceIfComplete(invoice, hash, updateTime, updater)
 }
 
+// finalizeAmpSetIfComplete updates an AMP sub-invoice after one HTLC finalizes.
+func finalizeAmpSetIfComplete(invoice *Invoice, setID SetID,
+	circuitKey models.CircuitKey, updater InvoiceUpdater) error {
+
+	ampState := invoice.AMPState[setID]
+	set := invoiceHTLCSet(invoice, (*[32]byte)(&setID))
+	allSettled := len(set) > 0
+	for _, htlc := range set {
+		switch htlc.State {
+		case HtlcStatePendingSettle:
+			ampState.State = HtlcStatePendingSettle
+			invoice.AMPState[setID] = ampState
+
+			return updater.UpdateAmpState(
+				setID, ampState, circuitKey,
+			)
+
+		case HtlcStateSettled:
+
+		default:
+			allSettled = false
+		}
+	}
+
+	if allSettled {
+		ampState.State = HtlcStateSettled
+	} else {
+		failedAmt := ampState.AmtPaid
+		amtPaid := lnwire.MilliSatoshi(0)
+		if invoice.AmtPaid > failedAmt {
+			amtPaid = invoice.AmtPaid - failedAmt
+		}
+
+		ampState.State = HtlcStateCanceled
+		ampState.AmtPaid = 0
+
+		err := updateInvoiceAmtPaid(invoice, amtPaid, updater)
+		if err != nil {
+			return err
+		}
+	}
+
+	invoice.AMPState[setID] = ampState
+
+	return updater.UpdateAmpState(setID, ampState, circuitKey)
+}
+
 // finalizeInvoiceIfComplete derives the terminal non-AMP invoice state once all
 // pending-settle HTLCs have reported a final outcome.
 func finalizeInvoiceIfComplete(invoice *Invoice, hash *lntypes.Hash,
 	updateTime time.Time, updater InvoiceUpdater) error {
 
 	var amtPaid lnwire.MilliSatoshi
-	for _, htlc := range invoice.Htlcs {
+	for _, htlc := range invoiceHTLCSet(invoice, nil) {
 		switch htlc.State {
 		case HtlcStatePendingSettle:
 			return nil
@@ -651,6 +707,21 @@ func finalizeInvoiceState(invoice *Invoice, hash *lntypes.Hash,
 	invoice.State = state
 
 	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
+}
+
+// invoiceHTLCSet returns all HTLCs that belong to a non-AMP or AMP set,
+// regardless of their current state.
+func invoiceHTLCSet(invoice *Invoice,
+	setID *[32]byte) map[models.CircuitKey]*InvoiceHTLC {
+
+	set := make(map[models.CircuitKey]*InvoiceHTLC)
+	for key, htlc := range invoice.Htlcs {
+		if htlc.IsInHTLCSet(setID) {
+			set[key] = htlc
+		}
+	}
+
+	return set
 }
 
 // cancelInvoice attempts to cancel the given invoice. That includes changing
