@@ -54,6 +54,21 @@ func ChanUpdSetDisable(disabled bool) ChannelUpdateModifier {
 	}
 }
 
+// ChanUpdSetHtlcMinMax is a functional option that sets the advertised
+// htlc_minimum_msat and htlc_maximum_msat fields of the update, ensuring the
+// max-htlc message flag is set so the maximum is honored. It is used to realign
+// an advertised channel_update with a committed dynamic-commitments change to
+// the channel's inbound HTLC limits.
+func ChanUpdSetHtlcMinMax(htlcMin,
+	htlcMax lnwire.MilliSatoshi) ChannelUpdateModifier {
+
+	return func(update *lnwire.ChannelUpdate1) {
+		update.HtlcMinimumMsat = htlcMin
+		update.HtlcMaximumMsat = htlcMax
+		update.MessageFlags |= lnwire.ChanUpdateRequiredMaxHtlc
+	}
+}
+
 // ChanUpdSetTimestamp is a functional option that sets the timestamp of the
 // update to the current time, or increments it if the timestamp is already in
 // the future.
