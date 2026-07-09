@@ -274,3 +274,185 @@ func TestInvoiceEventSuppressesAMPNonSettled(t *testing.T) {
 	invoice.AMPState[setID] = ampState
 	require.False(t, event.suppressedForAllClients())
 }
+
+// TestNotifyExitHopHtlcFinalizedSettle finalizes a pending-settle HTLC as
+// settled and verifies the invoice reaches its terminal settled state.
+func TestNotifyExitHopHtlcFinalizedSettle(t *testing.T) {
+	t.Parallel()
+
+	hash, circuitKey, invoice := newPendingSettleTestInvoice()
+	db := &finalTestDB{
+		hash:       hash,
+		invoice:    invoice,
+		updateTime: time.Now(),
+	}
+	registry := NewRegistry(db, nil, &RegistryConfig{})
+	registerPendingSettleTestInvoice(registry, hash, &invoice)
+
+	err := registry.NotifyExitHopHtlcFinalized(
+		t.Context(), circuitKey, true,
+	)
+	require.NoError(t, err)
+	require.Equal(t, ContractSettled, db.invoice.State)
+	require.Equal(
+		t, HtlcStateSettled, db.invoice.Htlcs[circuitKey].State,
+	)
+	require.Zero(t, db.fetchPendingCalls)
+}
+
+// TestNotifyExitHopHtlcFinalizedFail finalizes a pending-settle HTLC as failed
+// and verifies the invoice is canceled.
+func TestNotifyExitHopHtlcFinalizedFail(t *testing.T) {
+	t.Parallel()
+
+	hash, circuitKey, invoice := newPendingSettleTestInvoice()
+	db := &finalTestDB{
+		hash:       hash,
+		invoice:    invoice,
+		updateTime: time.Now(),
+	}
+	registry := NewRegistry(db, nil, &RegistryConfig{})
+	registerPendingSettleTestInvoice(registry, hash, &invoice)
+
+	err := registry.NotifyExitHopHtlcFinalized(
+		t.Context(), circuitKey, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, ContractCanceled, db.invoice.State)
+	require.Equal(
+		t, HtlcStateCanceled, db.invoice.Htlcs[circuitKey].State,
+	)
+	require.Zero(t, db.fetchPendingCalls)
+}
+
+// TestNotifyExitHopHtlcFinalizedSettleWaitsForSibling verifies a settled HTLC
+// does not finalize the invoice while another HTLC in the same set is still
+// pending finality.
+func TestNotifyExitHopHtlcFinalizedSettleWaitsForSibling(t *testing.T) {
+	t.Parallel()
+
+	hash, circuitKey, invoice := newPendingSettleTestInvoice()
+	secondKey := CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1),
+		HtlcID: 3,
+	}
+	invoice.Htlcs[secondKey] = &InvoiceHTLC{
+		Amt:   2000,
+		State: HtlcStatePendingSettle,
+	}
+	invoice.AmtPaid += 2000
+	db := &finalTestDB{
+		hash:       hash,
+		invoice:    invoice,
+		updateTime: time.Now(),
+	}
+	registry := NewRegistry(db, nil, &RegistryConfig{})
+	registerPendingSettleTestInvoice(registry, hash, &invoice)
+
+	err := registry.NotifyExitHopHtlcFinalized(
+		t.Context(), circuitKey, true,
+	)
+	require.NoError(t, err)
+	require.Equal(t, ContractPendingSettle, db.invoice.State)
+	require.Equal(
+		t, HtlcStateSettled, db.invoice.Htlcs[circuitKey].State,
+	)
+	require.Equal(
+		t, HtlcStatePendingSettle, db.invoice.Htlcs[secondKey].State,
+	)
+	assertNoInvoiceEvent(t, registry)
+
+	registry.Lock()
+	_, firstPending := registry.pendingSettleRefs[circuitKey]
+	_, secondPending := registry.pendingSettleRefs[secondKey]
+	registry.Unlock()
+	require.False(t, firstPending)
+	require.True(t, secondPending)
+
+	err = registry.NotifyExitHopHtlcFinalized(
+		t.Context(), secondKey, true,
+	)
+	require.NoError(t, err)
+	require.Equal(t, ContractSettled, db.invoice.State)
+	require.Equal(
+		t, HtlcStateSettled, db.invoice.Htlcs[secondKey].State,
+	)
+	require.Equal(t, lnwire.MilliSatoshi(3000), db.invoice.AmtPaid)
+}
+
+// TestNotifyExitHopHtlcFinalizedFailWaitsForSibling verifies a failed HTLC does
+// not cancel sibling pending-settle HTLCs, and a later settled sibling can
+// still settle the invoice if it satisfies the invoice amount.
+func TestNotifyExitHopHtlcFinalizedFailWaitsForSibling(t *testing.T) {
+	t.Parallel()
+
+	hash, circuitKey, invoice := newPendingSettleTestInvoice()
+	secondKey := CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1),
+		HtlcID: 3,
+	}
+	invoice.Htlcs[secondKey] = &InvoiceHTLC{
+		Amt:   2000,
+		State: HtlcStatePendingSettle,
+	}
+	invoice.AmtPaid += 2000
+	db := &finalTestDB{
+		hash:       hash,
+		invoice:    invoice,
+		updateTime: time.Now(),
+	}
+	registry := NewRegistry(db, nil, &RegistryConfig{})
+	registerPendingSettleTestInvoice(registry, hash, &invoice)
+
+	err := registry.NotifyExitHopHtlcFinalized(
+		t.Context(), circuitKey, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, ContractPendingSettle, db.invoice.State)
+	require.Equal(
+		t, HtlcStateCanceled, db.invoice.Htlcs[circuitKey].State,
+	)
+	require.Equal(
+		t, HtlcStatePendingSettle, db.invoice.Htlcs[secondKey].State,
+	)
+	assertNoInvoiceEvent(t, registry)
+
+	err = registry.NotifyExitHopHtlcFinalized(
+		t.Context(), secondKey, true,
+	)
+	require.NoError(t, err)
+	require.Equal(t, ContractSettled, db.invoice.State)
+	require.Equal(
+		t, HtlcStateSettled, db.invoice.Htlcs[secondKey].State,
+	)
+	require.Equal(t, lnwire.MilliSatoshi(2000), db.invoice.AmtPaid)
+}
+
+// TestScanInvoicesOnStartIndexesPendingSettle verifies startup scans rebuild
+// the pending-settle circuit index.
+func TestScanInvoicesOnStartIndexesPendingSettle(t *testing.T) {
+	t.Parallel()
+
+	hash, circuitKey, invoice := newPendingSettleTestInvoice()
+	db := &finalTestDB{
+		hash:       hash,
+		invoice:    invoice,
+		updateTime: time.Now(),
+	}
+	registry := NewRegistry(db, nil, &RegistryConfig{})
+
+	err := registry.scanInvoicesOnStart(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 1, db.fetchPendingCalls)
+
+	registry.Lock()
+	_, ok := registry.pendingSettleRefs[circuitKey]
+	registry.Unlock()
+	require.True(t, ok)
+
+	err = registry.NotifyExitHopHtlcFinalized(
+		t.Context(), circuitKey, true,
+	)
+	require.NoError(t, err)
+	require.Equal(t, ContractSettled, db.invoice.State)
+}
