@@ -276,58 +276,128 @@ func TestChannelLinkDynResponderReject(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 }
 
-// TestChannelLinkDynResponderCommit continues the responder happy path: after
-// acking a proposal, a matching bundled dyn_commit_sig is routed to the
-// updater, which hands off to the link's commitment dance and reaches the
-// committing terminal state.
+// TestChannelLinkDynResponderCommit drives the responder happy path end to end:
+// the peer proposes, our link acks, the peer sends the bundled dyn_commit_sig,
+// and our link runs the full commitment dance (revoke_and_ack + a normal
+// commitment_signed) with the peer replying with its final revoke_and_ack. Once
+// both chains lock in, the agreed params are applied to our config, both commit
+// heights advance, and quiescence is exited.
 func TestChannelLinkDynResponderCommit(t *testing.T) {
 	t.Parallel()
 
-	_, coreLink, msgs := newDynLinkHarness(t)
+	harness, coreLink, msgs := newDynLinkHarness(t)
+	bob := harness.bobChannel
 	quiesceAsResponder(t, coreLink, msgs)
 
 	chanID := coreLink.ChanID()
+
+	// The peer (Bob) is the proposer, so a max_accepted_htlcs change
+	// constrains our (the counterparty's) local config.
 	params := lnwallet.ChannelParams{
 		MaxAcceptedHtlcs: fn.Some(uint16(20)),
 	}
+	require.NotEqual(t, uint16(20),
+		coreLink.channel.State().LocalChanCfg.MaxAcceptedHtlcs)
+
+	aliceHeightBefore := coreLink.channel.State().LocalCommitment.CommitHeight
+	bobHeightBefore := bob.State().LocalCommitment.CommitHeight
+
 	dp := params.ToDynPropose(chanID)
 	coreLink.HandleChannelUpdate(dp)
 
+	// Our link acks the proposal.
 	msg := recvLinkMsg(t, msgs)
 	ack, ok := msg.(*lnwire.DynAck)
 	require.Truef(t, ok, "expected DynAck, got %T", msg)
 
-	// The proposer now sends the bundled dyn_commit_sig echoing the
-	// accepted proposal and our dyn_ack signature. The commitment signature
-	// is verified by the (TODO) commitment dance, so a zero value is fine.
+	// Bob (the proposer) stages the agreed update into his own log and signs
+	// our next commitment, producing the bundled dyn_commit_sig.
+	_, err := bob.AddDynUpdate(params)
+	require.NoError(t, err, "bob unable to stage dyn update")
+	bobCommit, err := bob.SignNextCommitment(t.Context())
+	require.NoError(t, err, "bob unable to sign dyn commitment")
+
 	dc := &lnwire.DynCommit{
 		DynPropose: *dp,
+		CommitSig:  bobCommit.CommitSig,
 		AckSig:     ack.Sig,
 	}
 	coreLink.HandleChannelUpdate(dc)
 
+	// Our link validates the bundled sig, revokes, and replies with its own
+	// revoke_and_ack followed by a normal commitment_signed for the
+	// proposer's next commitment.
+	aliceRev, ok := recvLinkMsg(t, msgs).(*lnwire.RevokeAndAck)
+	require.True(t, ok, "expected RevokeAndAck from link")
+	aliceSig, ok := recvLinkMsg(t, msgs).(*lnwire.CommitSig)
+	require.True(t, ok, "expected CommitSig from link")
+
+	// Bob processes our reply and sends his final revoke_and_ack.
+	_, _, err = bob.ReceiveRevocation(aliceRev)
+	require.NoError(t, err, "bob unable to receive revocation")
+	err = bob.ReceiveNewCommitment(&lnwallet.CommitSigs{
+		CommitSig: aliceSig.CommitSig,
+	})
+	require.NoError(t, err, "bob unable to receive new commitment")
+	bobRev, _, _, err := bob.RevokeCurrentCommitment()
+	require.NoError(t, err, "bob unable to revoke commitment")
+
+	coreLink.HandleChannelUpdate(bobRev)
+
+	// Wait for both chains to lock in. The negotiation state returning to
+	// idle is set (under the updater lock) only after applyDynParams has run,
+	// so it is a safe synchronization point for the config reads below.
 	require.Eventually(t, func() bool {
-		return coreLink.updater.State() == dyn.StateCommitting
-	}, 5*time.Second, 10*time.Millisecond)
+		return coreLink.updater.State() == dyn.StateIdle
+	}, 5*time.Second, 10*time.Millisecond, "dance did not complete")
+
+	// The agreed params are applied with proposer-owned semantics: a remote
+	// proposer's max_accepted_htlcs change lands in our local config.
+	require.Equal(t, uint16(20),
+		coreLink.channel.State().LocalChanCfg.MaxAcceptedHtlcs,
+		"agreed params not applied after lock-in")
+
+	// The dyn commit advanced both commitment heights like a normal
+	// commitment_signed.
+	require.Equal(t, aliceHeightBefore+1,
+		coreLink.channel.State().LocalCommitment.CommitHeight,
+		"our commit height did not advance")
+	require.Equal(t, bobHeightBefore+1,
+		bob.State().LocalCommitment.CommitHeight,
+		"bob commit height did not advance")
+
+	// Quiescence was exited so htlc traffic can resume.
+	require.False(t, coreLink.quiescer.IsQuiescent(),
+		"channel should no longer be quiescent")
 }
 
-// TestChannelLinkDynProposer exercises the proposer path end to end at the link
-// level: a local proposal request first drives quiescence with us as the
-// initiator, then sends a dyn_propose, and a valid dyn_ack reply drives the
-// updater to the accepted (ready-to-commit) state.
+// TestChannelLinkDynProposer drives the proposer path end to end at the link
+// level: a local proposal request drives quiescence with us as the initiator,
+// sends a dyn_propose, and a valid dyn_ack triggers the bundled dyn_commit_sig.
+// The peer completes the dance with its revoke_and_ack + commitment_signed, our
+// link replies with its final revoke_and_ack, and once both chains lock in the
+// agreed params are applied, both heights advance, and quiescence is exited.
 func TestChannelLinkDynProposer(t *testing.T) {
 	t.Parallel()
 
-	_, coreLink, msgs := newDynLinkHarness(t)
+	harness, coreLink, msgs := newDynLinkHarness(t)
+	bob := harness.bobChannel
 
 	chanID := coreLink.ChanID()
 
+	// We are the proposer, so a max_accepted_htlcs change constrains the
+	// counterparty (remote) config.
+	params := lnwallet.ChannelParams{
+		MaxAcceptedHtlcs: fn.Some(uint16(20)),
+	}
+	require.NotEqual(t, uint16(20),
+		coreLink.channel.State().RemoteChanCfg.MaxAcceptedHtlcs)
+
+	aliceHeightBefore := coreLink.channel.State().LocalCommitment.CommitHeight
+	bobHeightBefore := bob.State().LocalCommitment.CommitHeight
+
 	// Request a local proposal. This drives quiescence first.
-	errCh := coreLink.initDynProposal(dyn.ProposalRequest{
-		Params: lnwallet.ChannelParams{
-			MaxAcceptedHtlcs: fn.Some(uint16(20)),
-		},
-	})
+	errCh := coreLink.initDynProposal(dyn.ProposalRequest{Params: params})
 
 	// The link should send its Stfu as the quiescence initiator.
 	msg := recvLinkMsg(t, msgs)
@@ -356,14 +426,19 @@ func TestChannelLinkDynProposer(t *testing.T) {
 
 	require.Equal(t, dyn.StateAwaitingAck, coreLink.updater.State())
 
-	// The peer accepts by returning a valid dyn_ack over the exact proposal
-	// TLVs, bound to the next commitment height and chain.
+	// Bob (the responder) stages the agreed update into his remote log so
+	// that his rendering of both commitments matches ours, then accepts by
+	// returning a valid dyn_ack over the exact proposal TLVs, bound to the
+	// next commitment height and chain.
+	_, err := bob.ReceiveDynUpdate(params)
+	require.NoError(t, err, "bob unable to stage dyn update")
+
 	tlvs, err := dp.SerializeTlvData()
 	require.NoError(t, err)
 
 	bobNodePriv, _ := btcec.PrivKeyFromBytes(bobPrivKey)
 	height := coreLink.channel.State().LocalCommitment.CommitHeight + 1
-	sig, err := lnwire.SignDynAck(
+	ackSig, err := lnwire.SignDynAck(
 		bobNodePriv, coreLink.channel.State().ChainHash, chanID, height,
 		tlvs,
 	)
@@ -371,14 +446,65 @@ func TestChannelLinkDynProposer(t *testing.T) {
 
 	coreLink.HandleChannelUpdate(&lnwire.DynAck{
 		ChanID: chanID,
-		Sig:    sig,
+		Sig:    ackSig,
 	})
 
-	// The valid ack drives the updater to the accepted state and emits the
-	// ready-to-commit handoff (the dance itself is a TODO).
+	// The valid ack triggers the bundled dyn_commit_sig: our commitment
+	// signature over the responder's next commitment, the echoed dyn_ack
+	// signature, and the accepted proposal.
+	dc, ok := recvLinkMsg(t, msgs).(*lnwire.DynCommit)
+	require.True(t, ok, "expected DynCommit from link")
+	require.Equal(t, ackSig, dc.AckSig, "dyn_commit_sig echoed wrong ack")
+
+	// Bob validates the bundled sig against his newly rendered commitment,
+	// revokes, and signs our next commitment (a normal commitment_signed).
+	err = bob.ReceiveNewCommitment(&lnwallet.CommitSigs{
+		CommitSig: dc.CommitSig,
+	})
+	require.NoError(t, err, "bob unable to receive dyn commitment")
+	bobRev, _, _, err := bob.RevokeCurrentCommitment()
+	require.NoError(t, err, "bob unable to revoke commitment")
+	bobCommit, err := bob.SignNextCommitment(t.Context())
+	require.NoError(t, err, "bob unable to sign next commitment")
+
+	// Our link processes the peer's revoke_and_ack and commitment_signed,
+	// then replies with its final revoke_and_ack.
+	coreLink.HandleChannelUpdate(bobRev)
+	coreLink.HandleChannelUpdate(&lnwire.CommitSig{
+		ChanID:    chanID,
+		CommitSig: bobCommit.CommitSig,
+	})
+
+	aliceRev, ok := recvLinkMsg(t, msgs).(*lnwire.RevokeAndAck)
+	require.True(t, ok, "expected final RevokeAndAck from link")
+	_, _, err = bob.ReceiveRevocation(aliceRev)
+	require.NoError(t, err, "bob unable to receive final revocation")
+
+	// Wait for both chains to lock in. The negotiation state returning to
+	// idle is set (under the updater lock) only after applyDynParams has run,
+	// so it is a safe synchronization point for the config reads below.
 	require.Eventually(t, func() bool {
-		return coreLink.updater.State() == dyn.StateAccepted
-	}, 5*time.Second, 10*time.Millisecond)
+		return coreLink.updater.State() == dyn.StateIdle
+	}, 5*time.Second, 10*time.Millisecond, "dance did not complete")
+
+	// The agreed params are applied with proposer-owned semantics: a local
+	// proposer's max_accepted_htlcs change lands in the remote config.
+	require.Equal(t, uint16(20),
+		coreLink.channel.State().RemoteChanCfg.MaxAcceptedHtlcs,
+		"agreed params not applied after lock-in")
+
+	// The dyn commit advanced both commitment heights like a normal
+	// commitment_signed.
+	require.Equal(t, aliceHeightBefore+1,
+		coreLink.channel.State().LocalCommitment.CommitHeight,
+		"our commit height did not advance")
+	require.Equal(t, bobHeightBefore+1,
+		bob.State().LocalCommitment.CommitHeight,
+		"bob commit height did not advance")
+
+	// Quiescence was exited so htlc traffic can resume.
+	require.False(t, coreLink.quiescer.IsQuiescent(),
+		"channel should no longer be quiescent")
 }
 
 // TestChannelLinkApplyDynParams verifies the apply-at-lock-in step: applying an

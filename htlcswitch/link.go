@@ -457,6 +457,15 @@ type channelLink struct {
 	// only ever accessed from the htlcManager event loop.
 	pendingDynProposal fn.Option[dynProposalReq]
 
+	// pendingDynDance holds an in-flight dynamic-commitments commitment
+	// dance while the bundled dyn_commit_sig round trip completes. It is set
+	// when the dance begins (the proposer after sending dyn_commit_sig, the
+	// responder after receiving it) and consumed by maybeFinishDynDance once
+	// both commitment chains have locked in the agreed parameter change, at
+	// which point the params are applied and quiescence is exited. It is only
+	// ever accessed from the htlcManager event loop.
+	pendingDynDance fn.Option[dynDance]
+
 	// cg is a helper that encapsulates a wait group and quit channel and
 	// allows contexts that either block or cancel on those depending on
 	// the use case.
@@ -4502,6 +4511,12 @@ func (l *channelLink) processRemoteCommitSig(ctx context.Context,
 	}
 	l.Unlock()
 
+	// A dyn_commit_sig is treated as a commitment_signed, so an in-flight
+	// dynamic-commitments dance may have just locked in its final chain
+	// here; apply the agreed params and exit quiescence if so. This is a
+	// no-op for non-dyn channels and any non-terminating dance step.
+	l.maybeFinishDynDance(ctx)
+
 	return nil
 }
 
@@ -4606,6 +4621,12 @@ func (l *channelLink) processRemoteRevokeAndAck(ctx context.Context,
 		l.flushHooks.invoke()
 	}
 	l.Unlock()
+
+	// A revoke_and_ack may lock in the final chain of an in-flight
+	// dynamic-commitments dance; apply the agreed params and exit quiescence
+	// if so. This is a no-op for non-dyn channels and any non-terminating
+	// dance step.
+	l.maybeFinishDynDance(ctx)
 
 	return nil
 }

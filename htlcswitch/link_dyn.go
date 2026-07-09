@@ -482,51 +482,209 @@ func (l *channelLink) processDynTransition(ctx context.Context,
 	})
 }
 
-// handleDynCommitHandoff drives the commitment dance once negotiation has
-// produced an agreed parameter update. Negotiation itself is owned by the
-// dyn.Updater; from here the link + wallet must execute the bundled
-// dyn_commit_sig commitment dance and apply the params at lock-in.
+// dynDance carries the state needed to finish a dynamic-commitments commitment
+// dance once both commitment chains have locked in the agreed parameter change.
+type dynDance struct {
+	// handoff is the agreed parameter update handed off by the negotiation
+	// state machine.
+	handoff dyn.CommitHandoff
+
+	// lockIn is, per commitment chain, the last height the outgoing
+	// (pre-update) parameters applied to. Both chains lock in the new
+	// parameters at the bound commitment height, so this is that height
+	// minus one on each side.
+	lockIn lntypes.Dual[uint64]
+}
+
+// handleDynCommitHandoff drives the bundled dyn_commit_sig commitment dance
+// once negotiation has produced an agreed parameter update. Negotiation is
+// owned by the dyn.Updater; from here the link + wallet execute the dance and
+// apply the params once both chains lock in.
 //
-// TODO(dyn): the on-chain commitment dance is not executed yet. Completing it
-// requires lnwallet support that does not exist in the branches this one is
-// stacked on (branches 1-5 provide the epoch persistence, the mutable-params
-// apply API, and the wire/negotiation machinery, but not a dyn update-log
-// entry). The precise remaining sub-steps are:
+// The agreed update is staged into the channel's update log so the ordinary
+// SignNextCommitment / ReceiveNewCommitment machinery renders and validates the
+// next commitment under the new params with zero HTLCs. The proposer sends the
+// bundled dyn_commit_sig; the responder feeds the received one through the
+// ordinary commitment_signed handler. The remaining revoke_and_ack /
+// commitment_signed exchange rides the normal commitment-dance handlers, which
+// call maybeFinishDynDance to apply the params and exit quiescence at the
+// termination point (once both chains have locked in).
 //
-//  1. Add the agreed update to the channel as a dyn update-log entry (like
-//     update_fee) so that SignNextCommitment / ReceiveNewCommitment build and
-//     validate the next commitment with the proposed params applied and zero
-//     HTLCs. This lnwallet primitive does not exist yet.
-//  2. Proposer (h.Proposer == lntypes.Local): build the bundled DynCommit —
-//     the commitment signature over the responder's next commitment (from the
-//     new lnwallet primitive), the echoed responder dyn_ack signature
-//     (h.AckSig), and the accepted proposal TLVs (h.Proposal) — send it, then
-//     call updater.MarkCommitSent.
-//  3. Responder (h.Proposer == lntypes.Remote): verify h.ReceivedCommit's
-//     commitment signature against our next local commitment (again via the new
-//     primitive). Persist the received dyn_commit_sig + accepted TLVs +
-//     resulting commitment state BEFORE sending revoke_and_ack.
-//  4. Execute commitment_signed / revoke_and_ack in the required order,
-//     treating dyn_commit_sig as commitment_signed-equivalent for
-//     commitment-number accounting and retransmission (retransmission is
-//     branch 8).
-//  5. Apply the params to the local/remote config exactly when each chain
-//     locks in, via l.applyDynParams (already wired and unit-tested below);
-//     lock-in for a chain happens when the corresponding revocation is
-//     processed, so the per-side heights differ.
-//  6. Exit quiescence via l.quiescer.Resume() at the BOLT-defined termination
-//     point (after both chains have locked in).
-//
-// Until (1) lands, executing any of (2)-(6) against the live channel would
-// desync it with the peer, so we deliberately do not mutate channel state here.
-func (l *channelLink) handleDynCommitHandoff(_ context.Context,
+// TODO(dyn): retransmitting the bundled dyn_commit_sig when a peer's
+// channel_reestablish expects it (and forgetting a negotiation that disconnects
+// before dyn_commit_sig) is handled by the reestablish branch (branch 9); it is
+// out of scope here.
+func (l *channelLink) handleDynCommitHandoff(ctx context.Context,
 	h dyn.CommitHandoff) error {
 
 	l.log.Infof("Dyn negotiation agreed for ChannelID(%v): proposer=%v, "+
 		"height=%d, params=%s", l.ChanID(), h.Proposer,
 		h.NextCommitHeight, h.Params)
 
+	// Both commitment chains are synchronized at quiescence, so the agreed
+	// update binds to the same next commitment height on both, and the
+	// outgoing (pre-update) params applied through the prior height on each
+	// side. Stash the handoff so maybeFinishDynDance can apply the params
+	// and exit quiescence once both chains have locked in.
+	lockInHeight := h.NextCommitHeight - 1
+	l.pendingDynDance = fn.Some(dynDance{
+		handoff: h,
+		lockIn: lntypes.Dual[uint64]{
+			Local:  lockInHeight,
+			Remote: lockInHeight,
+		},
+	})
+
+	if h.Proposer.IsLocal() {
+		return l.driveDynProposerCommit(ctx, h)
+	}
+
+	return l.driveDynResponderCommit(ctx, h)
+}
+
+// driveDynProposerCommit executes the proposer side of the bundled
+// dyn_commit_sig dance. It stages the agreed update into our local update log,
+// signs the responder's next commitment under the new params, sends the bundled
+// dyn_commit_sig, and records the send with the negotiation state machine. The
+// responder then replies with a normal revoke_and_ack and commitment_signed,
+// which flow through the ordinary commitment-dance handlers.
+//
+// NOTE: MUST be called from the htlcManager event loop.
+func (l *channelLink) driveDynProposerCommit(ctx context.Context,
+	h dyn.CommitHandoff) error {
+
+	// Stage the agreed change so the next commitment we sign for the remote
+	// party is rendered with the new params and zero HTLCs.
+	if _, err := l.channel.AddDynUpdate(h.Params); err != nil {
+		return fmt.Errorf("stage dyn update: %w", err)
+	}
+
+	// Sign the responder's next commitment. dyn_commit_sig is the
+	// commitment_signed for that state; dynamic updates carry no HTLCs, so
+	// there are no HTLC signatures.
+	newCommit, err := l.channel.SignNextCommitment(ctx)
+	if err != nil {
+		return fmt.Errorf("sign dyn commitment: %w", err)
+	}
+
+	// TODO(dyn): taproot/musig2 channels produce a partial signature that
+	// the current dyn_commit_sig wire message cannot carry (it has no
+	// partial-sig field). Taproot dynamic commitments are out of scope for
+	// this milestone.
+	if newCommit.PartialSig.IsSome() {
+		return fmt.Errorf("dyn commitments unsupported for taproot " +
+			"channels")
+	}
+
+	dynCommit := &lnwire.DynCommit{
+		DynPropose: *h.Proposal,
+		CommitSig:  newCommit.CommitSig,
+		AckSig:     h.AckSig,
+	}
+	if err := l.cfg.Peer.SendMessage(false, dynCommit); err != nil {
+		return fmt.Errorf("send dyn_commit_sig: %w", err)
+	}
+
+	// Record that we have sent the bundled dyn_commit_sig, moving the state
+	// machine to its committing terminal state.
+	if _, err := l.updater.MarkCommitSent(ctx); err != nil {
+		return fmt.Errorf("mark commit sent: %w", err)
+	}
+
 	return nil
+}
+
+// driveDynResponderCommit executes the responder side of the bundled
+// dyn_commit_sig dance. It stages the agreed update into the remote
+// (proposer's) update log, then feeds the bundled commitment sig through the
+// commitment_signed handler, which validates and persists our newly rendered
+// commitment before sending revoke_and_ack, and signs the proposer's next
+// commitment (a normal commitment_signed). The proposer's final revoke_and_ack
+// then flows through the ordinary handler.
+//
+// NOTE: MUST be called from the htlcManager event loop.
+func (l *channelLink) driveDynResponderCommit(ctx context.Context,
+	h dyn.CommitHandoff) error {
+
+	dynCommit, err := h.ReceivedCommit.UnwrapOrErr(
+		fmt.Errorf("responder handoff missing dyn_commit_sig"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Stage the agreed change proposed by the remote party so our next local
+	// commitment is validated, and the proposer's next commitment is signed,
+	// under the new params.
+	if _, err := l.channel.ReceiveDynUpdate(h.Params); err != nil {
+		return fmt.Errorf("stage dyn update: %w", err)
+	}
+
+	// dyn_commit_sig is the commitment_signed for our next commitment. Reuse
+	// the ordinary handler so the received signature is validated and the
+	// resulting commitment is persisted (via ReceiveNewCommitment) before we
+	// send revoke_and_ack, and so our reply (revoke_and_ack plus a normal
+	// commitment_signed for the proposer's next commitment) is produced
+	// exactly as for any commitment dance. Dynamic updates carry no HTLCs and
+	// hence no HTLC/aux signatures.
+	//
+	// The accepted proposal TLVs and dyn_ack signature were already persisted
+	// by the negotiation state machine at accept time; durable persistence of
+	// the received dyn_commit_sig for reconnect resume is branch 9.
+	return l.processRemoteCommitSig(ctx, &lnwire.CommitSig{
+		ChanID:    l.ChanID(),
+		CommitSig: dynCommit.CommitSig,
+	})
+}
+
+// maybeFinishDynDance completes an in-flight dynamic-commitments commitment
+// dance once both commitment chains have locked in the agreed parameter change.
+// It is invoked at each commitment-dance step that may have just locked in the
+// last chain (after processing a revoke_and_ack or a commitment_signed). It is
+// a no-op unless a dance is in flight and the channel has returned to a clean
+// state, i.e. both chains sign the same updates with the dyn update committed
+// and compacted away.
+//
+// On completion it applies the agreed params to the persistent channel config
+// (recording a commit-chain epoch for script-rendering changes), clears the
+// negotiation state so a fresh proposal is possible, and exits quiescence at
+// the BOLT-defined termination point.
+//
+// NOTE: MUST be called from the htlcManager event loop.
+func (l *channelLink) maybeFinishDynDance(ctx context.Context) {
+	l.pendingDynDance.WhenSome(func(d dynDance) {
+		// The dance is only complete once both chains sign the same
+		// updates again: the agreed update has been committed on both
+		// commitments and compacted out of the logs.
+		if !l.channel.IsChannelClean() {
+			return
+		}
+
+		// Apply the agreed params to the persistent local/remote config
+		// and, for script-rendering changes, record the commit-chain
+		// epoch at the per-side lock-in heights.
+		if err := l.applyDynParams(d.handoff, d.lockIn); err != nil {
+			l.dynFailf("apply dyn params: %v", err)
+
+			return
+		}
+
+		l.pendingDynDance = fn.None[dynDance]()
+
+		// Clear the negotiation state so the channel can negotiate a
+		// fresh update after a new quiescence session.
+		if err := l.updater.Reset(ctx); err != nil {
+			l.log.Errorf("Unable to reset dyn updater for "+
+				"ChannelID(%v): %v", l.ChanID(), err)
+		}
+
+		// Both chains have locked in; exit quiescence at the
+		// BOLT-defined termination point.
+		l.quiescer.Resume()
+
+		l.log.Infof("Dyn update locked in for ChannelID(%v): params=%s",
+			l.ChanID(), d.handoff.Params)
+	})
 }
 
 // applyDynParams applies an agreed dynamic-commitments parameter update to the
