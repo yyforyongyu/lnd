@@ -241,6 +241,13 @@ right after the channel is created, as we have all the data required to make a
 backup, but lack information about the future HTLCs that the channel will
 process.
 
+If DLP is triggered while the local database still contains HTLC metadata, `lnd`
+can also recover outgoing HTLC outputs from the peer's confirmed remote
+commitment when they exactly match locally reconstructed scripts. This recovery
+only sweeps outputs from the observed remote force-close transaction; it never
+broadcasts an old commitment transaction or initiates channel closure. HTLCs
+that are absent from local state remain unrecoverable from an SCB alone.
+
 ### Obtaining SCBs
 
 #### On-Disk `channel.backup`
