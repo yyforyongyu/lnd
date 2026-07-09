@@ -91,6 +91,25 @@ func settleHtlcsAmp(invoice *Invoice, circuitKey models.CircuitKey,
 	return updater.UpdateAmpState(setID, newAmpState, circuitKey)
 }
 
+// pendingSettleHtlcsAmp marks an AMP HTLC set as pending settle without
+// changing the set's accepted amount.
+func pendingSettleHtlcsAmp(invoice *Invoice, circuitKey models.CircuitKey,
+	htlc *InvoiceHTLC, updater InvoiceUpdater) error {
+
+	setID := htlc.AMP.Record.SetID()
+
+	newAmpState, err := getUpdatedInvoiceAmpState(
+		invoice, setID, circuitKey, HtlcStatePendingSettle, 0,
+	)
+	if err != nil {
+		return err
+	}
+
+	invoice.AMPState[setID] = newAmpState
+
+	return updater.UpdateAmpState(setID, newAmpState, circuitKey)
+}
+
 // UpdateInvoice fetches the invoice, obtains the update descriptor from the
 // callback and applies the updates in a single db transaction.
 func UpdateInvoice(hash *lntypes.Hash, invoice *Invoice,
@@ -368,6 +387,22 @@ func addHTLCs(invoice *Invoice, hash *lntypes.Hash, updateTime time.Time,
 		// meta data state.
 		if htlcSettled && invoiceIsAMP {
 			err = settleHtlcsAmp(invoice, key, htlc, updater)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Pending-settle HTLCs passed settle validation, but are
+		// not final until the link or resolver reports the committed
+		// outcome.
+		htlcPendingSettle := htlcStateChanged &&
+			htlcState == HtlcStatePendingSettle
+
+		// AMP HTLCs also need their per-set state updated because
+		// settlement metadata is stored separately from the invoice
+		// HTLC map.
+		if htlcPendingSettle && invoiceIsAMP {
+			err = pendingSettleHtlcsAmp(invoice, key, htlc, updater)
 			if err != nil {
 				return err
 			}
@@ -963,6 +998,11 @@ func getUpdatedInvoiceAmpState(invoice *Invoice, setID SetID,
 	case HtlcStateCanceled:
 		ampState.State = HtlcStateCanceled
 		ampState.AmtPaid -= amt
+
+	// Pending-settle means the AMP set has released child preimages, but
+	// the final HTLC outcome is not known yet. Do not alter AmtPaid here.
+	case HtlcStatePendingSettle:
+		ampState.State = HtlcStatePendingSettle
 
 	case HtlcStateSettled:
 		ampState.State = HtlcStateSettled

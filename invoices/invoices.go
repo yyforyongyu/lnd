@@ -646,7 +646,8 @@ type InvoiceHtlcAMPData struct {
 	// Hash. The preimage will be derived either from secret share
 	// reconstruction of the shares in the AMP payload.
 	//
-	// NOTE: Preimage will only be present once the HTLC is in
+	// NOTE: Preimage will only be present once settlement has been
+	// requested and the HTLC is in HtlcStatePendingSettle or
 	// HtlcStateSettled.
 	Preimage *lntypes.Preimage
 }
