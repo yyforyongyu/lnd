@@ -26,9 +26,17 @@ type mockRegistry struct {
 
 	// immediateNotify records non-subscribing NotifyExitHopHtlc calls.
 	immediateNotify []notifyExitHopData
+	finalized       []finalizeExitHopData
 
 	// notifyHook is called after a NotifyExitHopHtlc call is recorded.
 	notifyHook func()
+}
+
+// finalizeExitHopData records a final exit-hop HTLC outcome delivered to the
+// mock registry.
+type finalizeExitHopData struct {
+	circuitKey models.CircuitKey
+	settled    bool
 }
 
 func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
@@ -69,6 +77,17 @@ func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
 }
 
 func (r *mockRegistry) HodlUnsubscribeAll(subscriber chan<- interface{}) {}
+
+func (r *mockRegistry) NotifyExitHopHtlcFinalized(_ context.Context,
+	circuitKey models.CircuitKey, settled bool) error {
+
+	r.finalized = append(r.finalized, finalizeExitHopData{
+		circuitKey: circuitKey,
+		settled:    settled,
+	})
+
+	return nil
+}
 
 func (r *mockRegistry) LookupInvoice(context.Context, lntypes.Hash) (
 	invoices.Invoice, error) {
