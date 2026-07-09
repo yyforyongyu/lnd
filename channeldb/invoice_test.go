@@ -8,6 +8,7 @@ import (
 	"github.com/lightningnetwork/lnd/graph/db/models"
 	invpkg "github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
@@ -127,4 +128,73 @@ func TestInvoiceBucketTombstone(t *testing.T) {
 	tombstoneExists, err = db.GetInvoiceBucketTombstone()
 	require.NoError(t, err)
 	require.True(t, tombstoneExists)
+}
+
+// TestKVInvoiceUpdaterUpdateAmpStatePersistsFullSet asserts AMP sub-invoice
+// updates rewrite the bucket with every HTLC in the set, including siblings
+// that reached a different state in an earlier update.
+func TestKVInvoiceUpdaterUpdateAmpStatePersistsFullSet(t *testing.T) {
+	t.Parallel()
+
+	setID := invpkg.SetID{1}
+	ampRecord := record.NewAMP([32]byte{2}, [32]byte(setID), 3)
+	circuitKey1 := models.CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1), HtlcID: 1,
+	}
+	circuitKey2 := models.CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1), HtlcID: 2,
+	}
+	circuitKey3 := models.CircuitKey{
+		ChanID: lnwire.NewShortChanIDFromInt(1), HtlcID: 3,
+	}
+
+	invoice := &invpkg.Invoice{
+		Htlcs: map[models.CircuitKey]*invpkg.InvoiceHTLC{
+			circuitKey1: {
+				State: invpkg.HtlcStateSettled,
+				AMP: &invpkg.InvoiceHtlcAMPData{
+					Record: *ampRecord,
+				},
+			},
+			circuitKey2: {
+				State: invpkg.HtlcStatePendingSettle,
+				AMP: &invpkg.InvoiceHtlcAMPData{
+					Record: *ampRecord,
+				},
+			},
+			circuitKey3: {
+				State: invpkg.HtlcStatePendingSettle,
+				AMP: &invpkg.InvoiceHtlcAMPData{
+					Record: *ampRecord,
+				},
+			},
+		},
+	}
+
+	newUpdater := func() *kvInvoiceUpdater {
+		return &kvInvoiceUpdater{
+			invoice:         invoice,
+			updatedAmpHtlcs: make(ampHTLCsMap),
+			settledSetIDs:   make(map[invpkg.SetID]struct{}),
+		}
+	}
+
+	updater := newUpdater()
+	err := updater.UpdateAmpState(
+		setID, invpkg.InvoiceStateAMP{
+			State: invpkg.HtlcStatePendingSettle,
+		}, circuitKey2,
+	)
+	require.NoError(t, err)
+	require.Equal(t, invoice.Htlcs, updater.updatedAmpHtlcs[setID])
+
+	updater = newUpdater()
+	err = updater.UpdateAmpState(
+		setID, invpkg.InvoiceStateAMP{
+			State: invpkg.HtlcStateSettled,
+		}, circuitKey3,
+	)
+	require.NoError(t, err)
+	require.Equal(t, invoice.Htlcs, updater.updatedAmpHtlcs[setID])
+	require.Contains(t, updater.settledSetIDs, setID)
 }
