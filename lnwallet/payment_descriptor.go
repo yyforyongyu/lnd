@@ -49,6 +49,16 @@ const (
 	// receiver. The criteria about whether the balance will go back to the
 	// sender is whether the receiver is sitting above the channel reserve.
 	NoOpAdd
+
+	// DynCommit is an update type sent by a dynamic-commitments proposer
+	// that renegotiates the "static" channel parameters (dust limit,
+	// to_self_delay, etc.) by committing a new channel state. Like
+	// FeeUpdate, it is not an HTLC: it changes how the next commitment
+	// transaction is rendered rather than moving a balance. On the wire it
+	// is carried by the bundled dyn_commit_sig message. The dynamic-
+	// commitments precondition guarantees no HTLCs are in flight while such
+	// an entry is active.
+	DynCommit
 )
 
 // String returns a human readable string that uniquely identifies the target
@@ -67,6 +77,8 @@ func (u updateType) String() string {
 		return "FeeUpdate"
 	case NoOpAdd:
 		return "NoOpAdd"
+	case DynCommit:
+		return "DynCommit"
 	default:
 		return "<unknown type>"
 	}
@@ -246,6 +258,15 @@ type paymentDescriptor struct {
 	// CustomRecords also stores the set of optional custom records that
 	// may have been attached to a sent HTLC.
 	CustomRecords lnwire.CustomRecords
+
+	// DynParams carries the proposed dynamic-commitments channel parameters
+	// for a DynCommit update-log entry. It is nil for every other entry
+	// type. The entry always lives in the proposer's update log, so the log
+	// it sits in identifies the proposing party; the params themselves are
+	// proposer-relative (see ChannelParams.ApplyToConfigs).
+	//
+	// NOTE: Populated only in payment descriptors with the DynCommit type.
+	DynParams *ChannelParams
 }
 
 // toLogUpdate recovers the underlying LogUpdate from the paymentDescriptor.
@@ -293,6 +314,17 @@ func (pd *paymentDescriptor) toLogUpdate() channeldb.LogUpdate {
 			ChanID:   pd.ChanID,
 			FeePerKw: uint32(pd.Amount.ToSatoshis()),
 		}
+	case DynCommit:
+		// The DynParams field holds the proposed parameters. We recover
+		// the on-the-wire dyn_commit_sig representation carrying just
+		// the accepted proposal TLVs; the commitment/ack signatures are
+		// tracked separately (in the CommitDiff and by the link) and are
+		// not part of the update-log payload.
+		dp := lnwire.DynPropose{ChanID: pd.ChanID}
+		if pd.DynParams != nil {
+			dp = *pd.DynParams.ToDynPropose(pd.ChanID)
+		}
+		msg = &lnwire.DynCommit{DynPropose: dp}
 	}
 
 	return channeldb.LogUpdate{
@@ -320,6 +352,19 @@ func (pd *paymentDescriptor) setCommitHeight(
 		// after they are sent/received, so we consider
 		// them being added and removed at the same
 		// height.
+		pd.addCommitHeights.SetForParty(
+			whoseCommitChain, nextHeight,
+		)
+		pd.removeCommitHeights.SetForParty(
+			whoseCommitChain, nextHeight,
+		)
+
+	case DynCommit:
+		// Like fee updates, a dyn_commit entry re-renders every
+		// commitment after it is sent/received, so we mark it added and
+		// removed at the same height. Once both chains have locked in
+		// the change (and it has been baked into the channel configs by
+		// ApplyChannelParams) the entry can be compacted away.
 		pd.addCommitHeights.SetForParty(
 			whoseCommitChain, nextHeight,
 		)

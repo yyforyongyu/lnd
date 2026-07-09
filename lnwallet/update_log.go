@@ -174,9 +174,12 @@ func compactLogs(ourLog, theirLog *updateLog,
 			if remoteChainTail >= rmvHeights.Remote &&
 				localChainTail >= rmvHeights.Local {
 
-				// Fee updates have no parent htlcs, so we only
-				// remove the update itself.
-				if htlc.EntryType == FeeUpdate {
+				// Fee updates and dyn_commit updates have no
+				// parent htlcs, so we only remove the update
+				// itself.
+				if htlc.EntryType == FeeUpdate ||
+					htlc.EntryType == DynCommit {
+
 					logA.removeUpdate(htlc.LogIndex)
 					continue
 				}
