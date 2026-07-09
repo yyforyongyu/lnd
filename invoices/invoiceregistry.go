@@ -148,6 +148,11 @@ type InvoiceRegistry struct {
 	// subscriber. This is used to unsubscribe from all hashes efficiently.
 	hodlReverseSubscriptions map[chan<- interface{}]map[CircuitKey]struct{}
 
+	// pendingSettleRefs maps pending-settle HTLCs back to the invoice
+	// update reference that should be used when their final outcome is
+	// reported.
+	pendingSettleRefs map[CircuitKey]pendingSettleRef
+
 	// htlcAutoReleaseChan contains the new htlcs that need to be
 	// auto-released.
 	htlcAutoReleaseChan chan *htlcReleaseEvent
@@ -156,6 +161,19 @@ type InvoiceRegistry struct {
 
 	wg   sync.WaitGroup
 	quit chan struct{}
+}
+
+// pendingSettleRef records the invoice reference needed to finalize a pending
+// settle HTLC without scanning all pending invoices.
+type pendingSettleRef struct {
+	// invoiceRef identifies the invoice that owns the pending-settle HTLC.
+	invoiceRef InvoiceRef
+
+	// eventHash is the payment hash used for invoice notifications.
+	eventHash lntypes.Hash
+
+	// setID identifies the AMP set for AMP HTLCs.
+	setID *SetID
 }
 
 // NewRegistry creates a new invoice registry. The invoice registry
@@ -178,6 +196,7 @@ func NewRegistry(idb InvoiceDB, expiryWatcher *InvoiceExpiryWatcher,
 		hodlReverseSubscriptions: make(
 			map[chan<- interface{}]map[CircuitKey]struct{},
 		),
+		pendingSettleRefs:   make(map[CircuitKey]pendingSettleRef),
 		cfg:                 cfg,
 		htlcAutoReleaseChan: make(chan *htlcReleaseEvent),
 		expiryWatcher:       expiryWatcher,
@@ -196,6 +215,12 @@ func (i *InvoiceRegistry) scanInvoicesOnStart(ctx context.Context) error {
 
 	var pending []invoiceExpiry
 	for paymentHash, invoice := range pendingInvoices {
+		i.Lock()
+		i.recordPendingSettleRefsLocked(
+			paymentHash, InvoiceRefByHash(paymentHash), &invoice,
+		)
+		i.Unlock()
+
 		expiryRef := makeInvoiceExpiry(paymentHash, &invoice)
 		if expiryRef != nil {
 			pending = append(pending, expiryRef)
@@ -1015,6 +1040,48 @@ func (i *InvoiceRegistry) NotifyExitHopHtlc(rHash lntypes.Hash,
 	}
 }
 
+// recordPendingSettleRefsLocked indexes all pending-settle HTLCs on an invoice
+// so that their final outcomes can be applied by circuit key.
+func (i *InvoiceRegistry) recordPendingSettleRefsLocked(eventHash lntypes.Hash,
+	invoiceRef InvoiceRef, invoice *Invoice) {
+
+	for key, htlc := range invoice.Htlcs {
+		if htlc.State != HtlcStatePendingSettle {
+			continue
+		}
+
+		i.pendingSettleRefs[key] = pendingSettleRef{
+			invoiceRef: invoiceRef,
+			eventHash:  eventHash,
+			setID:      pendingSettleSetID(htlc),
+		}
+	}
+}
+
+// removeResolvedPendingSettleRefsLocked removes index entries for HTLCs that
+// are no longer waiting for a final settle/fail outcome.
+func (i *InvoiceRegistry) removeResolvedPendingSettleRefsLocked(
+	invoice *Invoice) {
+
+	for key, htlc := range invoice.Htlcs {
+		if htlc.State == HtlcStatePendingSettle {
+			continue
+		}
+
+		delete(i.pendingSettleRefs, key)
+	}
+}
+
+// pendingSettleSetID returns the AMP set ID for a pending-settle HTLC.
+func pendingSettleSetID(htlc *InvoiceHTLC) *SetID {
+	if htlc.AMP == nil {
+		return nil
+	}
+
+	setID := SetID(htlc.AMP.Record.SetID())
+	return &setID
+}
+
 // notifyExitHopHtlcLocked is the internal implementation of NotifyExitHopHtlc
 // that should be executed inside the registry lock. The returned invoiceExpiry
 // (if not nil) needs to be added to the expiry watcher outside of the lock.
@@ -1203,6 +1270,7 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 		ctx.log(err.Error())
 		return nil, nil, err
 	}
+	i.recordPendingSettleRefsLocked(ctx.hash, invoiceRef, invoice)
 
 	var invoiceToExpire invoiceExpiry
 
@@ -1408,6 +1476,7 @@ func (i *InvoiceRegistry) SettleHodlInvoice(ctx context.Context,
 
 	log.Debugf("Invoice%v: settled with preimage %v", invoiceRef,
 		invoice.Terms.PaymentPreimage)
+	i.recordPendingSettleRefsLocked(hash, invoiceRef, invoice)
 
 	// In the callback, we marked the invoice as settled. UpdateInvoice will
 	// have seen this and should have moved all htlcs that were accepted to
@@ -1509,6 +1578,7 @@ func (i *InvoiceRegistry) cancelInvoiceImpl(ctx context.Context,
 	}
 
 	log.Debugf("Invoice%v: canceled", ref)
+	i.removeResolvedPendingSettleRefsLocked(invoice)
 
 	// In the callback, some htlcs may have been moved to the canceled
 	// state. We now go through all of these and notify links and resolvers
