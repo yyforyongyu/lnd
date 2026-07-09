@@ -625,6 +625,97 @@ func TestChannelArbitratorRemoteForceClose(t *testing.T) {
 	}
 }
 
+// TestChannelArbitratorDlpRemoteCloseUsesRemoteTrigger tests that remote-close
+// triggered DLP HTLC recovery does not skip far-from-expiry outgoing HTLCs.
+func TestChannelArbitratorDlpRemoteCloseUsesRemoteTrigger(t *testing.T) {
+	log := &mockArbitratorLog{
+		state:     StateDefault,
+		newStates: make(chan ArbitratorState, 5),
+	}
+	chanArbCtx, err := createTestChannelArbitrator(t, log)
+	require.NoError(t, err, "unable to create ChannelArbitrator")
+
+	htlc := channeldb.HTLC{
+		Incoming:      false,
+		HtlcIndex:     99,
+		OutputIndex:   3,
+		RefundTimeout: 100,
+	}
+	activeHTLCs := map[HtlcSetKey]htlcSet{
+		RemoteHtlcSet: newHtlcSet([]channeldb.HTLC{htlc}),
+	}
+
+	chainActions, err := chanArbCtx.chanArb.checkRemoteChainActions(
+		0, chainTrigger, activeHTLCs, false,
+	)
+	require.NoError(t, err)
+	require.Empty(t, chainActions)
+
+	remoteActions, err := chanArbCtx.chanArb.checkRemoteChainActions(
+		0, remoteCloseTrigger, activeHTLCs, false,
+	)
+	require.NoError(t, err)
+	require.Equal(
+		t, []channeldb.HTLC{htlc},
+		remoteActions[HtlcOutgoingWatchAction],
+	)
+}
+
+// TestChannelArbitratorDlpRemoteHtlcResolutionLookup tests that a corrected
+// remote HTLC output index resolves to the matching outgoing resolution.
+func TestChannelArbitratorDlpRemoteHtlcResolutionLookup(t *testing.T) {
+	log := &mockArbitratorLog{
+		state:     StateDefault,
+		newStates: make(chan ArbitratorState, 5),
+	}
+	chanArbCtx, err := createTestChannelArbitrator(t, log)
+	require.NoError(t, err, "unable to create ChannelArbitrator")
+
+	commitHash := chainhash.Hash{1}
+	htlc := channeldb.HTLC{
+		Incoming:      false,
+		HtlcIndex:     99,
+		OutputIndex:   3,
+		RefundTimeout: 10,
+		Amt:           1000,
+	}
+	claimPoint := wire.OutPoint{
+		Hash:  commitHash,
+		Index: uint32(htlc.OutputIndex),
+	}
+	outgoingRes := lnwallet.OutgoingHtlcResolution{
+		Expiry:        htlc.RefundTimeout,
+		ClaimOutpoint: claimPoint,
+		SweepSignDesc: input.SignDescriptor{
+			Output: &wire.TxOut{
+				Value: int64(htlc.Amt.ToSatoshis()),
+			},
+		},
+	}
+	outgoingResolutions := []lnwallet.OutgoingHtlcResolution{
+		outgoingRes,
+	}
+
+	resolvers, err := chanArbCtx.chanArb.prepContractResolutions(
+		&ContractResolutions{
+			CommitHash: commitHash,
+			HtlcResolutions: lnwallet.HtlcResolutions{
+				OutgoingHTLCs: outgoingResolutions,
+			},
+		}, htlc.RefundTimeout, ChainActionMap{
+			HtlcTimeoutAction: []channeldb.HTLC{htlc},
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, resolvers, 1)
+
+	timeoutResolver, ok := resolvers[0].(*htlcTimeoutResolver)
+	require.True(t, ok)
+	require.Equal(
+		t, claimPoint, timeoutResolver.htlcResolution.ClaimOutpoint,
+	)
+}
+
 // TestChannelArbitratorLocalForceClose tests that the ChannelArbitrator goes
 // through the expected states in case we request it to force close the channel,
 // and the local force close event is observed in chain.

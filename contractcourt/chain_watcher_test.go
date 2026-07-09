@@ -509,6 +509,187 @@ func TestChainWatcherDataLossProtect(t *testing.T) {
 	}
 }
 
+// TestChainWatcherDataLossProtectTweaklessNoPoint tests that tweakless DLP
+// recovery does not block if the peer has not delivered a commit point yet.
+func TestChainWatcherDataLossProtectTweaklessNoPoint(t *testing.T) {
+	t.Parallel()
+
+	aliceChannel, bobChannel, err := lnwallet.CreateTestChannels(
+		t, channeldb.SingleFunderTweaklessBit,
+	)
+	require.NoError(t, err, "unable to create test channels")
+
+	const htlcAmt = 1000
+	states, err := executeStateTransitions(
+		t, htlcAmt, aliceChannel, bobChannel, 2,
+	)
+	require.NoError(t, err, "unable to trigger state transition")
+	aliceChanState := states[1]
+
+	confRegistered := make(chan struct{}, 1)
+	aliceNotifier := &lnmock.ChainNotifier{
+		SpendChan:      make(chan *chainntnfs.SpendDetail, 1),
+		EpochChan:      make(chan *chainntnfs.BlockEpoch),
+		ConfChan:       make(chan *chainntnfs.TxConfirmation, 1),
+		ConfRegistered: confRegistered,
+	}
+	aliceChainWatcher, err := newChainWatcher(chainWatcherConfig{
+		chanState: aliceChanState,
+		notifier:  aliceNotifier,
+		signer:    aliceChannel.Signer,
+		extractStateNumHint: func(*wire.MsgTx,
+			[lnwallet.StateHintSize]byte) uint64 {
+
+			return 2
+		},
+		chanCloseConfs: fn.Some(uint32(1)),
+	})
+	require.NoError(t, err, "unable to create chain watcher")
+	require.NoError(t, aliceChainWatcher.Start())
+	defer func() {
+		require.NoError(t, aliceChainWatcher.Stop())
+	}()
+
+	chanEvents := aliceChainWatcher.SubscribeChannelEvents()
+	bobCommit := bobChannel.State().LocalCommitment.CommitTx
+	bobTxHash := bobCommit.TxHash()
+	bobSpend := &chainntnfs.SpendDetail{
+		SpenderTxHash: &bobTxHash,
+		SpendingTx:    bobCommit,
+	}
+
+	mockBeat := &chainio.MockBlockbeat{}
+	mockBeat.On("logger").Return(log)
+	mockBeat.On("Height").Return(int32(1)).Maybe()
+	mockBeat.On("NotifyBlockProcessed", nil, aliceChainWatcher.quit).
+		Return().Once()
+
+	select {
+	case aliceNotifier.SpendChan <- bobSpend:
+	case <-time.After(time.Second):
+		t.Fatalf("failed to send spend notification")
+	}
+
+	select {
+	case aliceChainWatcher.BlockbeatChan <- mockBeat:
+	case <-time.After(time.Second):
+		t.Fatalf("unable to send blockbeat")
+	}
+
+	select {
+	case uniClose := <-chanEvents.RemoteUnilateralClosure:
+		require.NotNil(t, uniClose.CommitResolution)
+		require.Empty(t, uniClose.RemoteCommit.Htlcs)
+
+	case <-time.After(time.Second * 5):
+		t.Fatalf("didn't receive unilateral close event")
+	}
+}
+
+// TestChainWatcherDataLossProtectHtlcRecovery tests that the DLP remote close
+// path recovers exact outgoing HTLC matches from the confirmed commitment.
+func TestChainWatcherDataLossProtectHtlcRecovery(t *testing.T) {
+	t.Parallel()
+
+	aliceChannel, bobChannel, err := lnwallet.CreateTestChannels(
+		t, channeldb.SingleFunderBit,
+	)
+	require.NoError(t, err, "unable to create test channels")
+
+	htlcAmount := lnwire.NewMSatFromSatoshis(20_000)
+	addFakeHTLC(t, htlcAmount, 0, aliceChannel, bobChannel)
+	require.NoError(
+		t, lnwallet.ForceStateTransition(aliceChannel, bobChannel),
+	)
+
+	aliceChanState, err := copyChannelState(t, aliceChannel.State())
+	require.NoError(t, err)
+	require.Len(t, aliceChanState.RemoteCommitment.Htlcs, 1)
+
+	addFakeHTLC(t, htlcAmount, 1, aliceChannel, bobChannel)
+	require.NoError(
+		t, lnwallet.ForceStateTransition(aliceChannel, bobChannel),
+	)
+
+	dlpPoint := aliceChannel.State().RemoteCurrentRevocation
+	require.NoError(t, aliceChanState.MarkDataLoss(dlpPoint))
+
+	confRegistered := make(chan struct{}, 1)
+	aliceNotifier := &lnmock.ChainNotifier{
+		SpendChan:      make(chan *chainntnfs.SpendDetail, 1),
+		EpochChan:      make(chan *chainntnfs.BlockEpoch),
+		ConfChan:       make(chan *chainntnfs.TxConfirmation, 1),
+		ConfRegistered: confRegistered,
+	}
+	aliceChainWatcher, err := newChainWatcher(chainWatcherConfig{
+		chanState:           aliceChanState,
+		notifier:            aliceNotifier,
+		signer:              aliceChannel.Signer,
+		extractStateNumHint: lnwallet.GetStateNumHint,
+		chanCloseConfs:      fn.Some(uint32(1)),
+	})
+	require.NoError(t, err, "unable to create chain watcher")
+	require.NoError(t, aliceChainWatcher.Start())
+	defer func() {
+		require.NoError(t, aliceChainWatcher.Stop())
+	}()
+
+	chanEvents := aliceChainWatcher.SubscribeChannelEvents()
+	bobCommit := bobChannel.State().LocalCommitment.CommitTx
+	bobTxHash := bobCommit.TxHash()
+	bobSpend := &chainntnfs.SpendDetail{
+		SpenderTxHash: &bobTxHash,
+		SpendingTx:    bobCommit,
+	}
+
+	mockBeat := &chainio.MockBlockbeat{}
+	mockBeat.On("logger").Return(log)
+	mockBeat.On("Height").Return(int32(1)).Maybe()
+	mockBeat.On("NotifyBlockProcessed", nil, aliceChainWatcher.quit).
+		Return().Once()
+
+	select {
+	case aliceNotifier.SpendChan <- bobSpend:
+	case <-time.After(time.Second):
+		t.Fatalf("failed to send spend notification")
+	}
+
+	select {
+	case aliceChainWatcher.BlockbeatChan <- mockBeat:
+	case <-time.After(time.Second):
+		t.Fatalf("unable to send blockbeat")
+	}
+
+	var uniClose *RemoteUnilateralCloseInfo
+	select {
+	case uniClose = <-chanEvents.RemoteUnilateralClosure:
+	case <-time.After(time.Second * 15):
+		t.Fatalf("didn't receive unilateral close event")
+	}
+
+	require.Len(t, uniClose.RemoteCommit.Htlcs, 1)
+	require.NotZero(t, uniClose.RemoteCommit.FeePerKw)
+	require.NotNil(t, uniClose.HtlcResolutions)
+	require.Len(t, uniClose.HtlcResolutions.OutgoingHTLCs, 1)
+
+	commitKey := uniClose.CommitSet.ConfCommitKey.UnwrapOrFail(t)
+	require.Equal(t, RemoteHtlcSet, commitKey)
+	commitSetHtlcs := uniClose.CommitSet.HtlcSets[RemoteHtlcSet]
+	require.Equal(t, uniClose.RemoteCommit.Htlcs, commitSetHtlcs)
+	require.Empty(t, uniClose.CommitSet.HtlcSets[LocalHtlcSet])
+	require.Empty(t, uniClose.CommitSet.HtlcSets[RemotePendingHtlcSet])
+
+	resolution := uniClose.HtlcResolutions.OutgoingHTLCs[0]
+	require.Equal(t, bobTxHash, resolution.ClaimOutpoint.Hash)
+	require.Equal(
+		t, uint32(uniClose.RemoteCommit.Htlcs[0].OutputIndex),
+		resolution.ClaimOutpoint.Index,
+	)
+	require.NotEqual(
+		t, aliceChanState.FundingOutpoint, resolution.ClaimOutpoint,
+	)
+}
+
 // TestChainWatcherLocalForceCloseDetect tests we're able to always detect our
 // commitment output based on only the outputs present on the transaction.
 func TestChainWatcherLocalForceCloseDetect(t *testing.T) {
