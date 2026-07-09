@@ -346,11 +346,9 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 		// dispatch notifications to all registered clients.
 		case event := <-i.invoiceEvents:
 			// For backwards compatibility, do not notify all
-			// invoice subscribers of cancel and accept events.
-			state := event.invoice.State
-			if state != ContractCanceled &&
-				state != ContractAccepted {
-
+			// invoice subscribers of cancel, accept and
+			// pending-settle events.
+			if !event.suppressedForAllClients() {
 				i.dispatchToClients(event)
 			}
 			i.dispatchToSingleClients(event)
@@ -382,6 +380,31 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 			return
 		}
 	}
+}
+
+// suppressedForAllClients returns true for invoice events that should only be
+// sent to single-invoice subscribers for backwards compatibility.
+func (e *invoiceEvent) suppressedForAllClients() bool {
+	state := e.invoice.State
+	if state == ContractCanceled || state == ContractAccepted ||
+		state == ContractPendingSettle {
+
+		// These non-terminal or cancel events are only delivered to
+		// single-invoice subscribers for backwards compatibility.
+		return true
+	}
+
+	if e.setID == nil || state != ContractOpen {
+		// Open base invoices are new-invoice events, and settled events
+		// are safe for all-invoice subscribers.
+		return false
+	}
+
+	ampState, ok := e.invoice.AMPState[SetID(*e.setID)]
+
+	// AMP set updates keep the base invoice open until the AMP set settles.
+	// Suppress accepted, canceled and pending-settle set updates.
+	return ok && ampState.State != HtlcStateSettled
 }
 
 // dispatchToSingleClients passes the supplied event to all notification
@@ -922,7 +945,7 @@ func (i *InvoiceRegistry) processAMP(ctx invoiceUpdateCtx) error {
 	}
 }
 
-// NotifyExitHopHtlc attempts to mark an invoice as settled. The return value
+// NotifyExitHopHtlc requests settlement of an invoice. The return value
 // describes how the htlc should be resolved.
 //
 // When the preimage of the invoice is not yet known (hodl invoice), this
@@ -1038,6 +1061,97 @@ func (i *InvoiceRegistry) NotifyExitHopHtlc(rHash lntypes.Hash,
 	default:
 		return nil, errors.New("invalid resolution type")
 	}
+}
+
+// NotifyExitHopHtlcFinalized marks a previously requested exit-hop HTLC
+// settlement as final. The invoice is only reported as settled after the HTLC
+// settle is locked in off-chain or claimed on-chain.
+//
+// Crash recovery before the settle/fail response is forwarding-package acked is
+// handled by the switch's replay: replayed exit-hop adds re-enter
+// NotifyExitHopHtlc, receive the pending-settle resolution again, and trigger a
+// new finalization callback once the response locks in. After that response is
+// acked, a failed finalization is retried from the registry's in-memory queue.
+// Recovery is best-effort: a restart can leave an invoice in
+// ContractPendingSettle if finalization did not complete. Channel finality
+// itself must not wait on invoice DB health.
+func (i *InvoiceRegistry) NotifyExitHopHtlcFinalized(ctx context.Context,
+	circuitKey CircuitKey, settled bool) error {
+
+	return i.notifyExitHopHtlcFinalized(ctx, circuitKey, settled)
+}
+
+// notifyExitHopHtlcFinalized applies the final outcome of a pending-settle
+// HTLC without queuing a retry on failure.
+func (i *InvoiceRegistry) notifyExitHopHtlcFinalized(ctx context.Context,
+	circuitKey CircuitKey, settled bool) error {
+
+	i.Lock()
+	defer i.Unlock()
+
+	pendingRef, ok := i.pendingSettleRefs[circuitKey]
+	if !ok {
+		return nil
+	}
+
+	var (
+		oldInvoiceState ContractState
+		oldAMPState     HtlcState
+		oldAMPStateOk   bool
+		updated         bool
+	)
+	updateInvoice := func(invoice *Invoice) (*InvoiceUpdateDesc, error) {
+		htlc, ok := invoice.Htlcs[circuitKey]
+		if !ok || htlc.State != HtlcStatePendingSettle {
+			return nil, nil
+		}
+
+		updated = true
+		oldInvoiceState = invoice.State
+		if pendingRef.setID != nil {
+			ampState, ok := invoice.AMPState[*pendingRef.setID]
+			oldAMPStateOk = ok
+			oldAMPState = ampState.State
+		}
+
+		outcome := HtlcStateCanceled
+		if settled {
+			outcome = HtlcStateSettled
+		}
+
+		return &InvoiceUpdateDesc{
+			UpdateType: FinalizeHTLCsUpdate,
+			FinalizeHtlcs: map[CircuitKey]HtlcState{
+				circuitKey: outcome,
+			},
+			SetID: pendingRef.setID,
+		}, nil
+	}
+
+	invoice, err := i.idb.UpdateInvoice(
+		ctx, pendingRef.invoiceRef, pendingRef.setID, updateInvoice,
+	)
+	if err != nil {
+		return err
+	}
+	i.removeResolvedPendingSettleRefsLocked(invoice)
+	delete(i.pendingSettleRefs, circuitKey)
+
+	updateSubscribers := updated && invoice.State != oldInvoiceState
+	if updated && pendingRef.setID != nil {
+		ampState, ok := invoice.AMPState[*pendingRef.setID]
+		updateSubscribers = oldAMPStateOk != ok ||
+			(ok && ampState.State != oldAMPState)
+	}
+
+	if updateSubscribers {
+		i.notifyClients(
+			pendingRef.eventHash, invoice,
+			(*[32]byte)(pendingRef.setID),
+		)
+	}
+
+	return nil
 }
 
 // recordPendingSettleRefsLocked indexes all pending-settle HTLCs on an invoice
