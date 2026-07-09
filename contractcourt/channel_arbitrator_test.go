@@ -749,7 +749,8 @@ func TestChannelArbitratorBreachClose(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb := chanArbCtx.chanArb
 	chanArb.cfg.PreimageDB = newMockWitnessBeacon()
-	chanArb.cfg.Registry = &mockRegistry{}
+	registry := &mockRegistry{}
+	chanArb.cfg.Registry = registry
 
 	beat := newBeatFromHeight(0)
 	if err := chanArb.Start(nil, beat); err != nil {
@@ -800,7 +801,8 @@ func TestChannelArbitratorBreachClose(t *testing.T) {
 		CommitSet: CommitSet{
 			ConfCommitKey: fn.Some(RemoteHtlcSet),
 			HtlcSets: map[HtlcSetKey][]channeldb.HTLC{
-				RemoteHtlcSet: {htlc1, htlc2},
+				RemoteHtlcSet:        {htlc1, htlc2},
+				RemotePendingHtlcSet: {htlc2},
 			},
 		},
 		CommitHash: chainhash.Hash{},
@@ -842,6 +844,33 @@ func TestChannelArbitratorBreachClose(t *testing.T) {
 		}
 	}
 	require.True(t, anchorExists && breachExists)
+	incomingCircuitKey := models.CircuitKey{
+		ChanID: chanArb.cfg.ShortChanID,
+		HtlcID: htlc2.HtlcIndex,
+	}
+
+	// The breach path stores and emits the final failed outcome for
+	// incoming HTLCs in addition to finalizing the invoice outcome.
+	require.Equal(t, map[uint64]bool{
+		htlc2.HtlcIndex: false,
+	}, chanArbCtx.finalHtlcs)
+	require.Equal(t, []finalizeExitHopData{
+		{
+			circuitKey: incomingCircuitKey,
+			settled:    false,
+		},
+	}, registry.finalized)
+	notifier, ok := chanArb.cfg.HtlcNotifier.(*mockHTLCNotifier)
+	require.True(t, ok)
+	require.Equal(t, []models.CircuitKey{
+		incomingCircuitKey,
+	}, notifier.finalHtlcEventKeys)
+	require.Equal(t, []channeldb.FinalHtlcInfo{
+		{
+			Settled:  false,
+			Offchain: false,
+		},
+	}, notifier.finalHtlcEvents)
 
 	// The anchor resolver is expected to re-offer the anchor input to the
 	// sweeper.
@@ -865,6 +894,38 @@ func TestChannelArbitratorBreachClose(t *testing.T) {
 	}
 }
 
+// TestFailBreachedIncomingHtlcsStoreError asserts breached incoming HTLCs do
+// not notify invoice or final-HTLC subscribers if the final outcome cannot be
+// stored persistently.
+func TestFailBreachedIncomingHtlcsStoreError(t *testing.T) {
+	t.Parallel()
+
+	storeErr := errors.New("store final htlc outcome")
+	registry := &mockRegistry{}
+	notifier := &mockHTLCNotifier{}
+	chanArb := &ChannelArbitrator{
+		cfg: ChannelArbitratorConfig{
+			ShortChanID: lnwire.NewShortChanIDFromInt(1),
+			ChainArbitratorConfig: ChainArbitratorConfig{
+				Registry:     registry,
+				HtlcNotifier: notifier,
+				PutFinalHtlcOutcome: func(
+					_ lnwire.ShortChannelID, _ uint64,
+					_ bool) error {
+
+					return storeErr
+				},
+			},
+		},
+	}
+
+	err := chanArb.failBreachedIncomingHtlcs(fn.NewSet[uint64](3))
+	require.ErrorIs(t, err, storeErr)
+	require.Empty(t, registry.finalized)
+	require.Empty(t, notifier.finalHtlcEventKeys)
+	require.Empty(t, notifier.finalHtlcEvents)
+}
+
 // TestChannelArbitratorLocalForceClosePendingHtlc tests that the
 // ChannelArbitrator goes through the expected states in case we request it to
 // force close a channel that still has an HTLC pending.
@@ -877,7 +938,8 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb := chanArbCtx.chanArb
 	chanArb.cfg.PreimageDB = newMockWitnessBeacon()
-	chanArb.cfg.Registry = &mockRegistry{}
+	registry := &mockRegistry{}
+	chanArb.cfg.Registry = registry
 
 	beat := newBeatFromHeight(0)
 	if err := chanArb.Start(nil, beat); err != nil {
@@ -1054,6 +1116,15 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 		incomingDustHtlc.HtlcIndex: false,
 	}
 	require.Equal(t, expectedFinalHtlcs, chanArbCtx.finalHtlcs)
+	require.Equal(t, []finalizeExitHopData{
+		{
+			circuitKey: models.CircuitKey{
+				ChanID: chanArb.cfg.ShortChanID,
+				HtlcID: incomingDustHtlc.HtlcIndex,
+			},
+			settled: false,
+		},
+	}, registry.finalized)
 
 	// We'll now re-create the resolver, notice that we use the existing
 	// arbLog so it carries over the same on-disk state.

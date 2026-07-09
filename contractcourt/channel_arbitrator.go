@@ -1352,6 +1352,25 @@ func (c *ChannelArbitrator) stateStep(
 		// HTLCs for their corresponding outgoing HTLCs on the remote
 		// commitment set (remote and remote pending set).
 		if contractResolutions.BreachResolution != nil {
+			incomingHTLCs := fn.NewSet[uint64]()
+			for htlcSetKey, htlcs := range confCommitSet.HtlcSets {
+				if !htlcSetKey.IsRemote {
+					continue
+				}
+
+				for _, htlc := range htlcs {
+					if !htlc.Incoming {
+						continue
+					}
+
+					incomingHTLCs.Add(htlc.HtlcIndex)
+				}
+			}
+			err := c.failBreachedIncomingHtlcs(incomingHTLCs)
+			if err != nil {
+				return StateError, closeTx, err
+			}
+
 			// cancelBreachedHTLCs is a set which holds HTLCs whose
 			// corresponding incoming HTLCs will be failed back
 			// because the peer broadcasted an old state.
@@ -1377,7 +1396,7 @@ func (c *ChannelArbitrator) stateStep(
 				}
 			}
 
-			err := c.abandonForwards(cancelBreachedHTLCs)
+			err = c.abandonForwards(cancelBreachedHTLCs)
 			if err != nil {
 				return StateError, closeTx, err
 			}
@@ -3574,6 +3593,49 @@ func (c *ChannelArbitrator) prepareAnchorSweeps(heightHint uint32,
 	return requests, nil
 }
 
+// failBreachedIncomingHtlcs finalizes incoming HTLCs found on a breached remote
+// commitment as failed. The registry ignores HTLCs that are not pending-settle
+// exit-hop payments.
+func (c *ChannelArbitrator) failBreachedIncomingHtlcs(
+	htlcs fn.Set[uint64]) error {
+
+	for htlcIndex := range htlcs {
+		chainArbCfg := c.cfg.ChainArbitratorConfig
+		key := models.CircuitKey{
+			ChanID: c.cfg.ShortChanID,
+			HtlcID: htlcIndex,
+		}
+
+		err := chainArbCfg.PutFinalHtlcOutcome(
+			key.ChanID, key.HtlcID, false,
+		)
+		if err != nil {
+			return fmt.Errorf("unable to store final breached "+
+				"incoming htlc outcome %v: %w", key, err)
+		}
+
+		err = chainArbCfg.Registry.NotifyExitHopHtlcFinalized(
+			context.Background(), key, false,
+		)
+		if err != nil {
+			log.Warnf(
+				"Unable to finalize breached incoming htlc %v: %v",
+				key, err,
+			)
+		}
+
+		chainArbCfg.HtlcNotifier.NotifyFinalHtlcEvent(
+			key,
+			channeldb.FinalHtlcInfo{
+				Settled:  false,
+				Offchain: false,
+			},
+		)
+	}
+
+	return nil
+}
+
 // failIncomingDust resolves the incoming dust HTLCs because they do not have
 // an output on the commitment transaction and cannot be resolved onchain. We
 // mark them as failed here.
@@ -3598,6 +3660,14 @@ func (c *ChannelArbitrator) failIncomingDust(
 		)
 		if err != nil {
 			return err
+		}
+
+		err = chainArbCfg.Registry.NotifyExitHopHtlcFinalized(
+			context.Background(), key, false,
+		)
+		if err != nil {
+			log.Warnf("Unable to finalize incoming dust htlc %v: %v",
+				key, err)
 		}
 
 		// Send notification.
