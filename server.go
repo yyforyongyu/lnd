@@ -60,6 +60,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -246,6 +247,13 @@ type server struct {
 	nodeSigner *netann.NodeSigner
 
 	chanStatusMgr *netann.ChanStatusManager
+
+	// dynAnnouncementMgr reconciles the gossip/channel-announcement layer
+	// with dynamic-commitments parameter updates that lock in on a link
+	// (public<->private conversion and channel_update realignment). It is
+	// invoked via the NotifyDynParamsLockIn peer/link hook, so it is inert
+	// for channels that never undergo a dynamic update.
+	dynAnnouncementMgr *netann.DynAnnouncementManager
 
 	// listenAddrs is the list of addresses the server is currently
 	// listening on.
@@ -955,6 +963,30 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 		return nil, err
 	}
 	s.chanStatusMgr = chanStatusMgr
+
+	// The dynamic-commitments announcement manager reconciles the gossip
+	// layer with a locked-in dynamic parameter update. Its dependencies
+	// mirror the ChanStatusManager's (same signer, key, and channel_update
+	// application path) plus the channel/graph lookups it needs to enforce
+	// the private->public preconditions and realign advertised policy.
+	//
+	// TODO(dyn): ReAnnounceChannel is intentionally left nil until the
+	// funding-manager AnnounceSignatures re-trigger is wired (see
+	// netann.DynAnnouncementManager.makePublic). Until then a private->public
+	// conversion enforces its preconditions and re-advertises our directional
+	// channel_update, but the channel_announcement proof is not produced.
+	s.dynAnnouncementMgr = netann.NewDynAnnouncementManager(
+		netann.DynAnnouncementConfig{
+			MessageSigner:         s.nodeSigner,
+			OurKeyLoc:             nodeKeyDesc.KeyLocator,
+			FetchChannel:          s.chanStateDB.FetchChannel,
+			FetchOurChannelUpdate: s.fetchOurChannelUpdate,
+			ApplyChannelUpdate:    s.applyChannelUpdate,
+			IsShutdownPending:     s.isChannelShutdownPending,
+			RequestDisable:        s.chanStatusMgr.RequestDisable,
+			MinHTLCOut:            cc.RoutingPolicy.MinHTLCOut,
+		},
+	)
 
 	// If enabled, use either UPnP or NAT-PMP to automatically configure
 	// port forwarding for users behind a NAT.
@@ -4598,14 +4630,15 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 
 			return s.defaultOnionActorOpts
 		},
-		ActorSystem:         s.actorSystem,
-		WitnessBeacon:       s.witnessBeacon,
-		Invoices:            s.invoices,
-		ChannelNotifier:     s.channelNotifier,
-		NotifyChannelBackup: s.updateChannelBackup,
-		HtlcNotifier:        s.htlcNotifier,
-		TowerClient:         towerClient,
-		DisconnectPeer:      s.DisconnectPeer,
+		ActorSystem:           s.actorSystem,
+		WitnessBeacon:         s.witnessBeacon,
+		Invoices:              s.invoices,
+		ChannelNotifier:       s.channelNotifier,
+		NotifyChannelBackup:   s.updateChannelBackup,
+		NotifyDynParamsLockIn: s.notifyDynParamsLockIn,
+		HtlcNotifier:          s.htlcNotifier,
+		TowerClient:           towerClient,
+		DisconnectPeer:        s.DisconnectPeer,
 		GenNodeAnnouncement: func(...netann.NodeAnnModifier) (
 			lnwire.NodeAnnouncement1, error) {
 
@@ -5451,6 +5484,96 @@ func (s *server) fetchLastChanUpdate() func(lnwire.ShortChannelID) (
 			ourPubKey[:], info, edge1, edge2,
 		)
 	}
+}
+
+// fetchOurChannelUpdate returns the most recent channel_update we advertised
+// for our direction of the channel identified by the given outpoint, along with
+// whether the channel is still private (i.e. has no channel_announcement proof).
+// It is used by the dynamic-commitments announcement manager to realign and
+// re-advertise our policy after a parameter update locks in.
+func (s *server) fetchOurChannelUpdate(op wire.OutPoint) (
+	*lnwire.ChannelUpdate1, bool, error) {
+
+	ourPubKey := s.identityECDH.PubKey().SerializeCompressed()
+
+	info, edge1, edge2, err := s.graphDB.FetchChannelEdgesByOutpoint(
+		context.TODO(), &op,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+
+	update, err := netann.ExtractChannelUpdate(
+		ourPubKey, info, edge1, edge2,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// A channel with no authentication proof has not been announced and is
+	// therefore still private; its updates must use the peer alias.
+	private := info.AuthProof == nil
+
+	return update, private, nil
+}
+
+// isChannelShutdownPending reports whether a cooperative shutdown has been
+// initiated on our side of the channel identified by the given channel id. It
+// is a best-effort, defense-in-depth precondition for the private->public
+// dynamic conversion: the link/quiescence layer additionally prevents a dyn
+// update from being negotiated while a shutdown (sent or received) is
+// outstanding.
+func (s *server) isChannelShutdownPending(chanID lnwire.ChannelID) bool {
+	channel, err := s.chanStateDB.FetchChannelByID(chanID)
+	if err != nil {
+		// If we cannot load the channel, conservatively treat it as
+		// having a pending shutdown so we do not announce a channel we
+		// cannot verify.
+		srvrLog.Warnf("Unable to fetch channel %v to check shutdown "+
+			"state: %v", chanID, err)
+
+		return true
+	}
+
+	info, err := channel.ShutdownInfo()
+	if err != nil {
+		srvrLog.Warnf("Unable to read shutdown info for channel %v: %v",
+			chanID, err)
+
+		return true
+	}
+
+	return info.IsSome()
+}
+
+// notifyDynParamsLockIn is the NotifyDynParamsLockIn hook the peer/link invokes
+// after a dynamic-commitments parameter update has locked in for a channel. It
+// hands the change to the dynamic announcement manager, which reconciles the
+// gossip layer (public<->private conversion and channel_update realignment). It
+// is fire-and-forget from the link's perspective: the params are already
+// committed, so gossip errors are logged, not surfaced back into the commitment
+// dance. The work runs in a goroutine tied to the server lifecycle so the link
+// event loop is never blocked on gossip round-trips.
+func (s *server) notifyDynParamsLockIn(chanPoint wire.OutPoint,
+	proposer lntypes.ChannelParty, oldFlags lnwire.FundingFlag,
+	params lnwallet.ChannelParams) {
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		ctx, cancel := lnutils.ContextFromQuit(s.quit)
+		defer cancel()
+
+		err := s.dynAnnouncementMgr.ProcessDynParamsLockIn(
+			ctx, chanPoint, proposer, oldFlags, params,
+		)
+		if err != nil {
+			srvrLog.Errorf("Unable to reconcile gossip state for "+
+				"dyn params lock-in on ChannelPoint(%v): %v",
+				chanPoint, err)
+		}
+	}()
 }
 
 // applyChannelUpdate applies the channel update to the different sub-systems of
