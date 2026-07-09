@@ -36,6 +36,22 @@ const (
 	// DefaultHtlcHoldDuration defines the default for how long mpp htlcs
 	// are held while waiting for the other set members to arrive.
 	DefaultHtlcHoldDuration = 120 * time.Second
+
+	// DefaultHtlcFinalizationRetryDelay defines how long to wait before
+	// retrying a failed invoice HTLC finalization.
+	DefaultHtlcFinalizationRetryDelay = time.Second
+
+	// DefaultHtlcFinalizationRetryMaxDelay defines the maximum delay
+	// between failed invoice HTLC finalization retries.
+	DefaultHtlcFinalizationRetryMaxDelay = time.Minute
+
+	// htlcFinalizationRetryEscalateAttempts is the number of failed retry
+	// attempts after which failures are logged as errors.
+	htlcFinalizationRetryEscalateAttempts = 5
+
+	// htlcFinalizationRetryLogInterval limits repeated error logs after the
+	// retry loop has escalated.
+	htlcFinalizationRetryLogInterval = 10
 )
 
 // RegistryConfig contains the configuration parameters for invoice registry.
@@ -94,12 +110,45 @@ type htlcReleaseEvent struct {
 	releaseTime time.Time
 }
 
+// htlcFinalizationRetryEvent describes an exit-hop HTLC finalization retry.
+type htlcFinalizationRetryEvent struct {
+	// key identifies the exit-hop HTLC to finalize.
+	key CircuitKey
+
+	// settled is the final outcome to record for the HTLC.
+	settled bool
+
+	// retryTime is when the retry should next be attempted.
+	retryTime time.Time
+
+	// attempts is the number of failed finalization attempts so far.
+	attempts uint32
+}
+
 // Less is used to order PriorityQueueItem's by their release time such that
 // items with the older release time are at the top of the queue.
 //
 // NOTE: Part of the queue.PriorityQueueItem interface.
 func (r *htlcReleaseEvent) Less(other queue.PriorityQueueItem) bool {
 	return r.releaseTime.Before(other.(*htlcReleaseEvent).releaseTime)
+}
+
+// Less is used to order finalization retries by their retry time.
+//
+// NOTE: Part of the queue.PriorityQueueItem interface.
+// Ensure htlcFinalizationRetryEvent implements the PriorityQueueItem
+// interface.
+var _ queue.PriorityQueueItem = (*htlcFinalizationRetryEvent)(nil)
+
+func (r *htlcFinalizationRetryEvent) Less(
+	other queue.PriorityQueueItem) bool {
+
+	retry, ok := other.(*htlcFinalizationRetryEvent)
+	if !ok {
+		return false
+	}
+
+	return r.retryTime.Before(retry.retryTime)
 }
 
 // InvoiceRegistry is a central registry of all the outstanding invoices
@@ -153,9 +202,18 @@ type InvoiceRegistry struct {
 	// reported.
 	pendingSettleRefs map[CircuitKey]pendingSettleRef
 
+	// htlcFinalizationRetries tracks exit-hop HTLCs that already have a
+	// retry queued so transient finalization errors don't enqueue
+	// duplicates.
+	htlcFinalizationRetries map[CircuitKey]struct{}
+
 	// htlcAutoReleaseChan contains the new htlcs that need to be
 	// auto-released.
 	htlcAutoReleaseChan chan *htlcReleaseEvent
+
+	// htlcFinalizationRetryChan contains exit-hop HTLC finalization
+	// retries.
+	htlcFinalizationRetryChan chan *htlcFinalizationRetryEvent
 
 	expiryWatcher *InvoiceExpiryWatcher
 
@@ -196,11 +254,17 @@ func NewRegistry(idb InvoiceDB, expiryWatcher *InvoiceExpiryWatcher,
 		hodlReverseSubscriptions: make(
 			map[chan<- interface{}]map[CircuitKey]struct{},
 		),
-		pendingSettleRefs:   make(map[CircuitKey]pendingSettleRef),
+		pendingSettleRefs: make(map[CircuitKey]pendingSettleRef),
+		htlcFinalizationRetries: make(
+			map[CircuitKey]struct{},
+		),
 		cfg:                 cfg,
 		htlcAutoReleaseChan: make(chan *htlcReleaseEvent),
-		expiryWatcher:       expiryWatcher,
-		quit:                make(chan struct{}),
+		htlcFinalizationRetryChan: make(
+			chan *htlcFinalizationRetryEvent, 100,
+		),
+		expiryWatcher: expiryWatcher,
+		quit:          make(chan struct{}),
 	}
 }
 
