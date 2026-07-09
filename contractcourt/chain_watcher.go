@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/types"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
@@ -1227,39 +1229,93 @@ func (c *chainWatcher) handleUnknownRemoteState(
 		"state #%v!!! Attempting recovery...",
 		broadcastStateNum, chainSet.remoteStateNum)
 
-	// If this isn't a tweakless commitment, then we'll need to wait for
-	// the remote party's latest unrevoked commitment point to be presented
-	// to us as we need this to sweep. Otherwise, we can dispatch the
-	// remote close and sweep immediately using a fake commitPoint as it
-	// isn't actually needed for recovery anymore.
+	// If the DLP commit point is already available, use it for exact HTLC
+	// output matching. Static-remote-key commitments can still recover the
+	// to-local output without it, so do not block startup waiting for the
+	// point in that case.
 	commitPoint := c.cfg.chanState.RemoteCurrentRevocation
+	matchDlpHtlcs := false
 	tweaklessCommit := c.cfg.chanState.ChanType.IsTweakless()
-	if !tweaklessCommit {
+	dlpPoint, err := c.cfg.chanState.DataLossCommitPoint()
+	switch {
+	case err == nil:
+		commitPoint = dlpPoint
+		matchDlpHtlcs = true
+
+		log.Infof("Recovered commit point(%x) for channel(%v)! Now "+
+			"attempting to use it to sweep our funds...",
+			commitPoint.SerializeCompressed(),
+			c.cfg.chanState.FundingOutpoint)
+
+	case !tweaklessCommit:
 		commitPoint = c.waitForCommitmentPoint()
 		if commitPoint == nil {
 			return false, fmt.Errorf("unable to get commit point")
 		}
 
-		log.Infof("Recovered commit point(%x) for "+
-			"channel(%v)! Now attempting to use it to "+
-			"sweep our funds...",
+		matchDlpHtlcs = true
+
+		log.Infof("Recovered commit point(%x) for channel(%v)! Now "+
+			"attempting to use it to sweep our funds...",
 			commitPoint.SerializeCompressed(),
 			c.cfg.chanState.FundingOutpoint)
-	} else {
-		log.Infof("ChannelPoint(%v) is tweakless, "+
-			"moving to sweep directly on chain",
-			c.cfg.chanState.FundingOutpoint)
+
+	default:
+		log.Infof("ChannelPoint(%v) is tweakless, moving to sweep "+
+			"directly on chain without HTLC recovery: %v",
+			c.cfg.chanState.FundingOutpoint, err)
 	}
 
-	// Since we don't have the commitment stored for this state, we'll just
-	// pass an empty commitment within the commitment set. Note that this
-	// means we won't be able to recover any HTLC funds.
-	//
-	// TODO(halseth): can we try to recover some HTLCs?
-	chainSet.commitSet.ConfCommitKey = fn.Some(RemoteHtlcSet)
-	err := c.dispatchRemoteForceClose(
-		commitSpend, channeldb.ChannelCommitment{},
-		chainSet.commitSet, commitPoint,
+	// Since we don't have the commitment stored for this state, we'll pass
+	// a synthetic commitment containing only HTLCs that exactly match the
+	// confirmed remote close transaction.
+	remoteCommit := channeldb.ChannelCommitment{}
+	commitSet := CommitSet{
+		ConfCommitKey: fn.Some(RemoteHtlcSet),
+		HtlcSets: map[HtlcSetKey][]channeldb.HTLC{
+			RemoteHtlcSet: nil,
+		},
+	}
+
+	if matchDlpHtlcs {
+		matchedHtlcs, err := lnwallet.MatchDlpRemoteCommitHtlcs(
+			c.cfg.chanState, commitSpend.SpendingTx, commitPoint,
+		)
+		switch {
+		case errors.Is(err, lnwallet.ErrDlpTaprootUnsupported):
+			log.Infof("ChannelPoint(%v): taproot DLP HTLC "+
+				"recovery unsupported",
+				c.cfg.chanState.FundingOutpoint)
+
+		case err != nil:
+			log.Warnf("ChannelPoint(%v): unable to match DLP "+
+				"HTLCs: %v", c.cfg.chanState.FundingOutpoint,
+				err)
+
+		case len(matchedHtlcs) == 0:
+			log.Infof("ChannelPoint(%v): no DLP HTLC outputs "+
+				"matched", c.cfg.chanState.FundingOutpoint)
+
+		default:
+			recoveredHtlcs := append(
+				[]channeldb.HTLC(nil), matchedHtlcs...,
+			)
+			remoteCommit = channeldb.ChannelCommitment{
+				FeePerKw: btcutil.Amount(
+					chainfee.FeePerKwFloor,
+				),
+				Htlcs: recoveredHtlcs,
+			}
+			commitSet.HtlcSets[RemoteHtlcSet] = recoveredHtlcs
+
+			log.Infof("ChannelPoint(%v): matched %v DLP HTLC "+
+				"outputs", c.cfg.chanState.FundingOutpoint,
+				len(recoveredHtlcs))
+		}
+	}
+
+	err = c.dispatchRemoteForceClose(
+		commitSpend, remoteCommit, commitSet, commitPoint,
 	)
 	if err != nil {
 		return false, fmt.Errorf("unable to handle remote "+
