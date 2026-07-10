@@ -361,6 +361,12 @@ type Config struct {
 	// ActiveLinkEvents.
 	ChannelNotifier *channelnotifier.ChannelNotifier
 
+	// NotifyChannelBackup re-emits a static channel backup for the given
+	// channel so the on-disk SCB reflects its current configuration. It is
+	// passed to the ChannelLink and invoked only on the dynamic-commitments
+	// apply path, after a parameter update locks in.
+	NotifyChannelBackup func(*channeldb.OpenChannel)
+
 	// HtlcNotifier is used when creating a ChannelLink.
 	HtlcNotifier *htlcswitch.HtlcNotifier
 
@@ -1564,6 +1570,7 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 		NotifyInactiveChannel:      p.cfg.ChannelNotifier.NotifyInactiveChannelEvent,
 		NotifyInactiveLinkEvent:    p.cfg.ChannelNotifier.NotifyInactiveLinkEvent,
 		NotifyChannelUpdate:        p.cfg.ChannelNotifier.NotifyChannelUpdateEvent,
+		NotifyChannelBackup:        p.cfg.NotifyChannelBackup,
 		HtlcNotifier:               p.cfg.HtlcNotifier,
 		GetAliases:                 p.cfg.GetAliases,
 		PreviouslySentShutdown:     shutdownMsg,

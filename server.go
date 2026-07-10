@@ -1812,6 +1812,18 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 		// buildBreachRetribution is a call-back that can be used to
 		// query the BreachRetribution info and channel type given a
 		// channel ID and commitment height.
+		//
+		// NOTE(dyn): the watchtower justice/backup path needs no
+		// dynamic-commitments-specific change. It reconstructs the
+		// revoked commitment for commitHeight solely through
+		// lnwallet.NewBreachRetribution, which (per the branch-1.3
+		// audit) looks up the per-side commit-chain epoch covering that
+		// height and rebuilds the witness scripts with the CSV/dust that
+		// were in effect then, not the live config. So a params update
+		// that later changes CSV cannot make a tower-backed justice
+		// transaction for a pre-change state unspendable. Historical
+		// correctness is covered by lnwallet's
+		// TestNewBreachRetributionHistoricalCSV / ...HistoricalDust.
 		buildBreachRetribution := func(chanID lnwire.ChannelID,
 			commitHeight uint64) (*lnwallet.BreachRetribution,
 			channeldb.ChannelType, error) {
@@ -4586,13 +4598,14 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 
 			return s.defaultOnionActorOpts
 		},
-		ActorSystem:     s.actorSystem,
-		WitnessBeacon:   s.witnessBeacon,
-		Invoices:        s.invoices,
-		ChannelNotifier: s.channelNotifier,
-		HtlcNotifier:    s.htlcNotifier,
-		TowerClient:     towerClient,
-		DisconnectPeer:  s.DisconnectPeer,
+		ActorSystem:         s.actorSystem,
+		WitnessBeacon:       s.witnessBeacon,
+		Invoices:            s.invoices,
+		ChannelNotifier:     s.channelNotifier,
+		NotifyChannelBackup: s.updateChannelBackup,
+		HtlcNotifier:        s.htlcNotifier,
+		TowerClient:         towerClient,
+		DisconnectPeer:      s.DisconnectPeer,
 		GenNodeAnnouncement: func(...netann.NodeAnnModifier) (
 			lnwire.NodeAnnouncement1, error) {
 

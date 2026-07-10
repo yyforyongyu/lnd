@@ -544,6 +544,68 @@ func TestChannelLinkApplyDynParams(t *testing.T) {
 		coreLink.channel.State().RemoteChanCfg.MaxAcceptedHtlcs)
 }
 
+// TestChannelLinkDynParamsReemitsBackup verifies that a successful
+// apply-at-lock-in re-emits a fresh static channel backup, and that the channel
+// snapshot handed to the backup hook already reflects the newly applied params.
+func TestChannelLinkDynParamsReemitsBackup(t *testing.T) {
+	t.Parallel()
+
+	_, coreLink, _ := newDynLinkHarness(t)
+
+	// Capture the channel state handed to the backup re-emission hook.
+	var (
+		backupCalls int
+		backupChan  *channeldb.OpenChannel
+	)
+	coreLink.cfg.NotifyChannelBackup = func(c *channeldb.OpenChannel) {
+		backupCalls++
+		backupChan = c
+	}
+
+	// Sanity check the starting value differs from what we will apply.
+	require.NotEqual(t, uint16(25),
+		coreLink.channel.State().RemoteChanCfg.MaxAcceptedHtlcs)
+
+	handoff := dyn.CommitHandoff{
+		Proposer: lntypes.Local,
+		Params: lnwallet.ChannelParams{
+			MaxAcceptedHtlcs: fn.Some(uint16(25)),
+		},
+	}
+	lockIn := lntypes.Dual[uint64]{Local: 0, Remote: 0}
+
+	require.NoError(t, coreLink.applyDynParams(handoff, lockIn))
+
+	// The backup hook must have fired exactly once, with a channel snapshot
+	// that already reflects the newly applied params (proposer-owned, so the
+	// counterparty/remote config carries the change).
+	require.Equal(t, 1, backupCalls)
+	require.NotNil(t, backupChan)
+	require.Equal(t, uint16(25), backupChan.RemoteChanCfg.MaxAcceptedHtlcs)
+}
+
+// TestChannelLinkDynParamsBackupNilSafe ensures the apply-at-lock-in step does
+// not panic and still succeeds when no backup hook is wired (a defensive guard;
+// non-dyn deployments never set the hook).
+func TestChannelLinkDynParamsBackupNilSafe(t *testing.T) {
+	t.Parallel()
+
+	_, coreLink, _ := newDynLinkHarness(t)
+	coreLink.cfg.NotifyChannelBackup = nil
+
+	handoff := dyn.CommitHandoff{
+		Proposer: lntypes.Local,
+		Params: lnwallet.ChannelParams{
+			MaxAcceptedHtlcs: fn.Some(uint16(25)),
+		},
+	}
+	lockIn := lntypes.Dual[uint64]{Local: 0, Remote: 0}
+
+	require.NoError(t, coreLink.applyDynParams(handoff, lockIn))
+	require.Equal(t, uint16(25),
+		coreLink.channel.State().RemoteChanCfg.MaxAcceptedHtlcs)
+}
+
 // TestChannelLinkDynDisabled ensures a link without the feature enabled ignores
 // incoming dyn messages and refuses local proposals, leaving non-dyn behavior
 // untouched.

@@ -294,3 +294,69 @@ func TestSubSwapperUpdater(t *testing.T) {
 	swapper.fail = true
 	require.Error(t, subSwapper.ManualUpdate([]Single{single}))
 }
+
+// TestSubSwapperManualUpdateReflectsConfigChange verifies that re-emitting a
+// Single for an already-known channel via ManualUpdate replaces the on-disk
+// backup with one reflecting the channel's current configuration. This is the
+// path a dynamic-commitments parameter update drives (via applyDynParams) to
+// keep the SCB current after a params change locks in.
+func TestSubSwapperManualUpdateReflectsConfigChange(t *testing.T) {
+	t.Parallel()
+
+	keyRing := &lnencrypt.MockKeyRing{}
+	chanNotifier := newMockChannelNotifier()
+	swapper := newMockSwapper(keyRing)
+
+	// Start with a single known channel.
+	channel, err := genRandomOpenChannelShell()
+	require.NoError(t, err)
+
+	initialSingle := NewSingle(channel, nil)
+	subSwapper, err := NewSubSwapper(
+		t.Context(), []Single{initialSingle}, chanNotifier, keyRing,
+		swapper,
+	)
+	require.NoError(t, err, "unable to make swapper")
+	require.NoError(t, subSwapper.Start())
+	defer subSwapper.Stop()
+
+	// The swapper writes the initial channel state as soon as it's active.
+	backupSet := map[wire.OutPoint]Single{
+		channel.FundingOutpoint: initialSingle,
+	}
+	assertExpectedBackupSwap(t, swapper, subSwapper, keyRing, backupSet)
+
+	// The initial swap above is written synchronously in Start, before the
+	// backupUpdater goroutine flips isActive. Wait for the goroutine to be
+	// live so the manual update below is accepted deterministically.
+	require.Eventually(
+		t, subSwapper.isActive.Load, time.Second*5,
+		time.Millisecond*10,
+	)
+
+	// Simulate a dynamic-commitments params update: the channel's on-disk
+	// config changes (here both to_self_delay/CSV values) and a fresh Single
+	// is re-emitted for the same funding outpoint via ManualUpdate.
+	newLocalCSV := channel.LocalChanCfg.CsvDelay + 100
+	newRemoteCSV := channel.RemoteChanCfg.CsvDelay + 200
+	channel.LocalChanCfg.CsvDelay = newLocalCSV
+	channel.RemoteChanCfg.CsvDelay = newRemoteCSV
+
+	updatedSingle := NewSingle(channel, nil)
+	require.NoError(t, subSwapper.ManualUpdate([]Single{updatedSingle}))
+
+	// The swapped-out backup must still hold exactly one channel (the same
+	// outpoint), now carrying the updated Single.
+	backupSet[channel.FundingOutpoint] = updatedSingle
+	assertExpectedBackupSwap(t, swapper, subSwapper, keyRing, backupSet)
+
+	// Decode the on-disk multi and assert the config change round-tripped
+	// into the persisted backup.
+	diskMulti, err := swapper.ExtractMulti(keyRing)
+	require.NoError(t, err)
+	require.Len(t, diskMulti.StaticBackups, 1)
+	require.Equal(t, newLocalCSV,
+		diskMulti.StaticBackups[0].LocalChanCfg.CsvDelay)
+	require.Equal(t, newRemoteCSV,
+		diskMulti.StaticBackups[0].RemoteChanCfg.CsvDelay)
+}
