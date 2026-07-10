@@ -4,6 +4,7 @@ import (
 	"bytes"
 	crand "crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"github.com/lightningnetwork/lnd/fn/v2"
 	graphdb "github.com/lightningnetwork/lnd/graph/db"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/htlcswitch/dyn"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntest/channels"
@@ -478,6 +480,15 @@ func (m *mockUpdateHandler) InitStfu() <-chan fn.Result[lntypes.ChannelParty] {
 	c := make(chan fn.Result[lntypes.ChannelParty], 1)
 
 	c <- fn.Errf[lntypes.ChannelParty]("InitStfu not yet implemented")
+
+	return c
+}
+
+func (m *mockUpdateHandler) InitDynProposal(
+	_ dyn.ProposalRequest) <-chan error {
+
+	c := make(chan error, 1)
+	c <- fmt.Errorf("InitDynProposal not yet implemented")
 
 	return c
 }

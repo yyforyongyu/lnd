@@ -496,6 +496,7 @@ func Main() {
 		verifyMessageCommand,
 		feeReportCommand,
 		updateChannelPolicyCommand,
+		updateChannelParamsCommand,
 		forwardingHistoryCommand,
 		deleteFwdHistoryCommand,
 		exportChanBackupCommand,

@@ -30,6 +30,7 @@ type DevConfig struct {
 	UnsafeConnect               bool          `long:"unsafeconnect" description:"Allow the rpcserver to connect to a peer even if there's already a connection."`
 	ForceChannelCloseConfs      uint32        `long:"force-channel-close-confs" description:"Force a specific number of confirmations for channel closes (dev/test only)"`
 	MinFwdHistoryAge            time.Duration `long:"min-fwd-history-age" description:"Minimum age of forwarding events before they can be deleted via DeleteForwardingHistory (dev/test only, default: 1h)"`
+	DynCommitEnabled            bool          `long:"dyncommit" description:"Enable the experimental dynamic-commitments UpdateChannelParams RPC (dev/test only)."`
 }
 
 // ChannelReadyWait returns the config value `ProcessChannelReadyWait`.
@@ -89,4 +90,10 @@ func (d *DevConfig) ChannelCloseConfs() fn.Option[uint32] {
 	}
 
 	return fn.Some(d.ForceChannelCloseConfs)
+}
+
+// GetDynCommitEnabled returns the config value `DynCommitEnabled`, gating the
+// experimental dynamic-commitments UpdateChannelParams RPC.
+func (d *DevConfig) GetDynCommitEnabled() bool {
+	return d.DynCommitEnabled
 }

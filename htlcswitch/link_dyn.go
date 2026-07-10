@@ -27,7 +27,7 @@ const defaultMaxLinkCSVDelay uint16 = 2016
 var errDynDisabled = fmt.Errorf("dynamic commitments not enabled for channel")
 
 // dynProposalReq is a locally-initiated dynamic-commitments proposal request
-// handed to the htlcManager event loop via initDynProposal.
+// handed to the htlcManager event loop via InitDynProposal.
 type dynProposalReq struct {
 	// req is the parameter-change proposal to negotiate.
 	req dyn.ProposalRequest
@@ -271,15 +271,17 @@ func (l *channelLink) dynMaxCSVDelay() uint16 {
 	return l.cfg.MaxLocalCSVDelay
 }
 
-// initDynProposal requests a locally-initiated dynamic-commitments parameter
+// InitDynProposal requests a locally-initiated dynamic-commitments parameter
 // change. It hands the request to the htlcManager event loop, which drives the
 // channel to quiescence (with us as the quiescence initiator) and then starts
 // the negotiation. It returns a channel that receives nil once the negotiation
 // has been kicked off (dyn_propose sent), or an error if the feature is
 // disabled or a precondition failed.
 //
-// This is the entry point the RPC branch drives; tests exercise it directly.
-func (l *channelLink) initDynProposal(
+// This is the entry point the RPC drives; tests exercise it directly.
+//
+// NOTE: Part of the ChannelUpdateHandler interface.
+func (l *channelLink) InitDynProposal(
 	req dyn.ProposalRequest) <-chan error {
 
 	resp := make(chan error, 1)

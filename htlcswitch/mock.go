@@ -26,6 +26,7 @@ import (
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/graph/db/models"
+	"github.com/lightningnetwork/lnd/htlcswitch/dyn"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
@@ -956,6 +957,15 @@ func (f *mockChannelLink) InitStfu() <-chan fn.Result[lntypes.ChannelParty] {
 	c := make(chan fn.Result[lntypes.ChannelParty], 1)
 
 	c <- fn.Errf[lntypes.ChannelParty]("InitStfu not implemented")
+
+	return c
+}
+
+func (f *mockChannelLink) InitDynProposal(
+	_ dyn.ProposalRequest) <-chan error {
+
+	c := make(chan error, 1)
+	c <- fmt.Errorf("InitDynProposal not implemented")
 
 	return c
 }

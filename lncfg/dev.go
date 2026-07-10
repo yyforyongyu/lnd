@@ -71,3 +71,10 @@ func (d *DevConfig) GetMinFwdHistoryAge() time.Duration {
 func (d *DevConfig) ChannelCloseConfs() fn.Option[uint32] {
 	return fn.None[uint32]()
 }
+
+// GetDynCommitEnabled returns whether the experimental dynamic-commitments
+// UpdateChannelParams RPC is enabled, which is always false for production
+// builds so the gated feature can never be driven outside of tests.
+func (d *DevConfig) GetDynCommitEnabled() bool {
+	return false
+}

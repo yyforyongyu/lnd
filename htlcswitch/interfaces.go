@@ -8,6 +8,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/graph/db/models"
+	"github.com/lightningnetwork/lnd/htlcswitch/dyn"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -184,6 +185,19 @@ type ChannelUpdateHandler interface {
 	// quiescence is a holdover until we have downstream protocols that use
 	// it.
 	InitStfu() <-chan fn.Result[lntypes.ChannelParty]
+
+	// InitDynProposal requests a locally-initiated dynamic-commitments
+	// parameter change on this link. It hands the request to the link's
+	// event loop, which drives the channel to quiescence (with us as the
+	// quiescence initiator) and then starts the negotiation. It returns a
+	// receive-only channel that yields nil once the negotiation has been
+	// kicked off (dyn_propose sent), or an error if the feature is disabled
+	// or a precondition failed.
+	//
+	// This operation has been added to allow dynamic-commitments updates to
+	// be driven via RPC. The feature is experimental and gated off by
+	// default.
+	InitDynProposal(req dyn.ProposalRequest) <-chan error
 }
 
 // CommitHookID is a value that is used to uniquely identify hooks in the
