@@ -476,8 +476,13 @@ func (l *channelLink) processDynTransition(ctx context.Context,
 
 	t.Handoff.WhenSome(func(h dyn.CommitHandoff) {
 		if herr := l.handleDynCommitHandoff(ctx, h); herr != nil {
-			l.log.Errorf("dyn commit handoff failed for "+
-				"ChannelID(%v): %v", l.ChanID(), herr)
+			// A failure to send, sign, stage, or record the bundled
+			// dyn_commit_sig aborts the dance mid-flight. Reset the
+			// negotiation by failing the link so the peer disconnects
+			// cleanly and a fresh reestablish recovers, rather than
+			// leaving the channel quiesced or with a stale
+			// pendingDynDance.
+			l.dynFailf("dyn commit handoff failed: %v", herr)
 		}
 	})
 }
@@ -521,6 +526,20 @@ func (l *channelLink) handleDynCommitHandoff(ctx context.Context,
 		"height=%d, params=%s", l.ChanID(), h.Proposer,
 		h.NextCommitHeight, h.Params)
 
+	// Drive our side of the bundled dyn_commit_sig dance first. Only once it
+	// succeeds do we record the pending dance, so that a mid-flight failure
+	// (which the caller turns into a link reset) never leaves stale
+	// pendingDynDance state behind.
+	var err error
+	if h.Proposer.IsLocal() {
+		err = l.driveDynProposerCommit(ctx, h)
+	} else {
+		err = l.driveDynResponderCommit(ctx, h)
+	}
+	if err != nil {
+		return err
+	}
+
 	// Both commitment chains are synchronized at quiescence, so the agreed
 	// update binds to the same next commitment height on both, and the
 	// outgoing (pre-update) params applied through the prior height on each
@@ -535,11 +554,7 @@ func (l *channelLink) handleDynCommitHandoff(ctx context.Context,
 		},
 	})
 
-	if h.Proposer.IsLocal() {
-		return l.driveDynProposerCommit(ctx, h)
-	}
-
-	return l.driveDynResponderCommit(ctx, h)
+	return nil
 }
 
 // driveDynProposerCommit executes the proposer side of the bundled
