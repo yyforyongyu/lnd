@@ -31,6 +31,18 @@ type DynCommit struct {
 	// across a reconnect.
 	AckSig Sig
 
+	// PartialSig is the musig2 extended partial signature (with the
+	// signer's public nonce) for the responder's next commitment. It is
+	// the partial_signature_with_nonce record (type 2) of the
+	// dyn_commit_sig_tlvs stream and is equivalent to the
+	// partial_signature_with_nonce TLV of commitment_signed.
+	//
+	// NOTE: This field is only populated for taproot (musig2) channels. In
+	// that case the CommitSig field above MUST be 64 zero bytes. For
+	// non-taproot channels this field MUST be absent and CommitSig carries
+	// the ECDSA commitment signature instead.
+	PartialSig OptPartialSigWithNonceTLV
+
 	// ExtraData is the set of data that was appended to this message to
 	// fill out the full maximum transport message size. These fields can
 	// be used to specify optional data such as custom TLV fields.
@@ -66,19 +78,47 @@ func (dc *DynCommit) Encode(w *bytes.Buffer, _ uint32) error {
 		return err
 	}
 
-	// Create extra data records.
+	// The accepted proposal parameters are serialized as a standalone,
+	// length-prefixed TLV stream (accepted_tlvs). This is the exact
+	// dyn_propose_tlvs byte stream the dyn_ack signature commits to, so it
+	// is kept separate from the dyn_commit_sig_tlvs stream below.
+	acceptedProducers, err := dc.DynPropose.ExtraData.RecordProducers()
+	if err != nil {
+		return err
+	}
+	acceptedProducers = append(
+		acceptedProducers, dynProposeRecords(&dc.DynPropose)...,
+	)
+
+	var acceptedTLVs ExtraOpaqueData
+	if err := acceptedTLVs.PackRecords(acceptedProducers...); err != nil {
+		return err
+	}
+
+	// Write the accepted_tlvs stream as a bigsize length prefix followed by
+	// the serialized records.
+	var buf [8]byte
+	err = tlv.WriteVarInt(w, uint64(len(acceptedTLVs)), &buf)
+	if err != nil {
+		return err
+	}
+	if err := WriteBytes(w, acceptedTLVs); err != nil {
+		return err
+	}
+
+	// Finally, encode the dyn_commit_sig_tlvs stream. For taproot channels
+	// this carries the partial_signature_with_nonce record (type 2). Any
+	// message-level extra data is appended here as well.
 	producers, err := dc.ExtraData.RecordProducers()
 	if err != nil {
 		return err
 	}
+	dc.PartialSig.WhenSome(func(sig PartialSigWithNonceTLV) {
+		producers = append(producers, &sig)
+	})
 
-	// Append the accepted proposal records.
-	producers = append(producers, dynProposeRecords(&dc.DynPropose)...)
-
-	// Encode all known records.
 	var tlvData ExtraOpaqueData
-	err = tlvData.PackRecords(producers...)
-	if err != nil {
+	if err := tlvData.PackRecords(producers...); err != nil {
 		return err
 	}
 
@@ -99,11 +139,19 @@ func (dc *DynCommit) Decode(r io.Reader, _ uint32) error {
 		return err
 	}
 
-	// Parse out TLV records.
-	var tlvRecords ExtraOpaqueData
-	if err := ReadElement(r, &tlvRecords); err != nil {
+	// Read the length-prefixed accepted proposal TLV stream
+	// (accepted_tlvs).
+	var buf [8]byte
+	acceptedLen, err := tlv.ReadVarInt(r, &buf)
+	if err != nil {
 		return err
 	}
+
+	acceptedBytes := make([]byte, acceptedLen)
+	if _, err := io.ReadFull(r, acceptedBytes); err != nil {
+		return err
+	}
+	acceptedTLVs := ExtraOpaqueData(acceptedBytes)
 
 	// Prepare receiving buffers to be filled by TLV extraction.
 	var dustLimit tlv.RecordT[tlv.TlvType0, tlv.BigSizeT[btcutil.Amount]]
@@ -114,9 +162,9 @@ func (dc *DynCommit) Decode(r io.Reader, _ uint32) error {
 	maxHtlcs := dc.MaxAcceptedHTLCs.Zero()
 	chanFlags := dc.ChannelFlags.Zero()
 
-	// Parse all known records and extra data.
-	knownRecords, extraData, err := ParseAndExtractExtraData(
-		tlvRecords, &dustLimit, &maxValue, &htlcMin, &reserve,
+	// Parse the accepted proposal records and any extra proposal data.
+	knownRecords, propExtra, err := ParseAndExtractExtraData(
+		acceptedTLVs, &dustLimit, &maxValue, &htlcMin, &reserve,
 		&csvDelay, &maxHtlcs, &chanFlags,
 	)
 	if err != nil {
@@ -145,6 +193,31 @@ func (dc *DynCommit) Decode(r io.Reader, _ uint32) error {
 	}
 	if _, ok := knownRecords[dc.ChannelFlags.TlvType()]; ok {
 		dc.ChannelFlags = tlv.SomeRecordT(chanFlags)
+	}
+
+	// Preserve any unknown records that were part of the accepted proposal
+	// so the accepted_tlvs stream round-trips faithfully.
+	if len(propExtra) > 0 {
+		dc.DynPropose.ExtraData = propExtra
+	}
+
+	// The remaining bytes form the dyn_commit_sig_tlvs stream, which may
+	// carry the partial_signature_with_nonce record (type 2) plus any
+	// message-level extra data.
+	var tlvRecords ExtraOpaqueData
+	if err := ReadElement(r, &tlvRecords); err != nil {
+		return err
+	}
+
+	partialSig := dc.PartialSig.Zero()
+	sigRecords, extraData, err := ParseAndExtractExtraData(
+		tlvRecords, &partialSig,
+	)
+	if err != nil {
+		return err
+	}
+	if _, ok := sigRecords[partialSig.TlvType()]; ok {
+		dc.PartialSig = tlv.SomeRecordT(partialSig)
 	}
 
 	dc.ExtraData = extraData

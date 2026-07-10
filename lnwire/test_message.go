@@ -1180,8 +1180,19 @@ func (dc *DynCommit) RandTestMessage(t *rapid.T) Message {
 
 	msg := &DynCommit{
 		DynPropose: *dp,
-		CommitSig:  RandSignature(t),
 		AckSig:     RandSignature(t),
+	}
+
+	// Randomly include the taproot partial signature. Per the spec, taproot
+	// channels set commit_signature to 64 zero bytes and include the
+	// partial_signature_with_nonce record; non-taproot channels carry the
+	// ECDSA commit_signature and omit the partial signature.
+	includePartialSig := rapid.Bool().Draw(t, "includePartialSig")
+	if includePartialSig {
+		sigWithNonce := RandPartialSigWithNonce(t)
+		msg.PartialSig = MaybePartialSigWithNonce(sigWithNonce)
+	} else {
+		msg.CommitSig = RandSignature(t)
 	}
 
 	msg.ExtraData = RandExtraOpaqueData(t, ignoreRecords)
