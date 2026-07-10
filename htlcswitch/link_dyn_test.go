@@ -723,7 +723,7 @@ func TestChannelLinkDynProposerTaproot(t *testing.T) {
 	bobHeightBefore := bob.State().LocalCommitment.CommitHeight
 
 	// Request a local proposal. This drives quiescence first.
-	errCh := coreLink.initDynProposal(dyn.ProposalRequest{Params: params})
+	errCh := coreLink.InitDynProposal(dyn.ProposalRequest{Params: params})
 
 	// The link should send its Stfu as the quiescence initiator.
 	msg := recvLinkMsg(t, msgs)
