@@ -30,6 +30,29 @@ func dynTestSig(t *testing.T) lnwire.Sig {
 	return wireSig
 }
 
+// dynTestPartialSig returns a well-formed musig2 partial signature with nonce
+// for use where the signature content is not itself under test. The nonce is
+// built from two real compressed secp256k1 points so it passes the wire-level
+// nonce validation performed on decode.
+func dynTestPartialSig(t *testing.T) lnwire.PartialSigWithNonce {
+	t.Helper()
+
+	priv1, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	priv2, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	var nonce [66]byte
+	copy(nonce[:33], priv1.PubKey().SerializeCompressed())
+	copy(nonce[33:], priv2.PubKey().SerializeCompressed())
+
+	var s btcec.ModNScalar
+	s.SetInt(42)
+
+	return *lnwire.NewPartialSigWithNonce(nonce, s)
+}
+
 // dynTestProposal builds a DynPropose that exercises multiple TLV fields so the
 // round-trip covers a non-trivial proposal.
 func dynTestProposal() *lnwire.DynPropose {
@@ -108,13 +131,26 @@ func TestDynAcceptedProposalRoundTrip(t *testing.T) {
 			},
 		},
 		{
-			name: "commit sig persisted",
+			name: "commit sig persisted (ecdsa)",
 			prop: DynAcceptedProposal{
 				Proposer:         lntypes.Local,
 				Proposal:         dynTestProposal(),
 				NextCommitHeight: 100,
 				AckSig:           fn.Some(dynTestSig(t)),
 				CommitSig:        fn.Some(dynTestSig(t)),
+			},
+		},
+		{
+			name: "commit sig persisted (taproot partial)",
+			prop: DynAcceptedProposal{
+				Proposer:         lntypes.Local,
+				Proposal:         dynTestProposal(),
+				NextCommitHeight: 101,
+				AckSig:           fn.Some(dynTestSig(t)),
+				CommitSig:        fn.None[lnwire.Sig](),
+				PartialSig: fn.Some(
+					dynTestPartialSig(t),
+				),
 			},
 		},
 	}
@@ -138,6 +174,7 @@ func TestDynAcceptedProposalRoundTrip(t *testing.T) {
 			)
 			require.Equal(t, tc.prop.AckSig, got.AckSig)
 			require.Equal(t, tc.prop.CommitSig, got.CommitSig)
+			require.Equal(t, tc.prop.PartialSig, got.PartialSig)
 
 			// The proposal must survive the encode/decode round
 			// trip byte-for-byte.

@@ -45,18 +45,30 @@ type DynAcceptedProposal struct {
 	// exchanged for this negotiation yet.
 	AckSig fn.Option[lnwire.Sig]
 
-	// CommitSig is the proposer's dyn_commit_sig commitment signature. Its
-	// presence is the persisted flag that a dyn_commit_sig has been sent (by
-	// the proposer) or received (by the responder) before disconnect, which
-	// is what promotes a negotiation from "forget on reconnect" to "retain
-	// and retransmit". When absent, no dyn_commit_sig has been persisted.
+	// CommitSig is the proposer's dyn_commit_sig commitment signature for a
+	// non-taproot (ECDSA) channel. Its presence, or the presence of
+	// PartialSig, is the persisted flag that a dyn_commit_sig has been sent
+	// (by the proposer) or received (by the responder) before disconnect,
+	// which is what promotes a negotiation from "forget on reconnect" to
+	// "retain and retransmit". When absent, no ECDSA dyn_commit_sig has been
+	// persisted.
 	CommitSig fn.Option[lnwire.Sig]
+
+	// PartialSig is the proposer's dyn_commit_sig commitment signature for a
+	// taproot (musig2) channel, carried as a partial_signature_with_nonce.
+	// It is the taproot counterpart of CommitSig: for a taproot channel the
+	// dyn_commit_sig rides this field and CommitSig is absent, while for a
+	// non-taproot channel this field is absent and CommitSig carries the
+	// ECDSA signature. Its presence is likewise a persisted flag that a
+	// dyn_commit_sig has crossed the wire.
+	PartialSig fn.Option[lnwire.PartialSigWithNonce]
 }
 
 // serialize writes the DynAcceptedProposal to the given writer following the
 // channeldb fixed-layout conventions: the proposer role and lock-in height, the
-// optional dyn_ack and dyn_commit_sig signatures each with a presence flag, and
-// finally the accepted proposal encoded as a length-prefixed lnwire message.
+// optional dyn_ack signature, the optional ECDSA and taproot-partial
+// dyn_commit_sig signatures each with a presence flag, and finally the accepted
+// proposal encoded as a length-prefixed lnwire message.
 func (p *DynAcceptedProposal) serialize(w io.Writer) error {
 	if p.Proposal == nil {
 		return fmt.Errorf("dyn accepted proposal has a nil proposal")
@@ -72,6 +84,10 @@ func (p *DynAcceptedProposal) serialize(w io.Writer) error {
 	}
 
 	if err := writeOptionalSig(w, p.CommitSig); err != nil {
+		return err
+	}
+
+	if err := writeOptionalPartialSig(w, p.PartialSig); err != nil {
 		return err
 	}
 
@@ -117,6 +133,11 @@ func deserializeDynAcceptedProposal(r io.Reader) (*DynAcceptedProposal, error) {
 		return nil, err
 	}
 
+	partialSig, err := readOptionalPartialSig(r)
+	if err != nil {
+		return nil, err
+	}
+
 	var propLen uint16
 	if err := ReadElement(r, &propLen); err != nil {
 		return nil, err
@@ -138,6 +159,7 @@ func deserializeDynAcceptedProposal(r io.Reader) (*DynAcceptedProposal, error) {
 		NextCommitHeight: nextHeight,
 		AckSig:           ackSig,
 		CommitSig:        commitSig,
+		PartialSig:       partialSig,
 	}, nil
 }
 
@@ -179,6 +201,47 @@ func readOptionalSig(r io.Reader) (fn.Option[lnwire.Sig], error) {
 	sig, err := lnwire.NewSigFromWireECDSA(raw[:])
 	if err != nil {
 		return fn.None[lnwire.Sig](), err
+	}
+
+	return fn.Some(sig), nil
+}
+
+// writeOptionalPartialSig writes an optional musig2 partial signature with
+// nonce: a presence flag followed, when present, by the 98-byte serialized
+// partial_signature_with_nonce (32-byte scalar || 66-byte nonce).
+func writeOptionalPartialSig(w io.Writer,
+	sig fn.Option[lnwire.PartialSigWithNonce]) error {
+
+	if sig.IsNone() {
+		return WriteElement(w, false)
+	}
+
+	if err := WriteElement(w, true); err != nil {
+		return err
+	}
+
+	s := sig.UnsafeFromSome()
+
+	return s.Encode(w)
+}
+
+// readOptionalPartialSig reads an optional musig2 partial signature with nonce
+// written by writeOptionalPartialSig.
+func readOptionalPartialSig(r io.Reader) (
+	fn.Option[lnwire.PartialSigWithNonce], error) {
+
+	var present bool
+	if err := ReadElement(r, &present); err != nil {
+		return fn.None[lnwire.PartialSigWithNonce](), err
+	}
+
+	if !present {
+		return fn.None[lnwire.PartialSigWithNonce](), nil
+	}
+
+	var sig lnwire.PartialSigWithNonce
+	if err := sig.Decode(r); err != nil {
+		return fn.None[lnwire.PartialSigWithNonce](), err
 	}
 
 	return fn.Some(sig), nil
