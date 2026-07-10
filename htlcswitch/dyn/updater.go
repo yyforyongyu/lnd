@@ -193,6 +193,17 @@ type Updater struct {
 	// ackSig holds the responder's dyn_ack signature once known.
 	ackSig fn.Option[lnwire.Sig]
 
+	// commitSig holds the ECDSA dyn_commit_sig commitment signature once the
+	// proposer has sent it or the responder has received it. It is only set
+	// for non-taproot channels; taproot channels use partialSig instead.
+	commitSig fn.Option[lnwire.Sig]
+
+	// partialSig holds the taproot (musig2) dyn_commit_sig commitment
+	// signature once the proposer has sent it or the responder has received
+	// it. It is only set for taproot channels; non-taproot channels use
+	// commitSig instead.
+	partialSig fn.Option[lnwire.PartialSigWithNonce]
+
 	// deadline is the time at which the in-flight negotiation times out. It
 	// is only meaningful while timerArmed is true.
 	deadline time.Time
@@ -507,16 +518,31 @@ func (u *Updater) RecvCommit(ctx context.Context,
 }
 
 // MarkCommitSent records that the proposer has sent the bundled dyn_commit_sig,
-// completing this machine's role and moving it to Committing. From here the
-// link owns the commitment dance and the negotiation is no longer abortable on
-// a reconnect.
-func (u *Updater) MarkCommitSent(_ context.Context) (*Transition, error) {
+// completing this machine's role and moving it to Committing. It persists the
+// real commitment signature it just sent (the ECDSA commitSig for non-taproot
+// channels or the taproot partialSig) before advancing, matching the extension
+// BOLT requirement that a sent dyn_commit_sig is persisted for retransmission.
+// From here the link owns the commitment dance and the negotiation is no longer
+// abortable on a reconnect: it is retransmitted, not forgotten.
+func (u *Updater) MarkCommitSent(ctx context.Context,
+	commitSig fn.Option[lnwire.Sig],
+	partialSig fn.Option[lnwire.PartialSigWithNonce]) (*Transition, error) {
+
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
 	if u.state != StateAccepted {
 		return nil, fmt.Errorf("%w: commit-sent in state %s",
 			ErrInvalidTransition, u.state)
+	}
+
+	// Record and persist the sent commitment signature before advancing, so
+	// a disconnect after this point resolves to retransmit rather than
+	// forget.
+	u.commitSig = commitSig
+	u.partialSig = partialSig
+	if err := u.persist(ctx); err != nil {
+		return nil, fmt.Errorf("persist sent commit: %w", err)
 	}
 
 	t, err := u.applyEvent(eventCommitSent)
@@ -528,6 +554,38 @@ func (u *Updater) MarkCommitSent(_ context.Context) (*Transition, error) {
 		u.chanID)
 
 	return t, nil
+}
+
+// RecordCommitReceived persists the responder's received dyn_commit_sig before
+// it sends its revoke_and_ack, matching the extension BOLT requirement that the
+// receiver MUST persist the received dyn_commit_sig before revoke_and_ack. It
+// records the real commitment signature (the ECDSA commitSig for non-taproot
+// channels or the taproot partialSig) so a reconnect resolves to resume rather
+// than forget the negotiation. It does not change the machine's state: the
+// responder is already in the committing handoff when this is called.
+func (u *Updater) RecordCommitReceived(ctx context.Context,
+	commitSig fn.Option[lnwire.Sig],
+	partialSig fn.Option[lnwire.PartialSigWithNonce]) error {
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.state != StateCommitting {
+		return fmt.Errorf("%w: record-commit-received in state %s",
+			ErrInvalidTransition, u.state)
+	}
+
+	u.commitSig = commitSig
+	u.partialSig = partialSig
+
+	if err := u.persist(ctx); err != nil {
+		return fmt.Errorf("persist received commit: %w", err)
+	}
+
+	log.Infof("Persisted received dyn_commit_sig for ChannelID(%v)",
+		u.chanID)
+
+	return nil
 }
 
 // CheckTimeout advances the negotiation timeout. The caller ticks it (for
@@ -707,7 +765,10 @@ func (u *Updater) send(ctx context.Context, t *Transition,
 	return nil
 }
 
-// persist writes the current in-flight session as an AcceptedProposal.
+// persist writes the current in-flight session as an AcceptedProposal. Once the
+// commitment dance has sent (proposer) or received (responder) the bundled
+// dyn_commit_sig, the recorded commitment signature is included so a reconnect
+// resolves to retransmit/resume rather than forget the negotiation.
 func (u *Updater) persist(ctx context.Context) error {
 	return u.cfg.Persister.StoreAcceptedProposal(
 		ctx, u.chanID, AcceptedProposal{
@@ -715,6 +776,8 @@ func (u *Updater) persist(ctx context.Context) error {
 			Proposal:         u.proposal,
 			NextCommitHeight: u.nextHeight,
 			AckSig:           u.ackSig,
+			CommitSig:        u.commitSig,
+			PartialSig:       u.partialSig,
 		},
 	)
 }
@@ -734,12 +797,15 @@ func (u *Updater) forget(ctx context.Context) error {
 }
 
 // clearInflight drops the in-flight session data (role, proposal, height, ack
-// signature, and timer) without touching the state. The caller must hold u.mu.
+// and commitment signatures, and timer) without touching the state. The caller
+// must hold u.mu.
 func (u *Updater) clearInflight() {
 	u.role = lntypes.Local
 	u.proposal = nil
 	u.nextHeight = 0
 	u.ackSig = fn.None[lnwire.Sig]()
+	u.commitSig = fn.None[lnwire.Sig]()
+	u.partialSig = fn.None[lnwire.PartialSigWithNonce]()
 	u.clearTimeout()
 }
 

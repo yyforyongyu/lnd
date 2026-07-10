@@ -1,6 +1,7 @@
 package htlcswitch
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -723,7 +724,7 @@ func TestChannelLinkDynProposerTaproot(t *testing.T) {
 	bobHeightBefore := bob.State().LocalCommitment.CommitHeight
 
 	// Request a local proposal. This drives quiescence first.
-	errCh := coreLink.initDynProposal(dyn.ProposalRequest{Params: params})
+	errCh := coreLink.InitDynProposal(dyn.ProposalRequest{Params: params})
 
 	// The link should send its Stfu as the quiescence initiator.
 	msg := recvLinkMsg(t, msgs)
@@ -833,4 +834,293 @@ func TestChannelLinkDynProposerTaproot(t *testing.T) {
 	// Quiescence was exited so htlc traffic can resume.
 	require.False(t, coreLink.quiescer.IsQuiescent(),
 		"channel should no longer be quiescent")
+}
+
+// dynLinkTestSig returns a well-formed ECDSA signature for injecting a
+// persisted accepted-proposal context in the reestablish tests, where the
+// content of the signature is not itself under test.
+func dynLinkTestSig(t *testing.T) lnwire.Sig {
+	t.Helper()
+
+	priv, _ := btcec.PrivKeyFromBytes(alicePrivKey)
+	sig, err := lnwire.SignDynAck(
+		priv, chainhash.Hash{}, lnwire.ChannelID{}, 0, []byte{0x00},
+	)
+	require.NoError(t, err)
+
+	return sig
+}
+
+// driveDynProposerToCommitSent drives the proposer path from a local proposal
+// request through the bundled dyn_commit_sig send, returning the dyn_commit_sig
+// the link emitted. On return the link has signed the responder's next
+// commitment (advancing the remote commitment chain) and durably persisted the
+// sent commitment signature, exactly the state a proposer is in when a
+// disconnect strikes after dyn_commit_sig but before the responder's
+// revoke_and_ack. It works for both non-taproot and taproot channels.
+func driveDynProposerToCommitSent(t *testing.T, harness singleLinkTestHarness,
+	coreLink *channelLink, msgs chan lnwire.Message) *lnwire.DynCommit {
+
+	t.Helper()
+
+	bob := harness.bobChannel
+	chanID := coreLink.ChanID()
+
+	params := lnwallet.ChannelParams{MaxAcceptedHtlcs: fn.Some(uint16(20))}
+
+	// Request a local proposal, which drives quiescence with us as the
+	// initiator.
+	errCh := coreLink.InitDynProposal(dyn.ProposalRequest{Params: params})
+
+	stfu, ok := recvLinkMsg(t, msgs).(*lnwire.Stfu)
+	require.True(t, ok, "expected Stfu")
+	require.True(t, stfu.Initiator, "we should be the quiescence initiator")
+
+	coreLink.HandleChannelUpdate(&lnwire.Stfu{
+		ChanID:    chanID,
+		Initiator: false,
+	})
+
+	dp, ok := recvLinkMsg(t, msgs).(*lnwire.DynPropose)
+	require.True(t, ok, "expected DynPropose")
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for proposal result")
+	}
+
+	// The responder mirrors the update into its remote log and returns a
+	// valid dyn_ack over the exact proposal TLVs.
+	_, err := bob.ReceiveDynUpdate(params)
+	require.NoError(t, err, "bob unable to stage dyn update")
+
+	tlvs, err := dp.SerializeTlvData()
+	require.NoError(t, err)
+
+	bobNodePriv, _ := btcec.PrivKeyFromBytes(bobPrivKey)
+	height := coreLink.channel.State().LocalCommitment.CommitHeight + 1
+	ackSig, err := lnwire.SignDynAck(
+		bobNodePriv, coreLink.channel.State().ChainHash, chanID, height,
+		tlvs,
+	)
+	require.NoError(t, err)
+
+	coreLink.HandleChannelUpdate(&lnwire.DynAck{
+		ChanID: chanID,
+		Sig:    ackSig,
+	})
+
+	// The valid ack triggers the bundled dyn_commit_sig.
+	dc, ok := recvLinkMsg(t, msgs).(*lnwire.DynCommit)
+	require.True(t, ok, "expected DynCommit from link")
+
+	// The link sends the dyn_commit_sig before it records and persists the
+	// sent signature (MarkCommitSent), so wait for the state machine to
+	// reach its committing terminal state, at which point the send has been
+	// durably persisted.
+	require.Eventually(t, func() bool {
+		return coreLink.updater.State() == dyn.StateCommitting
+	}, 5*time.Second, 10*time.Millisecond, "commit-sent not recorded")
+
+	return dc
+}
+
+// assertDynCommitResent runs the reconnect handling for a proposer that has a
+// persisted dyn_commit_sig the peer has not yet processed, and asserts the
+// retransmission set is exactly the bundled dyn_commit_sig (echoing the sent
+// signatures) with no bare commitment_signed. It simulates a fresh link on
+// reconnect so the durable Restore + dance-restore path is exercised.
+func assertDynCommitResent(t *testing.T, coreLink *channelLink,
+	bob *lnwallet.LightningChannel, dc *lnwire.DynCommit) {
+
+	t.Helper()
+
+	ctx := context.Background()
+
+	// The sent dyn_commit_sig must have been durably persisted.
+	persisted, err := coreLink.dynPersister.FetchAcceptedProposal(
+		ctx, coreLink.ChanID(),
+	)
+	require.NoError(t, err)
+	require.True(t, persisted.IsSome())
+	require.True(t, persisted.UnsafeFromSome().HasCommitSig())
+
+	// A reconnect tears the link down and builds a new one before
+	// syncChanStates runs, so stop the event loop before mutating the link's
+	// dyn state to mirror that (and to avoid racing the running goroutine).
+	coreLink.Stop()
+
+	// Simulate a fresh link on reconnect: the in-memory updater and pending
+	// dance are gone, only the persisted context survives.
+	coreLink.updater = coreLink.newDynUpdater()
+	coreLink.pendingDynDance = fn.None[dynDance]()
+	require.Equal(t, dyn.StateIdle, coreLink.updater.State())
+
+	// A reconnect builds a fresh channel with a fresh verification nonce; the
+	// in-memory channel consumed its nonce driving the dance, so regenerate
+	// it to mirror a taproot reconnect before processing the peer's sync.
+	if coreLink.channel.State().ChanType.IsTaproot() {
+		_, err = coreLink.channel.GenMusigNonces()
+		require.NoError(t, err)
+	}
+
+	// The peer reconnects; it never processed our dyn_commit_sig, so it
+	// still expects the commitment at that height.
+	bobSync, err := bob.State().ChanSyncMsg()
+	require.NoError(t, err)
+
+	msgsToReSend, _, _, err := coreLink.channel.ProcessChanSyncMsg(
+		ctx, bobSync,
+	)
+	require.NoError(t, err)
+
+	out, err := coreLink.handleDynReestablish(ctx, bobSync, msgsToReSend)
+	require.NoError(t, err)
+
+	// Exactly one bundled dyn_commit_sig is retransmitted; no bare
+	// commitment_signed rides alongside it.
+	require.Len(t, out, 1, "expected a single bundled dyn_commit_sig")
+	resent, ok := out[0].(*lnwire.DynCommit)
+	require.True(t, ok, "expected DynCommit in resend set")
+
+	// It echoes our dyn_ack and carries the commitment signature (ECDSA or
+	// the re-signed taproot partial), and preserves the accepted proposal.
+	require.Equal(t, dc.AckSig, resent.AckSig)
+	require.Equal(t, dc.CommitSig, resent.CommitSig)
+	require.Equal(t, dc.PartialSig.IsSome(), resent.PartialSig.IsSome())
+
+	wantTLV, err := dc.DynPropose.SerializeTlvData()
+	require.NoError(t, err)
+	gotTLV, err := resent.DynPropose.SerializeTlvData()
+	require.NoError(t, err)
+	require.Equal(t, wantTLV, gotTLV)
+
+	// The updater was rehydrated to the committing state and the in-flight
+	// dance restored so the agreed params still apply once both chains lock
+	// in.
+	require.Equal(t, dyn.StateCommitting, coreLink.updater.State())
+	require.True(t, coreLink.pendingDynDance.IsSome())
+}
+
+// TestChannelLinkDynReestablishRetransmit verifies that after a completed
+// dyn_commit_sig send, a reconnect whose channel_reestablish still expects that
+// commitment triggers a retransmission of the bundled dyn_commit_sig, folding
+// the split dyn_commit + commitment_signed ProcessChanSyncMsg reconstructs into
+// the single message the peer expects.
+func TestChannelLinkDynReestablishRetransmit(t *testing.T) {
+	t.Parallel()
+
+	harness, coreLink, msgs := newDynLinkHarness(t)
+
+	dc := driveDynProposerToCommitSent(t, harness, coreLink, msgs)
+	require.True(t, dc.PartialSig.IsNone(),
+		"non-taproot dyn_commit_sig must be ECDSA")
+
+	assertDynCommitResent(t, coreLink, harness.bobChannel, dc)
+}
+
+// TestChannelLinkDynReestablishRetransmitTaproot is the taproot variant of
+// TestChannelLinkDynReestablishRetransmit: the retransmitted dyn_commit_sig
+// carries a musig2 partial_signature_with_nonce, re-signed against the peer's
+// fresh reestablish nonce by ProcessChanSyncMsg.
+func TestChannelLinkDynReestablishRetransmitTaproot(t *testing.T) {
+	t.Parallel()
+
+	harness, coreLink, msgs := newDynLinkHarness(
+		t, channeldb.SimpleTaprootFeatureBit,
+	)
+	require.True(t, coreLink.channel.State().ChanType.IsTaproot(),
+		"expected a taproot channel")
+
+	dc := driveDynProposerToCommitSent(t, harness, coreLink, msgs)
+	require.True(t, dc.PartialSig.IsSome(),
+		"taproot dyn_commit_sig must carry a partial sig")
+
+	assertDynCommitResent(t, coreLink, harness.bobChannel, dc)
+}
+
+// TestChannelLinkDynReestablishForget verifies that on reconnect a proposer
+// negotiation that never reached dyn_commit_sig is forgotten: the persisted
+// context is deleted, the updater returns to Idle, and nothing is resent.
+func TestChannelLinkDynReestablishForget(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	_, coreLink, _ := newDynLinkHarness(t)
+	chanID := coreLink.ChanID()
+
+	// Persist a proposer context that received its dyn_ack but never sent a
+	// dyn_commit_sig.
+	params := lnwallet.ChannelParams{DustLimit: fn.Some(dynTestDust)}
+	prop := dyn.AcceptedProposal{
+		Proposer:         lntypes.Local,
+		Proposal:         params.ToDynPropose(chanID),
+		NextCommitHeight: 5,
+		AckSig:           fn.Some(dynLinkTestSig(t)),
+		CommitSig:        fn.None[lnwire.Sig](),
+		PartialSig:       fn.None[lnwire.PartialSigWithNonce](),
+	}
+	require.NoError(t, coreLink.dynPersister.StoreAcceptedProposal(
+		ctx, chanID, prop,
+	))
+
+	remoteSync := &lnwire.ChannelReestablish{
+		ChanID:                chanID,
+		NextLocalCommitHeight: 5,
+	}
+	out, err := coreLink.handleDynReestablish(ctx, remoteSync, nil)
+	require.NoError(t, err)
+	require.Empty(t, out, "a forgotten negotiation retransmits nothing")
+
+	// The persisted context is gone, the updater is Idle, and no dance is
+	// pending.
+	got, err := coreLink.dynPersister.FetchAcceptedProposal(ctx, chanID)
+	require.NoError(t, err)
+	require.True(t, got.IsNone())
+	require.Equal(t, dyn.StateIdle, coreLink.updater.State())
+	require.True(t, coreLink.pendingDynDance.IsNone())
+}
+
+// TestChannelLinkDynReestablishRetainAndWait verifies that on reconnect a
+// responder that sent its dyn_ack (but has not received a dyn_commit_sig)
+// retains the acceptance and rehydrates the updater to AckSent, resending
+// nothing.
+func TestChannelLinkDynReestablishRetainAndWait(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	_, coreLink, _ := newDynLinkHarness(t)
+	chanID := coreLink.ChanID()
+
+	// Persist a responder context that sent its dyn_ack.
+	params := lnwallet.ChannelParams{DustLimit: fn.Some(dynTestDust)}
+	prop := dyn.AcceptedProposal{
+		Proposer:         lntypes.Remote,
+		Proposal:         params.ToDynPropose(chanID),
+		NextCommitHeight: 5,
+		AckSig:           fn.Some(dynLinkTestSig(t)),
+		CommitSig:        fn.None[lnwire.Sig](),
+		PartialSig:       fn.None[lnwire.PartialSigWithNonce](),
+	}
+	require.NoError(t, coreLink.dynPersister.StoreAcceptedProposal(
+		ctx, chanID, prop,
+	))
+
+	remoteSync := &lnwire.ChannelReestablish{
+		ChanID:                chanID,
+		NextLocalCommitHeight: 5,
+	}
+	out, err := coreLink.handleDynReestablish(ctx, remoteSync, nil)
+	require.NoError(t, err)
+	require.Empty(t, out, "a retained acceptance resends nothing itself")
+
+	// The acceptance is retained and the updater is rehydrated to AckSent.
+	got, err := coreLink.dynPersister.FetchAcceptedProposal(ctx, chanID)
+	require.NoError(t, err)
+	require.True(t, got.IsSome())
+	require.Equal(t, dyn.StateAckSent, coreLink.updater.State())
 }
