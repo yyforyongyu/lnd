@@ -1130,12 +1130,15 @@ func (l *channelLink) syncChanStates(ctx context.Context) error {
 
 		// Apply the dynamic-commitments reconnect rules to any
 		// negotiation that was in flight across the disconnect. This is
-		// a no-op for non-dyn channels and never affects the normal
-		// commitment retransmission handled above.
-		if err := l.handleDynReestablish(
-			ctx, remoteChanSyncMsg,
-		); err != nil {
-
+		// a no-op for non-dyn channels; for a dyn channel that must
+		// retransmit a persisted dyn_commit_sig it folds the split
+		// dyn_commit + commitment_signed above into the bundled
+		// dyn_commit_sig the peer expects, leaving all other
+		// retransmission untouched.
+		msgsToReSend, err = l.handleDynReestablish(
+			ctx, remoteChanSyncMsg, msgsToReSend,
+		)
+		if err != nil {
 			return err
 		}
 
