@@ -68,6 +68,14 @@ var (
 	ErrBelowChanReserve = fmt.Errorf("commitment transaction dips peer " +
 		"below chan reserve")
 
+	// ErrDynHtlcsPresent is returned when a dynamic-commitments parameter
+	// update (dyn_commit) is active in a commitment view that still carries
+	// HTLCs. The dynamic-commitments protocol requires the channel to be
+	// free of HTLCs (including trimmed ones) before a parameter change can
+	// be executed, so this indicates a violated precondition.
+	ErrDynHtlcsPresent = fmt.Errorf("cannot render dyn_commit update with " +
+		"HTLCs present")
+
 	// ErrBelowMinHTLC is returned when a proposed HTLC has a value that
 	// is below the minimum HTLC value constraint for either us or our
 	// peer depending on which flags are set.
@@ -1260,6 +1268,24 @@ func (lc *LightningChannel) logUpdateToPayDesc(logUpdate *channeldb.LogUpdate,
 				Remote: commitHeight,
 			},
 		}
+
+	// For dyn_commit updates we recover the proposed parameters from the
+	// accepted proposal TLVs. Like fee updates, the entry has no parent
+	// HTLC, so we set both the add and remove height to the commit height.
+	case *lnwire.DynCommit:
+		params := ChannelParamsFromDynPropose(&wireMsg.DynPropose)
+		pd = &paymentDescriptor{
+			ChanID:    wireMsg.ChanID,
+			LogIndex:  logUpdate.LogIndex,
+			EntryType: DynCommit,
+			DynParams: &params,
+			addCommitHeights: lntypes.Dual[uint64]{
+				Remote: commitHeight,
+			},
+			removeCommitHeights: lntypes.Dual[uint64]{
+				Remote: commitHeight,
+			},
+		}
 	}
 
 	return pd, nil
@@ -1346,6 +1372,21 @@ func (lc *LightningChannel) localLogUpdateToPayDesc(logUpdate *channeldb.LogUpda
 				btcutil.Amount(wireMsg.FeePerKw),
 			),
 			EntryType: FeeUpdate,
+			addCommitHeights: lntypes.Dual[uint64]{
+				Remote: commitHeight,
+			},
+			removeCommitHeights: lntypes.Dual[uint64]{
+				Remote: commitHeight,
+			},
+		}, nil
+
+	case *lnwire.DynCommit:
+		params := ChannelParamsFromDynPropose(&wireMsg.DynPropose)
+		return &paymentDescriptor{
+			ChanID:    wireMsg.ChanID,
+			LogIndex:  logUpdate.LogIndex,
+			EntryType: DynCommit,
+			DynParams: &params,
 			addCommitHeights: lntypes.Dual[uint64]{
 				Remote: commitHeight,
 			},
@@ -1471,6 +1512,21 @@ func (lc *LightningChannel) remoteLogUpdateToPayDesc(logUpdate *channeldb.LogUpd
 				btcutil.Amount(wireMsg.FeePerKw),
 			),
 			EntryType: FeeUpdate,
+			addCommitHeights: lntypes.Dual[uint64]{
+				Local: commitHeight,
+			},
+			removeCommitHeights: lntypes.Dual[uint64]{
+				Local: commitHeight,
+			},
+		}, nil
+
+	case *lnwire.DynCommit:
+		params := ChannelParamsFromDynPropose(&wireMsg.DynPropose)
+		return &paymentDescriptor{
+			ChanID:    wireMsg.ChanID,
+			LogIndex:  logUpdate.LogIndex,
+			EntryType: DynCommit,
+			DynParams: &params,
 			addCommitHeights: lntypes.Dual[uint64]{
 				Local: commitHeight,
 			},
@@ -1819,7 +1875,7 @@ func (lc *LightningChannel) restorePendingRemoteUpdates(
 		// final value was properly persisted with the last local
 		// commitment update.
 		switch payDesc.EntryType {
-		case FeeUpdate:
+		case FeeUpdate, DynCommit:
 			if heightSet {
 				payDesc.addCommitHeights.Remote = height
 				payDesc.removeCommitHeights.Remote = height
@@ -1862,11 +1918,13 @@ func (lc *LightningChannel) restorePeerLocalUpdates(updates []channeldb.LogUpdat
 
 		lc.updateLogs.Local.restoreUpdate(payDesc)
 
-		// Since Add updates are not stored and FeeUpdates don't have a
-		// corresponding entry in the remote update log, we only need to
-		// mark the htlc as modified if the update was Settle, Fail, or
-		// MalformedFail.
-		if payDesc.EntryType != FeeUpdate {
+		// Since Add updates are not stored and FeeUpdates/DynCommits
+		// don't have a corresponding entry in the remote update log, we
+		// only need to mark the htlc as modified if the update was
+		// Settle, Fail, or MalformedFail.
+		if payDesc.EntryType != FeeUpdate &&
+			payDesc.EntryType != DynCommit {
+
 			lc.updateLogs.Remote.markHtlcModified(
 				payDesc.ParentIndex,
 			)
@@ -1953,7 +2011,7 @@ func (lc *LightningChannel) restorePendingLocalUpdates(
 
 			lc.updateLogs.Local.appendHtlc(payDesc)
 
-		case FeeUpdate:
+		case FeeUpdate, DynCommit:
 			lc.updateLogs.Local.appendUpdate(payDesc)
 
 		default:
@@ -2833,6 +2891,29 @@ type HtlcView struct {
 
 	// FeePerKw is the fee rate in sat/kw of the commitment transaction.
 	FeePerKw chainfee.SatPerKWeight
+
+	// DynParams, if set, carries an active dynamic-commitments parameter
+	// update (a dyn_commit update-log entry) that this commitment view must
+	// be rendered with. When present, the commitment transaction is built
+	// with the proposer's proposed dust limit and to_self_delay (CSV) in
+	// place of the channel's current configs, mirroring how a FeePerKw drawn
+	// from an update_fee entry overrides the commitment fee. The dynamic-
+	// commitments precondition guarantees the view carries no HTLCs whenever
+	// this is set.
+	DynParams fn.Option[DynCommitParams]
+}
+
+// DynCommitParams bundles an active dynamic-commitments parameter proposal with
+// the identity of the proposing party. Together they determine how the affected
+// commitment outputs are rendered: the params are proposer-relative, so the
+// proposer identity is required to map them onto the local/remote channel
+// configs via ChannelParams.ApplyToConfigs.
+type DynCommitParams struct {
+	// Proposer is the party that proposed (and owns) the parameter change.
+	Proposer lntypes.ChannelParty
+
+	// Params is the proposed change to the mutable channel parameters.
+	Params ChannelParams
 }
 
 // AuxOurUpdates returns the outgoing HTLCs as a read-only copy of
@@ -2945,6 +3026,23 @@ func (lc *LightningChannel) fetchCommitmentView(
 		return nil, err
 	}
 	feePerKw := filteredHTLCView.FeePerKw
+
+	// If an active dyn_commit entry re-renders this commitment with new
+	// parameters, the stored dust limit for this view must reflect the
+	// proposer's proposed dust limit for whichever chain we're building, so
+	// that any later dust classification on this commitment stays
+	// consistent with the transaction we actually build below.
+	filteredHTLCView.DynParams.WhenSome(func(d DynCommitParams) {
+		effLocal, effRemote := d.Params.ApplyToConfigs(
+			d.Proposer, lc.channelState.LocalChanCfg,
+			lc.channelState.RemoteChanCfg,
+		)
+
+		dustLimit = effLocal.DustLimit
+		if whoseCommitChain.IsRemote() {
+			dustLimit = effRemote.DustLimit
+		}
+	})
 
 	htlcView.NextHeight = nextHeight
 	filteredHTLCView.NextHeight = nextHeight
@@ -3098,6 +3196,31 @@ func (lc *LightningChannel) evaluateHTLCView(view *HtlcView,
 		)
 	})
 
+	// A dyn_commit update-log entry, if present, re-renders the commitment
+	// with the proposer's proposed parameters (new dust limit and CSV). Like
+	// fee updates, such an entry lives in the log of the party that sent it,
+	// so the log it sits in identifies the proposer. The dynamic-commitments
+	// protocol permits at most one active parameter negotiation at a time, so
+	// we take the last dyn_commit entry found across both logs.
+	for _, party := range lntypes.BothParties {
+		partyUpdates := view.Updates.GetForParty(party)
+		dynUpdates := fn.Filter(
+			partyUpdates, func(u *paymentDescriptor) bool {
+				return u.EntryType == DynCommit
+			},
+		)
+		fn.Last(dynUpdates).WhenSome(func(pd *paymentDescriptor) {
+			if pd.DynParams == nil {
+				return
+			}
+
+			newView.DynParams = fn.Some(DynCommitParams{
+				Proposer: party,
+				Params:   *pd.DynParams,
+			})
+		})
+	}
+
 	// We use two maps, one for the local log and one for the remote log to
 	// keep track of which entries we need to skip when creating the final
 	// htlc view. We skip an entry whenever we find a settle or a timeout
@@ -3229,6 +3352,22 @@ func (lc *LightningChannel) evaluateHTLCView(view *HtlcView,
 		newView.Updates.SetForParty(party, liveAdds)
 	}
 
+	// Enforce the dynamic-commitments precondition: a parameter update may
+	// only ride a commitment that carries no HTLCs (including trimmed ones,
+	// which are still Add entries in the view). If a dyn_commit entry is
+	// active while any HTLC survives in the filtered view, the negotiation
+	// reached the commitment dance in an illegal state, so we refuse to
+	// render it rather than sign a commitment that both peers could
+	// reconstruct differently.
+	if newView.DynParams.IsSome() {
+		if len(newView.Updates.Local) != 0 ||
+			len(newView.Updates.Remote) != 0 {
+
+			noDeltas := lntypes.Dual[int64]{}
+			return nil, noUncommitted, noDeltas, ErrDynHtlcsPresent
+		}
+	}
+
 	// Create a function that is capable of identifying whether or not the
 	// paymentDescriptor has been committed in the commitment chain
 	// corresponding to whoseCommitmentChain.
@@ -3239,7 +3378,7 @@ func (lc *LightningChannel) evaluateHTLCView(view *HtlcView,
 				whoseCommitChain,
 			) == 0
 
-		case FeeUpdate:
+		case FeeUpdate, DynCommit:
 			return update.addCommitHeights.GetForParty(
 				whoseCommitChain,
 			) == 0
@@ -3685,8 +3824,10 @@ func (lc *LightningChannel) createCommitDiff(newCommit *commitment,
 				)
 			}
 
-		case FeeUpdate:
-			// Nothing special to do.
+		case FeeUpdate, DynCommit:
+			// Nothing special to do; these carry no HTLC-level
+			// references and are serialized straight to the log
+			// below.
 		}
 
 		logUpdates = append(logUpdates, pd.toLogUpdate())
@@ -6015,9 +6156,9 @@ func (lc *LightningChannel) ReceiveRevocation(revMsg *lnwire.RevokeAndAck) (
 	for e := lc.updateLogs.Remote.Front(); e != nil; e = e.Next() {
 		pd := e.Value
 
-		// Fee updates are local to this particular channel, and should
-		// never be forwarded.
-		if pd.EntryType == FeeUpdate {
+		// Fee updates and dyn_commit updates are local to this
+		// particular channel, and should never be forwarded.
+		if pd.EntryType == FeeUpdate || pd.EntryType == DynCommit {
 			continue
 		}
 
@@ -9591,6 +9732,105 @@ func (lc *LightningChannel) ReceiveUpdateFee(feePerKw chainfee.SatPerKWeight) er
 	lc.updateLogs.Remote.appendUpdate(pd)
 
 	return nil
+}
+
+// hasAnyHtlcs reports whether either update log currently carries an HTLC Add
+// entry (offered or trimmed). It is used to enforce the dynamic-commitments
+// no-HTLC precondition.
+//
+// NOTE: The caller must hold the channel lock.
+func (lc *LightningChannel) hasAnyHtlcs() bool {
+	logs := []*updateLog{lc.updateLogs.Local, lc.updateLogs.Remote}
+	for _, log := range logs {
+		for e := log.Front(); e != nil; e = e.Next() {
+			if e.Value.isAdd() {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// addDynUpdate stages a dyn_commit update-log entry, carrying an agreed
+// dynamic-commitments parameter change proposed by the given party, into that
+// party's update log. Staging the entry causes the next commitment rendered for
+// the relevant chain to use the proposed parameters (see evaluateHTLCView and
+// createUnsignedCommitmentTx). The caller must hold the channel lock.
+func (lc *LightningChannel) addDynUpdate(params ChannelParams,
+	proposer lntypes.ChannelParty) (uint64, error) {
+
+	// An empty proposal changes nothing and must never reach the log.
+	if params.IsEmpty() {
+		return 0, ErrDynParamsNoChange
+	}
+
+	// The dynamic-commitments protocol forbids a parameter change while any
+	// HTLC is in flight, including trimmed ones. Enforce that here so a
+	// caller can never desync the channel by staging a dyn update on a busy
+	// channel; the commitment renderer enforces the same invariant as a
+	// second line of defense.
+	if lc.hasAnyHtlcs() {
+		return 0, ErrDynHtlcsPresent
+	}
+
+	log := lc.updateLogs.Local
+	if proposer.IsRemote() {
+		log = lc.updateLogs.Remote
+	}
+
+	// Copy the params so the staged entry doesn't alias the caller's value.
+	p := params
+	pd := &paymentDescriptor{
+		ChanID:    lc.ChannelID(),
+		LogIndex:  log.logIndex,
+		EntryType: DynCommit,
+		DynParams: &p,
+	}
+
+	log.appendUpdate(pd)
+
+	return pd.LogIndex, nil
+}
+
+// AddDynUpdate stages an agreed dynamic-commitments parameter change into our
+// local update log, so that the next commitment we sign for the remote party is
+// rendered with the new parameters. It is the dynamic-commitments analogue of
+// UpdateFee: the proposer calls it once negotiation has produced an accepted
+// proposal and before signing the bundled dyn_commit_sig. We are the proposer,
+// so the change is applied with proposer == Local semantics.
+//
+// The channel must be free of HTLCs, including trimmed ones, otherwise
+// ErrDynHtlcsPresent is returned; an empty proposal is rejected with
+// ErrDynParamsNoChange. The returned log index identifies the staged entry.
+//
+// NOTE: This only stages the update. Driving the commitment dance (signing and
+// exchanging the bundled dyn_commit_sig, then revoking) reuses the normal
+// SignNextCommitment / ReceiveNewCommitment / revocation machinery, exactly as
+// for any other log entry, and advances the commitment height like any other
+// commitment_signed. Baking the change into the persistent channel configs and
+// epoch history when each chain locks in is a separate step performed via
+// ApplyChannelParams; see that method for the intended call order.
+func (lc *LightningChannel) AddDynUpdate(params ChannelParams) (uint64, error) {
+	lc.Lock()
+	defer lc.Unlock()
+
+	return lc.addDynUpdate(params, lntypes.Local)
+}
+
+// ReceiveDynUpdate stages an agreed dynamic-commitments parameter change
+// proposed by the remote party into our remote update log, so that the next
+// commitment the remote party signs for us is validated against the new
+// parameters. It is the responder-side counterpart to AddDynUpdate; the remote
+// party is the proposer, so the change is applied with proposer == Remote
+// semantics. The same preconditions as AddDynUpdate apply.
+func (lc *LightningChannel) ReceiveDynUpdate(params ChannelParams) (uint64,
+	error) {
+
+	lc.Lock()
+	defer lc.Unlock()
+
+	return lc.addDynUpdate(params, lntypes.Remote)
 }
 
 // generateRevocation generates the revocation message for a given height.

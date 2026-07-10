@@ -715,9 +715,30 @@ func (cb *CommitmentBuilder) createUnsignedCommitmentTx(ourBalance,
 	filteredHTLCView *HtlcView, keyRing *CommitmentKeyRing,
 	prevCommit *commitment) (*unsignedCommitmentTx, error) {
 
-	dustLimit := cb.chanState.LocalChanCfg.DustLimit
+	// Determine the channel configs this commitment is rendered with. When a
+	// dyn_commit update-log entry is active in the view, we re-render the
+	// affected outputs (the to_local CSV delay and the output dust limits)
+	// using the proposer's proposed parameters instead of the channel's
+	// current configs. This mirrors how a fee update carried in the view
+	// overrides the commitment fee rate.
+	//
+	// Applying the proposal on top of the current configs is idempotent, so
+	// once the change locks in and LightningChannel.ApplyChannelParams bakes
+	// it into the persistent configs, this rendering keeps producing the same
+	// transaction until the (now redundant) log entry is compacted away. The
+	// dynamic-commitments precondition guarantees no HTLCs are present here,
+	// so only the to_local/to_remote(+anchor) outputs are affected.
+	localCfg := cb.chanState.LocalChanCfg
+	remoteCfg := cb.chanState.RemoteChanCfg
+	filteredHTLCView.DynParams.WhenSome(func(d DynCommitParams) {
+		localCfg, remoteCfg = d.Params.ApplyToConfigs(
+			d.Proposer, localCfg, remoteCfg,
+		)
+	})
+
+	dustLimit := localCfg.DustLimit
 	if whoseCommit.IsRemote() {
-		dustLimit = cb.chanState.RemoteChanCfg.DustLimit
+		dustLimit = remoteCfg.DustLimit
 	}
 
 	numHTLCs := int64(0)
@@ -804,7 +825,7 @@ func (cb *CommitmentBuilder) createUnsignedCommitmentTx(ourBalance,
 	if whoseCommit.IsLocal() {
 		commitTx, err = CreateCommitTx(
 			cb.chanState.ChanType, fundingTxIn(cb.chanState), keyRing,
-			&cb.chanState.LocalChanCfg, &cb.chanState.RemoteChanCfg,
+			&localCfg, &remoteCfg,
 			ourBalance.ToSatoshis(), theirBalance.ToSatoshis(),
 			numHTLCs, cb.chanState.IsInitiator, leaseExpiry,
 			auxResult.AuxLeaves,
@@ -812,7 +833,7 @@ func (cb *CommitmentBuilder) createUnsignedCommitmentTx(ourBalance,
 	} else {
 		commitTx, err = CreateCommitTx(
 			cb.chanState.ChanType, fundingTxIn(cb.chanState), keyRing,
-			&cb.chanState.RemoteChanCfg, &cb.chanState.LocalChanCfg,
+			&remoteCfg, &localCfg,
 			theirBalance.ToSatoshis(), ourBalance.ToSatoshis(),
 			numHTLCs, !cb.chanState.IsInitiator, leaseExpiry,
 			auxResult.AuxLeaves,
