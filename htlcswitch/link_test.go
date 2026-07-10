@@ -2137,7 +2137,8 @@ type singleLinkTestHarness struct {
 }
 
 func newSingleLinkTestHarness(t *testing.T, chanAmt,
-	chanReserve btcutil.Amount) (singleLinkTestHarness, error) {
+	chanReserve btcutil.Amount,
+	chanType ...channeldb.ChannelType) (singleLinkTestHarness, error) {
 
 	var chanIDBytes [8]byte
 	if _, err := io.ReadFull(rand.Reader, chanIDBytes[:]); err != nil {
@@ -2149,7 +2150,7 @@ func newSingleLinkTestHarness(t *testing.T, chanAmt,
 
 	aliceLc, bobLc, err := createTestChannel(
 		t, alicePrivKey, bobPrivKey, chanAmt, chanAmt,
-		chanReserve, chanReserve, chanID,
+		chanReserve, chanReserve, chanID, chanType...,
 	)
 	if err != nil {
 		return singleLinkTestHarness{}, err

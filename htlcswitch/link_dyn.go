@@ -510,15 +510,19 @@ type dynDance struct {
 // SignNextCommitment / ReceiveNewCommitment machinery renders and validates the
 // next commitment under the new params with zero HTLCs. The proposer sends the
 // bundled dyn_commit_sig; the responder feeds the received one through the
-// ordinary commitment_signed handler. The remaining revoke_and_ack /
-// commitment_signed exchange rides the normal commitment-dance handlers, which
-// call maybeFinishDynDance to apply the params and exit quiescence at the
-// termination point (once both chains have locked in).
+// ordinary commitment_signed handler. This works for both non-taproot channels
+// (ECDSA commit_signature) and taproot channels (musig2
+// partial_signature_with_nonce, signed against the channel's ambient
+// next_local_nonce). The remaining revoke_and_ack / commitment_signed exchange
+// rides the normal commitment-dance handlers, which call maybeFinishDynDance to
+// apply the params and exit quiescence at the termination point (once both
+// chains have locked in).
 //
-// TODO(dyn): retransmitting the bundled dyn_commit_sig when a peer's
-// channel_reestablish expects it (and forgetting a negotiation that disconnects
-// before dyn_commit_sig) is handled by the reestablish branch (branch 9); it is
-// out of scope here.
+// What remains for the reestablish branch (branch 9): retransmitting the
+// bundled dyn_commit_sig when a peer's channel_reestablish expects it,
+// forgetting a negotiation that disconnects before dyn_commit_sig, and durably
+// persisting the bundled sig so the dance survives a restart. Those are out of
+// scope here.
 func (l *channelLink) handleDynCommitHandoff(ctx context.Context,
 	h dyn.CommitHandoff) error {
 
@@ -582,19 +586,17 @@ func (l *channelLink) driveDynProposerCommit(ctx context.Context,
 		return fmt.Errorf("sign dyn commitment: %w", err)
 	}
 
-	// TODO(dyn): taproot/musig2 channels produce a partial signature that
-	// the current dyn_commit_sig wire message cannot carry (it has no
-	// partial-sig field). Taproot dynamic commitments are out of scope for
-	// this milestone.
-	if newCommit.PartialSig.IsSome() {
-		return fmt.Errorf("dyn commitments unsupported for taproot " +
-			"channels")
-	}
-
+	// Bundle the produced signature exactly as a normal commitment_signed
+	// carries it. For taproot (musig2) channels SignNextCommitment produces
+	// a partial_signature_with_nonce (and leaves the ECDSA CommitSig as the
+	// blank 64 zero bytes); for non-taproot channels it produces the ECDSA
+	// CommitSig (and PartialSig is absent). The nonce used is the channel's
+	// ambient next_local_nonce, so no separate nonce exchange is needed.
 	dynCommit := &lnwire.DynCommit{
 		DynPropose: *h.Proposal,
 		CommitSig:  newCommit.CommitSig,
 		AckSig:     h.AckSig,
+		PartialSig: newCommit.PartialSig,
 	}
 	if err := l.cfg.Peer.SendMessage(false, dynCommit); err != nil {
 		return fmt.Errorf("send dyn_commit_sig: %w", err)
@@ -643,12 +645,21 @@ func (l *channelLink) driveDynResponderCommit(ctx context.Context,
 	// exactly as for any commitment dance. Dynamic updates carry no HTLCs and
 	// hence no HTLC/aux signatures.
 	//
+	// For taproot channels the signature rides the
+	// partial_signature_with_nonce field and the ECDSA CommitSig is blank;
+	// for non-taproot channels the ECDSA CommitSig carries it and PartialSig
+	// is absent. Forwarding both mirrors how a normal commitment_signed is
+	// handled: ReceiveNewCommitment verifies the partial sig against our next
+	// commitment using the channel's existing nonce state for taproot, and
+	// the ECDSA sig otherwise.
+	//
 	// The accepted proposal TLVs and dyn_ack signature were already persisted
 	// by the negotiation state machine at accept time; durable persistence of
 	// the received dyn_commit_sig for reconnect resume is branch 9.
 	return l.processRemoteCommitSig(ctx, &lnwire.CommitSig{
-		ChanID:    l.ChanID(),
-		CommitSig: dynCommit.CommitSig,
+		ChanID:     l.ChanID(),
+		CommitSig:  dynCommit.CommitSig,
+		PartialSig: dynCommit.PartialSig,
 	})
 }
 

@@ -133,8 +133,16 @@ type testLightningChannel struct {
 // TODO(roasbeef): need to factor out, similar func re-used in many parts of codebase
 func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 	aliceAmount, bobAmount, aliceReserve, bobReserve btcutil.Amount,
-	chanID lnwire.ShortChannelID) (*testLightningChannel,
+	chanID lnwire.ShortChannelID,
+	chanTypeOpt ...channeldb.ChannelType) (*testLightningChannel,
 	*testLightningChannel, error) {
+
+	// Default to a tweakless single-funder channel unless the caller asked
+	// for a specific type (e.g. a taproot channel).
+	chanType := channeldb.SingleFunderTweaklessBit
+	if len(chanTypeOpt) > 0 {
+		chanType = chanTypeOpt[0]
+	}
 
 	aliceKeyPriv, aliceKeyPub := btcec.PrivKeyFromBytes(alicePrivKey)
 	bobKeyPriv, bobKeyPub := btcec.PrivKeyFromBytes(bobPrivKey)
@@ -244,7 +252,7 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 
 	aliceCommitTx, bobCommitTx, err := lnwallet.CreateCommitmentTxns(
 		aliceAmount, bobAmount, &aliceCfg, &bobCfg, aliceCommitPoint,
-		bobCommitPoint, *fundingTxIn, channeldb.SingleFunderTweaklessBit,
+		bobCommitPoint, *fundingTxIn, chanType,
 		isAliceInitiator, 0,
 	)
 	if err != nil {
@@ -296,7 +304,7 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 		RemoteChanCfg:           bobCfg,
 		IdentityPub:             aliceKeyPub,
 		FundingOutpoint:         *prevOut,
-		ChanType:                channeldb.SingleFunderTweaklessBit,
+		ChanType:                chanType,
 		IsInitiator:             isAliceInitiator,
 		Capacity:                channelCapacity,
 		RemoteCurrentRevocation: bobCommitPoint,
@@ -315,7 +323,7 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 		RemoteChanCfg:           aliceCfg,
 		IdentityPub:             bobKeyPub,
 		FundingOutpoint:         *prevOut,
-		ChanType:                channeldb.SingleFunderTweaklessBit,
+		ChanType:                chanType,
 		IsInitiator:             !isAliceInitiator,
 		Capacity:                channelCapacity,
 		RemoteCurrentRevocation: aliceCommitPoint,
@@ -365,6 +373,31 @@ func createTestChannel(t *testing.T, alicePrivKey, bobPrivKey []byte,
 		return nil, nil, err
 	}
 	bobPool.Start()
+
+	// For taproot (musig2) channels we must also simulate the initial nonce
+	// exchange that normally rides channel_ready / channel_reestablish, so
+	// that both channels can sign and verify commitment states. This mirrors
+	// lnwallet.initMusigNonce, using only the exported channel methods.
+	if chanType.IsTaproot() {
+		aliceNonces, err := channelAlice.GenMusigNonces()
+		if err != nil {
+			return nil, nil, err
+		}
+		bobNonces, err := channelBob.GenMusigNonces()
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := channelAlice.InitRemoteMusigNonces(
+			bobNonces,
+		); err != nil {
+			return nil, nil, err
+		}
+		if err := channelBob.InitRemoteMusigNonces(
+			aliceNonces,
+		); err != nil {
+			return nil, nil, err
+		}
+	}
 
 	// Now that the channel are open, simulate the start of a session by
 	// having Alice and Bob extend their revocation windows to each other.
