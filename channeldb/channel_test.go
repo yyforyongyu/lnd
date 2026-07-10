@@ -376,16 +376,22 @@ func createTestChannelState(t *testing.T, cdb *ChannelStateDB) *OpenChannel {
 	copy(tapscriptRoot[:], bytes.Repeat([]byte{1}, 32))
 
 	return &OpenChannel{
-		ChanType:          SingleFunderBit | FrozenBit,
-		ChainHash:         key,
-		FundingOutpoint:   op,
-		ShortChannelID:    chanID,
-		IsInitiator:       true,
-		IsPending:         true,
-		IdentityPub:       pubKey,
-		Capacity:          btcutil.Amount(10000),
-		LocalChanCfg:      localCfg,
-		RemoteChanCfg:     remoteCfg,
+		ChanType:        SingleFunderBit | FrozenBit,
+		ChainHash:       key,
+		FundingOutpoint: op,
+		ShortChannelID:  chanID,
+		IsInitiator:     true,
+		IsPending:       true,
+		IdentityPub:     pubKey,
+		Capacity:        btcutil.Amount(10000),
+		LocalChanCfg:    localCfg,
+		RemoteChanCfg:   remoteCfg,
+		CommitChainEpochHistory: NewCommitChainEpochHistory(
+			lntypes.Dual[CommitmentParams]{
+				Local:  localRenderingParams,
+				Remote: remoteRenderingParams,
+			},
+		),
 		TotalMSatSent:     8,
 		TotalMSatReceived: 2,
 		LocalCommitment: ChannelCommitment{
