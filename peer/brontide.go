@@ -367,6 +367,15 @@ type Config struct {
 	// apply path, after a parameter update locks in.
 	NotifyChannelBackup func(*channeldb.OpenChannel)
 
+	// NotifyDynParamsLockIn reconciles the gossip/channel-announcement layer
+	// with a dynamic-commitments parameter update that has locked in. It is
+	// passed to the ChannelLink and invoked only on the dynamic-commitments
+	// apply path, after the params are committed. See the like-named field on
+	// htlcswitch.ChannelLinkConfig.
+	NotifyDynParamsLockIn func(chanPoint wire.OutPoint,
+		proposer lntypes.ChannelParty, oldFlags lnwire.FundingFlag,
+		params lnwallet.ChannelParams)
+
 	// HtlcNotifier is used when creating a ChannelLink.
 	HtlcNotifier *htlcswitch.HtlcNotifier
 
@@ -1571,6 +1580,7 @@ func (p *Brontide) addLink(chanPoint *wire.OutPoint,
 		NotifyInactiveLinkEvent:    p.cfg.ChannelNotifier.NotifyInactiveLinkEvent,
 		NotifyChannelUpdate:        p.cfg.ChannelNotifier.NotifyChannelUpdateEvent,
 		NotifyChannelBackup:        p.cfg.NotifyChannelBackup,
+		NotifyDynParamsLockIn:      p.cfg.NotifyDynParamsLockIn,
 		HtlcNotifier:               p.cfg.HtlcNotifier,
 		GetAliases:                 p.cfg.GetAliases,
 		PreviouslySentShutdown:     shutdownMsg,

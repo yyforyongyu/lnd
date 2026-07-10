@@ -270,6 +270,20 @@ type ChannelLinkConfig struct {
 	// be nil, in which case the re-emission is simply skipped.
 	NotifyChannelBackup func(*channeldb.OpenChannel)
 
+	// NotifyDynParamsLockIn reconciles the gossip/channel-announcement layer
+	// with a dynamic-commitments parameter update that has just locked in.
+	// It is invoked only on the dynamic-commitments apply path (see
+	// applyDynParams), after the params have been committed and persisted,
+	// with the channel_flags value from before the update, the proposer, and
+	// the agreed parameter change. The server wires it to a
+	// netann.DynAnnouncementManager, which handles public<->private
+	// conversion and channel_update realignment. Non-dynamic channels never
+	// reach this path, so ordinary gossip is byte-for-byte unaffected. It
+	// may be nil, in which case the reconciliation is simply skipped.
+	NotifyDynParamsLockIn func(chanPoint wire.OutPoint,
+		proposer lntypes.ChannelParty, oldFlags lnwire.FundingFlag,
+		params lnwallet.ChannelParams)
+
 	// HtlcNotifier is an instance of a htlcNotifier which we will pipe htlc
 	// events through.
 	HtlcNotifier htlcNotifier
