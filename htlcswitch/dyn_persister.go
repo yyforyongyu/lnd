@@ -42,6 +42,7 @@ func (p *dbDynPersister) StoreAcceptedProposal(_ context.Context,
 		NextCommitHeight: prop.NextCommitHeight,
 		AckSig:           prop.AckSig,
 		CommitSig:        prop.CommitSig,
+		PartialSig:       prop.PartialSig,
 	})
 }
 
@@ -66,6 +67,7 @@ func (p *dbDynPersister) FetchAcceptedProposal(_ context.Context,
 			NextCommitHeight: s.NextCommitHeight,
 			AckSig:           s.AckSig,
 			CommitSig:        s.CommitSig,
+			PartialSig:       s.PartialSig,
 		}
 	})(stored), nil
 }

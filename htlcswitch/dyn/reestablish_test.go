@@ -171,6 +171,32 @@ func TestDecideTable(t *testing.T) {
 	}
 }
 
+// TestDecideTaprootCommitSig verifies the reconnect decision treats a taproot
+// dyn_commit_sig (persisted as a partial signature, with the ECDSA CommitSig
+// absent) exactly like an ECDSA one: a persisted commit sig in either form
+// promotes the negotiation from forget to retransmit/resume.
+func TestDecideTaprootCommitSig(t *testing.T) {
+	t.Parallel()
+
+	// A proposer that persisted a taproot partial commit sig, with the peer
+	// still expecting it, must retransmit.
+	p := mkAccepted(t, lntypes.Local, true, false)
+	p.PartialSig = fn.Some(testPartialSig(t))
+	require.True(t, p.HasCommitSig())
+	require.True(t, p.CommitSig.IsNone())
+
+	got := Decide(p, ReestablishState{
+		PeerNextCommitHeight: testNextHeight,
+	})
+	require.Equal(t, ReconnectRetransmitCommitSig, got)
+
+	// The same partial sig, once the peer has advanced past it, resumes.
+	got = Decide(p, ReestablishState{
+		PeerNextCommitHeight: testNextHeight + 1,
+	})
+	require.Equal(t, ReconnectResume, got)
+}
+
 // TestReconnectActionStrings checks that every action has a distinct,
 // non-default string form.
 func TestReconnectActionStrings(t *testing.T) {
@@ -261,6 +287,29 @@ func TestRestoreState(t *testing.T) {
 			require.Equal(t, tc.wantArmed, tr.Disconnect)
 		})
 	}
+}
+
+// TestRestoreTaprootCommitSig verifies Restore rehydrates a proposer that
+// persisted a taproot dyn_commit_sig (a partial signature, with the ECDSA
+// CommitSig absent) into the committing state, mirroring the ECDSA path.
+func TestRestoreTaprootCommitSig(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	rig := newRig(t, lntypes.Local)
+	p := mkAccepted(t, lntypes.Local, true, false)
+	p.PartialSig = fn.Some(testPartialSig(t))
+	require.True(t, p.HasCommitSig())
+
+	require.NoError(t, rig.u.Restore(ctx, p))
+	require.Equal(t, StateCommitting, rig.u.State())
+
+	// The negotiation is past the timeout boundary, so no timer is armed.
+	rig.clk.SetTime(rig.clk.Now().Add(2 * DefaultTimeout))
+	tr, err := rig.u.CheckTimeout(ctx)
+	require.NoError(t, err)
+	require.False(t, tr.Disconnect)
 }
 
 // TestRestoreInvalid verifies Restore rejects the shapes that cannot represent

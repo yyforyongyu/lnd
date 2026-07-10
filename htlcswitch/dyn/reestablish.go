@@ -93,7 +93,7 @@ type ReestablishState struct {
 // loads the persisted context and applies the returned action.
 func Decide(p AcceptedProposal, r ReestablishState) ReconnectAction {
 	ackKnown := p.AckSig.IsSome()
-	commitSigned := p.CommitSig.IsSome()
+	commitSigned := p.HasCommitSig()
 	proposer := p.Proposer == lntypes.Local
 
 	switch {
@@ -144,6 +144,8 @@ func (u *Updater) Restore(_ context.Context, p AcceptedProposal) error {
 	u.proposal = p.Proposal
 	u.nextHeight = p.NextCommitHeight
 	u.ackSig = p.AckSig
+	u.commitSig = p.CommitSig
+	u.partialSig = p.PartialSig
 	u.clearTimeout()
 
 	proposer := p.Proposer == lntypes.Local
@@ -151,7 +153,7 @@ func (u *Updater) Restore(_ context.Context, p AcceptedProposal) error {
 	switch {
 	// A dyn_commit_sig was persisted, so the negotiation is past the
 	// abort/timeout boundary and in the committing handoff.
-	case p.CommitSig.IsSome():
+	case p.HasCommitSig():
 		u.state = StateCommitting
 
 	// Proposer that received and verified the dyn_ack but had not yet sent

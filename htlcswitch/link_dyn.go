@@ -604,12 +604,41 @@ func (l *channelLink) driveDynProposerCommit(ctx context.Context,
 	}
 
 	// Record that we have sent the bundled dyn_commit_sig, moving the state
-	// machine to its committing terminal state.
-	if _, err := l.updater.MarkCommitSent(ctx); err != nil {
+	// machine to its committing terminal state. MarkCommitSent persists the
+	// real commitment signature we just sent (the ECDSA CommitSig for a
+	// non-taproot channel or the taproot PartialSig) so a disconnect after
+	// this point resolves to retransmit rather than forget the negotiation.
+	commitSig, partialSig := dynCommitSigOptions(
+		newCommit.CommitSig, newCommit.PartialSig,
+	)
+	if _, err := l.updater.MarkCommitSent(
+		ctx, commitSig, partialSig,
+	); err != nil {
+
 		return fmt.Errorf("mark commit sent: %w", err)
 	}
 
 	return nil
+}
+
+// dynCommitSigOptions splits a commitment signature into the ECDSA and taproot
+// partial-signature option forms the dyn negotiation state machine persists. A
+// taproot channel produces a partial_signature_with_nonce and a blank ECDSA
+// signature, so the partial form is returned and the ECDSA form is absent;
+// otherwise the ECDSA signature is returned and the partial form is absent.
+func dynCommitSigOptions(commitSig lnwire.Sig,
+	partial lnwire.OptPartialSigWithNonceTLV) (fn.Option[lnwire.Sig],
+	fn.Option[lnwire.PartialSigWithNonce]) {
+
+	var ps fn.Option[lnwire.PartialSigWithNonce]
+	partial.WhenSome(func(r lnwire.PartialSigWithNonceTLV) {
+		ps = fn.Some(r.Val)
+	})
+	if ps.IsSome() {
+		return fn.None[lnwire.Sig](), ps
+	}
+
+	return fn.Some(commitSig), fn.None[lnwire.PartialSigWithNonce]()
 }
 
 // driveDynResponderCommit executes the responder side of the bundled
@@ -654,9 +683,22 @@ func (l *channelLink) driveDynResponderCommit(ctx context.Context,
 	// commitment using the channel's existing nonce state for taproot, and
 	// the ECDSA sig otherwise.
 	//
-	// The accepted proposal TLVs and dyn_ack signature were already persisted
-	// by the negotiation state machine at accept time; durable persistence of
-	// the received dyn_commit_sig for reconnect resume is branch 9.
+	// Before we send our revoke_and_ack, durably persist the received
+	// dyn_commit_sig (its ECDSA or taproot partial form). The extension BOLT
+	// requires the receiver to persist the received dyn_commit_sig before
+	// revoke_and_ack so a reconnect resolves to resume rather than forget the
+	// locked-in update. The accepted proposal TLVs and dyn_ack signature were
+	// already persisted by the negotiation state machine at accept time.
+	commitSig, partialSig := dynCommitSigOptions(
+		dynCommit.CommitSig, dynCommit.PartialSig,
+	)
+	if err := l.updater.RecordCommitReceived(
+		ctx, commitSig, partialSig,
+	); err != nil {
+
+		return fmt.Errorf("record received dyn_commit_sig: %w", err)
+	}
+
 	return l.processRemoteCommitSig(ctx, &lnwire.CommitSig{
 		ChanID:     l.ChanID(),
 		CommitSig:  dynCommit.CommitSig,

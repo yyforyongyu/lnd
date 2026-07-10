@@ -285,11 +285,22 @@ func TestLocalInitToReadyToCommit(t *testing.T) {
 	require.True(t, handoff.Params.DustLimit.IsSome())
 	require.True(t, handoff.ReceivedCommit.IsNone())
 
-	// Finally, hand off the dance.
-	tr, err = rig.u.MarkCommitSent(ctx)
+	// Finally, hand off the dance, recording the sent ECDSA commit sig.
+	sentSig := testSig(t)
+	tr, err = rig.u.MarkCommitSent(
+		ctx, fn.Some(sentSig), fn.None[lnwire.PartialSigWithNonce](),
+	)
 	require.NoError(t, err)
 	require.Equal(t, StateCommitting, rig.u.State())
 	require.True(t, rig.u.State().IsTerminal())
+
+	// The sent commitment signature must have been persisted so a reconnect
+	// resolves to retransmit rather than forget.
+	stored, err = rig.persister.FetchAcceptedProposal(ctx, testChanID)
+	require.NoError(t, err)
+	require.True(t, stored.IsSome())
+	require.True(t, stored.UnsafeFromSome().HasCommitSig())
+	require.Equal(t, fn.Some(sentSig), stored.UnsafeFromSome().CommitSig)
 }
 
 // TestRemoteProposalAccept walks the responder happy path: validate an incoming
@@ -349,6 +360,22 @@ func TestRemoteProposalAccept(t *testing.T) {
 	require.Equal(t, lntypes.Remote, handoff.Proposer)
 	require.True(t, handoff.ReceivedCommit.IsSome())
 	require.Equal(t, commit, handoff.ReceivedCommit.UnsafeFromSome())
+
+	// The link records the received commitment signature before it sends its
+	// revoke_and_ack. Simulate that here and confirm it is persisted so a
+	// reconnect resolves to resume rather than forget.
+	require.NoError(t, rig.u.RecordCommitReceived(
+		ctx, fn.Some(commit.CommitSig),
+		fn.None[lnwire.PartialSigWithNonce](),
+	))
+
+	stored, err = rig.persister.FetchAcceptedProposal(ctx, testChanID)
+	require.NoError(t, err)
+	require.True(t, stored.IsSome())
+	require.True(t, stored.UnsafeFromSome().HasCommitSig())
+	require.Equal(
+		t, fn.Some(commit.CommitSig), stored.UnsafeFromSome().CommitSig,
+	)
 }
 
 // TestRejectInvalidParam checks that a proposal with an out-of-policy parameter
@@ -641,7 +668,10 @@ func TestInvalidTransitions(t *testing.T) {
 	_, err = rig.u.RecvCommit(ctx, &lnwire.DynCommit{})
 	require.ErrorIs(t, err, ErrInvalidTransition)
 
-	_, err = rig.u.MarkCommitSent(ctx)
+	_, err = rig.u.MarkCommitSent(
+		ctx, fn.None[lnwire.Sig](),
+		fn.None[lnwire.PartialSigWithNonce](),
+	)
 	require.ErrorIs(t, err, ErrInvalidTransition)
 
 	require.Equal(t, StateIdle, rig.u.State())
@@ -724,4 +754,26 @@ func testSig(t *testing.T) lnwire.Sig {
 	require.NoError(t, err)
 
 	return sig
+}
+
+// testPartialSig returns an arbitrary well-formed musig2 partial signature with
+// nonce for use where the content of a taproot commitment signature is not
+// under test.
+func testPartialSig(t *testing.T) lnwire.PartialSigWithNonce {
+	t.Helper()
+
+	priv1, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	priv2, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	var nonce [66]byte
+	copy(nonce[:33], priv1.PubKey().SerializeCompressed())
+	copy(nonce[33:], priv2.PubKey().SerializeCompressed())
+
+	var s btcec.ModNScalar
+	s.SetInt(7)
+
+	return *lnwire.NewPartialSigWithNonce(nonce, s)
 }

@@ -118,25 +118,37 @@ type AcceptedProposal struct {
 	// received dyn_ack.
 	AckSig fn.Option[lnwire.Sig]
 
-	// CommitSig is the proposer's dyn_commit_sig commitment signature. Its
-	// presence is the persisted flag that a dyn_commit_sig has crossed the
-	// wire before a disconnect: the proposer sets it when it sends the
-	// bundled dyn_commit_sig, and the responder sets it when it receives and
-	// persists one before sending its revoke_and_ack. A negotiation with a
-	// persisted CommitSig is retained and retransmitted across a reconnect;
-	// one without is forgotten (see Decide).
-	//
-	// TODO(dyn): the commitment dance that actually produces and consumes
-	// dyn_commit_sig is not complete on the branch this is stacked on, so
-	// nothing sets this in the live flow yet. The reconnect decision logic
-	// and the durable persistence handle it now so the retransmission path
-	// is ready to be wired once the dance lands.
+	// CommitSig is the proposer's dyn_commit_sig commitment signature for a
+	// non-taproot (ECDSA) channel. Its presence, or the presence of
+	// PartialSig, is the persisted flag that a dyn_commit_sig has crossed
+	// the wire before a disconnect: the proposer sets it when it sends the
+	// bundled dyn_commit_sig, and the responder sets it when it receives one
+	// before sending its revoke_and_ack. A negotiation with a persisted
+	// commit sig is retained and retransmitted across a reconnect; one
+	// without is forgotten (see Decide).
 	CommitSig fn.Option[lnwire.Sig]
+
+	// PartialSig is the proposer's dyn_commit_sig commitment signature for a
+	// taproot (musig2) channel, carried as a partial_signature_with_nonce.
+	// It is the taproot counterpart of CommitSig: for a taproot channel the
+	// dyn_commit_sig rides this field and CommitSig is absent, while for a
+	// non-taproot channel this field is absent and CommitSig carries the
+	// ECDSA signature.
+	PartialSig fn.Option[lnwire.PartialSigWithNonce]
 }
 
 // Params returns the canonical channel-params view of the accepted proposal.
 func (a *AcceptedProposal) Params() lnwallet.ChannelParams {
 	return lnwallet.ChannelParamsFromDynPropose(a.Proposal)
+}
+
+// HasCommitSig returns true if a dyn_commit_sig commitment signature has been
+// persisted for this negotiation, in either its ECDSA (CommitSig) or taproot
+// partial (PartialSig) form. It is the persisted flag the reconnect decision
+// keys on to tell a negotiation that must be retransmitted from one that must
+// be forgotten.
+func (a AcceptedProposal) HasCommitSig() bool {
+	return a.CommitSig.IsSome() || a.PartialSig.IsSome()
 }
 
 // Persister persists the accepted-proposal context at the boundaries the state
