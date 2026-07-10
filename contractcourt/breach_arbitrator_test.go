@@ -28,6 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntest/channels"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lntest/wait"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -2322,6 +2323,15 @@ func createInitChannels(t *testing.T) (
 		Db:                      dbAlice.ChannelStateDB(),
 		Packager:                channeldb.NewChannelPackager(shortChanID),
 		FundingTxn:              channels.TestFundingTx,
+		// Mirror the read-time default synthesized by fetchOpenChannel
+		// so historical-parameter lookups behave as on a disk-loaded
+		// channel (see lnwallet breach recovery).
+		CommitChainEpochHistory: channeldb.NewCommitChainEpochHistory(
+			lntypes.Dual[channeldb.CommitmentParams]{
+				Local:  aliceCfg.CommitmentParams,
+				Remote: bobCfg.CommitmentParams,
+			},
+		),
 	}
 	bobChannelState := &channeldb.OpenChannel{
 		LocalChanCfg:            bobCfg,
@@ -2339,6 +2349,12 @@ func createInitChannels(t *testing.T) (
 		RemoteCommitment:        bobCommit,
 		Db:                      dbBob.ChannelStateDB(),
 		Packager:                channeldb.NewChannelPackager(shortChanID),
+		CommitChainEpochHistory: channeldb.NewCommitChainEpochHistory(
+			lntypes.Dual[channeldb.CommitmentParams]{
+				Local:  bobCfg.CommitmentParams,
+				Remote: aliceCfg.CommitmentParams,
+			},
+		),
 	}
 
 	aliceSigner := input.NewMockSigner(

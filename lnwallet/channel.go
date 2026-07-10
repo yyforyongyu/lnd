@@ -2086,6 +2086,42 @@ type BreachRetribution struct {
 	ChanType channeldb.ChannelType
 }
 
+// Dynamic-commitments historical-parameter audit (PR 1.3)
+// ------------------------------------------------------
+// Once dynamic commitments allow CSV/dust to change mid-channel, any path
+// that reconstructs a *historical* (revoked/old-height) commitment or HTLC
+// script must use the parameters that were in effect at that height, not the
+// live config, or it will build the wrong witness script. The classification
+// of every CSV/dust read in lnwallet (commitment.go + channel.go) is:
+//
+//   HISTORICAL (fixed to look up the per-side epoch history by height):
+//     - NewBreachRetribution: CSV for the revoked remote to_local, plus
+//       dust to gate the output sweep descriptors.
+//     - createHtlcRetribution: CSV for the revoked remote 2nd-level script.
+//     - createBreachRetributionLegacy: dust to re-trim the revoked HTLC set.
+//     - findOutputIndexesFromRemote: CSV for the remote commitment being
+//       moved into the revocation log.
+//   These reconstruct the *remote* commitment chain at an arbitrary past
+//   height, so they query CommitParamsForHeight(lntypes.Remote, height).
+//
+//   CURRENT/latest state (live config is correct; audited, left as-is):
+//     - CreateCommitTx / genRemoteHtlcSigJobs / genHtlcSigValidationJobs
+//       build or validate the *new* commitment in an active state
+//       transition.
+//     - NewLocalForceCloseSummary / extractHtlcResolutions resolve the
+//       *latest* broadcastable commitment (a force close only ever spends
+//       the current tip; an old state would be a self-breach), so current
+//       config == the params of the state being resolved.
+//
+// ChanType reads are left untouched: channel-type transitions are out of
+// scope for the params-only milestone, so the type never changes. CSV is the
+// hard requirement (it is embedded directly in the reconstructed witness
+// scripts); the historical dust limit is additionally consulted where a dust
+// comparison gates output *presence* on the revoked commitment, so a later
+// dust-limit increase can't strand an output that legitimately existed at
+// the revoked height. Both CSV and dust already live in the epoch history, so
+// the revocation-log on-disk format is unchanged.
+
 // NewBreachRetribution creates a new fully populated BreachRetribution for the
 // passed channel, at a particular revoked state number. If the spend
 // transaction that the breach retribution should target is known, then it can
@@ -2170,7 +2206,21 @@ func NewBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 			return l.LocalAuxLeaf
 		},
 	)(auxResult.AuxLeaves)
-	theirDelay := uint32(chanState.RemoteChanCfg.CsvDelay)
+	// A breach is the remote party broadcasting one of their own revoked
+	// commitment transactions, so the to_local (and HTLC second-level)
+	// delay we must reconstruct is the CSV imposed on the *remote*
+	// commitment chain at the revoked state's height. Consult the per-side
+	// epoch history rather than the live config: with dynamic commitments
+	// the live CSV may have changed since this revoked state, and rebuilding
+	// with it would yield an unspendable justice tx. The historical dust
+	// limit is looked up alongside it (used below to gate the sweep
+	// descriptors) so that an output that was above dust at the revoked
+	// height is still swept even if the current dust limit was later raised
+	// above it. For channels without epoch history (pre-dyn, or never
+	// updated) this returns the current RemoteChanCfg params, matching
+	// legacy behavior exactly.
+	remoteParams := chanState.CommitParamsForHeight(lntypes.Remote, stateNum)
+	theirDelay := uint32(remoteParams.CsvDelay)
 	theirScript, err := CommitScriptToSelf(
 		chanState.ChanType, isRemoteInitiator, keyRing.ToLocalKey,
 		keyRing.RevocationKey, theirDelay, leaseExpiry, localAuxLeaf,
@@ -2191,7 +2241,8 @@ func NewBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 	if revokedLog != nil {
 		br, ourAmt, theirAmt, err = createBreachRetribution(
 			revokedLog, spendTx, chanState, keyRing,
-			commitmentSecret, leaseExpiry, auxResult.AuxLeaves,
+			commitmentSecret, leaseExpiry, theirDelay,
+			auxResult.AuxLeaves,
 		)
 		if err != nil {
 			return nil, err
@@ -2206,7 +2257,8 @@ func NewBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 		// are confident that no legacy format is in use.
 		br, ourAmt, theirAmt, err = createBreachRetributionLegacy(
 			revokedLogLegacy, chanState, keyRing, commitmentSecret,
-			ourScript, theirScript, leaseExpiry,
+			ourScript, theirScript, leaseExpiry, theirDelay,
+			remoteParams.DustLimit,
 		)
 		if err != nil {
 			return nil, err
@@ -2218,8 +2270,12 @@ func NewBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 	// party's dust limit, the respective sign descriptor will be nil.
 	//
 	// If our balance exceeds the remote party's dust limit, instantiate
-	// the sign descriptor for our output.
-	if ourAmt >= int64(chanState.RemoteChanCfg.DustLimit) {
+	// the sign descriptor for our output. We use the dust limit that was in
+	// effect for the remote commitment at the revoked height (see
+	// remoteParams above) rather than the live one, so a later dust-limit
+	// increase can't cause us to skip sweeping an output that legitimately
+	// exists on this revoked commitment.
+	if ourAmt >= int64(remoteParams.DustLimit) {
 		// As we're about to sweep our own output w/o a delay, we'll
 		// obtain the witness script for the success/delay path.
 		witnessScript, err := ourScript.WitnessScriptForPath(
@@ -2299,8 +2355,10 @@ func NewBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 	}
 
 	// Similarly, if their balance exceeds the remote party's dust limit,
-	// assemble the sign descriptor for their output, which we can sweep.
-	if theirAmt >= int64(chanState.RemoteChanCfg.DustLimit) {
+	// assemble the sign descriptor for their output, which we can sweep. As
+	// above, we compare against the historical dust limit for this revoked
+	// height rather than the live one.
+	if theirAmt >= int64(remoteParams.DustLimit) {
 		// As we're trying to defend the channel against a breach
 		// attempt from the remote party, we want to obain the
 		// revocation witness script here.
@@ -2392,16 +2450,19 @@ func NewBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 }
 
 // createHtlcRetribution is a helper function to construct an HtlcRetribution
-// based on the passed params.
+// based on the passed params. The theirDelay argument is the CSV delay that
+// governed the remote commitment chain at the revoked state's height (looked
+// up from the epoch history by the caller). It is used for the second-level
+// HTLC script rather than the live config, so historical breach scripts stay
+// correct once dynamic commitments can change CSV.
 func createHtlcRetribution(chanState *channeldb.OpenChannel,
 	keyRing *CommitmentKeyRing, commitHash chainhash.Hash,
 	commitmentSecret *btcec.PrivateKey, leaseExpiry uint32,
-	htlc *channeldb.HTLCEntry,
+	theirDelay uint32, htlc *channeldb.HTLCEntry,
 	auxLeaves fn.Option[CommitAuxLeaves]) (HtlcRetribution, error) {
 
 	var emptyRetribution HtlcRetribution
 
-	theirDelay := uint32(chanState.RemoteChanCfg.CsvDelay)
 	isRemoteInitiator := !chanState.IsInitiator
 
 	// We'll generate the original second level witness script now, as
@@ -2522,7 +2583,7 @@ func createHtlcRetribution(chanState *channeldb.OpenChannel,
 func createBreachRetribution(revokedLog *channeldb.RevocationLog,
 	spendTx *wire.MsgTx, chanState *channeldb.OpenChannel,
 	keyRing *CommitmentKeyRing, commitmentSecret *btcec.PrivateKey,
-	leaseExpiry uint32,
+	leaseExpiry uint32, theirDelay uint32,
 	auxLeaves fn.Option[CommitAuxLeaves]) (*BreachRetribution, int64, int64,
 	error) {
 
@@ -2533,7 +2594,8 @@ func createBreachRetribution(revokedLog *channeldb.RevocationLog,
 	for i, htlc := range revokedLog.HTLCEntries {
 		hr, err := createHtlcRetribution(
 			chanState, keyRing, commitHash.Val,
-			commitmentSecret, leaseExpiry, htlc, auxLeaves,
+			commitmentSecret, leaseExpiry, theirDelay, htlc,
+			auxLeaves,
 		)
 		if err != nil {
 			return nil, 0, 0, err
@@ -2640,7 +2702,8 @@ func createBreachRetributionLegacy(revokedLog *channeldb.ChannelCommitment,
 	chanState *channeldb.OpenChannel, keyRing *CommitmentKeyRing,
 	commitmentSecret *btcec.PrivateKey,
 	ourScript, theirScript input.ScriptDescriptor,
-	leaseExpiry uint32) (*BreachRetribution, int64, int64, error) {
+	leaseExpiry uint32, theirDelay uint32,
+	dustLimit btcutil.Amount) (*BreachRetribution, int64, int64, error) {
 
 	commitHash := revokedLog.CommitTx.TxHash()
 	ourOutpoint := wire.OutPoint{
@@ -2668,11 +2731,16 @@ func createBreachRetributionLegacy(revokedLog *channeldb.ChannelCommitment,
 	for i, htlc := range revokedLog.Htlcs {
 		// If the HTLC is dust, then we'll skip it as it doesn't have
 		// an output on the commitment transaction.
+		// Trim with the dust limit that was in effect for the remote
+		// commitment at this revoked height (passed in by the caller
+		// from the epoch history), not the live one, so the set of
+		// non-dust HTLCs we rebuild matches the outputs that were
+		// actually present on the revoked commitment.
 		if HtlcIsDust(
 			chanState.ChanType, htlc.Incoming, lntypes.Remote,
 			chainfee.SatPerKWeight(revokedLog.FeePerKw),
 			htlc.Amt.ToSatoshis(),
-			chanState.RemoteChanCfg.DustLimit,
+			dustLimit,
 		) {
 
 			continue
@@ -2685,7 +2753,7 @@ func createBreachRetributionLegacy(revokedLog *channeldb.ChannelCommitment,
 
 		hr, err := createHtlcRetribution(
 			chanState, keyRing, commitHash,
-			commitmentSecret, leaseExpiry, entry,
+			commitmentSecret, leaseExpiry, theirDelay, entry,
 			fn.None[CommitAuxLeaves](),
 		)
 		if err != nil {
@@ -3340,6 +3408,10 @@ func genRemoteHtlcSigJobs(keyRing *CommitmentKeyRing,
 	leafStore fn.Option[AuxLeafStore]) ([]SignJob, []AuxSigJob,
 	chan struct{}, error) {
 
+	// PR 1.3 audit (dyncomms historical params): current-state site. The
+	// remote CSV/dust read below feeds sig jobs for the new remote
+	// commitment in the in-progress state transition, so the live config is
+	// the correct value and no epoch lookup is needed.
 	var (
 		isRemoteInitiator = !chanState.IsInitiator
 		localChanCfg      = chanState.LocalChanCfg
@@ -4971,6 +5043,10 @@ func genHtlcSigValidationJobs(chanState *channeldb.OpenChannel,
 	leafStore fn.Option[AuxLeafStore], auxSigner fn.Option[AuxSigner],
 	sigBlob fn.Option[tlv.Blob]) ([]VerifyJob, []AuxVerifyJob, error) {
 
+	// PR 1.3 audit (dyncomms historical params): current-state site. The
+	// local CSV read below validates sigs for the new local commitment in
+	// the in-progress state transition, so the live config is correct and no
+	// epoch lookup is needed.
 	var (
 		isLocalInitiator = chanState.IsInitiator
 		localChanCfg     = chanState.LocalChanCfg
@@ -8173,6 +8249,12 @@ func extractHtlcResolutions(feePerKw chainfee.SatPerKWeight,
 	auxLeaves fn.Option[CommitAuxLeaves],
 	auxResolver fn.Option[AuxContractResolver]) (*HtlcResolutions, error) {
 
+	// PR 1.3 audit (dyncomms historical params): current-state site. Force
+	// close / unilateral close only ever resolves the latest broadcastable
+	// commitment (an old state would be a self-breach handled by the breach
+	// path), so the live config CSV/dust for whoseCommit is the correct
+	// value and no epoch lookup is needed.
+	//
 	// TODO(roasbeef): don't need to swap csv delay?
 	dustLimit := remoteChanCfg.DustLimit
 	csvDelay := remoteChanCfg.CsvDelay
@@ -8393,6 +8475,11 @@ func NewLocalForceCloseSummary(chanState *channeldb.OpenChannel,
 	// commitment transaction. We'll need this to find the corresponding
 	// output in the commitment transaction and potentially for creating
 	// the sign descriptor.
+	//
+	// PR 1.3 audit (dyncomms historical params): current-state site. A local
+	// force close broadcasts our latest local commitment (never a revoked
+	// one), so the live LocalChanCfg CSV matches the state being resolved
+	// and no epoch lookup is needed.
 	csvTimeout := uint32(chanState.LocalChanCfg.CsvDelay)
 
 	// We use the passed state num to derive our scripts, since in case

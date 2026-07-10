@@ -325,6 +325,16 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType,
 		Db:                      dbAlice.ChannelStateDB(),
 		Packager:                channeldb.NewChannelPackager(shortChanID),
 		FundingTxn:              testTx,
+		// Mirror the read-time default synthesized by fetchOpenChannel:
+		// a single epoch 0 per side seeded from the current configs, so
+		// historical-parameter lookups behave as on a disk-loaded
+		// channel.
+		CommitChainEpochHistory: channeldb.NewCommitChainEpochHistory(
+			lntypes.Dual[channeldb.CommitmentParams]{
+				Local:  aliceCfg.CommitmentParams,
+				Remote: bobCfg.CommitmentParams,
+			},
+		),
 	}
 	bobChannelState := &channeldb.OpenChannel{
 		LocalChanCfg:            bobCfg,
@@ -342,6 +352,12 @@ func CreateTestChannels(t *testing.T, chanType channeldb.ChannelType,
 		RemoteCommitment:        bobRemoteCommit,
 		Db:                      dbBob.ChannelStateDB(),
 		Packager:                channeldb.NewChannelPackager(shortChanID),
+		CommitChainEpochHistory: channeldb.NewCommitChainEpochHistory(
+			lntypes.Dual[channeldb.CommitmentParams]{
+				Local:  bobCfg.CommitmentParams,
+				Remote: aliceCfg.CommitmentParams,
+			},
+		),
 	}
 
 	// If the channel type has a tapscript root, then we'll also specify
