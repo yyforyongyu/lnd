@@ -21,6 +21,44 @@ const (
 	FFAnnounceChannel FundingFlag = 1 << iota
 )
 
+// Record returns a TLV record that can be used to encode/decode a FundingFlag
+// to/from a TLV stream. The flag is serialized as a single byte, matching the
+// channel_flags field of open_channel.
+func (f *FundingFlag) Record() tlv.Record {
+	return tlv.MakeStaticRecord(
+		0, f, 1, fundingFlagEncoder, fundingFlagDecoder,
+	)
+}
+
+// fundingFlagEncoder is a custom TLV encoder for the FundingFlag record.
+func fundingFlagEncoder(w io.Writer, val interface{}, buf *[8]byte) error {
+	if v, ok := val.(*FundingFlag); ok {
+		flag := uint8(*v)
+
+		return tlv.EUint8(w, &flag, buf)
+	}
+
+	return tlv.NewTypeForEncodingErr(val, "lnwire.FundingFlag")
+}
+
+// fundingFlagDecoder is a custom TLV decoder for the FundingFlag record.
+func fundingFlagDecoder(r io.Reader, val interface{}, buf *[8]byte,
+	l uint64) error {
+
+	if v, ok := val.(*FundingFlag); ok {
+		var flag uint8
+		if err := tlv.DUint8(r, &flag, buf, l); err != nil {
+			return err
+		}
+
+		*v = FundingFlag(flag)
+
+		return nil
+	}
+
+	return tlv.NewTypeForDecodingErr(val, "lnwire.FundingFlag", l, 1)
+}
+
 // OpenChannel is the message Alice sends to Bob if we should like to create a
 // channel with Bob where she's the sole provider of funds to the channel.
 // Single funder channels simplify the initial funding workflow, are supported

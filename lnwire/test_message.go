@@ -960,26 +960,15 @@ var _ TestMessage = (*DynAck)(nil)
 func (da *DynAck) RandTestMessage(t *rapid.T) Message {
 	msg := &DynAck{
 		ChanID: RandChannelID(t),
+		Sig:    RandSignature(t),
 	}
 
-	includeLocalNonce := rapid.Bool().Draw(t, "includeLocalNonce")
-	if includeLocalNonce {
-		nonce := RandMusig2Nonce(t)
-		rec := tlv.NewRecordT[tlv.TlvType14](nonce)
-		msg.LocalNonce = tlv.SomeRecordT(rec)
+	// DynAck has no known TLV records; any trailing bytes are opaque extra
+	// data.
+	randData := RandExtraOpaqueData(t, nil)
+	if len(randData) > 0 {
+		msg.ExtraData = randData
 	}
-
-	// Create a tlv type lists to hold all known records which will be
-	// ignored when creating ExtraData records.
-	ignoreRecords := fn.NewSet[uint64]()
-	for i := range uint64(15) {
-		// Ignore known records.
-		if i%2 == 0 {
-			ignoreRecords.Add(i)
-		}
-	}
-
-	msg.ExtraData = RandExtraOpaqueData(t, ignoreRecords)
 
 	return msg
 }
@@ -1002,12 +991,13 @@ func (dp *DynPropose) RandTestMessage(t *rapid.T) Message {
 	includeMaxValueInFlight := rapid.Bool().Draw(
 		t, "includeMaxValueInFlight",
 	)
+	includeHtlcMinimum := rapid.Bool().Draw(t, "includeHtlcMinimum")
 	includeChannelReserve := rapid.Bool().Draw(t, "includeChannelReserve")
 	includeCsvDelay := rapid.Bool().Draw(t, "includeCsvDelay")
 	includeMaxAcceptedHTLCs := rapid.Bool().Draw(
 		t, "includeMaxAcceptedHTLCs",
 	)
-	includeChannelType := rapid.Bool().Draw(t, "includeChannelType")
+	includeChannelFlags := rapid.Bool().Draw(t, "includeChannelFlags")
 
 	// Generate random values for each included field
 	if includeDustLimit {
@@ -1018,14 +1008,21 @@ func (dp *DynPropose) RandTestMessage(t *rapid.T) Message {
 	}
 
 	if includeMaxValueInFlight {
-		var rec tlv.RecordT[tlv.TlvType2, MilliSatoshi]
+		var rec tlv.RecordT[tlv.TlvType1, MilliSatoshi]
 		val := MilliSatoshi(rapid.Uint64().Draw(t, "maxValueInFlight"))
 		rec.Val = val
 		msg.MaxValueInFlight = tlv.SomeRecordT(rec)
 	}
 
+	if includeHtlcMinimum {
+		var rec tlv.RecordT[tlv.TlvType2, MilliSatoshi]
+		val := MilliSatoshi(rapid.Uint64().Draw(t, "htlcMinimum"))
+		rec.Val = val
+		msg.HtlcMinimum = tlv.SomeRecordT(rec)
+	}
+
 	if includeChannelReserve {
-		var rec tlv.RecordT[tlv.TlvType6, tlv.BigSizeT[btcutil.Amount]]
+		var rec tlv.RecordT[tlv.TlvType3, tlv.BigSizeT[btcutil.Amount]]
 		val := btcutil.Amount(rapid.Uint32().Draw(t, "channelReserve"))
 		rec.Val = tlv.NewBigSizeT(val)
 		msg.ChannelReserve = tlv.SomeRecordT(rec)
@@ -1044,20 +1041,18 @@ func (dp *DynPropose) RandTestMessage(t *rapid.T) Message {
 		msg.MaxAcceptedHTLCs = tlv.SomeRecordT(maxHtlcs)
 	}
 
-	if includeChannelType {
-		chanType := msg.ChannelType.Zero()
-		chanType.Val = *RandChannelType(t)
-		msg.ChannelType = tlv.SomeRecordT(chanType)
+	if includeChannelFlags {
+		chanFlags := msg.ChannelFlags.Zero()
+		chanFlags.Val = FundingFlag(rapid.Byte().Draw(t, "channelFlags"))
+		msg.ChannelFlags = tlv.SomeRecordT(chanFlags)
 	}
 
-	// Create a tlv type lists to hold all known records which will be
-	// ignored when creating ExtraData records.
+	// Create a tlv type list to hold all known records, which will be
+	// ignored when creating ExtraData records. The known records occupy
+	// TLV types 0 through 6.
 	ignoreRecords := fn.NewSet[uint64]()
-	for i := range uint64(13) {
-		// Ignore known records.
-		if i%2 == 0 {
-			ignoreRecords.Add(i)
-		}
+	for i := range uint64(7) {
+		ignoreRecords.Add(i)
 	}
 
 	msg.ExtraData = RandExtraOpaqueData(t, ignoreRecords)
@@ -1110,10 +1105,6 @@ var _ TestMessage = (*DynCommit)(nil)
 func (dc *DynCommit) RandTestMessage(t *rapid.T) Message {
 	chanID := RandChannelID(t)
 
-	da := &DynAck{
-		ChanID: chanID,
-	}
-
 	dp := &DynPropose{
 		ChanID: chanID,
 	}
@@ -1123,12 +1114,13 @@ func (dc *DynCommit) RandTestMessage(t *rapid.T) Message {
 	includeMaxValueInFlight := rapid.Bool().Draw(
 		t, "includeMaxValueInFlight",
 	)
+	includeHtlcMinimum := rapid.Bool().Draw(t, "includeHtlcMinimum")
 	includeChannelReserve := rapid.Bool().Draw(t, "includeChannelReserve")
 	includeCsvDelay := rapid.Bool().Draw(t, "includeCsvDelay")
 	includeMaxAcceptedHTLCs := rapid.Bool().Draw(
 		t, "includeMaxAcceptedHTLCs",
 	)
-	includeChannelType := rapid.Bool().Draw(t, "includeChannelType")
+	includeChannelFlags := rapid.Bool().Draw(t, "includeChannelFlags")
 
 	// Generate random values for each included field
 	if includeDustLimit {
@@ -1139,14 +1131,21 @@ func (dc *DynCommit) RandTestMessage(t *rapid.T) Message {
 	}
 
 	if includeMaxValueInFlight {
-		var rec tlv.RecordT[tlv.TlvType2, MilliSatoshi]
+		var rec tlv.RecordT[tlv.TlvType1, MilliSatoshi]
 		val := MilliSatoshi(rapid.Uint64().Draw(t, "maxValueInFlight"))
 		rec.Val = val
 		dp.MaxValueInFlight = tlv.SomeRecordT(rec)
 	}
 
+	if includeHtlcMinimum {
+		var rec tlv.RecordT[tlv.TlvType2, MilliSatoshi]
+		val := MilliSatoshi(rapid.Uint64().Draw(t, "htlcMinimum"))
+		rec.Val = val
+		dp.HtlcMinimum = tlv.SomeRecordT(rec)
+	}
+
 	if includeChannelReserve {
-		var rec tlv.RecordT[tlv.TlvType6, tlv.BigSizeT[btcutil.Amount]]
+		var rec tlv.RecordT[tlv.TlvType3, tlv.BigSizeT[btcutil.Amount]]
 		val := btcutil.Amount(rapid.Uint32().Draw(t, "channelReserve"))
 		rec.Val = tlv.NewBigSizeT(val)
 		dp.ChannelReserve = tlv.SomeRecordT(rec)
@@ -1165,31 +1164,35 @@ func (dc *DynCommit) RandTestMessage(t *rapid.T) Message {
 		dp.MaxAcceptedHTLCs = tlv.SomeRecordT(maxHtlcs)
 	}
 
-	if includeChannelType {
-		chanType := dp.ChannelType.Zero()
-		chanType.Val = *RandChannelType(t)
-		dp.ChannelType = tlv.SomeRecordT(chanType)
+	if includeChannelFlags {
+		chanFlags := dp.ChannelFlags.Zero()
+		chanFlags.Val = FundingFlag(rapid.Byte().Draw(t, "channelFlags"))
+		dp.ChannelFlags = tlv.SomeRecordT(chanFlags)
 	}
 
-	includeLocalNonce := rapid.Bool().Draw(t, "includeLocalNonce")
-	if includeLocalNonce {
-		nonce := RandMusig2Nonce(t)
-		rec := tlv.NewRecordT[tlv.TlvType14](nonce)
-		da.LocalNonce = tlv.SomeRecordT(rec)
-	}
-
-	// Create a tlv type lists to hold all known records which will be
-	// ignored when creating ExtraData records.
+	// Create a tlv type list to hold all known records, which will be
+	// ignored when creating ExtraData records. The known records occupy
+	// TLV types 0 through 6.
 	ignoreRecords := fn.NewSet[uint64]()
-	for i := range uint64(15) {
-		// Ignore known records.
-		if i%2 == 0 {
-			ignoreRecords.Add(i)
-		}
+	for i := range uint64(7) {
+		ignoreRecords.Add(i)
 	}
+
 	msg := &DynCommit{
 		DynPropose: *dp,
-		DynAck:     *da,
+		AckSig:     RandSignature(t),
+	}
+
+	// Randomly include the taproot partial signature. Per the spec, taproot
+	// channels set commit_signature to 64 zero bytes and include the
+	// partial_signature_with_nonce record; non-taproot channels carry the
+	// ECDSA commit_signature and omit the partial signature.
+	includePartialSig := rapid.Bool().Draw(t, "includePartialSig")
+	if includePartialSig {
+		sigWithNonce := RandPartialSigWithNonce(t)
+		msg.PartialSig = MaybePartialSigWithNonce(sigWithNonce)
+	} else {
+		msg.CommitSig = RandSignature(t)
 	}
 
 	msg.ExtraData = RandExtraOpaqueData(t, ignoreRecords)

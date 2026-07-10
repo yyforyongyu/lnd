@@ -94,6 +94,9 @@ var deps = depDesc{
 	lnwire.Bolt11BlindedPathsOptional: {
 		lnwire.RouteBlindingOptional: {},
 	},
+	lnwire.DynamicCommitmentsOptional: {
+		lnwire.QuiescenceOptional: {},
+	},
 }
 
 // ValidateDeps asserts that a feature vector sets all features and their
