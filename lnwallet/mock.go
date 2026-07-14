@@ -70,9 +70,9 @@ func (w *mockWalletController) FetchOutpointInfo(
 // given UTXO. An error is returned if the UTXO does not belong to our wallet or
 // it is not a managed pubKey address.
 func (w *mockWalletController) ScriptForOutput(*wire.TxOut) (
-	waddrmgr.ManagedPubKeyAddress, []byte, []byte, error) {
+	base.OutputScriptInfo, error) {
 
-	return nil, nil, nil, nil
+	return base.OutputScriptInfo{}, nil
 }
 
 // ConfirmedBalance currently returns dummy values.
@@ -108,7 +108,13 @@ func (w *mockWalletController) IsOurAddress(address.Address) bool {
 
 // AddressInfo currently returns a dummy value.
 func (w *mockWalletController) AddressInfo(
-	address.Address) (waddrmgr.ManagedAddress, error) {
+	address.Address) (base.AddressInfo, error) {
+
+	return base.AddressInfo{}, nil
+}
+
+func (w *mockWalletController) PrivKeyForAddress(
+	address.Address) (*btcec.PrivateKey, error) {
 
 	return nil, nil
 }
@@ -149,9 +155,9 @@ func (w *mockWalletController) ImportPublicKey(*btcec.PublicKey,
 
 // ImportTaprootScript currently returns a dummy value.
 func (w *mockWalletController) ImportTaprootScript(waddrmgr.KeyScope,
-	*waddrmgr.Tapscript) (waddrmgr.ManagedAddress, error) {
+	*waddrmgr.Tapscript) (base.AddressInfo, error) {
 
-	return nil, nil
+	return base.AddressInfo{}, nil
 }
 
 // SendOutputs currently returns dummy values.
@@ -219,7 +225,7 @@ func (w *mockWalletController) ReleaseOutput(wtxmgr.LockID,
 }
 
 func (w *mockWalletController) ListLeasedOutputs() (
-	[]*base.ListLeasedOutputResult, error) {
+	[]*base.LeasedOutput, error) {
 
 	return nil, nil
 }

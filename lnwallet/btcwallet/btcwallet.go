@@ -589,17 +589,19 @@ func (b *BtcWallet) IsOurAddress(a address.Address) bool {
 // wallet.
 //
 // NOTE: This is a part of the WalletController interface.
-func (b *BtcWallet) AddressInfo(a address.Address) (waddrmgr.ManagedAddress,
+func (b *BtcWallet) AddressInfo(a address.Address) (base.AddressInfo, error) {
+	// Ported to the role-based AddressManager.GetAddressInfo, which returns
+	// the wallet.AddressInfo struct directly.
+	return b.wallet.GetAddressInfo(context.Background(), a)
+}
+
+// PrivKeyForAddress returns the private key for a wallet-managed address.
+//
+// This is a part of the WalletController interface.
+func (b *BtcWallet) PrivKeyForAddress(a address.Address) (*btcec.PrivateKey,
 	error) {
 
-	// NOT PORTED to the role API. The role method GetAddressInfo returns a
-	// wallet.AddressInfo struct, but lnwallet.WalletController fixes this
-	// method's return type to waddrmgr.ManagedAddress (consumed as such in
-	// lnwallet/interface.go and rpcwallet.go). Moving to the role type would
-	// require migrating the shared WalletController interface and all its
-	// implementers/consumers off waddrmgr types, which is out of scope for
-	// this experiment. See the port report.
-	return b.wallet.AddressInfoDeprecated(a)
+	return b.wallet.PrivKeyForAddress(a)
 }
 
 // ListAccounts retrieves all accounts belonging to the wallet by default. A
@@ -948,28 +950,19 @@ func (b *BtcWallet) ImportPublicKey(pubKey *btcec.PublicKey,
 
 // ImportTaprootScript imports a user-provided taproot script into the address
 // manager. The imported script will act as a pay-to-taproot address.
-func (b *BtcWallet) ImportTaprootScript(scope waddrmgr.KeyScope,
-	tapscript *waddrmgr.Tapscript) (waddrmgr.ManagedAddress, error) {
+func (b *BtcWallet) ImportTaprootScript(_ waddrmgr.KeyScope,
+	tapscript *waddrmgr.Tapscript) (base.AddressInfo, error) {
 
-	// We want to be able to import script addresses into a watch-only
-	// wallet, which is only possible if we don't encrypt the script with
-	// the private key encryption key. By specifying the script as being
-	// "not secret", we can also decrypt the script in a watch-only wallet.
-	const isSecretScript = false
-
-	// Currently, only v1 (Taproot) scripts are supported. We don't even
-	// know what a v2 witness version would look like at this point.
-	const witnessVersionTaproot byte = 1
-
-	// NOT PORTED to the role API. AddressManager.ImportTaprootScript(ctx,
-	// tapscript) returns a wallet.AddressInfo and drops the scope /
-	// blockstamp / witnessVersion / isSecretScript parameters, but
-	// lnwallet.WalletController fixes this method's return type to
-	// waddrmgr.ManagedAddress and lnd relies on the extra parameters
-	// (watch-only, non-secret import). See the port report.
-	return b.wallet.ImportTaprootScriptDeprecated(
-		scope, tapscript, nil, witnessVersionTaproot, isSecretScript,
-	)
+	// Ported to the role-based AddressManager.ImportTaprootScript, which
+	// returns a wallet.AddressInfo.
+	//
+	// GAP (behaviour change): the role method takes only the tapscript and
+	// drops the legacy scope / blockstamp / witnessVersion / isSecretScript
+	// parameters. lnd previously forced witness version 1 and a non-secret
+	// import (so watch-only wallets can decrypt the script); those knobs are
+	// no longer exposed here and are decided by the wallet. See the port
+	// report.
+	return b.wallet.ImportTaprootScript(context.Background(), *tapscript)
 }
 
 // SendOutputs funds, signs, and broadcasts a Bitcoin transaction paying out to
@@ -1100,16 +1093,14 @@ func (b *BtcWallet) LeaseOutput(id wtxmgr.LockID, op wire.OutPoint,
 }
 
 // ListLeasedOutputs returns a list of all currently locked outputs.
-func (b *BtcWallet) ListLeasedOutputs() ([]*base.ListLeasedOutputResult,
-	error) {
-
-	// NOT PORTED to the role API. UtxoManager.ListLeasedOutputs returns
-	// []*wallet.LeasedOutput, which omits the Value and PkScript fields that
-	// lnwallet.WalletController's []*base.ListLeasedOutputResult carries and
-	// that lnd consumers rely on. Routing through the role type would
-	// silently drop those fields, so we keep the deprecated method. See the
-	// port report.
-	return b.wallet.ListLeasedOutputsDeprecated()
+func (b *BtcWallet) ListLeasedOutputs() ([]*base.LeasedOutput, error) {
+	// Ported to the role-based UtxoManager.ListLeasedOutputs.
+	//
+	// GAP (behaviour change): the role method's wallet.LeasedOutput omits
+	// the Value and PkScript fields present on the legacy
+	// base.ListLeasedOutputResult. Consumers that need those must now fetch
+	// them separately (e.g. via FetchOutpointInfo). See the port report.
+	return b.wallet.ListLeasedOutputs(context.Background())
 }
 
 // ReleaseOutput unlocks an output, allowing it to be available for coin

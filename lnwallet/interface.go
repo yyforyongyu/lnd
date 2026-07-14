@@ -244,8 +244,7 @@ type WalletController interface {
 	// ScriptForOutput returns the address, witness program and redeem
 	// script for a given UTXO. An error is returned if the UTXO does not
 	// belong to our wallet or it is not a managed pubKey address.
-	ScriptForOutput(output *wire.TxOut) (waddrmgr.ManagedPubKeyAddress,
-		[]byte, []byte, error)
+	ScriptForOutput(output *wire.TxOut) (base.OutputScriptInfo, error)
 
 	// ConfirmedBalance returns the sum of all the wallet's unspent outputs
 	// that have at least confs confirmations. If confs is set to zero,
@@ -286,7 +285,15 @@ type WalletController interface {
 
 	// AddressInfo returns the information about an address, if it's known
 	// to this wallet.
-	AddressInfo(a address.Address) (waddrmgr.ManagedAddress, error)
+	AddressInfo(a address.Address) (base.AddressInfo, error)
+
+	// PrivKeyForAddress returns the private key for a wallet-managed
+	// address.
+	//
+	// NOTE(port): added to migrate callers off the removed
+	// waddrmgr.ManagedPubKeyAddress.PrivKey() path; the role-based
+	// AddressInfo no longer exposes private-key material.
+	PrivKeyForAddress(a address.Address) (*btcec.PrivateKey, error)
 
 	// ListAccounts retrieves all accounts belonging to the wallet by
 	// default. A name and key scope filter can be provided to filter
@@ -344,7 +351,7 @@ type WalletController interface {
 	// used for funding PSBTs. Only tracking the balance and UTXOs is
 	// currently supported.
 	ImportTaprootScript(scope waddrmgr.KeyScope,
-		tapscript *waddrmgr.Tapscript) (waddrmgr.ManagedAddress, error)
+		tapscript *waddrmgr.Tapscript) (base.AddressInfo, error)
 
 	// SendOutputs funds, signs, and broadcasts a Bitcoin transaction paying
 	// out to the specified outputs. In the case the wallet has insufficient
@@ -429,7 +436,12 @@ type WalletController interface {
 	ReleaseOutput(id wtxmgr.LockID, op wire.OutPoint) error
 
 	// ListLeasedOutputs returns a list of all currently locked outputs.
-	ListLeasedOutputs() ([]*base.ListLeasedOutputResult, error)
+	//
+	// NOTE(port): the role-based UtxoManager.ListLeasedOutputs returns
+	// []*base.LeasedOutput, which drops the Value and PkScript fields that
+	// the legacy base.ListLeasedOutputResult carried. Consumers that need
+	// those must now fetch them separately (e.g. via FetchOutpointInfo).
+	ListLeasedOutputs() ([]*base.LeasedOutput, error)
 
 	// PublishTransaction performs cursory validation (dust checks, etc),
 	// then finally broadcasts the passed transaction to the Bitcoin network.
@@ -655,32 +667,24 @@ func InternalKeyForAddr(wallet WalletController, netParams *chaincfg.Params,
 		return none, err
 	}
 
-	// No wallet addr. No error, but we'll return an nil error value here,
-	// as callers can use the .Option() method to get an option value.
-	if walletAddr == nil {
+	// Imported addresses (and any address without derivation info or a
+	// pubkey) do not provide the internal key, so return no key. This
+	// replaces the old waddrmgr.ManagedPubKeyAddress cast: the role-based
+	// AddressInfo exposes Imported/Derivation/PubKey directly.
+	if walletAddr.Imported || walletAddr.Derivation == nil ||
+		walletAddr.PubKey == nil {
+
 		return none, nil
 	}
-
-	// Imported addresses do not provide private keys, so they do not
-	// implement waddrmgr.ManagedPubKeyAddress. See RPC ImportTapscript.
-	if walletAddr.Imported() {
-		return none, nil
-	}
-
-	pubKeyAddr, ok := walletAddr.(waddrmgr.ManagedPubKeyAddress)
-	if !ok {
-		return none, fmt.Errorf("expected pubkey addr, got %T",
-			walletAddr)
-	}
-
-	_, derivationPath, _ := pubKeyAddr.DerivationInfo()
 
 	return fn.Some[keychain.KeyDescriptor](keychain.KeyDescriptor{
 		KeyLocator: keychain.KeyLocator{
-			Family: keychain.KeyFamily(derivationPath.Account),
-			Index:  derivationPath.Index,
+			Family: keychain.KeyFamily(
+				walletAddr.Derivation.Account,
+			),
+			Index: walletAddr.Derivation.Index,
 		},
-		PubKey: pubKeyAddr.PubKey(),
+		PubKey: walletAddr.PubKey,
 	}), nil
 }
 

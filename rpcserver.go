@@ -3846,7 +3846,17 @@ func (r *rpcServer) WalletBalance(ctx context.Context,
 		return nil, err
 	}
 	for _, leasedOutput := range leases {
-		lockedBalance += btcutil.Amount(leasedOutput.Value)
+		// GAP(port): the role-based base.LeasedOutput no longer carries
+		// the output value, so fetch it from the wallet's outpoint
+		// info. A btcwallet-side addition of Value to LeasedOutput would
+		// avoid this extra round-trip per lease.
+		utxo, err := r.server.cc.Wallet.FetchOutpointInfo(
+			&leasedOutput.OutPoint,
+		)
+		if err != nil {
+			continue
+		}
+		lockedBalance += utxo.Value
 	}
 
 	// Get the current number of non-private anchor channels.

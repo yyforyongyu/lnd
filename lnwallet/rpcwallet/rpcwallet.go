@@ -598,17 +598,16 @@ func (r *RPCKeyRing) SignOutputRaw(tx *wire.MsgTx,
 func (r *RPCKeyRing) ComputeInputScript(tx *wire.MsgTx,
 	signDesc *input.SignDescriptor) (*input.Script, error) {
 
-	addr, witnessProgram, sigScript, err := r.WalletController.ScriptForOutput(
-		signDesc.Output,
-	)
+	scriptInfo, err := r.WalletController.ScriptForOutput(signDesc.Output)
 	if err != nil {
 		return nil, err
 	}
+	witnessProgram := scriptInfo.WitnessProgram
 	signDesc.WitnessScript = witnessProgram
 
 	// If this is a p2tr address, then it must be a BIP0086 key spend if we
 	// are coming through this path (instead of SignOutputRaw).
-	switch addr.AddrType() {
+	switch scriptInfo.AddrType {
 	case waddrmgr.TaprootPubKey:
 		signDesc.SignMethod = input.TaprootKeySpendBIP0086SignMethod
 		signDesc.WitnessScript = nil
@@ -649,9 +648,9 @@ func (r *RPCKeyRing) ComputeInputScript(tx *wire.MsgTx,
 	return &input.Script{
 		Witness: wire.TxWitness{
 			append(sig.Serialize(), byte(signDesc.HashType)),
-			addr.PubKey().SerializeCompressed(),
+			scriptInfo.PubKey.SerializeCompressed(),
 		},
-		SigScript: sigScript,
+		SigScript: scriptInfo.SigScript,
 	}, nil
 }
 
@@ -995,20 +994,22 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 				"public key %x: %v", pubKeyBytes, err)
 		}
 
-		managedAddr, err := r.AddressInfo(addr)
+		addrInfo, err := r.AddressInfo(addr)
 		if err != nil {
 			return nil, fmt.Errorf("error fetching address info "+
 				"for public key %x: %v", pubKeyBytes, err)
 		}
 
-		pubKeyAddr, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
-		if !ok {
+		// The role-based AddressInfo exposes the derivation directly;
+		// a non-pubkey (e.g. script) address has no Derivation.
+		if addrInfo.Derivation == nil {
 			return nil, fmt.Errorf("address derived for public "+
 				"key %x is not a p2wkh address", pubKeyBytes)
 		}
 
-		scope, path, _ := pubKeyAddr.DerivationInfo()
-		if scope.Purpose != keychain.BIP0043Purpose {
+		if addrInfo.Derivation.KeyScope.Purpose !=
+			keychain.BIP0043Purpose {
+
 			return nil, fmt.Errorf("address derived for public "+
 				"key %x is not in custom key scope %d'",
 				pubKeyBytes, keychain.BIP0043Purpose)
@@ -1016,9 +1017,13 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 
 		// We now have all the information we need to complete our key
 		// locator information.
+		//
+		// NOTE(port): the legacy DerivationPath.InternalAccount is
+		// mapped to AddressDerivation.Account; for lnd's custom 1017'
+		// scope these coincide.
 		signDesc.KeyDesc.KeyLocator = keychain.KeyLocator{
-			Family: keychain.KeyFamily(path.InternalAccount),
-			Index:  path.Index,
+			Family: keychain.KeyFamily(addrInfo.Derivation.Account),
+			Index:  addrInfo.Derivation.Index,
 		}
 
 	// Case 2: Family and index only. This case is easy, we can just go

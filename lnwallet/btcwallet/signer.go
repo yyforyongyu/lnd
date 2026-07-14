@@ -1,6 +1,7 @@
 package btcwallet
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/btcsuite/btcd/address/v2"
@@ -14,6 +15,7 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -65,17 +67,13 @@ func (b *BtcWallet) FetchDerivationInfo(
 // ScriptForOutput returns the address, witness program and redeem script for a
 // given UTXO. An error is returned if the UTXO does not belong to our wallet or
 // it is not a managed pubKey address.
-func (b *BtcWallet) ScriptForOutput(output *wire.TxOut) (
-	waddrmgr.ManagedPubKeyAddress, []byte, []byte, error) {
+func (b *BtcWallet) ScriptForOutput(output *wire.TxOut) (base.OutputScriptInfo,
+	error) {
 
-	// NOT PORTED to the role API. AddressManager.ScriptForOutput returns a
-	// wallet.OutputScriptInfo struct, but lnwallet.WalletController fixes
-	// this method's return to (waddrmgr.ManagedPubKeyAddress, witnessProgram,
-	// redeemScript) and lnd (e.g. rpcwallet.go) consumes the concrete
-	// ManagedPubKeyAddress. The role struct cannot be turned back into a
-	// waddrmgr.ManagedPubKeyAddress, so we keep the deprecated method. See
-	// the port report.
-	return b.wallet.ScriptForOutputDeprecated(output)
+	// Ported to the role-based AddressManager.ScriptForOutput, which returns
+	// the wallet.OutputScriptInfo struct (embedded AddressInfo plus the
+	// witness program, redeem script and sig script).
+	return b.wallet.ScriptForOutput(context.Background(), *output)
 }
 
 // deriveKeyByBIP32Path derives a key described by a BIP32 path. We expect the
