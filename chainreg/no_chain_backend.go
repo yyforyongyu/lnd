@@ -7,6 +7,7 @@ import (
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcjson"
+	"github.com/btcsuite/btcd/btcutil/v2/gcs"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
@@ -223,6 +224,40 @@ func (n *NoChainSource) TestMempoolAccept([]*wire.MsgTx,
 
 func (n *NoChainSource) MapRPCErr(err error) error {
 	return err
+}
+
+func (n *NoChainSource) GetBlockHashes(_, _ int64) ([]chainhash.Hash, error) {
+	return nil, errNotImplemented
+}
+
+func (n *NoChainSource) GetBlockHeaders(_ []chainhash.Hash) (
+	[]*wire.BlockHeader, error) {
+
+	return nil, errNotImplemented
+}
+
+func (n *NoChainSource) GetBlocks(_ []chainhash.Hash) ([]*wire.MsgBlock,
+	error) {
+
+	return nil, errNotImplemented
+}
+
+func (n *NoChainSource) GetCFilter(_ *chainhash.Hash,
+	_ wire.FilterType) (*gcs.Filter, error) {
+
+	return nil, errNotImplemented
+}
+
+func (n *NoChainSource) GetCFilters(_ []chainhash.Hash,
+	_ wire.FilterType) ([]*gcs.Filter, error) {
+
+	return nil, errNotImplemented
+}
+
+func (n *NoChainSource) SubmitPackage(_ []*wire.MsgTx,
+	_ *float64) (*btcjson.SubmitPackageResult, error) {
+
+	return nil, errNotImplemented
 }
 
 var _ chain.Interface = (*NoChainSource)(nil)

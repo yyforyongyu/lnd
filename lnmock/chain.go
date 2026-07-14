@@ -5,6 +5,7 @@ import (
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcjson"
+	"github.com/btcsuite/btcd/btcutil/v2/gcs"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
@@ -176,4 +177,76 @@ func (m *MockChain) MapRPCErr(err error) error {
 	args := m.Called(err)
 
 	return args.Error(0)
+}
+
+func (m *MockChain) GetBlockHashes(startHeight, endHeight int64) (
+	[]chainhash.Hash, error) {
+
+	args := m.Called(startHeight, endHeight)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]chainhash.Hash), args.Error(1)
+}
+
+func (m *MockChain) GetBlockHeaders(hashes []chainhash.Hash) (
+	[]*wire.BlockHeader, error) {
+
+	args := m.Called(hashes)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*wire.BlockHeader), args.Error(1)
+}
+
+func (m *MockChain) GetBlocks(hashes []chainhash.Hash) ([]*wire.MsgBlock,
+	error) {
+
+	args := m.Called(hashes)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*wire.MsgBlock), args.Error(1)
+}
+
+func (m *MockChain) GetCFilter(hash *chainhash.Hash,
+	filterType wire.FilterType) (*gcs.Filter, error) {
+
+	args := m.Called(hash, filterType)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*gcs.Filter), args.Error(1)
+}
+
+func (m *MockChain) GetCFilters(hashes []chainhash.Hash,
+	filterType wire.FilterType) ([]*gcs.Filter, error) {
+
+	args := m.Called(hashes, filterType)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*gcs.Filter), args.Error(1)
+}
+
+func (m *MockChain) SubmitPackage(txns []*wire.MsgTx,
+	maxFeeRate *float64) (*btcjson.SubmitPackageResult, error) {
+
+	args := m.Called(txns, maxFeeRate)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*btcjson.SubmitPackageResult), args.Error(1)
 }
