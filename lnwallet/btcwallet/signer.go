@@ -68,7 +68,14 @@ func (b *BtcWallet) FetchDerivationInfo(
 func (b *BtcWallet) ScriptForOutput(output *wire.TxOut) (
 	waddrmgr.ManagedPubKeyAddress, []byte, []byte, error) {
 
-	return b.wallet.ScriptForOutput(output)
+	// NOT PORTED to the role API. AddressManager.ScriptForOutput returns a
+	// wallet.OutputScriptInfo struct, but lnwallet.WalletController fixes
+	// this method's return to (waddrmgr.ManagedPubKeyAddress, witnessProgram,
+	// redeemScript) and lnd (e.g. rpcwallet.go) consumes the concrete
+	// ManagedPubKeyAddress. The role struct cannot be turned back into a
+	// waddrmgr.ManagedPubKeyAddress, so we keep the deprecated method. See
+	// the port report.
+	return b.wallet.ScriptForOutputDeprecated(output)
 }
 
 // deriveKeyByBIP32Path derives a key described by a BIP32 path. We expect the

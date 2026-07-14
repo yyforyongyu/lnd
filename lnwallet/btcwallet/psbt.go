@@ -2,6 +2,7 @@ package btcwallet
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/pkg/btcunit"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wtxmgr"
@@ -82,69 +84,92 @@ func (b *BtcWallet) FundPsbt(packet *psbt.Packet, minConfs int32,
 	allowUtxo func(wtxmgr.Credit) bool) (int32, error) {
 
 	// The fee rate is passed in using units of sat/kw, so we'll convert
-	// this to sat/KB as the CreateSimpleTx method requires this unit.
+	// this to sat/KB, which is the unit that FundIntent.FeeRate expects.
 	feeSatPerKB := btcutil.Amount(feeRate.FeePerKVByte())
 
-	var (
-		keyScope   *waddrmgr.KeyScope
-		accountNum uint32
-	)
-
+	// Resolve the key scope used for coin selection and change. This
+	// mirrors the legacy behaviour: default/imported accounts default their
+	// change scope to P2WKH, while custom accounts derive their single key
+	// scope and reject an explicit change scope.
 	switch accountName {
-	// For default accounts and single imported public keys, we'll provide a
-	// nil key scope to FundPsbt, allowing it to select inputs from all
-	// scopes (NP2WKH, P2WKH, P2TR). By default, the change key scope for
-	// these accounts will be P2WKH.
 	case lnwallet.DefaultAccountName:
 		if changeScope == nil {
 			changeScope = &waddrmgr.KeyScopeBIP0084
 		}
-
-		accountNum = defaultAccount
 
 	case waddrmgr.ImportedAddrAccountName:
 		if changeScope == nil {
 			changeScope = &waddrmgr.KeyScopeBIP0084
 		}
 
-		accountNum = importedAccount
-
-	// Otherwise, map the account name to its key scope and internal account
-	// number to only select inputs from said account. No change key scope
-	// should have been specified as a custom account should only have one
-	// key scope. Providing a change key scope would break this assumption
-	// and lead to non-deterministic behavior by using a different change
-	// key scope than the custom account key scope. The change key scope
-	// will always be the same as the coin selection.
 	default:
 		if changeScope != nil {
 			return 0, fmt.Errorf("couldn't select a " +
 				"custom change type for custom accounts")
 		}
 
-		scope, account, err := b.lookupFirstCustomAccount(accountName)
+		scope, _, err := b.lookupFirstCustomAccount(accountName)
 		if err != nil {
 			return 0, err
 		}
-		keyScope = &scope
-		changeScope = keyScope
-		accountNum = account
+		changeScope = &scope
 	}
 
-	var opts []wallet.TxCreateOption
-	if changeScope != nil {
-		opts = append(opts, wallet.WithCustomChangeScope(changeScope))
-	}
+	// GAP (behaviour change): the legacy FundPsbt accepted an allowUtxo
+	// filter callback (wallet.WithUtxoFilter) that excluded specific UTXOs
+	// from coin selection. The new FundIntent / InputsPolicy model exposes
+	// no equivalent hook, so the filter is DROPPED here. Callers that relied
+	// on it (e.g. to skip coins already earmarked for other purposes) will
+	// see different coin selection. This must not ship without a
+	// replacement; see the port report.
 	if allowUtxo != nil {
-		opts = append(opts, wallet.WithUtxoFilter(allowUtxo))
+		log.Warnf("FundPsbt: allowUtxo filter is ignored; the new " +
+			"FundIntent API exposes no UTXO-filter hook")
 	}
 
-	// Let the wallet handle coin selection and/or fee estimation based on
-	// the partial TX information in the packet.
-	return b.wallet.FundPsbt(
-		packet, keyScope, minConfs, accountNum, feeSatPerKB,
-		strategy, opts...,
-	)
+	// InputsPolicy.MinConfs is unsigned, so clamp the legacy negative
+	// "include unconfirmed" sentinel to 0.
+	var minConfsU uint32
+	if minConfs > 0 {
+		minConfsU = uint32(minConfs)
+	}
+
+	// GAP (behaviour change): the legacy default-account path passed a nil
+	// key scope, which let the wallet select inputs across ALL scopes
+	// (NP2WKH/P2WKH/P2TR). FundIntent.Policy.Source is a single
+	// ScopedAccount, so here we scope coin selection to the change scope for
+	// the default/imported accounts. This narrows default-account coin
+	// selection to a single scope. The Policy is only consulted when the
+	// packet has no inputs (automatic coin selection); when inputs are
+	// present the wallet uses them directly and this Source is ignored. See
+	// the port report.
+	intent := &wallet.FundIntent{
+		Packet:  packet,
+		FeeRate: btcunit.NewSatPerKVByte(feeSatPerKB),
+		Policy: &wallet.InputsPolicy{
+			Strategy: strategy,
+			MinConfs: minConfsU,
+			Source: &wallet.ScopedAccount{
+				AccountName: accountName,
+				KeyScope:    *changeScope,
+			},
+		},
+		ChangeSource: &wallet.ScopedAccount{
+			AccountName: accountName,
+			KeyScope:    *changeScope,
+		},
+	}
+
+	// The new FundPsbt mutates the passed packet in place (adding the
+	// selected inputs, an optional change output, and sorting it) and
+	// returns the same packet together with the change output index (-1 if
+	// none). We therefore only surface the change index to the caller.
+	_, changeIndex, err := b.wallet.FundPsbt(context.Background(), intent)
+	if err != nil {
+		return 0, err
+	}
+
+	return changeIndex, nil
 }
 
 // SignPsbt expects a partial transaction with all inputs and outputs fully
@@ -175,7 +200,10 @@ func (b *BtcWallet) SignPsbt(packet *psbt.Packet) ([]uint32, error) {
 	// there are inputs that we don't know how to sign, we won't return any
 	// error. So it's possible we're not the final signer.
 	tx := packet.UnsignedTx
-	prevOutputFetcher := wallet.PsbtPrevOutputFetcher(packet)
+	prevOutputFetcher, err := wallet.PsbtPrevOutputFetcher(packet)
+	if err != nil {
+		return nil, err
+	}
 	sigHashes := txscript.NewTxSigHashes(tx, prevOutputFetcher)
 	for idx := range tx.TxIn {
 		in := &packet.Inputs[idx]
@@ -578,33 +606,14 @@ func maybeTweakPrivKeyPsbt(unknowns []*psbt.Unknown,
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) FinalizePsbt(packet *psbt.Packet, accountName string) error {
-	var (
-		keyScope   *waddrmgr.KeyScope
-		accountNum uint32
-	)
-	switch accountName {
-	// If the default/imported account name was specified, we'll provide a
-	// nil key scope to FundPsbt, allowing it to sign inputs from both key
-	// scopes (NP2WKH, P2WKH).
-	case lnwallet.DefaultAccountName:
-		accountNum = defaultAccount
+	// Ported to the role-based PsbtManager.FinalizePsbt, which no longer
+	// needs the account name or key scope: it locates each wallet-owned
+	// input and derives its signing key directly from the PSBT's BIP32
+	// derivation info. The accountName parameter is retained only to satisfy
+	// the lnwallet.WalletController signature and is unused here.
+	_ = accountName
 
-	case waddrmgr.ImportedAddrAccountName:
-		accountNum = importedAccount
-
-	// Otherwise, map the account name to its key scope and internal account
-	// number to determine if the inputs belonging to this account should be
-	// signed.
-	default:
-		scope, account, err := b.lookupFirstCustomAccount(accountName)
-		if err != nil {
-			return err
-		}
-		keyScope = &scope
-		accountNum = account
-	}
-
-	return b.wallet.FinalizePsbt(keyScope, accountNum, packet)
+	return b.wallet.FinalizePsbt(context.Background(), packet)
 }
 
 // DecorateInputs fetches the UTXO information of all inputs it can identify and
@@ -616,7 +625,16 @@ func (b *BtcWallet) FinalizePsbt(packet *psbt.Packet, accountName string) error 
 func (b *BtcWallet) DecorateInputs(packet *psbt.Packet,
 	failOnUnknown bool) error {
 
-	return b.wallet.DecorateInputs(packet, failOnUnknown)
+	// Ported to the role-based PsbtManager.DecorateInputs. Note the
+	// parameter inversion: the legacy failOnUnknown maps to the new
+	// skipUnknown (skipUnknown = !failOnUnknown). The method mutates the
+	// passed packet in place and returns it, so we discard the returned
+	// packet.
+	_, err := b.wallet.DecorateInputs(
+		context.Background(), packet, !failOnUnknown,
+	)
+
+	return err
 }
 
 // lookupFirstCustomAccount returns the first custom account found. In theory,
