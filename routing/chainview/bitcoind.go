@@ -67,7 +67,7 @@ var _ FilteredChainView = (*BitcoindFilteredChainView)(nil)
 // from RPC credentials and a ZMQ socket address for a bitcoind instance.
 func NewBitcoindFilteredChainView(
 	chainConn *chain.BitcoindConn,
-	blockCache *blockcache.BlockCache) *BitcoindFilteredChainView {
+	blockCache *blockcache.BlockCache) (*BitcoindFilteredChainView, error) {
 
 	chainView := &BitcoindFilteredChainView{
 		chainFilter:     make(map[wire.OutPoint]struct{}),
@@ -77,10 +77,16 @@ func NewBitcoindFilteredChainView(
 		quit:            make(chan struct{}),
 	}
 
-	chainView.chainClient = chainConn.NewBitcoindClient()
+	// NewBitcoindClient now returns an error (btcwallet chain-package API
+	// drift), so we propagate it to the caller.
+	chainClient, err := chainConn.NewBitcoindClient()
+	if err != nil {
+		return nil, err
+	}
+	chainView.chainClient = chainClient
 	chainView.blockQueue = newBlockEventQueue()
 
-	return chainView
+	return chainView, nil
 }
 
 // Start starts all goroutines necessary for normal operation.

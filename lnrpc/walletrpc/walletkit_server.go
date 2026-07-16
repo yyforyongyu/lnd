@@ -560,7 +560,7 @@ func (w *WalletKit) ListLeases(ctx context.Context,
 	}
 
 	return &ListLeasesResponse{
-		LockedUtxos: marshallLeases(leases),
+		LockedUtxos: marshallLeases(w.cfg.Wallet, leases),
 	}, nil
 }
 
@@ -2192,7 +2192,7 @@ func (w *WalletKit) lockAndCreateFundingResponse(packet *psbt.Packet,
 	}
 
 	// Convert the lock leases to the RPC format.
-	rpcLocks := marshallLeases(locks)
+	rpcLocks := marshallLeases(w.cfg.Wallet, locks)
 
 	return &FundPsbtResponse{
 		FundedPsbt:        buf.Bytes(),
@@ -2243,12 +2243,34 @@ func (w *WalletKit) handleChange(packet *psbt.Packet, changeIndex int32,
 				err)
 		}
 
-		deriv, trDeriv, _, err := btcwallet.Bip32DerivationFromAddress(
-			changeAddrInfo,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("could not get derivation info: "+
-				"%w", err)
+		// GAP(port): the legacy path fed a waddrmgr.ManagedAddress into
+		// btcwallet.Bip32DerivationFromAddress. The role-based
+		// AddressInfo exposes the derivation directly, so we build the
+		// BIP-32 (and taproot) derivation from it here.
+		d := changeAddrInfo.Derivation
+		if d == nil || changeAddrInfo.PubKey == nil {
+			return 0, fmt.Errorf("change address has no " +
+				"derivation info")
+		}
+
+		bip32Path := []uint32{
+			d.KeyScope.Purpose + hdkeychain.HardenedKeyStart,
+			d.KeyScope.Coin + hdkeychain.HardenedKeyStart,
+			d.Account + hdkeychain.HardenedKeyStart,
+			d.Branch,
+			d.Index,
+		}
+		pubKeyBytes := changeAddrInfo.PubKey.SerializeCompressed()
+		deriv := &psbt.Bip32Derivation{
+			PubKey:               pubKeyBytes,
+			MasterKeyFingerprint: d.MasterKeyFingerprint,
+			Bip32Path:            bip32Path,
+		}
+		trDeriv := &psbt.TaprootBip32Derivation{
+			XOnlyPubKey:          pubKeyBytes[1:],
+			MasterKeyFingerprint: d.MasterKeyFingerprint,
+			Bip32Path:            bip32Path,
+			LeafHashes:           make([][]byte, 0),
 		}
 
 		pOut.TaprootInternalKey = trDeriv.XOnlyPubKey
@@ -2271,16 +2293,36 @@ func (w *WalletKit) handleChange(packet *psbt.Packet, changeIndex int32,
 }
 
 // marshallLeases converts the lock leases to the RPC format.
-func marshallLeases(locks []*base.ListLeasedOutputResult) []*UtxoLease {
+// marshallLeases converts the role-based leased outputs to their RPC form.
+//
+// GAP(port): the role-based base.LeasedOutput no longer carries the output
+// Value/PkScript that the legacy base.ListLeasedOutputResult did, so they are
+// fetched per-lease from the wallet's outpoint info. This is an extra wallet
+// round-trip per lease; a btcwallet-side addition of Value/PkScript to
+// LeasedOutput would avoid it.
+func marshallLeases(w lnwallet.WalletController,
+	locks []*base.LeasedOutput) []*UtxoLease {
+
 	rpcLocks := make([]*UtxoLease, len(locks))
 	for idx, lock := range locks {
+		var (
+			value    uint64
+			pkScript []byte
+		)
+		if utxo, err := w.FetchOutpointInfo(
+			&lock.OutPoint,
+		); err == nil {
+
+			value = uint64(utxo.Value)
+			pkScript = utxo.PkScript
+		}
 
 		rpcLocks[idx] = &UtxoLease{
 			Id:         lock.LockID[:],
-			Outpoint:   lnrpc.MarshalOutPoint(&lock.Outpoint),
+			Outpoint:   lnrpc.MarshalOutPoint(&lock.OutPoint),
 			Expiration: uint64(lock.Expiration.Unix()),
-			PkScript:   lock.PkScript,
-			Value:      uint64(lock.Value),
+			PkScript:   pkScript,
+			Value:      value,
 		}
 	}
 
@@ -2744,11 +2786,10 @@ func (w *WalletKit) SignMessageWithAddr(_ context.Context,
 			"wallet database: %w", err)
 	}
 
-	// Verifying by checking the interface type that the wallet knows about
-	// the public and private keys so it can sign the message with the
-	// private key of this address.
-	pubKey, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
-	if !ok {
+	// The wallet must know the public key for this address so it can sign
+	// the message with the corresponding private key. The role-based
+	// AddressInfo exposes the pubkey directly (nil for non-pubkey addrs).
+	if managedAddr.PubKey == nil {
 		return nil, fmt.Errorf("private key to address is unknown")
 	}
 
@@ -2762,13 +2803,17 @@ func (w *WalletKit) SignMessageWithAddr(_ context.Context,
 	// ECDSA is used to create a compact signature which makes the public
 	// key of the signature recoverable. For Schnorr no known compact
 	// signing algorithm exists yet.
-	privKey, err := pubKey.PrivKey()
+	//
+	// NOTE(port): the private key is now fetched via the dedicated
+	// WalletController.PrivKeyForAddress rather than
+	// waddrmgr.ManagedPubKeyAddress.PrivKey().
+	privKey, err := w.cfg.Wallet.PrivKeyForAddress(addr)
 	if err != nil {
 		return nil, fmt.Errorf("no private key could be "+
 			"fetched from wallet database: %w", err)
 	}
 
-	sigBytes := ecdsa.SignCompact(privKey, digest, pubKey.Compressed())
+	sigBytes := ecdsa.SignCompact(privKey, digest, managedAddr.Compressed)
 
 	// Bitcoin signatures are base64 encoded (being compatible with
 	// bitcoin-core and btcd).
@@ -3080,6 +3125,6 @@ func (w *WalletKit) ImportTapscript(_ context.Context,
 	}
 
 	return &ImportTapscriptResponse{
-		P2TrAddress: addr.Address().String(),
+		P2TrAddress: addr.Addr.String(),
 	}, nil
 }

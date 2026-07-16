@@ -317,7 +317,14 @@ func (b *BtcWallet) Start() error {
 	// contracts. If this is a watch-only wallet, we don't have any private
 	// keys and therefore unlocking is not necessary.
 	if !walletIsWatchOnly {
-		if err := b.wallet.Unlock(b.cfg.PrivatePass, nil); err != nil {
+		// Ported to the new Controller.Unlock API. A negative timeout
+		// keeps the wallet unlocked until it is explicitly locked or
+		// stopped, matching the legacy nil lock-channel semantics.
+		err := b.wallet.Unlock(context.Background(), base.UnlockRequest{
+			Passphrase: b.cfg.PrivatePass,
+			Timeout:    -1,
+		})
+		if err != nil {
 			return err
 		}
 
@@ -377,7 +384,22 @@ func (b *BtcWallet) Start() error {
 	// create accounts for all the key families we're going to use. This
 	// will make it possible to list all the account/family xpubs in the
 	// wallet list RPC.
-	err = b.wallet.InitAccounts(scope, convertToWatchOnly, 255)
+	//
+	// NOTE: The role API exposes account creation only by name
+	// (AccountManager.NewAccount), whereas InitAccounts operates on raw
+	// account numbers within lnd's custom 1017' scope. We therefore still
+	// use InitAccounts, which requires the concrete *ScopedKeyManager. This
+	// is NOT SQL-correct: InitAccounts populates the legacy kvdb bucket
+	// only, so for SQL-backed wallets the key-family accounts never land in
+	// the store and store-backed key derivation will not find them. See the
+	// port report for the required follow-up (a number-addressable,
+	// store-backed account-init path).
+	scopedMgr, ok := scope.(*waddrmgr.ScopedKeyManager)
+	if !ok {
+		return fmt.Errorf("expected *waddrmgr.ScopedKeyManager, "+
+			"got %T", scope)
+	}
+	err = b.wallet.InitAccounts(scopedMgr, convertToWatchOnly, 255)
 	if err != nil {
 		return err
 	}
@@ -388,8 +410,15 @@ func (b *BtcWallet) Start() error {
 		return err
 	}
 
-	// Start the underlying btcwallet core.
-	b.wallet.Start()
+	// Start the underlying btcwallet core via the new Controller API.
+	//
+	// NOTE: The new Controller.Start owns the wallet's sync lifecycle,
+	// which overlaps with lnd's manual chain.Start/SynchronizeRPC wiring
+	// below. This compiles and starts the core, but the two lifecycle
+	// models are not fully reconciled here (see the port report).
+	if err := b.wallet.Start(context.Background()); err != nil {
+		return err
+	}
 
 	// Pass the rpc client into the wallet so it can sync up to the
 	// current main chain.
@@ -403,7 +432,11 @@ func (b *BtcWallet) Start() error {
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) Stop() error {
-	b.wallet.Stop()
+	// Ported to the new Controller.Stop API, which blocks until all wallet
+	// background processes have exited.
+	if err := b.wallet.Stop(context.Background()); err != nil {
+		return err
+	}
 
 	b.wallet.WaitForShutdown()
 
@@ -489,15 +522,36 @@ func (b *BtcWallet) NewAddress(t lnwallet.AddressType, change bool,
 		return nil, errNoImportedAddrGen
 	}
 
-	keyScope, account, err := b.keyScopeForAccountAddr(accountName, t)
+	// Map the lnd address type to the wallet's address type. The role-based
+	// AddressManager.NewAddress resolves the key scope from the address
+	// type and the account from its name, so we no longer resolve the key
+	// scope / account number ourselves here (the change branch is folded
+	// into the trailing bool).
+	addrType, err := lnToWaddrmgrAddrType(t)
 	if err != nil {
 		return nil, err
 	}
 
-	if change {
-		return b.wallet.NewChangeAddress(account, keyScope)
+	return b.wallet.NewAddress(
+		context.Background(), accountName, addrType, change,
+	)
+}
+
+// lnToWaddrmgrAddrType maps an lnwallet address type to the corresponding
+// waddrmgr address type used by the role-based wallet API.
+func lnToWaddrmgrAddrType(t lnwallet.AddressType) (waddrmgr.AddressType,
+	error) {
+
+	switch t {
+	case lnwallet.WitnessPubKey:
+		return waddrmgr.WitnessPubKey, nil
+	case lnwallet.NestedWitnessPubKey:
+		return waddrmgr.NestedWitnessPubKey, nil
+	case lnwallet.TaprootPubkey:
+		return waddrmgr.TaprootPubKey, nil
+	default:
+		return 0, fmt.Errorf("unknown address type")
 	}
-	return b.wallet.NewAddress(account, keyScope)
 }
 
 // LastUnusedAddress returns the last *unused* address known by the wallet. An
@@ -535,10 +589,19 @@ func (b *BtcWallet) IsOurAddress(a address.Address) bool {
 // wallet.
 //
 // NOTE: This is a part of the WalletController interface.
-func (b *BtcWallet) AddressInfo(a address.Address) (waddrmgr.ManagedAddress,
+func (b *BtcWallet) AddressInfo(a address.Address) (base.AddressInfo, error) {
+	// Ported to the role-based AddressManager.GetAddressInfo, which returns
+	// the wallet.AddressInfo struct directly.
+	return b.wallet.GetAddressInfo(context.Background(), a)
+}
+
+// PrivKeyForAddress returns the private key for a wallet-managed address.
+//
+// This is a part of the WalletController interface.
+func (b *BtcWallet) PrivKeyForAddress(a address.Address) (*btcec.PrivateKey,
 	error) {
 
-	return b.wallet.AddressInfo(a)
+	return b.wallet.PrivKeyForAddress(a)
 }
 
 // ListAccounts retrieves all accounts belonging to the wallet by default. A
@@ -694,20 +757,24 @@ func (b *BtcWallet) ListAddresses(name string,
 	addresses := make(lnwallet.AccountAddressMap)
 	addressBalance := make(map[string]btcutil.Amount)
 
-	// Retrieve all the unspent ouputs.
-	outputs, err := b.wallet.ListUnspent(0, math.MaxInt32, "")
+	// Retrieve all the unspent ouputs via the role-based UtxoManager. The
+	// new wallet.Utxo already carries the amount in satoshis and a decoded
+	// address, so no BTC->sat conversion or string handling is needed.
+	outputs, err := b.wallet.ListUnspent(context.Background(), base.UtxoQuery{
+		MinConfs: 0,
+		MaxConfs: math.MaxInt32,
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	// Calculate the total balance of each address.
 	for _, output := range outputs {
-		amount, err := btcutil.NewAmount(output.Amount)
-		if err != nil {
-			return nil, err
+		if output.Address == nil {
+			continue
 		}
 
-		addressBalance[output.Address] += amount
+		addressBalance[output.Address.String()] += output.Amount
 	}
 
 	for _, accntDetails := range accounts {
@@ -828,7 +895,12 @@ func (b *BtcWallet) ImportAccount(name string, accountPubKey *hdkeychain.Extende
 	}
 
 	if !dryRun {
-		accountProps, err := b.wallet.ImportAccount(
+		// NOT PORTED to the role API. AccountManager.ImportAccount
+		// returns a *db.AccountInfo, but lnwallet.WalletController fixes
+		// this method's return type to *waddrmgr.AccountProperties.
+		// Adapting would require migrating the shared interface off
+		// waddrmgr types. See the port report.
+		accountProps, err := b.wallet.ImportAccountDeprecated(
 			name, accountPubKey, masterKeyFingerprint, addrType,
 		)
 		if err != nil {
@@ -871,27 +943,26 @@ func (b *BtcWallet) ImportAccount(name string, accountPubKey *hdkeychain.Extende
 func (b *BtcWallet) ImportPublicKey(pubKey *btcec.PublicKey,
 	addrType waddrmgr.AddressType) error {
 
-	return b.wallet.ImportPublicKey(pubKey, addrType)
+	// Ported to the role-based AddressManager.ImportPublicKey (identical
+	// argument types, plus the context).
+	return b.wallet.ImportPublicKey(context.Background(), pubKey, addrType)
 }
 
 // ImportTaprootScript imports a user-provided taproot script into the address
 // manager. The imported script will act as a pay-to-taproot address.
-func (b *BtcWallet) ImportTaprootScript(scope waddrmgr.KeyScope,
-	tapscript *waddrmgr.Tapscript) (waddrmgr.ManagedAddress, error) {
+func (b *BtcWallet) ImportTaprootScript(_ waddrmgr.KeyScope,
+	tapscript *waddrmgr.Tapscript) (base.AddressInfo, error) {
 
-	// We want to be able to import script addresses into a watch-only
-	// wallet, which is only possible if we don't encrypt the script with
-	// the private key encryption key. By specifying the script as being
-	// "not secret", we can also decrypt the script in a watch-only wallet.
-	const isSecretScript = false
-
-	// Currently, only v1 (Taproot) scripts are supported. We don't even
-	// know what a v2 witness version would look like at this point.
-	const witnessVersionTaproot byte = 1
-
-	return b.wallet.ImportTaprootScript(
-		scope, tapscript, nil, witnessVersionTaproot, isSecretScript,
-	)
+	// Ported to the role-based AddressManager.ImportTaprootScript, which
+	// returns a wallet.AddressInfo.
+	//
+	// GAP (behaviour change): the role method takes only the tapscript and
+	// drops the legacy scope / blockstamp / witnessVersion / isSecretScript
+	// parameters. lnd previously forced witness version 1 and a non-secret
+	// import (so watch-only wallets can decrypt the script); those knobs are
+	// no longer exposed here and are decided by the wallet. See the port
+	// report.
+	return b.wallet.ImportTaprootScript(context.Background(), *tapscript)
 }
 
 // SendOutputs funds, signs, and broadcasts a Bitcoin transaction paying out to
@@ -1009,7 +1080,11 @@ func (b *BtcWallet) LeaseOutput(id wtxmgr.LockID, op wire.OutPoint,
 		return time.Time{}, wtxmgr.ErrOutputAlreadyLocked
 	}
 
-	lockedUntil, err := b.wallet.LeaseOutput(id, op, duration)
+	// Ported to the role-based UtxoManager.LeaseOutput (identical types plus
+	// the context).
+	lockedUntil, err := b.wallet.LeaseOutput(
+		context.Background(), id, op, duration,
+	)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -1018,10 +1093,14 @@ func (b *BtcWallet) LeaseOutput(id wtxmgr.LockID, op wire.OutPoint,
 }
 
 // ListLeasedOutputs returns a list of all currently locked outputs.
-func (b *BtcWallet) ListLeasedOutputs() ([]*base.ListLeasedOutputResult,
-	error) {
-
-	return b.wallet.ListLeasedOutputs()
+func (b *BtcWallet) ListLeasedOutputs() ([]*base.LeasedOutput, error) {
+	// Ported to the role-based UtxoManager.ListLeasedOutputs.
+	//
+	// GAP (behaviour change): the role method's wallet.LeasedOutput omits
+	// the Value and PkScript fields present on the legacy
+	// base.ListLeasedOutputResult. Consumers that need those must now fetch
+	// them separately (e.g. via FetchOutpointInfo). See the port report.
+	return b.wallet.ListLeasedOutputs(context.Background())
 }
 
 // ReleaseOutput unlocks an output, allowing it to be available for coin
@@ -1030,7 +1109,9 @@ func (b *BtcWallet) ListLeasedOutputs() ([]*base.ListLeasedOutputResult,
 //
 // NOTE: This method requires the global coin selection lock to be held.
 func (b *BtcWallet) ReleaseOutput(id wtxmgr.LockID, op wire.OutPoint) error {
-	return b.wallet.ReleaseOutput(id, op)
+	// Ported to the role-based UtxoManager.ReleaseOutput (identical types
+	// plus the context).
+	return b.wallet.ReleaseOutput(context.Background(), id, op)
 }
 
 // ListUnspentWitness returns all unspent outputs which are version 0 witness
@@ -1048,9 +1129,16 @@ func (b *BtcWallet) ReleaseOutput(id wtxmgr.LockID, op wire.OutPoint) error {
 func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 	accountFilter string) ([]*lnwallet.Utxo, error) {
 
-	// First, grab all the unfiltered currently unspent outputs.
+	// First, grab all the unfiltered currently unspent outputs via the
+	// role-based UtxoManager. The new wallet.Utxo already exposes the
+	// decoded pkScript, outpoint and satoshi amount, so the previous BTC
+	// string/float handling is no longer needed.
 	unspentOutputs, err := b.wallet.ListUnspent(
-		minConfs, maxConfs, accountFilter,
+		context.Background(), base.UtxoQuery{
+			MinConfs: minConfs,
+			MaxConfs: maxConfs,
+			Account:  accountFilter,
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -1060,10 +1148,7 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 	// which are p2wkh outputs or a p2wsh output nested within a p2sh output.
 	witnessOutputs := make([]*lnwallet.Utxo, 0, len(unspentOutputs))
 	for _, output := range unspentOutputs {
-		pkScript, err := hex.DecodeString(output.ScriptPubKey)
-		if err != nil {
-			return nil, err
-		}
+		pkScript := output.PkScript
 
 		addressType := lnwallet.UnknownAddressType
 		if txscript.IsPayToWitnessPubKeyHash(pkScript) {
@@ -1081,27 +1166,12 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 			addressType == lnwallet.NestedWitnessPubKey ||
 			addressType == lnwallet.TaprootPubkey {
 
-			txid, err := chainhash.NewHashFromStr(output.TxID)
-			if err != nil {
-				return nil, err
-			}
-
-			// We'll ensure we properly convert the amount given in
-			// BTC to satoshis.
-			amt, err := btcutil.NewAmount(output.Amount)
-			if err != nil {
-				return nil, err
-			}
-
 			utxo := &lnwallet.Utxo{
-				AddressType: addressType,
-				Value:       amt,
-				PkScript:    pkScript,
-				OutPoint: wire.OutPoint{
-					Hash:  *txid,
-					Index: output.Vout,
-				},
-				Confirmations: output.Confirmations,
+				AddressType:   addressType,
+				Value:         output.Amount,
+				PkScript:      pkScript,
+				OutPoint:      output.OutPoint,
+				Confirmations: int64(output.Confirmations),
 			}
 			witnessOutputs = append(witnessOutputs, utxo)
 		}

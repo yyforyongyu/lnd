@@ -1,6 +1,7 @@
 package keychain
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 
@@ -11,7 +12,6 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
-	"github.com/btcsuite/btcwallet/walletdb"
 )
 
 const (
@@ -45,18 +45,15 @@ var (
 // construction means that all key derivation will be protected under the root
 // seed of the wallet, making each derived key fully deterministic.
 type BtcWalletKeyRing struct {
-	// wallet is a pointer to the active instance of the btcwallet core.
-	// This is required as we'll need to manually open database
-	// transactions in order to derive addresses and lookup relevant keys
+	// wallet is a pointer to the active instance of the btcwallet core. Key
+	// derivation is performed through its bucket-free, role-based
+	// DerivePubKey/DerivePrivKey API so that it works for both legacy kvdb
+	// and SQL-backed wallets.
 	wallet wallet.Interface
 
 	// chainKeyScope defines the purpose and coin type to be used when generating
 	// keys for this keyring.
 	chainKeyScope waddrmgr.KeyScope
-
-	// lightningScope is a pointer to the scope that we'll be using as a
-	// sub key manager to derive all the keys that we require.
-	lightningScope *waddrmgr.ScopedKeyManager
 }
 
 // NewBtcWalletKeyRing creates a new implementation of the
@@ -79,62 +76,50 @@ func NewBtcWalletKeyRing(w wallet.Interface, coinType uint32) SecretKeyRing {
 	}
 }
 
-// keyScope attempts to return the key scope that we'll use to derive all of
-// our keys. If the scope has already been fetched from the database, then a
-// cached version will be returned. Otherwise, we'll fetch it from the database
-// and cache it for subsequent accesses.
-func (b *BtcWalletKeyRing) keyScope() (*waddrmgr.ScopedKeyManager, error) {
-	// If the scope has already been populated, then we'll return it
-	// directly.
-	if b.lightningScope != nil {
-		return b.lightningScope, nil
+// bip32Path builds the full BIP32 derivation path for the given key family and
+// index within lnd's custom key scope. lnd's keychain always derives from the
+// external (receive) branch, and models each key family as an account whose
+// number equals the family.
+func (b *BtcWalletKeyRing) bip32Path(keyFam KeyFamily,
+	index uint32) wallet.BIP32Path {
+
+	return wallet.BIP32Path{
+		KeyScope: b.chainKeyScope,
+		DerivationPath: waddrmgr.DerivationPath{
+			InternalAccount: uint32(keyFam),
+			Account:         uint32(keyFam),
+			Branch:          0,
+			Index:           index,
+		},
 	}
-
-	// Otherwise, we'll first do a check to ensure that the root manager
-	// isn't locked, as otherwise we won't be able to *use* the scope.
-	if !b.wallet.AddrManager().WatchOnly() &&
-		b.wallet.AddrManager().IsLocked() {
-
-		return nil, fmt.Errorf("cannot create BtcWalletKeyRing with " +
-			"locked waddrmgr.Manager")
-	}
-
-	// If the manager is indeed unlocked, then we'll fetch the scope, cache
-	// it, and return to the caller.
-	lnScope, err := b.wallet.AddrManager().FetchScopedKeyManager(
-		b.chainKeyScope,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	b.lightningScope = lnScope
-
-	return lnScope, nil
 }
 
-// createAccountIfNotExists will create the corresponding account for a key
-// family if it doesn't already exist in the database.
-func (b *BtcWalletKeyRing) createAccountIfNotExists(
-	addrmgrNs walletdb.ReadWriteBucket, keyFam KeyFamily,
-	scope *waddrmgr.ScopedKeyManager) error {
+// nextExternalIndex returns the next unused external (receive) key index for
+// the given key family by locating the account whose number matches the family
+// within lnd's custom key scope, and reading its external key count.
+//
+// GAP: this reads the account's recorded external key count but does not
+// atomically reserve/advance it, and for SQL-backed wallets the custom-scope
+// accounts are not present in the store (InitAccounts only populates the legacy
+// kvdb bucket). See the port report.
+func (b *BtcWalletKeyRing) nextExternalIndex(ctx context.Context,
+	keyFam KeyFamily) (uint32, error) {
 
-	// If this is the multi-sig key family, then we can return early as
-	// this is the default account that's created.
-	if keyFam == KeyFamilyMultiSig {
-		return nil
+	accounts, err := b.wallet.ListAccountsByScope(ctx, b.chainKeyScope)
+	if err != nil {
+		return 0, err
 	}
 
-	// Otherwise, we'll check if the account already exists, if so, we can
-	// once again bail early.
-	_, err := scope.AccountName(addrmgrNs, uint32(keyFam))
-	if err == nil {
-		return nil
+	for _, acct := range accounts {
+		if acct.AccountNumber != nil &&
+			*acct.AccountNumber == uint32(keyFam) {
+
+			return acct.ExternalKeyCount, nil
+		}
 	}
 
-	// If we reach this point, then the account hasn't yet been created, so
-	// we'll need to create it before we can proceed.
-	return scope.NewRawAccount(addrmgrNs, uint32(keyFam))
+	return 0, fmt.Errorf("account %d not found in key scope %v", keyFam,
+		b.chainKeyScope)
 }
 
 // DeriveNextKey attempts to derive the *next* key within the key family
@@ -142,61 +127,36 @@ func (b *BtcWalletKeyRing) createAccountIfNotExists(
 // child within this branch.
 //
 // NOTE: This is part of the keychain.KeyRing interface.
-func (b *BtcWalletKeyRing) DeriveNextKey(keyFam KeyFamily) (KeyDescriptor, error) {
-	var (
-		pubKey *btcec.PublicKey
-		keyLoc KeyLocator
-	)
+func (b *BtcWalletKeyRing) DeriveNextKey(keyFam KeyFamily) (KeyDescriptor,
+	error) {
 
-	db := b.wallet.Database()
-	err := walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+	ctx := context.Background()
 
-		scope, err := b.keyScope()
-		if err != nil {
-			return err
-		}
+	// Determine the next unused external index for this key family, then
+	// derive the corresponding public key via the wallet's bucket-free
+	// DerivePubKey.
+	//
+	// GAP (not fully runtime-correct): unlike the legacy path, which called
+	// NextExternalAddresses to atomically derive AND persist the next
+	// address, DerivePubKey does not advance/persist the address chain. See
+	// nextExternalIndex and the port report for the required by-number,
+	// store-backed "next address" primitive.
+	nextIndex, err := b.nextExternalIndex(ctx, keyFam)
+	if err != nil {
+		return KeyDescriptor{}, err
+	}
 
-		// If the account doesn't exist, then we may need to create it
-		// for the first time in order to derive the keys that we
-		// require.
-		err = b.createAccountIfNotExists(addrmgrNs, keyFam, scope)
-		if err != nil {
-			return err
-		}
-
-		addrs, err := scope.NextExternalAddresses(
-			addrmgrNs, uint32(keyFam), 1,
-		)
-		if err != nil {
-			return err
-		}
-
-		// Extract the first address, ensuring that it is of the proper
-		// interface type, otherwise we can't manipulate it below.
-		addr, ok := addrs[0].(waddrmgr.ManagedPubKeyAddress)
-		if !ok {
-			return fmt.Errorf("address is not a managed pubkey " +
-				"addr")
-		}
-
-		pubKey = addr.PubKey()
-
-		_, pathInfo, _ := addr.DerivationInfo()
-		keyLoc = KeyLocator{
-			Family: keyFam,
-			Index:  pathInfo.Index,
-		}
-
-		return nil
-	})
+	pubKey, err := b.wallet.DerivePubKey(ctx, b.bip32Path(keyFam, nextIndex))
 	if err != nil {
 		return KeyDescriptor{}, err
 	}
 
 	return KeyDescriptor{
-		PubKey:     pubKey,
-		KeyLocator: keyLoc,
+		PubKey: pubKey,
+		KeyLocator: KeyLocator{
+			Family: keyFam,
+			Index:  nextIndex,
+		},
 	}, nil
 }
 
@@ -206,51 +166,21 @@ func (b *BtcWalletKeyRing) DeriveNextKey(keyFam KeyFamily) (KeyDescriptor, error
 //
 // NOTE: This is part of the keychain.KeyRing interface.
 func (b *BtcWalletKeyRing) DeriveKey(keyLoc KeyLocator) (KeyDescriptor, error) {
-	var keyDesc KeyDescriptor
-
-	db := b.wallet.Database()
-	err := walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		scope, err := b.keyScope()
-		if err != nil {
-			return err
-		}
-
-		// If the account doesn't exist, then we may need to create it
-		// for the first time in order to derive the keys that we
-		// require. We skip this if we're using a remote signer in which
-		// case we _need_ to create all accounts when creating the
-		// wallet, so it must exist now.
-		if !b.wallet.AddrManager().WatchOnly() {
-			err = b.createAccountIfNotExists(
-				addrmgrNs, keyLoc.Family, scope,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		path := waddrmgr.DerivationPath{
-			InternalAccount: uint32(keyLoc.Family),
-			Branch:          0,
-			Index:           keyLoc.Index,
-		}
-		addr, err := scope.DeriveFromKeyPath(addrmgrNs, path)
-		if err != nil {
-			return err
-		}
-
-		keyDesc.KeyLocator = keyLoc
-		keyDesc.PubKey = addr.(waddrmgr.ManagedPubKeyAddress).PubKey()
-
-		return nil
-	})
+	// The derivation path is fully specified by the key locator, so we can
+	// derive the public key directly via the wallet's bucket-free
+	// DerivePubKey (which transparently falls back to the store for
+	// SQL-backed accounts).
+	pubKey, err := b.wallet.DerivePubKey(
+		context.Background(), b.bip32Path(keyLoc.Family, keyLoc.Index),
+	)
 	if err != nil {
-		return keyDesc, err
+		return KeyDescriptor{}, err
 	}
 
-	return keyDesc, nil
+	return KeyDescriptor{
+		KeyLocator: keyLoc,
+		PubKey:     pubKey,
+	}, nil
 }
 
 // DerivePrivKey attempts to derive the private key that corresponds to the
@@ -260,121 +190,46 @@ func (b *BtcWalletKeyRing) DeriveKey(keyLoc KeyLocator) (KeyDescriptor, error) {
 func (b *BtcWalletKeyRing) DerivePrivKey(keyDesc KeyDescriptor) (
 	*btcec.PrivateKey, error) {
 
-	var key *btcec.PrivateKey
+	ctx := context.Background()
 
-	scope, err := b.keyScope()
-	if err != nil {
-		return nil, err
+	// If the exact derivation path is known (either there's no public key
+	// to search for, or a specific non-zero index was given), we can derive
+	// the private key directly via the wallet's bucket-free DerivePrivKey,
+	// which transparently falls back to the store for SQL-backed accounts.
+	if keyDesc.PubKey == nil || keyDesc.Index > 0 {
+		return b.wallet.DerivePrivKey(
+			ctx, b.bip32Path(keyDesc.Family, keyDesc.Index),
+		)
 	}
 
-	// First, attempt to see if we can read the key directly from
-	// btcwallet's internal cache, if we can then we can skip all the
-	// operations below (fast path).
-	if keyDesc.PubKey == nil {
-		keyPath := waddrmgr.DerivationPath{
-			InternalAccount: uint32(keyDesc.Family),
-			Account:         uint32(keyDesc.Family),
-			Branch:          0,
-			Index:           keyDesc.Index,
+	// Otherwise we only know the public key and its key family, so we scan
+	// forward through the family's external branch, deriving each public
+	// key until we find the matching index, then return that private key.
+	//
+	// TODO(roasbeef): possibly move scanning into wallet to allow to be
+	// parallelized
+	for i := 0; i < MaxKeyRangeScan; i++ {
+		path := b.bip32Path(keyDesc.Family, uint32(i))
+
+		pubKey, err := b.wallet.DerivePubKey(ctx, path)
+		if err != nil {
+			return nil, err
 		}
-		privKey, err := scope.DeriveFromKeyPathCache(keyPath)
-		if err == nil {
-			return privKey, nil
+
+		// This wasn't the target key, so roll forward and try the next
+		// one.
+		if !pubKey.IsEqual(keyDesc.PubKey) {
+			continue
 		}
+
+		// This is the target public key, so derive and return the
+		// corresponding private key.
+		return b.wallet.DerivePrivKey(ctx, path)
 	}
 
-	db := b.wallet.Database()
-	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		// If the account doesn't exist, then we may need to create it
-		// for the first time in order to derive the keys that we
-		// require. We skip this if we're using a remote signer in which
-		// case we _need_ to create all accounts when creating the
-		// wallet, so it must exist now.
-		if !b.wallet.AddrManager().WatchOnly() {
-			err = b.createAccountIfNotExists(
-				addrmgrNs, keyDesc.Family, scope,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		// If the public key isn't set or they have a non-zero index,
-		// then we know that the caller instead knows the derivation
-		// path for a key.
-		if keyDesc.PubKey == nil || keyDesc.Index > 0 {
-			// Now that we know the account exists, we can safely
-			// derive the full private key from the given path.
-			path := waddrmgr.DerivationPath{
-				InternalAccount: uint32(keyDesc.Family),
-				Branch:          0,
-				Index:           keyDesc.Index,
-			}
-			addr, err := scope.DeriveFromKeyPath(addrmgrNs, path)
-			if err != nil {
-				return err
-			}
-
-			key, err = addr.(waddrmgr.ManagedPubKeyAddress).PrivKey()
-			if err != nil {
-				return err
-			}
-
-			return nil
-		}
-
-		// If the public key isn't nil, then this indicates that we
-		// need to scan for the private key, assuming that we know the
-		// valid key family.
-		nextPath := waddrmgr.DerivationPath{
-			InternalAccount: uint32(keyDesc.Family),
-			Branch:          0,
-			Index:           0,
-		}
-
-		// We'll now iterate through our key range in an attempt to
-		// find the target public key.
-		//
-		// TODO(roasbeef): possibly move scanning into wallet to allow
-		// to be parallelized
-		for i := 0; i < MaxKeyRangeScan; i++ {
-			// Derive the next key in the range and fetch its
-			// managed address.
-			addr, err := scope.DeriveFromKeyPath(
-				addrmgrNs, nextPath,
-			)
-			if err != nil {
-				return err
-			}
-			managedAddr := addr.(waddrmgr.ManagedPubKeyAddress)
-
-			// If this is the target public key, then we'll return
-			// it directly back to the caller.
-			if managedAddr.PubKey().IsEqual(keyDesc.PubKey) {
-				key, err = managedAddr.PrivKey()
-				if err != nil {
-					return err
-				}
-
-				return nil
-			}
-
-			// This wasn't the target key, so roll forward and try
-			// the next one.
-			nextPath.Index++
-		}
-
-		// If we reach this point, then we we're unable to derive the
-		// private key, so return an error back to the user.
-		return ErrCannotDerivePrivKey
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return key, nil
+	// If we reach this point, then we were unable to derive the private
+	// key, so return an error back to the user.
+	return nil, ErrCannotDerivePrivKey
 }
 
 // ECDH performs a scalar multiplication (ECDH-like operation) between the

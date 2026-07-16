@@ -46,16 +46,16 @@ func verifyInputsUnspent(inputs []*wire.TxIn, utxos []*lnwallet.Utxo) error {
 // or the wallet's internal static lock ID with the default 10-minute duration.
 func lockInputs(w lnwallet.WalletController, outpoints []wire.OutPoint,
 	customLockID *wtxmgr.LockID, customLockDuration time.Duration) (
-	[]*base.ListLeasedOutputResult, error) {
+	[]*base.LeasedOutput, error) {
 
-	locks := make(
-		[]*base.ListLeasedOutputResult, len(outpoints),
-	)
+	locks := make([]*base.LeasedOutput, len(outpoints))
 	for idx := range outpoints {
-		lock := &base.ListLeasedOutputResult{
-			LockedOutput: &wtxmgr.LockedOutput{
-				Outpoint: outpoints[idx],
-			},
+		// NOTE(port): the role-based base.LeasedOutput no longer carries
+		// PkScript/Value (they are resolved later by marshallLeases via
+		// FetchOutpointInfo), so we only populate the outpoint, lock ID
+		// and expiration here.
+		lock := &base.LeasedOutput{
+			OutPoint: outpoints[idx],
 		}
 
 		lock.LockID = chanfunding.LndInternalLockID
@@ -68,14 +68,8 @@ func lockInputs(w lnwallet.WalletController, outpoints []wire.OutPoint,
 			lockDuration = customLockDuration
 		}
 
-		// Get the details about this outpoint.
-		utxo, err := w.FetchOutpointInfo(&lock.Outpoint)
-		if err != nil {
-			return nil, fmt.Errorf("fetch outpoint info: %w", err)
-		}
-
 		expiration, err := w.LeaseOutput(
-			lock.LockID, lock.Outpoint, lockDuration,
+			lock.LockID, lock.OutPoint, lockDuration,
 		)
 		if err != nil {
 			// If we run into a problem with locking one output, we
@@ -83,7 +77,7 @@ func lockInputs(w lnwallet.WalletController, outpoints []wire.OutPoint,
 			// locked so far. If that fails as well, there's not
 			// much we can do.
 			for i := 0; i < idx; i++ {
-				op := locks[i].Outpoint
+				op := locks[i].OutPoint
 				if err := w.ReleaseOutput(
 					chanfunding.LndInternalLockID, op,
 				); err != nil {
@@ -97,8 +91,6 @@ func lockInputs(w lnwallet.WalletController, outpoints []wire.OutPoint,
 		}
 
 		lock.Expiration = expiration
-		lock.PkScript = utxo.PkScript
-		lock.Value = int64(utxo.Value)
 		locks[idx] = lock
 	}
 
