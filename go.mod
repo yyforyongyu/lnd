@@ -115,9 +115,6 @@ require (
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway v1.16.0 // indirect
-	github.com/hashicorp/errwrap v1.1.0 // indirect
-	github.com/hashicorp/go-multierror v1.1.1 // indirect
-	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/jackc/pgerrcode v0.0.0-20240316143900-6e2875d9b438 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
@@ -184,11 +181,9 @@ require (
 	go.uber.org/multierr v1.6.0 // indirect
 	go.uber.org/zap v1.17.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
-	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0
-	golang.org/x/tools v0.45.0 // indirect
 	google.golang.org/genproto v0.0.0-20250603155806-513f23925822 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
@@ -196,13 +191,10 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	modernc.org/gc/v3 v3.1.3 // indirect
 	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.53.0 // indirect
-	modernc.org/strutil v1.2.1 // indirect
-	modernc.org/token v1.1.0 // indirect
 	sigs.k8s.io/yaml v1.2.0 // indirect
 )
 
@@ -236,14 +228,14 @@ replace github.com/lightningnetwork/lnd/queue => ./queue
 
 replace github.com/lightningnetwork/lnd/ticker => ./ticker
 
-replace github.com/btcsuite/btcwallet => /Users/yong/Projects/lightning_labs/btcsuite/btcwallet-wds
+replace github.com/btcsuite/btcwallet => github.com/yyforyongyu/btcwallet v0.16.12-0.20260714182228-e0761cbd1d18
 
-replace github.com/btcsuite/btcwallet/walletdb => /Users/yong/Projects/lightning_labs/btcsuite/btcwallet-wds/walletdb
+replace github.com/btcsuite/btcwallet/walletdb => github.com/yyforyongyu/btcwallet/walletdb v1.4.5-0.20260714182228-e0761cbd1d18
 
-replace github.com/btcsuite/btcwallet/wtxmgr => /Users/yong/Projects/lightning_labs/btcsuite/btcwallet-wds/wtxmgr
+replace github.com/btcsuite/btcwallet/wtxmgr => github.com/yyforyongyu/btcwallet/wtxmgr v1.5.5-0.20260714182228-e0761cbd1d18
 
-replace github.com/btcsuite/btcwallet/wallet/txauthor => /Users/yong/Projects/lightning_labs/btcsuite/btcwallet-wds/wallet/txauthor
+replace github.com/btcsuite/btcwallet/wallet/txauthor => github.com/yyforyongyu/btcwallet/wallet/txauthor v1.3.6-0.20260714182228-e0761cbd1d18
 
-replace github.com/btcsuite/btcwallet/wallet/txrules => /Users/yong/Projects/lightning_labs/btcsuite/btcwallet-wds/wallet/txrules
+replace github.com/btcsuite/btcwallet/wallet/txrules => github.com/yyforyongyu/btcwallet/wallet/txrules v1.2.3-0.20260714182228-e0761cbd1d18
 
-replace github.com/btcsuite/btcwallet/wallet/txsizes => /Users/yong/Projects/lightning_labs/btcsuite/btcwallet-wds/wallet/txsizes
+replace github.com/btcsuite/btcwallet/wallet/txsizes => github.com/yyforyongyu/btcwallet/wallet/txsizes v1.2.6-0.20260714182228-e0761cbd1d18
