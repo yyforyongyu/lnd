@@ -16,6 +16,8 @@ import (
 	"github.com/lightningnetwork/lnd/chanbackup"
 	"github.com/lightningnetwork/lnd/funding"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
@@ -1218,9 +1220,8 @@ func testDataLossProtection(ht *lntest.HarnessTest) {
 
 		// With the channel open, we'll create a few invoices for the
 		// node that Carol will pay to in order to advance the state of
-		// the channel.
-		// TODO(halseth): have dangling HTLCs on the commitment, able to
-		// retrieve funds?
+		// the channel. A separate test case covers dangling HTLC
+		// recovery.
 		payReqs, _, _ := ht.CreatePayReqs(dave, paymentAmt, numInvoices)
 
 		// Send payments from Carol using 3 of the payment hashes
@@ -1348,6 +1349,108 @@ func testDataLossProtection(ht *lntest.HarnessTest) {
 		if daveBalance <= daveStartingBalance {
 			return fmt.Errorf("expected dave to have balance "+
 				"above %d, intead had %v", daveStartingBalance,
+				daveBalance)
+		}
+
+		return nil
+	}, defaultTimeout)
+	require.NoError(ht, err, "timeout while checking dave's balance")
+}
+
+// testDataLossProtectionHtlcRecovery tests that a stale node recovers an
+// outgoing HTLC from an unknown remote commitment after local data loss.
+func testDataLossProtectionHtlcRecovery(ht *lntest.HarnessTest) {
+	const (
+		chanAmt     = btcutil.Amount(1_000_000)
+		paymentAmt  = btcutil.Amount(50_000)
+		numInvoices = 3
+		htlcAmt     = int64(80_000)
+	)
+
+	carol := ht.NewNode(
+		"CarolHtlc", []string{"--nolisten", "--minbackoff=1h"},
+	)
+	dave := ht.NewNode("DaveHtlc", nil)
+
+	ht.FundCoins(btcutil.SatoshiPerBitcoin, carol)
+	ht.EnsureConnected(carol, dave)
+	chanPoint := ht.OpenChannel(
+		carol, dave, lntest.OpenChannelParams{Amt: chanAmt},
+	)
+
+	payReqs, _, _ := ht.CreatePayReqs(dave, paymentAmt, numInvoices)
+	ht.CompletePaymentRequests(carol, payReqs)
+	daveLocalBalance := int64(paymentAmt * numInvoices)
+	ht.AssertChannelLocalBalance(dave, chanPoint, daveLocalBalance)
+
+	preimage := ht.RandomPreimage()
+	payHash := preimage.Hash()
+	invoiceReq := &invoicesrpc.AddHoldInvoiceRequest{
+		Value:      htlcAmt,
+		CltvExpiry: finalCltvDelta,
+		Hash:       payHash[:],
+	}
+	invoice := carol.RPC.AddHoldInvoice(invoiceReq)
+	stream := carol.RPC.SubscribeSingleInvoice(payHash[:])
+
+	req := &routerrpc.SendPaymentRequest{
+		PaymentRequest: invoice.PaymentRequest,
+		FeeLimitMsat:   noFeeLimitMsat,
+	}
+	ht.SendPaymentAssertInflight(dave, req)
+	ht.AssertOutgoingHTLCActive(dave, chanPoint, payHash[:])
+	ht.AssertIncomingHTLCActive(carol, chanPoint, payHash[:])
+	ht.AssertInvoiceState(stream, lnrpc.Invoice_ACCEPTED)
+
+	chanState := ht.QueryChannelByChanPoint(dave, chanPoint)
+	stateNumPreCopy := chanState.NumUpdates
+	ht.BackupDB(dave)
+	ht.EnsureConnected(carol, dave)
+
+	payReqs, _, _ = ht.CreatePayReqs(dave, paymentAmt, numInvoices)
+	ht.CompletePaymentRequests(carol, payReqs)
+
+	ht.RestartNodeAndRestoreDB(dave)
+	ht.AssertNodeNumChannels(dave, 1)
+	ht.AssertChannelNumUpdates(dave, stateNumPreCopy, chanPoint)
+	ht.AssertPaymentStatus(dave, payHash, lnrpc.Payment_IN_FLIGHT)
+	daveStartingBalance := dave.RPC.WalletBalance().ConfirmedBalance
+
+	// Reconnect so Dave receives and stores Carol's DLP commit point
+	// before the force close confirms. The channel sync causes Carol to
+	// publish her latest commitment.
+	ht.EnsureConnected(carol, dave)
+	ht.AssertNumTxsInMempool(1)
+	ht.AssertNumWaitingClose(carol, 1)
+	ht.AssertNumWaitingClose(dave, 1)
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+
+	pending := ht.AssertNumPendingForceClose(dave, 1)[0]
+	require.Len(ht, pending.PendingHtlcs, 1)
+	pendingHtlc := pending.PendingHtlcs[0]
+	require.False(ht, pendingHtlc.Incoming)
+	require.Equal(ht, htlcAmt, pendingHtlc.Amount)
+
+	ht.Shutdown(carol)
+	ht.AssertNumPendingSweeps(dave, 1)
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+
+	pending = ht.AssertNumPendingForceClose(dave, 1)[0]
+	require.Len(ht, pending.PendingHtlcs, 1)
+	blocksTillMaturity := pending.PendingHtlcs[0].BlocksTilMaturity
+	require.Positive(ht, blocksTillMaturity)
+
+	ht.MineEmptyBlocks(int(blocksTillMaturity))
+	ht.AssertNumPendingSweeps(dave, 1)
+	ht.MineBlocksAndAssertNumTxes(1, 1)
+	ht.AssertNumPendingForceClose(dave, 0)
+	ht.AssertPaymentStatus(dave, payHash, lnrpc.Payment_FAILED)
+
+	err := wait.NoError(func() error {
+		daveBalance := dave.RPC.WalletBalance().ConfirmedBalance
+		if daveBalance <= daveStartingBalance {
+			return fmt.Errorf("expected dave balance above %d, "+
+				"instead had %v", daveStartingBalance,
 				daveBalance)
 		}
 

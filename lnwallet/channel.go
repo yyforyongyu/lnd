@@ -131,6 +131,11 @@ var (
 	ErrForceCloseLocalDataLoss = errors.New("cannot force close " +
 		"channel with local data loss")
 
+	// ErrDlpTaprootUnsupported is returned when DLP HTLC recovery is
+	// attempted for a taproot channel.
+	ErrDlpTaprootUnsupported = errors.New("taproot DLP HTLC recovery " +
+		"unsupported")
+
 	// errNoNonce is returned when a nonce is required, but none is found.
 	errNoNonce = errors.New("no nonce found")
 
@@ -8158,6 +8163,127 @@ func (r *OutgoingHtlcResolution) HtlcPoint() wire.OutPoint {
 	}
 
 	return r.ClaimOutpoint
+}
+
+type dlpHtlcMatchKey struct {
+	htlcIndex uint64
+	incoming  bool
+}
+
+// MatchDlpRemoteCommitHtlcs matches recoverable outgoing HTLCs on a remote
+// commitment transaction in a local data loss scenario. The returned HTLCs are
+// copies with OutputIndex corrected to the matched on-chain output.
+func MatchDlpRemoteCommitHtlcs(chanState *channeldb.OpenChannel,
+	commitTx *wire.MsgTx, commitPoint *btcec.PublicKey) ([]channeldb.HTLC,
+	error) {
+
+	if chanState.ChanType.IsTaproot() {
+		return nil, ErrDlpTaprootUnsupported
+	}
+	if commitTx == nil {
+		return nil, errors.New("missing commitment transaction")
+	}
+	if commitPoint == nil {
+		return nil, errors.New("missing commitment point")
+	}
+
+	keyRing := DeriveCommitmentKeys(
+		commitPoint, lntypes.Remote, chanState.ChanType,
+		&chanState.LocalChanCfg, &chanState.RemoteChanCfg,
+	)
+
+	candidates := append(
+		[]channeldb.HTLC(nil), chanState.RemoteCommitment.Htlcs...,
+	)
+	if chanState.Db != nil {
+		pendingRemoteCommit, err := chanState.RemoteCommitChainTip()
+		switch {
+		case err == nil && pendingRemoteCommit != nil:
+			candidates = append(
+				candidates,
+				pendingRemoteCommit.Commitment.Htlcs...,
+			)
+		case err == nil, errors.Is(err, channeldb.ErrNoPendingCommit):
+		case err != nil:
+			return nil, err
+		}
+	}
+
+	var (
+		seen          = make(map[dlpHtlcMatchKey]struct{})
+		outputMatches = make(map[uint32][]channeldb.HTLC)
+	)
+	for _, htlc := range candidates {
+		if htlc.Incoming {
+			continue
+		}
+
+		scriptInfo, err := genHtlcScript(
+			chanState.ChanType, htlc.Incoming, lntypes.Remote,
+			htlc.RefundTimeout, htlc.RHash, keyRing,
+			fn.None[txscript.TapLeaf](),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		var matches []uint32
+		for outputIndex, txOut := range commitTx.TxOut {
+			if txOut.Value != int64(htlc.Amt.ToSatoshis()) {
+				continue
+			}
+			if !bytes.Equal(txOut.PkScript, scriptInfo.PkScript()) {
+				continue
+			}
+
+			matches = append(matches, uint32(outputIndex))
+		}
+
+		switch len(matches) {
+		case 0:
+			continue
+		case 1:
+		default:
+			walletLog.Warnf("ChannelPoint(%v): DLP HTLC candidate "+
+				"matched multiple outputs: htlc_id=%v",
+				chanState.FundingOutpoint, htlc.HtlcIndex)
+
+			continue
+		}
+
+		matchKey := dlpHtlcMatchKey{
+			htlcIndex: htlc.HtlcIndex,
+			incoming:  htlc.Incoming,
+		}
+		if _, ok := seen[matchKey]; ok {
+			continue
+		}
+		seen[matchKey] = struct{}{}
+
+		htlc.OutputIndex = int32(matches[0])
+		outputMatches[matches[0]] = append(
+			outputMatches[matches[0]], htlc,
+		)
+	}
+
+	recoveredHtlcs := make([]channeldb.HTLC, 0, len(outputMatches))
+	for outputIndex, htlcs := range outputMatches {
+		if len(htlcs) > 1 {
+			walletLog.Warnf("ChannelPoint(%v): multiple DLP HTLC "+
+				"candidates matched output_index=%v",
+				chanState.FundingOutpoint, outputIndex)
+
+			continue
+		}
+
+		recoveredHtlcs = append(recoveredHtlcs, htlcs[0])
+	}
+
+	slices.SortFunc(recoveredHtlcs, func(a, b channeldb.HTLC) int {
+		return cmp.Compare(a.OutputIndex, b.OutputIndex)
+	})
+
+	return recoveredHtlcs, nil
 }
 
 // extractHtlcResolutions creates a series of outgoing HTLC resolutions, and
