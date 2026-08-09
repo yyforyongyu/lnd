@@ -35,6 +35,9 @@ That said, we constantly put in a lot of effort to make `lnd` safer to use and
 more secure. We will update this documentation with each safety mechanism that
 we implement.
 
+For case-by-case analysis of stolen seeds, passwords, macaroons, host access,
+and remote signers, see the [operator credential threat model](threat_model.md).
+
 The first part of this document describes the security elements that are used in
 `lnd` and how they work on a high level.   
 The second part is a list of best practices that has crystallized from bug
