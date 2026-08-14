@@ -1075,6 +1075,16 @@ func (h *htlcTimeoutResolver) sweepTimeoutTxOutput() error {
 
 		return nil
 	}
+	secondLevelOutpoint, matches, err := matchSecondLevelOutput(
+		commitSpend.SpendingTx, commitSpend.SpenderInputIndex,
+		h.htlcResolution.SweepSignDesc.Output,
+	)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return nil
+	}
 
 	waitHeight := h.deriveWaitHeight(h.htlcResolution.CsvDelay, commitSpend)
 
@@ -1095,16 +1105,6 @@ func (h *htlcTimeoutResolver) sweepTimeoutTxOutput() error {
 			waitHeight)
 	}
 
-	// We'll use this input index to determine the second-level output
-	// index on the transaction, as the signatures requires the indexes to
-	// be the same. We don't look for the second-level output script
-	// directly, as there might be more than one HTLC output to the same
-	// pkScript.
-	op := &wire.OutPoint{
-		Hash:  commitSpend.SpendingTx.TxHash(),
-		Index: commitSpend.SpenderInputIndex,
-	}
-
 	var witType input.StandardWitnessType
 	switch {
 	case h.isTaprootFinal():
@@ -1118,7 +1118,7 @@ func (h *htlcTimeoutResolver) sweepTimeoutTxOutput() error {
 	// Let the sweeper sweep the second-level output now that the CSV/CLTV
 	// locks have expired.
 	inp := h.makeSweepInput(
-		op, witType,
+		&secondLevelOutpoint, witType,
 		input.LeaseHtlcOfferedTimeoutSecondLevel,
 		&h.htlcResolution.SweepSignDesc,
 		h.htlcResolution.CsvDelay, uint32(commitSpend.SpendingHeight),
