@@ -93,6 +93,20 @@ type htlcTimeoutTestCase struct {
 	outcome channeldb.ResolverOutcome
 }
 
+type recordingSpendNotifier struct {
+	chainntnfs.ChainNotifier
+	registrations chan wire.OutPoint
+}
+
+// RegisterSpendNtfn records the watched outpoint before delegating to the
+// shared test notifier.
+func (r *recordingSpendNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
+	pkScript []byte, heightHint uint32) (*chainntnfs.SpendEvent, error) {
+
+	r.registrations <- *outpoint
+	return r.ChainNotifier.RegisterSpendNtfn(outpoint, pkScript, heightHint)
+}
+
 func genHtlcTimeoutTestCases() []htlcTimeoutTestCase {
 	fakePreimageBytes := testResPreimage[:]
 
@@ -792,7 +806,7 @@ func TestHtlcTimeoutSingleStageRemoteSpend(t *testing.T) {
 	htlcOutpoint := wire.OutPoint{Index: 3}
 
 	spendTx := &wire.MsgTx{
-		TxIn:  []*wire.TxIn{{}},
+		TxIn:  []*wire.TxIn{{PreviousOutPoint: commitOutpoint}},
 		TxOut: []*wire.TxOut{{}},
 	}
 
@@ -1021,6 +1035,10 @@ func TestHtlcTimeoutSecondStageRemoteSpend(t *testing.T) {
 //nolint:ll
 func TestHtlcTimeoutSecondStageSweeper(t *testing.T) {
 	htlcOutpoint := wire.OutPoint{Index: 3}
+	secondLevelOutput := cloneTxOut(testSignDesc.Output)
+	secondLevelOutput.PkScript = []byte{0xff, 0xff}
+	sweepSignDesc := testSignDesc
+	sweepSignDesc.Output = secondLevelOutput
 
 	timeoutTx := &wire.MsgTx{
 		TxIn: []*wire.TxIn{
@@ -1028,12 +1046,7 @@ func TestHtlcTimeoutSecondStageSweeper(t *testing.T) {
 				PreviousOutPoint: htlcOutpoint,
 			},
 		},
-		TxOut: []*wire.TxOut{
-			{
-				Value:    123,
-				PkScript: []byte{0xff, 0xff},
-			},
-		},
+		TxOut: []*wire.TxOut{cloneTxOut(secondLevelOutput)},
 	}
 
 	// We set the timeout witness since the script is used when subscribing
@@ -1068,7 +1081,7 @@ func TestHtlcTimeoutSecondStageSweeper(t *testing.T) {
 				Value:    111,
 				PkScript: []byte{0xaa, 0xaa},
 			},
-			timeoutTx.TxOut[0],
+			cloneTxOut(secondLevelOutput),
 		},
 	}
 	reSignedHash := reSignedTimeoutTx.TxHash()
@@ -1091,7 +1104,7 @@ func TestHtlcTimeoutSecondStageSweeper(t *testing.T) {
 			SignDesc: testSignDesc,
 			PeerSig:  testSig,
 		},
-		SweepSignDesc: testSignDesc,
+		SweepSignDesc: sweepSignDesc,
 	}
 
 	firstStage := &channeldb.ResolverReport{
@@ -1143,6 +1156,7 @@ func TestHtlcTimeoutSecondStageSweeper(t *testing.T) {
 		}
 	}
 
+	registrations := make(chan wire.OutPoint, 3)
 	checkpoints := []checkpoint{
 		{
 			// The output should be given to the sweeper.
@@ -1201,6 +1215,15 @@ func TestHtlcTimeoutSecondStageSweeper(t *testing.T) {
 					return nil
 				}
 
+				var watched wire.OutPoint
+				for watched != timeoutTxOutpoint {
+					select {
+					case watched = <-registrations:
+					case <-time.After(time.Second):
+						t.Fatal("expected spend registration")
+					}
+				}
+
 				mockSweepTxSpend(ctx)
 
 				// The resolver should deliver a failure
@@ -1256,8 +1279,197 @@ func TestHtlcTimeoutSecondStageSweeper(t *testing.T) {
 	}
 
 	testHtlcTimeout(
-		t, twoStageResolution, checkpoints,
+		t, twoStageResolution, checkpoints, registrations,
 	)
+}
+
+// testHtlcTimeoutOutputMatch exercises a mutated live zero-fee timeout spend.
+func testHtlcTimeoutOutputMatch(t *testing.T,
+	prepare func(*lnwallet.OutgoingHtlcResolution,
+		*chainntnfs.SpendDetail), expectedErr error) {
+
+	t.Helper()
+	op := wire.OutPoint{Index: 3}
+	timeoutTx := &wire.MsgTx{TxIn: []*wire.TxIn{{
+		PreviousOutPoint: op, Witness: wire.TxWitness{{0x01}},
+	}}, TxOut: []*wire.TxOut{cloneTxOut(testSignDesc.Output)}}
+	resolution := lnwallet.OutgoingHtlcResolution{
+		ClaimOutpoint:   op,
+		SignedTimeoutTx: timeoutTx,
+		SignDetails: &input.SignDetails{
+			SignDesc: testSignDesc,
+			PeerSig:  testSig,
+		},
+		SweepSignDesc: testSignDesc,
+	}
+	spendingTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{{}, {
+			PreviousOutPoint: op, Witness: wire.TxWitness{{0x01}},
+		}},
+		TxOut: []*wire.TxOut{{}, cloneTxOut(testSignDesc.Output)},
+	}
+	spend := newSpendDetail(op, spendingTx, 1)
+	prepare(&resolution, spend)
+
+	ctx := newHtlcResolverTestContext(t, func(htlc channeldb.HTLC,
+		cfg ResolverConfig) ContractResolver {
+
+		return newTimeoutResolver(resolution, 0, htlc, 0, cfg)
+	})
+	var reports []*channeldb.ResolverReport
+	ctx.checkpoint = func(_ ContractResolver,
+		got ...*channeldb.ResolverReport) error {
+
+		reports = got
+		return nil
+	}
+	ctx.notifier.SpendChan <- spend
+
+	resolver, ok := ctx.resolver.(*htlcTimeoutResolver)
+	require.True(t, ok)
+	err := resolver.resolveTimeoutTx()
+	if expectedErr != nil {
+		require.ErrorIs(t, err, expectedErr)
+		require.False(t, resolver.IsResolved())
+		require.Empty(t, reports)
+		require.Empty(t, ctx.resolutionChan)
+	} else {
+		require.NoError(t, err)
+		require.True(t, resolver.IsResolved())
+		require.Len(t, reports, 1)
+		require.Equal(t, spendingTx.TxHash(), *reports[0].SpendTxID)
+		require.NotNil(t, (<-ctx.resolutionChan).Failure)
+	}
+	sweeper, ok := resolver.Sweeper.(*mockSweeper)
+	require.True(t, ok)
+	require.Empty(t, sweeper.sweptInputs)
+	require.False(t, ctx.finalHtlcOutcomeStored)
+	require.Empty(t, ctx.htlcNotifier.finalHtlcEvents)
+}
+
+// TestHtlcTimeoutCheckpointsForeignOutput tests that a fully formed non-match
+// is checkpointed as a terminal timeout without a phantom sweep.
+func TestHtlcTimeoutCheckpointsForeignOutput(t *testing.T) {
+	testHtlcTimeoutOutputMatch(t, func(_ *lnwallet.OutgoingHtlcResolution,
+		spend *chainntnfs.SpendDetail) {
+
+		spend.SpendingTx.TxOut = spend.SpendingTx.TxOut[:1]
+		spend.SpenderTxHash = nil
+	}, nil)
+}
+
+// TestHtlcTimeoutRejectsMalformedOutput tests that malformed spend or resolver
+// data returns before producing terminal side effects.
+func TestHtlcTimeoutRejectsMalformedOutput(t *testing.T) {
+	testCases := []struct {
+		name    string
+		prepare func(*lnwallet.OutgoingHtlcResolution,
+			*chainntnfs.SpendDetail)
+		expectedErr error
+	}{
+		{
+			name: "missing expected output",
+			prepare: func(res *lnwallet.OutgoingHtlcResolution,
+				_ *chainntnfs.SpendDetail) {
+
+				res.SweepSignDesc.Output = nil
+			},
+			expectedErr: errInvalidSecondLevelOutput,
+		},
+		{
+			name: "nil indexed output",
+			prepare: func(_ *lnwallet.OutgoingHtlcResolution,
+				spend *chainntnfs.SpendDetail) {
+
+				spend.SpendingTx.TxOut[1] = nil
+			},
+			expectedErr: errInvalidSpendDetails,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			testHtlcTimeoutOutputMatch(
+				t, testCase.prepare, testCase.expectedErr,
+			)
+		})
+	}
+}
+
+// TestHtlcTimeoutSkipsRestoredForeignOutput tests that Launch skips a phantom
+// sweep and leaves a replayed foreign spend for Resolve to checkpoint.
+func TestHtlcTimeoutSkipsRestoredForeignOutput(t *testing.T) {
+	commitOutpoint := wire.OutPoint{Index: 3}
+	timeoutTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: commitOutpoint,
+			Witness:          wire.TxWitness{{0x01}},
+		}},
+		TxOut: []*wire.TxOut{cloneTxOut(testSignDesc.Output)},
+	}
+	resolution := lnwallet.OutgoingHtlcResolution{
+		ClaimOutpoint:   commitOutpoint,
+		SignedTimeoutTx: timeoutTx,
+		SignDetails: &input.SignDetails{
+			SignDesc: testSignDesc,
+			PeerSig:  testSig,
+		},
+		SweepSignDesc: testSignDesc,
+	}
+	foreignTx := &wire.MsgTx{
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: commitOutpoint,
+			Witness:          wire.TxWitness{{0x01}},
+		}},
+	}
+	foreignSpend := newSpendDetail(commitOutpoint, foreignTx, 0)
+
+	ctx := newHtlcResolverTestContext(t, func(htlc channeldb.HTLC,
+		cfg ResolverConfig) ContractResolver {
+
+		resolver := newTimeoutResolver(resolution, 0, htlc, 0, cfg)
+		resolver.outputIncubating = true
+		var state bytes.Buffer
+		require.NoError(t, resolver.Encode(&state))
+
+		restored, err := newTimeoutResolverFromReader(&state, cfg)
+		require.NoError(t, err)
+		restored.Supplement(htlc)
+
+		return restored
+	})
+	var reports []*channeldb.ResolverReport
+	ctx.checkpoint = func(_ ContractResolver,
+		got ...*channeldb.ResolverReport) error {
+
+		reports = got
+		return nil
+	}
+
+	resolver, ok := ctx.resolver.(*htlcTimeoutResolver)
+	require.True(t, ok)
+	sweeper, ok := resolver.Sweeper.(*mockSweeper)
+	require.True(t, ok)
+	ctx.notifier.SpendChan <- foreignSpend
+	require.NoError(t, resolver.Launch())
+	require.False(t, resolver.IsResolved())
+	require.True(t, resolver.outputIncubating)
+	require.Empty(t, sweeper.sweptInputs)
+	require.Empty(t, reports)
+	require.Empty(t, ctx.resolutionChan)
+
+	ctx.notifier.SpendChan <- foreignSpend
+	nextResolver, err := resolver.Resolve()
+	require.NoError(t, err)
+	require.Nil(t, nextResolver)
+	require.True(t, resolver.IsResolved())
+	require.Len(t, reports, 1)
+	require.Equal(t, commitOutpoint, reports[0].OutPoint)
+	require.Equal(t, foreignTx.TxHash(), *reports[0].SpendTxID)
+	require.Equal(t, channeldb.ResolverOutcomeTimeout,
+		reports[0].ResolverOutcome)
+	require.NotNil(t, (<-ctx.resolutionChan).Failure)
+	require.Empty(t, sweeper.sweptInputs)
 }
 
 // TestHtlcTimeoutSecondStageSweeperRemoteSpend tests that if a local timeout
@@ -1292,7 +1504,7 @@ func TestHtlcTimeoutSecondStageSweeperRemoteSpend(t *testing.T) {
 	timeoutTx.TxIn[0].Witness = timeoutWitness
 
 	spendTx := &wire.MsgTx{
-		TxIn:  []*wire.TxIn{{}},
+		TxIn:  []*wire.TxIn{{PreviousOutPoint: commitOutpoint}},
 		TxOut: []*wire.TxOut{{}},
 	}
 
@@ -1396,7 +1608,7 @@ func TestHtlcTimeoutSecondStageSweeperRemoteSpend(t *testing.T) {
 }
 
 func testHtlcTimeout(t *testing.T, resolution lnwallet.OutgoingHtlcResolution,
-	checkpoints []checkpoint) {
+	checkpoints []checkpoint, registrations ...chan wire.OutPoint) {
 
 	t.Helper()
 
@@ -1411,6 +1623,12 @@ func testHtlcTimeout(t *testing.T, resolution lnwallet.OutgoingHtlcResolution,
 				contractResolverKit: *newContractResolverKit(cfg),
 				htlc:                htlc,
 				htlcResolution:      resolution,
+			}
+			if len(registrations) != 0 {
+				r.Notifier = &recordingSpendNotifier{
+					ChainNotifier: r.Notifier,
+					registrations: registrations[0],
+				}
 			}
 			r.initLogger("htlcTimeoutResolver")
 
