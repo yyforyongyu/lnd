@@ -19,6 +19,7 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
+	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnmock"
@@ -304,6 +305,70 @@ func TestListLeasedOutputs(t *testing.T) {
 	require.Equal(t, parent.TxOut[0].Value, leases[0].Value)
 	require.Equal(t, parent.TxOut[0].PkScript, leases[0].PkScript)
 	backend.AssertExpectations(t)
+}
+
+// TestBtcWalletStop proves Manager releases storage before lnd stops its
+// borrowed chain source, without introducing a mock Manager lifecycle.
+func TestBtcWalletStop(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a real Manager holding a bbolt database. The chain's Stop
+	// expectation attempts a bounded reopen, which succeeds only after the
+	// Manager has joined wallet work and released the database lock.
+	params := &chaincfg.RegressionNetParams
+	source := &lnmock.MockChain{}
+	source.On("IsCurrent").Return(false).Maybe()
+	source.On("GetBestBlock").
+		Return(params.GenesisHash, int32(0), nil).Maybe()
+	source.On("GetBlockHash", int64(0)).
+		Return(params.GenesisHash, nil).Maybe()
+	source.On("GetBlockHeader", params.GenesisHash).
+		Return(&params.GenesisBlock.Header, nil).Maybe()
+	source.On("BackEnd").Return("mock").Maybe()
+	dbPath := filepath.Join(t.TempDir(), "wallet.db")
+	source.On("Stop").Run(func(mock.Arguments) {
+		db, err := walletdb.Open(
+			"bdb",
+			dbPath,
+			true,
+			time.Second,
+			false,
+		)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+	}).Return().Once()
+	manager, err := wallet.NewManager(t.Context(), wallet.ManagerConfig{
+		Backend:           wallet.DBBackendKVDB,
+		DataSource:        dbPath,
+		ChainParams:       *params,
+		ChainSource:       source,
+		KVDBPubPassphrase: defaultPubPassphrase,
+		Timeout:           time.Second,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, manager.Stop()) })
+	_, err = manager.Start(t.Context())
+	require.NoError(t, err)
+	_, err = manager.Create(wallet.CreateWalletParams{
+		Name:              "lnd",
+		Mode:              wallet.ModeImportSeed,
+		Seed:              seedBytes,
+		PubPassphrase:     defaultPubPassphrase,
+		PrivatePassphrase: []byte("test-password"),
+	})
+	require.NoError(t, err)
+	controller := &BtcWallet{
+		cfg:   &Config{Manager: manager},
+		chain: source,
+	}
+
+	// Act through WalletController's ordinary shutdown entry point.
+	err = controller.Stop()
+
+	// Assert the database was available at chain shutdown and the owned
+	// source received exactly the single Stop arranged above.
+	require.NoError(t, err)
+	source.AssertExpectations(t)
 }
 
 // TestPreviousOutpoints preserves input order and ownership in lnd's

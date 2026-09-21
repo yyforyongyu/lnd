@@ -27,6 +27,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/wait"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/stretchr/testify/require"
 )
@@ -1066,7 +1067,87 @@ func testFundPsbt(ht *lntest.HarnessTest) {
 	alice := ht.NewNodeWithCoins("Alice", nil)
 	bob := ht.NewNodeWithCoins("Bob", nil)
 
+	// Exercise owned input decoration before the existing pay-join path,
+	// which supplies metadata for its external template input itself.
+	runFundPsbtLeasedInput(ht, alice, bob)
 	runFundPsbt(ht, alice, bob)
+}
+
+// runFundPsbtLeasedInput funds a bare, owned template input without replacing
+// its existing reservation or requiring the caller to supply wallet metadata.
+func runFundPsbtLeasedInput(ht *lntest.HarnessTest,
+	alice, bob *node.HarnessNode) {
+
+	// Arrange a real owned outpoint and record its reservation before
+	// funding. Cleanup releases every resulting lease through the same
+	// public RPC.
+	utxos := alice.RPC.ListUnspent(&walletrpc.ListUnspentRequest{
+		MinConfs: 1,
+		MaxConfs: 1000000,
+	})
+	require.NotEmpty(ht, utxos.Utxos)
+	utxo := utxos.Utxos[0]
+	lockID := ht.Random32Bytes()
+	lease, err := alice.RPC.WalletKit.LeaseOutput(
+		ht.Context(), &walletrpc.LeaseOutputRequest{
+			Id:                lockID,
+			Outpoint:          utxo.Outpoint,
+			ExpirationSeconds: 600,
+		},
+	)
+	require.NoError(ht, err)
+	defer func() {
+		for _, lease := range alice.RPC.ListLeases().LockedUtxos {
+			_, err := alice.RPC.WalletKit.ReleaseOutput(
+				ht.Context(), &walletrpc.ReleaseOutputRequest{
+					Id:       lease.Id,
+					Outpoint: lease.Outpoint,
+				},
+			)
+			require.NoError(ht, err)
+		}
+	}()
+	op, err := walletrpc.UnmarshallOutPoint(utxo.Outpoint)
+	require.NoError(ht, err)
+	addr := bob.RPC.NewAddress(&lnrpc.NewAddressRequest{
+		Type: lnrpc.AddressType_WITNESS_PUBKEY_HASH,
+	})
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(wire.NewTxIn(op, nil, nil))
+	tx.AddTxOut(&wire.TxOut{
+		Value:    100000,
+		PkScript: addressToPkScript(ht, addr.Address),
+	})
+	packet, err := psbt.NewFromUnsignedTx(tx)
+	require.NoError(ht, err)
+
+	// Act using coin_select with no UTXO or key-origin fields on the input.
+	// The adapter must read these from the wallet despite the existing
+	// lease.
+	funded := fundPsbtCoinSelect(ht, alice, packet, -1)
+
+	// Assert the owned input is decorated and its original ID and expiry
+	// survive exactly. Existing signing scenarios cover spending this
+	// metadata.
+	require.Equal(ht, *op, funded.UnsignedTx.TxIn[0].PreviousOutPoint)
+	in := funded.Inputs[0]
+	require.NotNil(ht, in.WitnessUtxo)
+	require.Equal(ht, utxo.AmountSat, in.WitnessUtxo.Value)
+	require.NotEmpty(ht, in.Bip32Derivation)
+	require.Len(ht, in.Bip32Derivation[0].Bip32Path, 5)
+	pkScript, err := hex.DecodeString(utxo.PkScript)
+	require.NoError(ht, err)
+	require.Equal(ht, pkScript, in.WitnessUtxo.PkScript)
+	found := false
+	for _, retained := range alice.RPC.ListLeases().LockedUtxos {
+		if lntest.LnrpcOutpointToStr(retained.Outpoint) != op.String() {
+			continue
+		}
+		found = true
+		require.Equal(ht, lockID, retained.Id)
+		require.Equal(ht, lease.Expiration, retained.Expiration)
+	}
+	require.True(ht, found, "owned input lease disappeared during funding")
 }
 
 // runFundPsbt tests the FundPsbt RPC use case where we want to fund a PSBT
@@ -1515,6 +1596,15 @@ func assertPsbtFundSignSpend(ht *lntest.HarnessTest, alice *node.HarnessNode,
 	// type we provided in FundPsbt.
 	changeScript := finalTx.TxOut[fundResp.ChangeOutputIndex].PkScript
 	assertChangeScriptType(ht, changeScript, changeType)
+
+	// Reopen after confirmation so the owned change must be recovered from
+	// storage, rather than surviving only in the original wallet runtime.
+	ht.RestartNode(alice)
+	txHash := finalTx.TxHash()
+	ht.AssertUTXOInWallet(alice, &lnrpc.OutPoint{
+		TxidBytes:   txHash[:],
+		OutputIndex: uint32(fundResp.ChangeOutputIndex),
+	}, lnwallet.DefaultAccountName)
 }
 
 // assertChangeScriptType checks if the given script has the right type given

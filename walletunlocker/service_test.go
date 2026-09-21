@@ -522,6 +522,83 @@ func TestUnlockWallet(t *testing.T) {
 	}
 }
 
+// TestUnlockWalletSQLite keeps request cancellation separate from the retained
+// Manager's lifetime, while requiring every unlock attempt to authenticate.
+func TestUnlockWalletSQLite(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a real native wallet and the same shared pointer used by
+	// startup. Its chain mock stays unsynced so shutdown owns all
+	// background work; no request context is used as the Manager's runtime
+	// lifetime.
+	cfg := testManagerConfig(t, t.TempDir())
+	cfg.Backend = wallet.DBBackendSQLite
+	cfg.DataSource = path.Join(t.TempDir(), "wallet.sqlite")
+	manager, err := wallet.NewManager(
+		t.Context(), *cfg,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, manager.Stop())
+	})
+	_, err = manager.Start(t.Context())
+	require.NoError(t, err)
+	w, err := manager.Create(wallet.CreateWalletParams{
+		Name: "lnd",
+		Mode: wallet.
+			ModeImportSeed,
+		Seed:              testSeed,
+		PrivatePassphrase: testPassword,
+	})
+	require.NoError(t, err)
+	current := &atomic.Pointer[wallet.Wallet]{}
+	current.Store(w)
+	service := walletunlocker.New(testNetParams, nil, false, cfg)
+	service.SetManagerConfig(*cfg, manager, current)
+	req := &lnrpc.UnlockWalletRequest{WalletPassword: testPassword}
+
+	// Act first with cancellation before handoff. Then submit a wrong
+	// password to prove the canceled attempt did not leave usable private
+	// state that could let a later caller bypass authentication.
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = service.UnlockWallet(canceled, req)
+	require.ErrorIs(t, err, walletunlocker.ErrUnlockTimeout)
+	_, err = service.UnlockWallet(t.Context(), &lnrpc.UnlockWalletRequest{
+		WalletPassword: []byte("wrong password"),
+	})
+	require.Error(t, err)
+
+	// Retry with the right secret and cancel only after receiving the
+	// unlocked wallet. The goroutine exits through the canceled RPC wait.
+	ctx, cancel := context.WithTimeout(
+		t.Context(), defaultTestTimeout,
+	)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := service.UnlockWallet(ctx, req)
+		result <- err
+	}()
+	select {
+	case msg := <-service.UnlockMsgs:
+		require.Same(t, w, msg.Wallet)
+		require.Same(t, manager, msg.Manager)
+		cancel()
+	case err := <-result:
+		t.Fatalf("unlock ended before handoff: %v", err)
+	case <-ctx.Done():
+		t.Fatal("unlock handoff timed out")
+	}
+
+	// Assert the RPC ends but the handed-off wallet remains running and
+	// unlocked. This distinguishes ownership transfer from a retry cleanup.
+	require.ErrorIs(t, <-result, walletunlocker.ErrUnlockTimeout)
+	info, err := w.Info(t.Context())
+	require.NoError(t, err)
+	require.False(t, info.Locked)
+}
+
 // TestChangeWalletPasswordNewRootKey tests that we can successfully change the
 // wallet's password needed to unlock it and rotate the root key for the
 // macaroons in the same process.
@@ -753,6 +830,123 @@ func TestChangeWalletPasswordStateless(t *testing.T) {
 
 	// Check that the new password can be used to open the db.
 	assertPasswordChanged(t, testDir, req.NewPassword)
+}
+
+// TestChangeWalletPasswordCanceled verifies cancellation after rotation begins
+// leaves wallet and macaroon credentials usable with the same new password.
+func TestChangeWalletPasswordCanceled(t *testing.T) {
+	for _, backend := range []wallet.DBBackend{
+		wallet.DBBackendKVDB, wallet.DBBackendSQLite,
+	} {
+		t.Run(string(backend), func(t *testing.T) {
+			// Arrange real credential stores and a macaroon file
+			// whose removal marks admission to the password-change
+			// operation.
+			dir := t.TempDir()
+			store, err := openOrCreateTestMacStore(
+				dir, &testPassword, testNetParams,
+			)
+			require.NoError(t, err)
+			require.NoError(t, store.Close())
+			defer store.Backend.Close()
+			macFile := path.Join(dir, "admin.macaroon")
+			require.NoError(t, os.WriteFile(macFile, testMac, 0600))
+			cfg := testManagerConfig(t, dir)
+			cfg.Backend = backend
+			service := walletunlocker.New(
+				testNetParams, []string{macFile}, false, cfg,
+			)
+			service.SetMacaroonDB(store.Backend)
+			if backend == wallet.DBBackendKVDB {
+				createTestWallet(t, dir, testNetParams)
+			} else {
+				cfg.DataSource = path.Join(dir, "wallet.sqlite")
+				manager, err := wallet.NewManager(
+					t.Context(), *cfg,
+				)
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					require.NoError(t, manager.Stop())
+				})
+				_, err = manager.Start(t.Context())
+				require.NoError(t, err)
+				params := wallet.CreateWalletParams{
+					Name: "lnd",
+					Mode: wallet.
+						ModeImportSeed,
+					Seed:              testSeed,
+					PrivatePassphrase: testPassword,
+				}
+				w, err := manager.Create(params)
+				require.NoError(t, err)
+				current := &atomic.Pointer[wallet.Wallet]{}
+				current.Store(w)
+				service.SetManagerConfig(*cfg, manager, current)
+			}
+			newPassword := []byte("new-test-password")
+
+			// A failed authentication must not remove the old
+			// macaroon, even though native storage was already
+			// opened by Manager.
+			request := &lnrpc.ChangePasswordRequest{
+				CurrentPassword:    []byte("wrong password"),
+				NewPassword:        newPassword,
+				NewMacaroonRootKey: true,
+			}
+			_, err = service.ChangePassword(t.Context(), request)
+			require.Error(t, err)
+			require.FileExists(t, macFile)
+
+			// Act by canceling once rotation has started, while the
+			// RPC is waiting for either credential work or the
+			// daemon reply.
+			ctx, cancel := context.WithTimeout(
+				t.Context(), defaultTestTimeout,
+			)
+			defer cancel()
+			result := make(chan error, 1)
+			request.CurrentPassword = testPassword
+			go func() {
+				_, err := service.ChangePassword(ctx, request)
+				result <- err
+			}()
+			require.Eventually(t, func() bool {
+				_, err := os.Stat(macFile)
+				return os.IsNotExist(err)
+			}, defaultTestTimeout, time.Millisecond)
+			cancel()
+			require.ErrorIs(
+				t,
+				<-result,
+				walletunlocker.ErrUnlockTimeout,
+			)
+
+			// Assert both credentials after cancellation. If
+			// handoff won the race, first close KVDB or relock the
+			// retained SQL wallet; a fresh unlock must authenticate
+			// the new wallet password.
+			select {
+			case msg := <-service.UnlockMsgs:
+				if backend == wallet.DBBackendKVDB {
+					require.NoError(t, msg.UnloadWallet())
+				} else {
+					require.NoError(
+						t,
+						msg.Wallet.Lock(t.Context()),
+					)
+				}
+			default:
+			}
+			_, _, cleanup, err := service.LoadAndUnlock(
+				newPassword,
+				0,
+			)
+			require.NoError(t, err)
+			require.NoError(t, cleanup())
+			require.NoError(t, store.Backend.Close())
+			assertPasswordChanged(t, dir, newPassword)
+		})
+	}
 }
 
 // doChangePassword completes the RPC response and returns its error to the

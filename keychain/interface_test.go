@@ -138,6 +138,36 @@ func createTestBtcWallet(t testing.TB, coinType uint32) (*wallet.Wallet, error) 
 		return nil, err
 	}
 
+	// Allocate in an otherwise unused family, then replace the Manager.
+	// This proves allocation is durable independently of runtime caches.
+	ring := NewBtcWalletKeyRing(w, coinType)
+	first, err := ring.DeriveNextKey(KeyFamily(255))
+	require.NoError(t, err)
+	require.NoError(t, manager.Stop())
+	reopened, err := wallet.NewManager(t.Context(), managerConfig)
+	require.NoError(t, err)
+	manager = reopened
+	wallets, err = manager.Start(t.Context())
+	require.NoError(t, err)
+	require.Len(t, wallets, 1)
+	w = wallets[0]
+	err = w.Unlock(t.Context(), wallet.UnlockRequest{
+		Passphrase: pass,
+		Timeout:    -1,
+	})
+	require.NoError(t, err)
+	ring = NewBtcWalletKeyRing(w, coinType)
+	next, err := ring.DeriveNextKey(KeyFamily(255))
+
+	// Assert reopen advances the persisted cursor and preserves exact
+	// lookup of the allocated key; remaining tests receive this reopened
+	// runtime.
+	require.NoError(t, err)
+	require.Equal(t, first.Index+1, next.Index)
+	previous, err := ring.DeriveKey(first.KeyLocator)
+	require.NoError(t, err)
+	require.True(t, first.PubKey.IsEqual(previous.PubKey))
+
 	return w, nil
 }
 
