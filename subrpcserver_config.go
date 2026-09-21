@@ -186,6 +186,11 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 			subCfgValue.FieldByName("Wallet").Set(
 				reflect.ValueOf(cc.Wallet),
 			)
+			// Lease reporting reuses the validated storage choice.
+			subCfgValue.FieldByName("NativeSQLWallet").Set(
+				reflect.ValueOf(cfg.DB.UseNativeSQL),
+			)
+
 			subCfgValue.FieldByName("CoinSelectionLocker").Set(
 				reflect.ValueOf(cc.Wallet),
 			)

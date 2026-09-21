@@ -8,24 +8,25 @@ import (
 	"time"
 
 	"github.com/btcsuite/btclog/v2"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/kvdb/etcd"
 	"github.com/lightningnetwork/lnd/kvdb/postgres"
 	"github.com/lightningnetwork/lnd/kvdb/sqlbase"
 	"github.com/lightningnetwork/lnd/kvdb/sqlite"
 	"github.com/lightningnetwork/lnd/lnrpc"
-	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
 	"github.com/lightningnetwork/lnd/sqldb"
 )
 
 const (
-	ChannelDBName     = "channel.db"
-	MacaroonDBName    = "macaroons.db"
-	DecayedLogDbName  = "sphinxreplay.db"
-	TowerClientDBName = "wtclient.db"
-	TowerServerDBName = "watchtower.db"
-	WalletDBName      = "wallet.db"
-	NeutrinoDBName    = "neutrino.db"
+	ChannelDBName      = "channel.db"
+	MacaroonDBName     = "macaroons.db"
+	DecayedLogDbName   = "sphinxreplay.db"
+	TowerClientDBName  = "wtclient.db"
+	TowerServerDBName  = "watchtower.db"
+	WalletDBName       = "wallet.db"
+	WalletSQLiteDBName = "wallet.sqlite"
+	NeutrinoDBName     = "neutrino.db"
 
 	SqliteChannelDBName  = "channel.sqlite"
 	SqliteChainDBName    = "chain.sqlite"
@@ -245,9 +246,8 @@ type DatabaseBackends struct {
 	// server data. This might be nil if the watchtower server is disabled.
 	TowerServerDB kvdb.Backend
 
-	// WalletDB is an option that instructs the wallet loader where to load
-	// the underlying wallet database from.
-	WalletDB btcwallet.LoaderOption
+	// WalletDB locates the wallet database owned by its Manager.
+	WalletDB wallet.ManagerConfig
 
 	// NativeSQLStore holds a reference to the native SQL store that can
 	// be used for native SQL queries for tables that already support it.
@@ -367,18 +367,6 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 		}
 		closeFuncs[NSTowerServerDB] = etcdTowerServerBackend.Close
 
-		etcdWalletBackend, err := kvdb.Open(
-			kvdb.EtcdBackendName, ctx,
-			db.Etcd.
-				CloneWithSubNamespace(NSWalletDB).
-				CloneWithSingleWriter(),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error opening etcd macaroon "+
-				"DB: %v", err)
-		}
-		closeFuncs[NSWalletDB] = etcdWalletBackend.Close
-
 		returnEarly = false
 
 		return &DatabaseBackends{
@@ -389,14 +377,12 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 			DecayedLogDB:  etcdDecayedLogBackend,
 			TowerClientDB: etcdTowerClientBackend,
 			TowerServerDB: etcdTowerServerBackend,
-			// The wallet loader will attempt to use/create the
-			// wallet in the replicated remote DB if we're running
-			// in a clustered environment. This will ensure that all
-			// members of the cluster have access to the same wallet
-			// state.
-			WalletDB: btcwallet.LoaderWithExternalWalletDB(
-				etcdWalletBackend,
-			),
+			// Manager cannot adopt an externally owned walletdb
+			// handle. Preserve the selected mode so startup reports
+			// that limit.
+			WalletDB: wallet.ManagerConfig{
+				Backend: "etcd-walletdb",
+			},
 			Remote:     true,
 			CloseFuncs: closeFuncs,
 		}, nil
@@ -477,7 +463,40 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 			return nil, fmt.Errorf("error opening postgres wallet "+
 				"DB: %v", err)
 		}
-		closeFuncs[NSWalletDB] = postgresWalletBackend.Close
+		// Read the existing wallet marker before selecting native
+		// storage. A populated walletdb needs migration; a new native
+		// wallet must never silently replace its keys. This probe owns
+		// no runtime.
+		err = kvdb.View(postgresWalletBackend, func(tx kvdb.RTx) error {
+			bucket := tx.ReadBucket([]byte("lnwallet"))
+			if bucket == nil {
+				return nil
+			}
+			if string(bucket.Get([]byte("ready"))) == "ready" {
+				return fmt.Errorf("existing walletdb " +
+					"requires migration before " +
+					"native wallet " +
+					"storage can be used")
+			}
+
+			return nil
+		}, func() {})
+		closeErr := postgresWalletBackend.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if !db.UseNativeSQL {
+			return nil, fmt.Errorf("managed wallet cannot open " +
+				"external postgres walletdb storage")
+		}
+		if lnrpc.FileExists(filepath.Join(walletDBPath, WalletDBName)) {
+			return nil, fmt.Errorf("existing bbolt wallet " +
+				"requires migration before native " +
+				"wallet storage can be used")
+		}
 
 		var nativeSQLStore sqldb.DB
 		if db.UseNativeSQL {
@@ -512,14 +531,14 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 			DecayedLogDB:  postgresDecayedLogBackend,
 			TowerClientDB: postgresTowerClientBackend,
 			TowerServerDB: postgresTowerServerBackend,
-			// The wallet loader will attempt to use/create the
-			// wallet in the replicated remote DB if we're running
-			// in a clustered environment. This will ensure that all
-			// members of the cluster have access to the same wallet
-			// state.
-			WalletDB: btcwallet.LoaderWithExternalWalletDB(
-				postgresWalletBackend,
-			),
+			// Native wallet storage has separate tables/files and
+			// is opened and closed exclusively by the wallet
+			// Manager.
+			WalletDB: wallet.ManagerConfig{
+				Backend:        wallet.DBBackendPostgres,
+				DataSource:     db.Postgres.Dsn,
+				MaxConnections: db.Postgres.MaxConnections,
+			},
 			NativeSQLStore: nativeSQLStore,
 			Remote:         true,
 			CloseFuncs:     closeFuncs,
@@ -599,7 +618,40 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 			return nil, fmt.Errorf("error opening sqlite macaroon "+
 				"DB: %v", err)
 		}
-		closeFuncs[NSWalletDB] = sqliteWalletBackend.Close
+		// Read the existing wallet marker before selecting native
+		// storage. A populated walletdb needs migration; a new native
+		// wallet must never silently replace its keys. This probe owns
+		// no runtime.
+		err = kvdb.View(sqliteWalletBackend, func(tx kvdb.RTx) error {
+			bucket := tx.ReadBucket([]byte("lnwallet"))
+			if bucket == nil {
+				return nil
+			}
+			if string(bucket.Get([]byte("ready"))) == "ready" {
+				return fmt.Errorf("existing walletdb " +
+					"requires migration before " +
+					"native wallet " +
+					"storage can be used")
+			}
+
+			return nil
+		}, func() {})
+		closeErr := sqliteWalletBackend.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if !db.UseNativeSQL {
+			return nil, fmt.Errorf("managed wallet cannot open " +
+				"external sqlite walletdb storage")
+		}
+		if lnrpc.FileExists(filepath.Join(walletDBPath, WalletDBName)) {
+			return nil, fmt.Errorf("existing bbolt wallet " +
+				"requires migration before native " +
+				"wallet storage can be used")
+		}
 
 		var nativeSQLStore sqldb.DB
 		if db.UseNativeSQL {
@@ -635,14 +687,16 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 			DecayedLogDB:  sqliteDecayedLogBackend,
 			TowerClientDB: sqliteTowerClientBackend,
 			TowerServerDB: sqliteTowerServerBackend,
-			// The wallet loader will attempt to use/create the
-			// wallet in the replicated remote DB if we're running
-			// in a clustered environment. This will ensure that all
-			// members of the cluster have access to the same wallet
-			// state.
-			WalletDB: btcwallet.LoaderWithExternalWalletDB(
-				sqliteWalletBackend,
-			),
+			// Native wallet storage has separate tables/files and
+			// is opened and closed exclusively by the wallet
+			// Manager.
+			WalletDB: wallet.ManagerConfig{
+				Backend: wallet.DBBackendSQLite,
+				DataSource: filepath.Join(
+					walletDBPath, WalletSQLiteDBName,
+				),
+				MaxConnections: db.Sqlite.MaxConnections,
+			},
 			NativeSQLStore: nativeSQLStore,
 			CloseFuncs:     closeFuncs,
 		}, nil
@@ -740,14 +794,16 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 		DecayedLogDB:  decayedLogBackend,
 		TowerClientDB: towerClientBackend,
 		TowerServerDB: towerServerBackend,
-		// When "running locally", LND will use the bbolt wallet.db to
-		// store the wallet located in the chain data dir, parametrized
-		// by the active network. The wallet loader has its own cleanup
-		// method so we don't need to add anything to our map (in fact
-		// nothing is opened just yet).
-		WalletDB: btcwallet.LoaderWithLocalWalletDB(
-			walletDBPath, db.Bolt.NoFreelistSync, db.Bolt.DBTimeout,
-		),
+		// Manager opens the existing local wallet file after the public
+		// passphrase is available and owns its eventual close.
+		WalletDB: wallet.ManagerConfig{
+			Backend: wallet.DBBackendKVDB,
+			DataSource: filepath.Join(
+				walletDBPath, WalletDBName,
+			),
+			NoFreelistSync: db.Bolt.NoFreelistSync,
+			Timeout:        db.Bolt.DBTimeout,
+		},
 		CloseFuncs: closeFuncs,
 	}, nil
 }

@@ -1,19 +1,22 @@
 package btcwallet
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
-	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -28,7 +31,24 @@ import (
 func (b *BtcWallet) FetchOutpointInfo(prevOut *wire.OutPoint) (*lnwallet.Utxo,
 	error) {
 
-	prevTx, txOut, confirmations, err := b.wallet.FetchOutpointInfo(prevOut)
+	// The public UTXO read preserves lease state; parent bytes come from
+	// transaction history for callers that need a complete previous tx.
+	utxo, err := b.wallet.GetUtxo(context.Background(), *prevOut)
+	// WalletController callers distinguish foreign inputs from unavailable
+	// wallet state using ErrNotMine, including externally funded PSBTs.
+	if errors.Is(err, base.ErrUnknownOutput) {
+		return nil, lnwallet.ErrNotMine
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	detail, err := b.wallet.GetTx(context.Background(), prevOut.Hash)
+	if err != nil {
+		return nil, err
+	}
+	prevTx := wire.NewMsgTx(2)
+	err = prevTx.Deserialize(bytes.NewReader(detail.RawTx))
 	if err != nil {
 		return nil, err
 	}
@@ -36,19 +56,19 @@ func (b *BtcWallet) FetchOutpointInfo(prevOut *wire.OutPoint) (*lnwallet.Utxo,
 	// Then, we'll populate all of the information required by the struct.
 	addressType := lnwallet.UnknownAddressType
 	switch {
-	case txscript.IsPayToWitnessPubKeyHash(txOut.PkScript):
+	case txscript.IsPayToWitnessPubKeyHash(utxo.PkScript):
 		addressType = lnwallet.WitnessPubKey
-	case txscript.IsPayToScriptHash(txOut.PkScript):
+	case txscript.IsPayToScriptHash(utxo.PkScript):
 		addressType = lnwallet.NestedWitnessPubKey
-	case txscript.IsPayToTaproot(txOut.PkScript):
+	case txscript.IsPayToTaproot(utxo.PkScript):
 		addressType = lnwallet.TaprootPubkey
 	}
 
 	return &lnwallet.Utxo{
 		AddressType:   addressType,
-		Value:         btcutil.Amount(txOut.Value),
-		PkScript:      txOut.PkScript,
-		Confirmations: confirmations,
+		Value:         utxo.Amount,
+		PkScript:      utxo.PkScript,
+		Confirmations: int64(utxo.Confirmations),
 		OutPoint:      *prevOut,
 		PrevTx:        prevTx,
 	}, nil
@@ -59,16 +79,33 @@ func (b *BtcWallet) FetchOutpointInfo(prevOut *wire.OutPoint) (*lnwallet.Utxo,
 func (b *BtcWallet) FetchDerivationInfo(
 	pkScript []byte) (*psbt.Bip32Derivation, error) {
 
-	return b.wallet.FetchDerivationInfo(pkScript)
+	// Resolve the owned address from its script before asking the wallet
+	// for origin metadata; this also covers nested witness scripts.
+	info, err := b.wallet.ScriptForOutput(context.Background(), wire.TxOut{
+		PkScript: pkScript,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return b.wallet.GetDerivationInfo(context.Background(), info.Addr)
 }
 
 // ScriptForOutput returns the address, witness program and redeem script for a
 // given UTXO. An error is returned if the UTXO does not belong to our wallet or
 // it is not a managed pubKey address.
 func (b *BtcWallet) ScriptForOutput(output *wire.TxOut) (
-	waddrmgr.ManagedPubKeyAddress, []byte, []byte, error) {
+	*base.OutputScriptInfo, error) {
 
-	return b.wallet.ScriptForOutput(output)
+	// Return the wallet-owned snapshot directly so callers retain both
+	// nested scripts and key origin without a legacy managed-address
+	// object.
+	info, err := b.wallet.ScriptForOutput(context.Background(), *output)
+	if err != nil {
+		return nil, err
+	}
+
+	return &info, nil
 }
 
 // deriveKeyByBIP32Path derives a key described by a BIP32 path. We expect the
@@ -156,7 +193,11 @@ func (b *BtcWallet) deriveKeyByBIP32Path(path []uint32) (*btcec.PrivateKey,
 		Index:           index,
 	}
 
-	privKey, err := b.wallet.DeriveFromKeyPath(scope, keyPath)
+	fullPath := base.BIP32Path{
+		KeyScope:       scope,
+		DerivationPath: keyPath,
+	}
+	privKey, err := b.wallet.DerivePrivKey(context.Background(), fullPath)
 	if err != nil {
 		return nil, fmt.Errorf("error deriving key from path %#v: %w",
 			keyPath, err)
@@ -191,7 +232,10 @@ func (b *BtcWallet) deriveKeyByLocator(
 		Index:           keyLoc.Index,
 	}
 
-	key, err := b.wallet.DeriveFromKeyPathAddAccount(scope, path)
+	key, err := b.wallet.DerivePrivKey(context.Background(), base.BIP32Path{
+		KeyScope:       scope,
+		DerivationPath: path,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -220,14 +264,24 @@ func (b *BtcWallet) fetchPrivKey(
 	// Otherwise, we'll attempt to derive the key based on the address.
 	// This will only work if we've already derived this address in the
 	// past, since the wallet relies on a mapping of addr -> key.
-	key, err := b.wallet.PrivKeyForAddress(addr)
+	key, err := b.wallet.GetPrivKeyForAddress(context.Background(), addr)
 	switch {
 	// If we didn't find this key in the wallet, then there's a chance that
 	// this is actually an "empty" key locator. The legacy KeyLocator
 	// format failed to properly distinguish an empty key locator from the
 	// very first in the index (0, 0).IsEmpty() == true.
-	case waddrmgr.IsError(err, waddrmgr.ErrAddressNotFound) && emptyLocator:
-		return b.deriveKeyByLocator(keyDesc.KeyLocator)
+	case errors.Is(err, base.ErrNoAssocPrivateKey) && emptyLocator:
+		// The maintained signer uses the same error for unknown and
+		// watch-only addresses. Only an unknown address permits the
+		// legacy (0,0) fallback; never replace an owned public key.
+		_, addrErr := b.wallet.GetAddressInfo(
+			context.Background(), addr,
+		)
+		if errors.Is(addrErr, base.ErrAddressNotFound) {
+			return b.deriveKeyByLocator(keyDesc.KeyLocator)
+		}
+
+		return nil, err
 
 	case err != nil:
 		return nil, err
@@ -389,17 +443,23 @@ func (b *BtcWallet) ComputeInputScript(tx *wire.MsgTx,
 	}
 
 	// Let the wallet compute the input script now.
-	witness, sigScript, err := b.wallet.ComputeInputScript(
-		tx, signDesc.Output, signDesc.InputIndex, signDesc.SigHashes,
-		signDesc.HashType, privKeyTweaker,
+	script, err := b.wallet.ComputeUnlockingScript(
+		context.Background(), &base.UnlockingScriptParams{
+			Tx:         tx,
+			Output:     signDesc.Output,
+			InputIndex: signDesc.InputIndex,
+			SigHashes:  signDesc.SigHashes,
+			HashType:   signDesc.HashType,
+			Tweaker:    privKeyTweaker,
+		},
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	return &input.Script{
-		Witness:   witness,
-		SigScript: sigScript,
+		Witness:   script.Witness,
+		SigScript: script.SigScript,
 	}, nil
 }
 

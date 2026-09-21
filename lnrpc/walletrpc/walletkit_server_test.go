@@ -24,8 +24,10 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,33 +36,38 @@ import (
 func TestMarshallLeasesIncludesSpendProgress(t *testing.T) {
 	t.Parallel()
 
-	testCases := []int32{0, 123, -1}
-	for _, spendHeight := range testCases {
-		testName := fmt.Sprintf("height %d", spendHeight)
-		t.Run(testName, func(t *testing.T) {
-			t.Parallel()
+	// Arrange the real adapter because the maintained lease DTO cannot
+	// represent confirmation-depth state in an in-memory fixture. Request
+	// that state through WalletKit before attempting to inspect its
+	// progress.
+	controller := &btcwallet.BtcWallet{}
+	rpcServer, _, err := New(&Config{
+		Wallet:              controller,
+		CoinSelectionLocker: &lnwallet.LightningWallet{},
+	})
+	require.NoError(t, err)
 
-			lockedOutput := &wtxmgr.LockedOutput{
-				Outpoint:               wire.OutPoint{Index: 2},
-				LockID:                 wtxmgr.LockID{1},
-				Expiration:             time.Unix(123, 0),
-				ReleaseAfterSpendConfs: 6,
-				ConfirmedSpendHeight:   spendHeight,
-			}
-			locks := []*wallet.ListLeasedOutputResult{{
-				LockedOutput: lockedOutput,
-				Value:        1000,
-				PkScript:     []byte{0x51},
-			}}
+	// Act by acquiring a confirmation-controlled lease through the public
+	// request. Unsupported storage must remain a visible failure here.
+	_, err = rpcServer.LeaseOutput(t.Context(), &LeaseOutputRequest{
+		Id: bytes.Repeat([]byte{1}, 32),
+		Outpoint: &lnrpc.OutPoint{
+			TxidBytes:   make([]byte, 32),
+			OutputIndex: 2,
+		},
+		ReleaseAfterSpendConfs: 6,
+	})
 
-			rpcLocks := marshallLeases(locks)
-			require.Len(t, rpcLocks, 1)
-			require.Equal(
-				t, spendHeight,
-				rpcLocks[0].ConfirmedSpendHeight,
-			)
-		})
-	}
+	// Assert the existing success contract before reading persisted
+	// progress; a missing lease capability cannot be replaced by synthetic
+	// DTO fields.
+	require.NoError(t, err)
+	leases, err := controller.ListLeasedOutputs()
+	require.NoError(t, err)
+	rpcLocks := marshallLeases(leases)
+	require.Len(t, rpcLocks, 1)
+	require.Equal(t, uint32(6), rpcLocks[0].ReleaseAfterSpendConfs)
+	require.Zero(t, rpcLocks[0].ConfirmedSpendHeight)
 }
 
 // TestWitnessTypeMapping tests that the two witness type enums in the `input`
@@ -104,20 +111,31 @@ type mockCoinSelectionLocker struct {
 	fail bool
 }
 
-// renewalWallet returns a persisted lease after extending it through the
-// legacy lease method.
+// renewalWallet records lease reads and mutations at the RPC boundary.
+// Unarranged operations fail instead of simulating unavailable depth state.
 type renewalWallet struct {
-	*leaseOptionsWallet
-
-	leases  []*wallet.ListLeasedOutputResult
-	listErr error
+	lnwallet.WalletController
+	testifymock.Mock
 }
 
-// ListLeasedOutputs returns the persisted leases visible after renewal.
+// ListLeasedOutputs returns the arranged persisted lease view.
 func (w *renewalWallet) ListLeasedOutputs() (
 	[]*wallet.ListLeasedOutputResult, error) {
 
-	return w.leases, w.listErr
+	args := w.Called()
+	leases, _ := args.Get(0).([]*wallet.ListLeasedOutputResult)
+
+	return leases, args.Error(1)
+}
+
+// LeaseOutput records that a request reached the wallet mutation boundary.
+func (w *renewalWallet) LeaseOutput(id wtxmgr.LockID, op wire.OutPoint,
+	duration time.Duration) (time.Time, error) {
+
+	args := w.Called(id, op, duration)
+	expiration, _ := args.Get(0).(time.Time)
+
+	return expiration, args.Error(1)
 }
 
 // WithCoinSelectLock runs the callback and optionally returns a test error.
@@ -171,24 +189,23 @@ func TestLeaseOutputReturnsEffectiveRenewalDepth(t *testing.T) {
 
 	lockID := wtxmgr.LockID{1}
 	outpoint := wire.OutPoint{Index: 1}
-	controller := &renewalWallet{
-		leaseOptionsWallet: &leaseOptionsWallet{
-			WalletController: &mock.WalletController{},
+	// Arrange the adapter's actual capability boundary. Installing a lease
+	// through the public operation avoids inventing metadata absent from
+	// btcwallet's maintained result type.
+	controller := &btcwallet.BtcWallet{}
+	_, err := controller.LeaseOutputWithOptions(
+		lockID, outpoint, time.Minute, lnwallet.LeaseOutputOptions{
+			ReleaseAfterSpendConfs: 6,
 		},
-		leases: []*wallet.ListLeasedOutputResult{{
-			LockedOutput: &wtxmgr.LockedOutput{
-				Outpoint:               outpoint,
-				LockID:                 lockID,
-				ReleaseAfterSpendConfs: 6,
-			},
-		}},
-	}
+	)
+	require.NoError(t, err)
 	rpcServer, _, err := New(&Config{
 		Wallet:              controller,
-		CoinSelectionLocker: &mockCoinSelectionLocker{},
+		CoinSelectionLocker: &lnwallet.LightningWallet{},
 	})
 	require.NoError(t, err)
 
+	// Act by renewing with zero depth, which must retain the stored policy.
 	resp, err := rpcServer.LeaseOutput(t.Context(), &LeaseOutputRequest{
 		Id: lockID[:],
 		Outpoint: &lnrpc.OutPoint{
@@ -197,39 +214,186 @@ func TestLeaseOutputReturnsEffectiveRenewalDepth(t *testing.T) {
 		},
 		ExpirationSeconds: 60,
 	})
+	// Assert the persisted depth survives renewal rather than being reset.
 	require.NoError(t, err)
 	require.Equal(t, uint32(6), resp.ReleaseAfterSpendConfs)
-	require.Equal(t, 1, controller.legacyCalls)
 }
 
-// TestLeaseOutputIgnoresRenewalDepthReadError verifies an informational depth
-// lookup cannot prevent a successful legacy lease.
-func TestLeaseOutputIgnoresRenewalDepthReadError(t *testing.T) {
+// TestLeaseOutputDepthReadback permits timed leases only when their public
+// depth response is known, rejecting ambiguous legacy renewals before mutation.
+func TestLeaseOutputDepthReadback(t *testing.T) {
 	t.Parallel()
 
+	// Arrange a same-owner lease without inventing depth fields absent from
+	// the maintained result. Cases distinguish known native-SQL policy,
+	// fresh legacy creation and an existing or unreadable legacy policy.
 	lockID := wtxmgr.LockID{1}
-	controller := &renewalWallet{
-		leaseOptionsWallet: &leaseOptionsWallet{
-			WalletController: &mock.WalletController{},
+	outpoint := wire.OutPoint{Index: 1}
+	expiration := time.Unix(123, 0)
+	persisted := []*wallet.ListLeasedOutputResult{
+		{
+			LockedOutput: &wtxmgr.LockedOutput{
+				LockID:   lockID,
+				Outpoint: outpoint,
+			},
 		},
-		listErr: errors.New("list leases failed"),
 	}
-	rpcServer, _, err := New(&Config{
-		Wallet:              controller,
-		CoinSelectionLocker: &mockCoinSelectionLocker{},
-	})
-	require.NoError(t, err)
-
-	resp, err := rpcServer.LeaseOutput(t.Context(), &LeaseOutputRequest{
-		Id: lockID[:],
-		Outpoint: &lnrpc.OutPoint{
-			TxidBytes: make([]byte, 32),
+	testCases := []struct {
+		name      string
+		nativeSQL bool
+		existing  bool
+		listErr   error
+		wantErr   string
+	}{
+		{
+			name:      "native SQL timed lease",
+			nativeSQL: true,
 		},
-		ExpirationSeconds: 60,
-	})
-	require.NoError(t, err)
-	require.Zero(t, resp.ReleaseAfterSpendConfs)
-	require.Equal(t, 1, controller.legacyCalls)
+		{
+			name: "fresh legacy timed lease",
+		},
+		{
+			name:     "ambiguous legacy renewal",
+			existing: true,
+			wantErr:  "metadata is unavailable",
+		},
+		{
+			name:    "legacy read failure",
+			listErr: errors.New("list leases failed"),
+			wantErr: "list leases failed",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange permitted reads and mutations. Rejected
+			// requests have no mutation expectation.
+			controller := &renewalWallet{}
+			if !tc.nativeSQL {
+				var leases []*wallet.ListLeasedOutputResult
+				if tc.existing {
+					leases = persisted
+				}
+				controller.On("ListLeasedOutputs").
+					Return(leases, tc.listErr).Once()
+			}
+			if tc.wantErr == "" {
+				controller.On("LeaseOutput", lockID, outpoint,
+					time.Minute,
+				).Return(expiration, nil).Once()
+			}
+			coinLocker := &lnwallet.LightningWallet{}
+			rpcServer, _, err := New(&Config{
+				Wallet:              controller,
+				NativeSQLWallet:     tc.nativeSQL,
+				CoinSelectionLocker: coinLocker,
+			})
+			require.NoError(t, err)
+
+			// Act through the same zero-depth RPC used for creation
+			// and renewal, under the real coin-selection lock.
+			resp, err := rpcServer.LeaseOutput(
+				t.Context(), &LeaseOutputRequest{
+					Id: lockID[:],
+					Outpoint: &lnrpc.OutPoint{
+						TxidBytes:   outpoint.Hash[:],
+						OutputIndex: outpoint.Index,
+					},
+					ExpirationSeconds: 60,
+				},
+			)
+
+			// Assert success reports timed policy and expiration.
+			// Failed reads must yield no response or mutation.
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				require.Nil(t, resp)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, uint64(123), resp.Expiration)
+				require.Zero(t, resp.ReleaseAfterSpendConfs)
+			}
+			controller.AssertExpectations(t)
+		})
+	}
+}
+
+// TestListLeases confines unavailable legacy depth reporting to its RPC,
+// while retaining empty legacy lists and native-SQL timed lease results.
+func TestListLeases(t *testing.T) {
+	t.Parallel()
+
+	// Arrange the same maintained lease view for native and legacy storage.
+	// Only the RPC knows whether its zero depth is established by storage.
+	lease := &wallet.ListLeasedOutputResult{
+		LockedOutput: &wtxmgr.LockedOutput{},
+		Value:        12345,
+	}
+	testCases := []struct {
+		name      string
+		nativeSQL bool
+		empty     bool
+		wantErr   bool
+	}{
+		{
+			name:    "nonempty legacy",
+			wantErr: true,
+		},
+		{
+			name:  "empty legacy",
+			empty: true,
+		},
+		{
+			name:      "native SQL",
+			nativeSQL: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange a lease read without mutation expectations.
+			leases := []*wallet.ListLeasedOutputResult{lease}
+			if tc.empty {
+				leases = nil
+			}
+			controller := &renewalWallet{}
+			controller.On("ListLeasedOutputs").Return(leases, nil).
+				Once()
+			rpcServer, _, err := New(&Config{
+				Wallet:          controller,
+				NativeSQLWallet: tc.nativeSQL,
+			})
+			require.NoError(t, err)
+
+			// Act through the depth-reporting RPC. The underlying
+			// lease values and reservations must remain intact.
+			resp, err := rpcServer.ListLeases(
+				t.Context(), &ListLeasesRequest{},
+			)
+
+			// Assert ambiguous legacy depth fails; supported
+			// results retain the timed amount and zero depth.
+			if tc.wantErr {
+				require.ErrorContains(
+					t, err, "lease spend-depth",
+				)
+				require.Nil(t, resp)
+			} else {
+				require.NoError(t, err)
+				require.Len(t, resp.LockedUtxos, len(leases))
+				if !tc.empty {
+					rpcLease := resp.LockedUtxos[0]
+					require.Equal(
+						t, uint64(12345),
+						rpcLease.Value,
+					)
+					require.Zero(
+						t,
+						rpcLease.ReleaseAfterSpendConfs,
+					)
+				}
+			}
+			controller.AssertExpectations(t)
+		})
+	}
 }
 
 // TestFundPsbtRequiresCustomLockID verifies confirmation-controlled input

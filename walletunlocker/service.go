@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
@@ -18,7 +19,6 @@ import (
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
-	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
 	"github.com/lightningnetwork/lnd/macaroons"
 )
 
@@ -48,6 +48,9 @@ type WalletUnlockParams struct {
 	// later when lnd actually uses it). Because unlocking involves scrypt
 	// which is resource intensive, we want to avoid doing it twice.
 	Wallet *wallet.Wallet
+
+	// Manager owns the handed-off wallet runtime and database.
+	Manager *wallet.Manager
 
 	// ChansToRestore a set of static channel backups that should be
 	// restored before the main server instance starts up.
@@ -162,6 +165,9 @@ type WalletUnlockMsg struct {
 	// resource intensive, we want to avoid doing it twice.
 	Wallet *wallet.Wallet
 
+	// Manager owns the handed-off wallet runtime and database.
+	Manager *wallet.Manager
+
 	// ChanBackups a set of static channel backups that should be received
 	// after the wallet has been unlocked.
 	ChanBackups ChannelsToRecover
@@ -207,8 +213,13 @@ type UnlockerService struct {
 	// reset on unlock to force a full chain rescan.
 	resetWalletTransactions bool
 
-	// LoaderOpts holds the functional options for the wallet loader.
-	loaderOpts []btcwallet.LoaderOption
+	// managerConfig selects storage and the immutable startup policy.
+	managerConfig *wallet.ManagerConfig
+
+	// manager and currentWallet borrow native SQL startup's owned runtime
+	// and its published Create/Start result. Password retries reuse both.
+	manager       *wallet.Manager
+	currentWallet *atomic.Pointer[wallet.Wallet]
 
 	// macaroonDB is an instance of a database backend that stores all
 	// macaroon root keys. This will be nil on initialization and must be
@@ -219,7 +230,7 @@ type UnlockerService struct {
 // New creates and returns a new UnlockerService.
 func New(params *chaincfg.Params, macaroonFiles []string,
 	resetWalletTransactions bool,
-	loaderOpts []btcwallet.LoaderOption) *UnlockerService {
+	managerConfig *wallet.ManagerConfig) *UnlockerService {
 
 	return &UnlockerService{
 		InitMsgs:   make(chan *WalletInitMsg, 1),
@@ -231,14 +242,18 @@ func New(params *chaincfg.Params, macaroonFiles []string,
 		netParams:               params,
 		macaroonFiles:           macaroonFiles,
 		resetWalletTransactions: resetWalletTransactions,
-		loaderOpts:              loaderOpts,
+		managerConfig:           managerConfig,
 	}
 }
 
-// SetLoaderOpts can be used to inject wallet loader options after the unlocker
-// service has been hooked to the main RPC server.
-func (u *UnlockerService) SetLoaderOpts(loaderOpts []btcwallet.LoaderOption) {
-	u.loaderOpts = loaderOpts
+// SetManagerConfig supplies wallet startup policy and, for native SQL, borrows
+// the one started Manager and its wallet result before serving unlock requests.
+func (u *UnlockerService) SetManagerConfig(cfg wallet.ManagerConfig,
+	manager *wallet.Manager, current *atomic.Pointer[wallet.Wallet]) {
+
+	u.managerConfig = &cfg
+	u.manager = manager
+	u.currentWallet = current
 }
 
 // SetMacaroonDB can be used to inject the macaroon database after the unlocker
@@ -247,22 +262,69 @@ func (u *UnlockerService) SetMacaroonDB(macaroonDB kvdb.Backend) {
 	u.macaroonDB = macaroonDB
 }
 
-func (u *UnlockerService) newLoader(recoveryWindow uint32) (*wallet.Loader,
-	error) {
+// newManager reuses native SQL startup or starts the local walletdb Manager
+// after the request supplies its public passphrase and recovery policy.
+func (u *UnlockerService) newManager(publicPass []byte,
+	recoveryWindow uint32) (*wallet.Manager, *wallet.Wallet, error) {
 
-	return btcwallet.NewWalletLoader(
-		u.netParams, recoveryWindow, u.loaderOpts...,
-	)
+	if u.managerConfig == nil {
+		return nil, nil, fmt.Errorf("wallet manager is not configured")
+	}
+	if u.managerConfig.Backend != wallet.DBBackendKVDB {
+		if recoveryWindow != 0 {
+			return nil, nil, fmt.Errorf("native wallet " +
+				"historical " +
+				"recovery requires accounts to exist before " +
+				"synchronization")
+		}
+		if u.manager == nil || u.currentWallet == nil {
+			return nil, nil, fmt.Errorf("native wallet manager " +
+				"is not started")
+		}
+
+		return u.manager, u.currentWallet.Load(), nil
+	}
+
+	cfg := *u.managerConfig
+	cfg.KVDBPubPassphrase = publicPass
+	cfg.RecoveryWindow = recoveryWindow
+	manager, err := wallet.NewManager(context.Background(), cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	wallets, err := manager.Start(context.Background())
+	if err != nil || len(wallets) != 1 {
+		_ = manager.Stop()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return nil, nil, fmt.Errorf("expected one initialized wallet")
+	}
+
+	return manager, wallets[0], nil
 }
 
-// WalletExists returns whether a wallet exists on the file path the
-// UnlockerService is using.
+// WalletExists uses the native Manager's durable wallet set. A local walletdb
+// still uses its file boundary because its public passphrase is not known yet.
 func (u *UnlockerService) WalletExists() (bool, error) {
-	loader, err := u.newLoader(0)
-	if err != nil {
-		return false, err
+	if u.managerConfig == nil {
+		return false, fmt.Errorf("wallet manager is not configured")
 	}
-	return loader.WalletExists()
+	if u.managerConfig.Backend != wallet.DBBackendKVDB {
+		if u.currentWallet == nil {
+			return false, fmt.Errorf("native wallet manager " +
+				"is not started")
+		}
+
+		return u.currentWallet.Load() != nil, nil
+	}
+	_, err := os.Stat(u.managerConfig.DataSource)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+
+	return err == nil, err
 }
 
 // GenSeed is the first method that should be used to instantiate a new lnd
@@ -278,12 +340,7 @@ func (u *UnlockerService) GenSeed(_ context.Context,
 
 	// Before we start, we'll ensure that the wallet hasn't already created
 	// so we don't show a *new* seed to the user if one already exists.
-	loader, err := u.newLoader(0)
-	if err != nil {
-		return nil, err
-	}
-
-	walletExists, err := loader.WalletExists()
+	walletExists, err := u.WalletExists()
 	if err != nil {
 		return nil, err
 	}
@@ -417,14 +474,16 @@ func (u *UnlockerService) InitWallet(ctx context.Context,
 		)
 	}
 
-	// We'll then open up the directory that will be used to store the
-	// wallet's files so we can check if the wallet already exists.
-	loader, err := u.newLoader(uint32(recoveryWindow))
-	if err != nil {
-		return nil, err
-	}
+	// Native SQL begins synchronization before this RPC, so historical
+	// recovery cannot promise discovery of accounts created afterward.
+	if u.managerConfig != nil &&
+		u.managerConfig.Backend != wallet.DBBackendKVDB &&
+		recoveryWindow != 0 {
 
-	walletExists, err := loader.WalletExists()
+		return nil, fmt.Errorf("native wallet historical recovery " +
+			"requires accounts to exist before synchronization")
+	}
+	walletExists, err := u.WalletExists()
 	if err != nil {
 		return nil, err
 	}
@@ -622,75 +681,50 @@ func (u *UnlockerService) InitWallet(ctx context.Context,
 	}
 }
 
-// LoadAndUnlock creates a loader for the wallet and tries to unlock the wallet
-// with the given password and recovery window. If the drop wallet transactions
-// flag is set, the history state drop is performed before unlocking the wallet
-// yet again.
+// LoadAndUnlock authenticates the private passphrase on the started wallet. Its
+// cleanup locks a borrowed native wallet or closes the request-owned kvdb
+// Manager; successful handoff transfers that Manager to normal node shutdown.
 func (u *UnlockerService) LoadAndUnlock(password []byte,
-	recoveryWindow uint32) (*wallet.Wallet, func() error, error) {
+	recoveryWindow uint32) (*wallet.Wallet, *wallet.Manager, func() error,
+	error) {
 
-	loader, err := u.newLoader(recoveryWindow)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Check if wallet already exists.
-	walletExists, err := loader.WalletExists()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if !walletExists {
-		// Cannot unlock a wallet that does not exist!
-		return nil, nil, fmt.Errorf("wallet not found")
-	}
-
-	// Try opening the existing wallet with the provided password.
-	unlockedWallet, err := loader.OpenExistingWallet(password, false)
-	if err != nil {
-		// Could not open wallet, most likely this means that provided
-		// password was incorrect.
-		return nil, nil, err
-	}
-
-	// The user requested to drop their whole wallet transaction state to
-	// force a full chain rescan for wallet addresses. Dropping the state
-	// only properly takes effect after opening the wallet. That's why we
-	// start, drop, stop and start again.
 	if u.resetWalletTransactions {
-		dropErr := wallet.DropTransactionHistory(
-			unlockedWallet.Database(), true,
-		)
-
-		// Even if dropping the history fails, we'll want to unload the
-		// wallet. If unloading fails, that error is probably more
-		// important to be returned to the user anyway.
-		if err := loader.UnloadWallet(); err != nil {
-			return nil, nil, fmt.Errorf("could not unload "+
-				"wallet (tx history drop err: %v): %v", dropErr,
-				err)
-		}
-
-		// If dropping failed but unloading didn't, we'll still abort
-		// and inform the user.
-		if dropErr != nil {
-			return nil, nil, dropErr
-		}
-
-		// All looks good, let's now open the wallet again. The loader
-		// was unloaded and might have removed its remote DB connection,
-		// so let's re-create it as well.
-		loader, err = u.newLoader(recoveryWindow)
-		if err != nil {
-			return nil, nil, err
-		}
-		unlockedWallet, err = loader.OpenExistingWallet(password, false)
-		if err != nil {
-			return nil, nil, err
+		return nil, nil, nil, fmt.Errorf("managed wallet " +
+			"does not support " +
+			"transaction-history reset")
+	}
+	exists, err := u.WalletExists()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if !exists {
+		return nil, nil, nil, fmt.Errorf("wallet not found")
+	}
+	manager, w, err := u.newManager(password, recoveryWindow)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cleanup := manager.Stop
+	if u.managerConfig.Backend != wallet.DBBackendKVDB {
+		cleanup = func() error {
+			return w.Lock(context.Background())
 		}
 	}
+	// An already-unlocked error must remain an authentication failure.
+	// Never clear another request's private state when this unlock fails.
+	err = w.Unlock(context.Background(), wallet.UnlockRequest{
+		Passphrase: password,
+		Timeout:    -1,
+	})
+	if err != nil {
+		if u.managerConfig.Backend == wallet.DBBackendKVDB {
+			_ = manager.Stop()
+		}
 
-	return unlockedWallet, loader.UnloadWallet, nil
+		return nil, nil, nil, err
+	}
+
+	return w, manager, cleanup, nil
 }
 
 // UnlockWallet sends the password provided by the incoming UnlockWalletRequest
@@ -702,11 +736,18 @@ func (u *UnlockerService) UnlockWallet(ctx context.Context,
 	password := in.WalletPassword
 	recoveryWindow := uint32(in.RecoveryWindow)
 
-	unlockedWallet, unloadFn, err := u.LoadAndUnlock(
+	unlockedWallet, manager, unloadFn, err := u.LoadAndUnlock(
 		password, recoveryWindow,
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	// Cancellation before handoff releases this attempt's private state;
+	// after handoff the node owns the runtime independently of the RPC.
+	if ctx.Err() != nil {
+		_ = unloadFn()
+		return nil, ErrUnlockTimeout
 	}
 
 	// We successfully opened the wallet and pass the instance back to
@@ -715,6 +756,7 @@ func (u *UnlockerService) UnlockWallet(ctx context.Context,
 		Passphrase:     password,
 		RecoveryWindow: recoveryWindow,
 		Wallet:         unlockedWallet,
+		Manager:        manager,
 		UnloadWallet:   unloadFn,
 		StatelessInit:  in.StatelessInit,
 	}
@@ -743,6 +785,7 @@ func (u *UnlockerService) UnlockWallet(ctx context.Context,
 		}
 
 	case <-ctx.Done():
+		_ = unloadFn()
 		return nil, ErrUnlockTimeout
 	}
 }
@@ -753,14 +796,12 @@ func (u *UnlockerService) UnlockWallet(ctx context.Context,
 func (u *UnlockerService) ChangePassword(ctx context.Context,
 	in *lnrpc.ChangePasswordRequest) (*lnrpc.ChangePasswordResponse, error) {
 
-	loader, err := u.newLoader(0)
-	if err != nil {
+	// Reject cancellation before rotating either credential store. Once
+	// rotation begins, wallet and macaroon updates must finish together.
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	// First, we'll make sure the wallet exists for the specific chain and
-	// network.
-	walletExists, err := loader.WalletExists()
+	walletExists, err := u.WalletExists()
 	if err != nil {
 		return nil, err
 	}
@@ -785,7 +826,7 @@ func (u *UnlockerService) ChangePassword(ctx context.Context,
 	}
 
 	// Load the existing wallet in order to proceed with the password change.
-	w, err := loader.OpenExistingWallet(publicPw, false)
+	manager, w, err := u.newManager(publicPw, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -795,9 +836,33 @@ func (u *UnlockerService) ChangePassword(ctx context.Context,
 	orderlyReturn := false
 	defer func() {
 		if !orderlyReturn {
-			_ = loader.UnloadWallet()
+			if u.managerConfig.Backend == wallet.DBBackendKVDB {
+				_ = manager.Stop()
+			} else {
+				_ = w.Lock(context.Background())
+			}
 		}
 	}()
+
+	// Native storage opens before private authentication. Validate the old
+	// secret before deleting macaroon files, then restore the locked state
+	// expected by the final unlock after both credential stores rotate.
+	if u.managerConfig.Backend != wallet.DBBackendKVDB {
+		err = w.Unlock(context.WithoutCancel(ctx), wallet.UnlockRequest{
+			Passphrase: privatePw,
+			Timeout:    -1,
+		})
+		if err != nil {
+			// Failed admission acquired no private state to clean
+			// up. In particular, do not relock another admitted
+			// request.
+			orderlyReturn = true
+			return nil, err
+		}
+		if err := w.Lock(context.WithoutCancel(ctx)); err != nil {
+			return nil, err
+		}
+	}
 
 	// Before we actually change the password, we need to check if all flags
 	// were set correctly. The content of the previously generated macaroon
@@ -821,12 +886,20 @@ func (u *UnlockerService) ChangePassword(ctx context.Context,
 	// Attempt to change both the public and private passphrases for the
 	// wallet. This will be done atomically in order to prevent one
 	// passphrase change from being successful and not the other.
-	err = w.ChangePassphrases(
-		publicPw, in.NewPassword, privatePw, in.NewPassword,
+	changePublic := u.managerConfig.Backend == wallet.DBBackendKVDB
+	err = w.ChangePassphrase(context.WithoutCancel(ctx),
+		wallet.ChangePassphraseRequest{
+			ChangePublic:  changePublic,
+			PublicOld:     publicPw,
+			PublicNew:     in.NewPassword,
+			ChangePrivate: true,
+			PrivateOld:    privatePw,
+			PrivateNew:    in.NewPassword,
+		},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to change wallet passphrase: "+
-			"%v", err)
+			"%w", err)
 	}
 
 	// The next step is to load the macaroon database, change the password
@@ -886,13 +959,27 @@ func (u *UnlockerService) ChangePassword(ctx context.Context,
 			err)
 	}
 
+	// Authenticate the new credential for the same unlocked-wallet handoff
+	// used by UnlockWallet, only after macaroon rotation has completed.
+	err = w.Unlock(context.WithoutCancel(ctx), wallet.UnlockRequest{
+		Passphrase: in.NewPassword,
+		Timeout:    -1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if ctx.Err() != nil {
+		return nil, ErrUnlockTimeout
+	}
+
 	// Finally, send the new password across the UnlockPasswords channel to
 	// automatically unlock the wallet.
 	walletUnlockMsg := &WalletUnlockMsg{
 		Passphrase:    in.NewPassword,
 		Wallet:        w,
 		StatelessInit: in.StatelessInit,
-		UnloadWallet:  loader.UnloadWallet,
+		UnloadWallet:  manager.Stop,
+		Manager:       manager,
 	}
 	select {
 	case u.UnlockMsgs <- walletUnlockMsg:

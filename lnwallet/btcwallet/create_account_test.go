@@ -1,334 +1,260 @@
 package btcwallet
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-// createAccountWallet is a minimal fake of btcwallet's base.Interface covering
-// only the calls CreateAccount makes. The embedded interface is deliberately
-// left nil so that any additional call this test does not expect panics loudly
-// rather than silently returning a zero value.
+// createAccountWallet exposes only expected account operations. Unused embedded
+// capabilities have no implementation, so an accidental extra call fails.
 type createAccountWallet struct {
-	base.Interface
-
-	// existing maps a key scope to the account names that already exist in
-	// it, which drives the duplicate-name lookups.
-	existing map[waddrmgr.KeyScope][]string
-
-	// createdScope and createdName record the arguments of the NextAccount
-	// call so the test can assert the scope was forwarded unchanged.
-	createdScope waddrmgr.KeyScope
-	createdName  string
-
-	// nextAccountErr, when set, is returned by NextAccount.
-	nextAccountErr error
+	walletAPI
+	mock.Mock
 }
 
-// AccountPropertiesByName reports whether the named account exists in the given
-// scope, mirroring waddrmgr's not-found error so that the caller's
-// waddrmgr.IsError check behaves as it does against a real wallet.
-func (w *createAccountWallet) AccountPropertiesByName(scope waddrmgr.KeyScope,
-	name string) (*waddrmgr.AccountProperties, error) {
+// ListAccounts returns the arranged snapshot used for lnd's global name check.
+func (w *createAccountWallet) ListAccounts(ctx context.Context) (
+	[]base.AccountInfo, error) {
 
-	if slices.Contains(w.existing[scope], name) {
-		return &waddrmgr.AccountProperties{
-			AccountName: name,
-		}, nil
+	args := w.Called(ctx)
+	accounts, _ := args.Get(0).([]base.AccountInfo)
+	return accounts, args.Error(1)
+}
+
+// NewAccount verifies that lnd forwards the exact scope and name to btcwallet.
+func (w *createAccountWallet) NewAccount(ctx context.Context,
+	params base.NewAccountParams) (*base.AccountInfo, error) {
+
+	args := w.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
 	}
+	account, _ := args.Get(0).(*base.AccountInfo)
 
-	return nil, newAccountNotFoundError(name)
+	return account, args.Error(1)
 }
 
-// lookupOnlyWallet answers the duplicate-name lookups but deliberately does not
-// implement NextAccount, standing in for a wallet backend that cannot derive
-// new accounts.
-type lookupOnlyWallet struct {
-	base.Interface
-}
-
-// AccountPropertiesByName always reports the account as missing.
-func (w *lookupOnlyWallet) AccountPropertiesByName(_ waddrmgr.KeyScope,
-	name string) (*waddrmgr.AccountProperties, error) {
-
-	return nil, newAccountNotFoundError(name)
-}
-
-// NextAccount records the requested scope and name.
-func (w *createAccountWallet) NextAccount(scope waddrmgr.KeyScope,
-	name string) (uint32, error) {
-
-	if w.nextAccountErr != nil {
-		return 0, w.nextAccountErr
-	}
-
-	w.createdScope = scope
-	w.createdName = name
-
-	return 7, nil
-}
-
-// AccountProperties returns the properties of the freshly created account.
-func (w *createAccountWallet) AccountProperties(_ waddrmgr.KeyScope,
-	account uint32) (*waddrmgr.AccountProperties, error) {
-
-	return &waddrmgr.AccountProperties{
-		AccountNumber: account,
-		AccountName:   w.createdName,
-	}, nil
-}
-
-// TestCreateAccount asserts the guard rails around creating a wallet-owned
-// account: the wallet's own reserved account names cannot be taken, a name may
-// not be reused, and the requested key scope is what the account is created in.
+// TestCreateAccount preserves reserved names, cross-scope name uniqueness and
+// the requested derivation scope at the maintained account boundary.
 func TestCreateAccount(t *testing.T) {
 	t.Parallel()
-
-	const accountName = "custom"
 
 	tests := []struct {
 		name        string
 		accountName string
 		keyScope    waddrmgr.KeyScope
-		existing    map[waddrmgr.KeyScope][]string
+		existing    []base.AccountInfo
 		expectedErr string
-	}{{
-		name:        "taproot account created",
-		accountName: accountName,
-		keyScope:    waddrmgr.KeyScopeBIP0086,
-	}, {
-		name:        "witness pubkey account created",
-		accountName: accountName,
-		keyScope:    waddrmgr.KeyScopeBIP0084,
-	}, {
-		name:        "empty name rejected",
-		accountName: "",
-		keyScope:    waddrmgr.KeyScopeBIP0086,
-		expectedErr: "account name is required",
-	}, {
-		name:        "default account name reserved",
-		accountName: lnwallet.DefaultAccountName,
-		keyScope:    waddrmgr.KeyScopeBIP0086,
-		expectedErr: "reserved by the wallet",
-	}, {
-		name:        "imported account name reserved",
-		accountName: waddrmgr.ImportedAddrAccountName,
-		keyScope:    waddrmgr.KeyScopeBIP0086,
-		expectedErr: "reserved by the wallet",
-	}, {
-		name:        "duplicate in requested scope rejected",
-		accountName: accountName,
-		keyScope:    waddrmgr.KeyScopeBIP0086,
-		existing: map[waddrmgr.KeyScope][]string{
-			waddrmgr.KeyScopeBIP0086: {accountName},
+	}{
+		{
+			name:        "taproot account created",
+			accountName: "custom",
+			keyScope:    waddrmgr.KeyScopeBIP0086,
 		},
-		expectedErr: "already exists",
-	}, {
-		// A name that exists under a different scope must also be
-		// rejected: coin selection resolves a custom account name to
-		// whichever scope matches first, so allowing the same name
-		// twice would make later funding calls ambiguous.
-		name:        "duplicate in other scope rejected",
-		accountName: accountName,
-		keyScope:    waddrmgr.KeyScopeBIP0086,
-		existing: map[waddrmgr.KeyScope][]string{
-			waddrmgr.KeyScopeBIP0084: {accountName},
+		{
+			name:        "witness pubkey account created",
+			accountName: "custom",
+			keyScope:    waddrmgr.KeyScopeBIP0084,
 		},
-		expectedErr: "already exists",
-	}}
-
+		{
+			name:        "empty name rejected",
+			keyScope:    waddrmgr.KeyScopeBIP0086,
+			expectedErr: "account name is required",
+		},
+		{
+			name:        "default account name reserved",
+			accountName: lnwallet.DefaultAccountName,
+			keyScope:    waddrmgr.KeyScopeBIP0086,
+			expectedErr: "reserved by the wallet",
+		},
+		{
+			name:        "imported account name reserved",
+			accountName: waddrmgr.ImportedAddrAccountName,
+			keyScope:    waddrmgr.KeyScopeBIP0086,
+			expectedErr: "reserved by the wallet",
+		},
+		{
+			name:        "duplicate in requested scope rejected",
+			accountName: "custom",
+			keyScope:    waddrmgr.KeyScopeBIP0086,
+			existing: []base.AccountInfo{
+				{
+					AccountName: "custom",
+					KeyScope:    waddrmgr.KeyScopeBIP0086,
+				},
+			},
+			expectedErr: "already exists",
+		},
+		{
+			name:        "duplicate in other scope rejected",
+			accountName: "custom",
+			keyScope:    waddrmgr.KeyScopeBIP0086,
+			existing: []base.AccountInfo{
+				{
+					AccountName: "custom",
+					KeyScope:    waddrmgr.KeyScopeBIP0084,
+				},
+			},
+			expectedErr: "already exists",
+		},
+	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			fake := &createAccountWallet{existing: test.existing}
-			w := &BtcWallet{wallet: fake}
+			// Arrange only calls admitted by the name guard.
+			// Successful creation must receive this exact scope and
+			// unnumbered request.
+			backend := &createAccountWallet{}
+			if test.accountName == "custom" {
+				backend.On("ListAccounts", mock.Anything).
+					Return(test.existing, nil).Once()
+			}
+			if test.expectedErr == "" {
+				request := base.NewAccountParams{
+					Scope: test.keyScope,
+					Name:  test.accountName,
+				}
+				backend.On(
+					"NewAccount", mock.Anything, request,
+				).Return(&base.AccountInfo{
+					AccountName: test.accountName,
+					KeyScope:    test.keyScope,
+				}, nil).Once()
+			}
+			w := &BtcWallet{wallet: backend}
 
+			// Act through the public adapter, including its shared
+			// name lock.
 			props, err := w.CreateAccount(
-				test.keyScope, test.accountName,
+				test.keyScope,
+				test.accountName,
 			)
 
+			// Assert rejected names produce no account; successful
+			// calls retain the requested identity and exhaust all
+			// required calls.
 			if test.expectedErr != "" {
 				require.ErrorContains(t, err, test.expectedErr)
 				require.Nil(t, props)
-
-				// A rejected request must not have reached the
-				// wallet.
-				require.Empty(t, fake.createdName)
-
-				return
+			} else {
+				require.NoError(t, err)
+				require.Equal(
+					t,
+					test.accountName,
+					props.AccountName,
+				)
+				require.Equal(t, test.keyScope, props.KeyScope)
 			}
-
-			require.NoError(t, err)
-			require.Equal(t, test.accountName, props.AccountName)
-			require.Equal(t, test.keyScope, fake.createdScope)
-			require.Equal(t, test.accountName, fake.createdName)
+			backend.AssertExpectations(t)
 		})
 	}
 }
 
-// TestCreateAccountUnsupportedWallet asserts that a wallet backend which cannot
-// derive new accounts is reported as such instead of panicking.
-func TestCreateAccountUnsupportedWallet(t *testing.T) {
-	t.Parallel()
-
-	w := &BtcWallet{wallet: &lookupOnlyWallet{}}
-
-	_, err := w.CreateAccount(waddrmgr.KeyScopeBIP0086, "custom")
-	require.ErrorContains(t, err, "does not support creating accounts")
-}
-
-// TestCreateAccountWalletError asserts that a failure from the underlying
-// wallet is surfaced with the account name attached.
+// TestCreateAccountWalletError preserves backend refusal and unlock errors
+// while adding the requested account name to their context.
 func TestCreateAccountWalletError(t *testing.T) {
 	t.Parallel()
+	for _, walletErr := range []error{
+		base.ErrAccountOperationUnsupported,
+		errors.New("wallet is locked"),
+	} {
+		t.Run(walletErr.Error(), func(t *testing.T) {
+			// Arrange a free name followed by a failing maintained
+			// create.
+			backend := &createAccountWallet{}
+			backend.On("ListAccounts", mock.Anything).
+				Return([]base.AccountInfo(nil), nil).Once()
+			request := base.NewAccountParams{
+				Scope: waddrmgr.KeyScopeBIP0086,
+				Name:  "custom",
+			}
+			backend.On("NewAccount", mock.Anything, request).
+				Return(nil, walletErr).Once()
+			w := &BtcWallet{wallet: backend}
 
-	walletErr := errors.New("wallet is locked")
-	fake := &createAccountWallet{nextAccountErr: walletErr}
-	w := &BtcWallet{wallet: fake}
+			// Act by requesting an account through the same public
+			// method.
+			_, err := w.CreateAccount(
+				waddrmgr.KeyScopeBIP0086,
+				"custom",
+			)
 
-	_, err := w.CreateAccount(waddrmgr.KeyScopeBIP0086, "custom")
-	require.ErrorIs(t, err, walletErr)
-	require.ErrorContains(t, err, "custom")
+			// Assert callers retain errors.Is matching and useful
+			// context.
+			require.ErrorIs(t, err, walletErr)
+			require.ErrorContains(t, err, "custom")
+			backend.AssertExpectations(t)
+		})
+	}
 }
 
-// TestCreateAccountSerialisesCallers asserts that concurrent CreateAccount
-// calls do not overlap.
-//
-// The duplicate-name check and the creation are separate database
-// transactions, and btcwallet's own check is per-scope, so two overlapping
-// calls could both pass the check and both create — leaving one name in two
-// key scopes, the exact ambiguity the check exists to prevent. The wallet
-// fake reports the greatest number of calls it ever saw inside the critical
-// section, which is 1 only while the caller serialises them.
+// TestCreateAccountSerialisesCallers keeps simultaneous requests inside one
+// name-check/create critical section using the existing account lock.
 func TestCreateAccountSerialisesCallers(t *testing.T) {
 	t.Parallel()
 
+	// Arrange eight distinct names and measure overlapping backend calls.
+	// Pausing the mock widens the same scheduling window as the old
+	// fixture.
 	const callers = 8
+	var active, peak atomic.Int32
+	observe := func(mock.Arguments) {
+		n := active.Add(1)
+		for old := peak.Load(); n > old; old = peak.Load() {
+			if peak.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+		active.Add(-1)
+	}
+	backend := &createAccountWallet{}
+	backend.On("ListAccounts", mock.Anything).
+		Return([]base.AccountInfo(nil), nil).Times(callers).Run(observe)
+	for i := range callers {
+		name := fmt.Sprintf("custom-%d", i)
+		backend.On("NewAccount", mock.Anything, base.NewAccountParams{
+			Scope: waddrmgr.KeyScopeBIP0086,
+			Name:  name,
+		}).Return(&base.AccountInfo{
+			AccountName: name,
+		}, nil).Once().Run(observe)
+	}
+	w := &BtcWallet{wallet: backend}
 
-	fake := &serialisingWallet{}
-	w := &BtcWallet{wallet: fake}
-
+	// Act concurrently and collect errors for assertions in the test owner.
 	var wg sync.WaitGroup
+	results := make(chan error, callers)
 	for i := range callers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
-			// Distinct names: a shared name would be rejected by
-			// the duplicate check, which is a different property
-			// from the one under test here.
-			_, _ = w.CreateAccount(
+			_, err := w.CreateAccount(
 				waddrmgr.KeyScopeBIP0086,
 				fmt.Sprintf("custom-%d", i),
 			)
+			results <- err
 		}()
 	}
 	wg.Wait()
+	close(results)
 
-	require.Equal(t, 1, fake.maxInFlight(),
-		"CreateAccount calls must not overlap")
-	require.Equal(t, callers, fake.created)
-}
-
-// serialisingWallet records created accounts and tracks how many callers are
-// ever inside CreateAccount's check-then-create section at once.
-type serialisingWallet struct {
-	base.Interface
-
-	mtx      sync.Mutex
-	names    []string
-	created  int
-	inFlight int
-	maxSeen  int
-}
-
-// AccountPropertiesByName marks the caller as in-flight, pauses long enough
-// for any unsynchronised peer to overlap with it, and reports whether the
-// account exists.
-func (w *serialisingWallet) AccountPropertiesByName(_ waddrmgr.KeyScope,
-	name string) (*waddrmgr.AccountProperties, error) {
-
-	w.enter()
-	defer w.exit()
-
-	time.Sleep(time.Millisecond)
-
-	w.mtx.Lock()
-	defer w.mtx.Unlock()
-
-	if slices.Contains(w.names, name) {
-		return &waddrmgr.AccountProperties{AccountName: name}, nil
+	// Assert each request succeeded and backend calls never overlapped.
+	for err := range results {
+		require.NoError(t, err)
 	}
-
-	return nil, newAccountNotFoundError(name)
-}
-
-// enter records one more caller inside the section.
-func (w *serialisingWallet) enter() {
-	w.mtx.Lock()
-	defer w.mtx.Unlock()
-
-	w.inFlight++
-	if w.inFlight > w.maxSeen {
-		w.maxSeen = w.inFlight
-	}
-}
-
-// exit records one fewer caller inside the section.
-func (w *serialisingWallet) exit() {
-	w.mtx.Lock()
-	defer w.mtx.Unlock()
-
-	w.inFlight--
-}
-
-// maxInFlight reports the greatest overlap observed.
-func (w *serialisingWallet) maxInFlight() int {
-	w.mtx.Lock()
-	defer w.mtx.Unlock()
-
-	return w.maxSeen
-}
-
-// NextAccount records the new account. It is instrumented like the lookup so
-// the test observes the whole check-then-create section: a lock around only
-// the lookup would otherwise pass while leaving the real window open.
-func (w *serialisingWallet) NextAccount(_ waddrmgr.KeyScope,
-	name string) (uint32, error) {
-
-	w.enter()
-	defer w.exit()
-
-	time.Sleep(time.Millisecond)
-
-	w.mtx.Lock()
-	defer w.mtx.Unlock()
-
-	w.names = append(w.names, name)
-	w.created++
-
-	return uint32(w.created), nil
-}
-
-// AccountProperties returns the properties of the created account.
-func (w *serialisingWallet) AccountProperties(_ waddrmgr.KeyScope,
-	account uint32) (*waddrmgr.AccountProperties, error) {
-
-	w.mtx.Lock()
-	defer w.mtx.Unlock()
-
-	return &waddrmgr.AccountProperties{
-		AccountNumber: account,
-		AccountName:   w.names[len(w.names)-1],
-	}, nil
+	require.EqualValues(t, 1, peak.Load())
+	backend.AssertExpectations(t)
 }

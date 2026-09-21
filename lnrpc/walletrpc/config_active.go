@@ -48,6 +48,11 @@ type Config struct {
 	// any relevant requests to.
 	Wallet lnwallet.WalletController
 
+	// NativeSQLWallet identifies the wallet storage selected at startup.
+	// Legacy leases may retain depth metadata absent from the maintained
+	// result, so their public depth reporting must reject ambiguity.
+	NativeSQLWallet bool
+
 	// CoinSelectionLocker allows the caller to perform an operation, which
 	// is synchronized with all coin selection attempts. This can be used
 	// when an operation requires that all coin selection operations cease

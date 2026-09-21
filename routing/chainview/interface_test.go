@@ -707,11 +707,11 @@ var interfaceImpls = []struct {
 			)
 			blockCache := blockcache.NewBlockCache(10000)
 
-			chainView := NewBitcoindFilteredChainView(
+			chainView, err := NewBitcoindFilteredChainView(
 				chainConn, blockCache,
 			)
 
-			return chainView, nil
+			return chainView, err
 		},
 	},
 	{
@@ -727,7 +727,7 @@ var interfaceImpls = []struct {
 			)
 			blockCache := blockcache.NewBlockCache(10000)
 
-			chainView := NewBitcoindFilteredChainView(
+			chainView, err := NewBitcoindFilteredChainView(
 				chainConn, blockCache,
 			)
 
@@ -745,7 +745,7 @@ var interfaceImpls = []struct {
 			// `DisconnectedBlocks`.
 			time.Sleep(1 * time.Second)
 
-			return chainView, nil
+			return chainView, err
 		},
 	},
 	{
@@ -816,7 +816,7 @@ var interfaceImpls = []struct {
 				return nil, err
 			}
 
-			return chainView, nil
+			return chainView, err
 		},
 	},
 	{

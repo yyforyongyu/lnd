@@ -2,9 +2,11 @@ package btcwallet
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -13,6 +15,7 @@ import (
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/pkg/btcunit"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wtxmgr"
@@ -85,66 +88,97 @@ func (b *BtcWallet) FundPsbt(packet *psbt.Packet, minConfs int32,
 	// this to sat/KB as the CreateSimpleTx method requires this unit.
 	feeSatPerKB := btcutil.Amount(feeRate.FeePerKVByte())
 
-	var (
-		keyScope   *waddrmgr.KeyScope
-		accountNum uint32
-	)
-
+	if minConfs < 0 {
+		return 0, lnwallet.ErrInvalidMinconf
+	}
+	if err := psbt.VerifyInputOutputLen(packet, false, false); err != nil {
+		return 0, err
+	}
+	changeAccount := accountName
 	switch accountName {
-	// For default accounts and single imported public keys, we'll provide a
-	// nil key scope to FundPsbt, allowing it to select inputs from all
-	// scopes (NP2WKH, P2WKH, P2TR). By default, the change key scope for
-	// these accounts will be P2WKH.
-	case lnwallet.DefaultAccountName:
+	case lnwallet.DefaultAccountName, waddrmgr.ImportedAddrAccountName:
+		changeAccount = lnwallet.DefaultAccountName
 		if changeScope == nil {
 			changeScope = &waddrmgr.KeyScopeBIP0084
 		}
-
-		accountNum = defaultAccount
-
-	case waddrmgr.ImportedAddrAccountName:
-		if changeScope == nil {
-			changeScope = &waddrmgr.KeyScopeBIP0084
-		}
-
-		accountNum = importedAccount
-
-	// Otherwise, map the account name to its key scope and internal account
-	// number to only select inputs from said account. No change key scope
-	// should have been specified as a custom account should only have one
-	// key scope. Providing a change key scope would break this assumption
-	// and lead to non-deterministic behavior by using a different change
-	// key scope than the custom account key scope. The change key scope
-	// will always be the same as the coin selection.
 	default:
 		if changeScope != nil {
-			return 0, fmt.Errorf("couldn't select a " +
-				"custom change type for custom accounts")
+			return 0, fmt.Errorf("couldn't select a custom " +
+				"change type for custom accounts")
 		}
-
-		scope, account, err := b.lookupFirstCustomAccount(accountName)
+		scope, _, err := b.lookupFirstCustomAccount(accountName)
 		if err != nil {
 			return 0, err
 		}
-		keyScope = &scope
-		changeScope = keyScope
-		accountNum = account
+		changeScope = &scope
+	}
+	intent := &wallet.FundIntent{
+		Packet:  packet,
+		FeeRate: btcunit.NewSatPerKVByte(feeSatPerKB),
+		ChangeSource: &wallet.ScopedAccount{
+			AccountName: changeAccount,
+			KeyScope:    *changeScope,
+		},
 	}
 
-	var opts []wallet.TxCreateOption
-	if changeScope != nil {
-		opts = append(opts, wallet.WithCustomChangeScope(changeScope))
+	// Enumerate eligible candidates to preserve default-account selection
+	// across scopes and lnd's existing credit filter. btcwallet still owns
+	// coin selection, authoring, funding reservations and failure cleanup.
+	var utxos []*lnwallet.Utxo
+	if len(packet.UnsignedTx.TxIn) == 0 {
+		var err error
+		utxos, err = b.ListUnspentWitness(
+			minConfs, math.MaxInt32, accountName,
+		)
+		if err != nil {
+			return 0, err
+		}
 	}
-	if allowUtxo != nil {
-		opts = append(opts, wallet.WithUtxoFilter(allowUtxo))
+	var candidates []wire.OutPoint
+	for _, utxo := range utxos {
+		if allowUtxo != nil {
+			parent, err := b.wallet.GetTx(
+				context.Background(), utxo.OutPoint.Hash,
+			)
+			if err != nil {
+				return 0, err
+			}
+			credit := wtxmgr.Credit{
+				OutPoint: utxo.OutPoint,
+				Amount:   utxo.Value,
+				PkScript: utxo.PkScript,
+			}
+			credit.Height = -1
+			if parent.Block != nil {
+				credit.Height = parent.Block.Height
+				credit.Hash = parent.Block.Hash
+			}
+			if !allowUtxo(credit) {
+				continue
+			}
+		}
+		candidates = append(candidates, utxo.OutPoint)
 	}
-
-	// Let the wallet handle coin selection and/or fee estimation based on
-	// the partial TX information in the packet.
-	return b.wallet.FundPsbt(
-		packet, keyScope, minConfs, accountNum, feeSatPerKB,
-		strategy, opts...,
+	if len(packet.UnsignedTx.TxIn) == 0 {
+		if len(candidates) == 0 {
+			return 0, fmt.Errorf("no eligible wallet inputs")
+		}
+		intent.Policy = &wallet.InputsPolicy{
+			Strategy: strategy,
+			MinConfs: uint32(minConfs),
+			Source:   &wallet.CoinSourceUTXOs{UTXOs: candidates},
+		}
+	}
+	funded, changeIndex, err := b.wallet.FundPsbt(
+		context.Background(),
+		intent,
 	)
+	if err != nil {
+		return 0, err
+	}
+	*packet = *funded
+
+	return changeIndex, nil
 }
 
 // SignPsbt expects a partial transaction with all inputs and outputs fully
@@ -175,7 +209,10 @@ func (b *BtcWallet) SignPsbt(packet *psbt.Packet) ([]uint32, error) {
 	// there are inputs that we don't know how to sign, we won't return any
 	// error. So it's possible we're not the final signer.
 	tx := packet.UnsignedTx
-	prevOutputFetcher := wallet.PsbtPrevOutputFetcher(packet)
+	prevOutputFetcher, err := wallet.PsbtPrevOutputFetcher(packet)
+	if err != nil {
+		return nil, err
+	}
 	sigHashes := txscript.NewTxSigHashes(tx, prevOutputFetcher)
 	for idx := range tx.TxIn {
 		in := &packet.Inputs[idx]
@@ -193,9 +230,22 @@ func (b *BtcWallet) SignPsbt(packet *psbt.Packet) ([]uint32, error) {
 			continue
 		}
 
-		// Skip this input if there is no BIP32 derivation info
-		// available.
-		if len(in.Bip32Derivation) == 0 {
+		// Maintained funding emits Taproot origins without a parallel
+		// legacy BIP32 field. Select the supplied origin directly while
+		// preserving the existing first-key policy for lnd's own
+		// inputs.
+		var path []uint32
+		var expectedKey []byte
+		xOnly := false
+		switch {
+		case len(in.Bip32Derivation) != 0:
+			path = in.Bip32Derivation[0].Bip32Path
+			expectedKey = in.Bip32Derivation[0].PubKey
+		case len(in.TaprootBip32Derivation) != 0:
+			path = in.TaprootBip32Derivation[0].Bip32Path
+			expectedKey = in.TaprootBip32Derivation[0].XOnlyPubKey
+			xOnly = true
+		default:
 			continue
 		}
 
@@ -206,8 +256,7 @@ func (b *BtcWallet) SignPsbt(packet *psbt.Packet) ([]uint32, error) {
 		// Let's try and derive the key now. This method will decide if
 		// it's a BIP49/84 key for normal on-chain funds or a key of the
 		// custom purpose 1017 key scope.
-		derivationInfo := in.Bip32Derivation[0]
-		privKey, err := b.deriveKeyByBIP32Path(derivationInfo.Bip32Path)
+		privKey, err := b.deriveKeyByBIP32Path(path)
 		if err != nil {
 			log.Warnf("SignPsbt: Skipping input %d, error "+
 				"deriving signing key: %v", idx, err)
@@ -216,16 +265,17 @@ func (b *BtcWallet) SignPsbt(packet *psbt.Packet) ([]uint32, error) {
 
 		// We need to make sure we actually derived the key that was
 		// expected to be derived.
-		pubKeysEqual := bytes.Equal(
-			derivationInfo.PubKey,
-			privKey.PubKey().SerializeCompressed(),
-		)
+		actualKey := privKey.PubKey().SerializeCompressed()
+		if xOnly {
+			actualKey = schnorr.SerializePubKey(privKey.PubKey())
+		}
+		pubKeysEqual := bytes.Equal(expectedKey, actualKey)
 		if !pubKeysEqual {
 			log.Warnf("SignPsbt: Skipping input %d, derived "+
 				"public key %x does not match bip32 "+
 				"derivation info public key %x", idx,
 				privKey.PubKey().SerializeCompressed(),
-				derivationInfo.PubKey)
+				expectedKey)
 			continue
 		}
 
@@ -578,33 +628,60 @@ func maybeTweakPrivKeyPsbt(unknowns []*psbt.Unknown,
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) FinalizePsbt(packet *psbt.Packet, accountName string) error {
-	var (
-		keyScope   *waddrmgr.KeyScope
-		accountNum uint32
-	)
-	switch accountName {
-	// If the default/imported account name was specified, we'll provide a
-	// nil key scope to FundPsbt, allowing it to sign inputs from both key
-	// scopes (NP2WKH, P2WKH).
-	case lnwallet.DefaultAccountName:
-		accountNum = defaultAccount
+	if err := psbt.InputsReadyToSign(packet); err != nil {
+		return err
+	}
+	accounts, err := b.ListAccounts(accountName, nil)
+	if err != nil {
+		return err
+	}
 
-	case waddrmgr.ImportedAddrAccountName:
-		accountNum = importedAccount
+	// The maintained finalizer can auto-sign. Check every unfinished owned
+	// input against the requested account first, retaining lnd's
+	// authorization boundary while leaving already finalized external
+	// inputs intact.
+	for index, in := range packet.Inputs {
+		if len(in.FinalScriptWitness) != 0 ||
+			len(in.FinalScriptSig) != 0 {
 
-	// Otherwise, map the account name to its key scope and internal account
-	// number to determine if the inputs belonging to this account should be
-	// signed.
-	default:
-		scope, account, err := b.lookupFirstCustomAccount(accountName)
+			continue
+		}
+		output := in.WitnessUtxo
+		if output == nil && in.NonWitnessUtxo != nil {
+			op := packet.UnsignedTx.TxIn[index].PreviousOutPoint
+			if uint64(op.Index) >=
+				uint64(len(in.NonWitnessUtxo.TxOut)) {
+
+				return fmt.Errorf("PSBT input index " +
+					"exceeds parent outputs")
+			}
+			output = in.NonWitnessUtxo.TxOut[op.Index]
+		}
+		info, err := b.ScriptForOutput(output)
+		if errors.Is(err, wallet.ErrAddressNotFound) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
-		keyScope = &scope
-		accountNum = account
+		allowed := accountName == waddrmgr.ImportedAddrAccountName &&
+			info.Imported
+		for _, account := range accounts {
+			path := info.Derivation
+			if path != nil && path.KeyScope == account.KeyScope &&
+				path.Account == account.AccountNumber {
+
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("input %d does not belong to "+
+				"account %s", index, accountName)
+		}
 	}
 
-	return b.wallet.FinalizePsbt(keyScope, accountNum, packet)
+	return b.wallet.FinalizePsbt(context.Background(), packet)
 }
 
 // DecorateInputs fetches the UTXO information of all inputs it can identify and
@@ -616,7 +693,66 @@ func (b *BtcWallet) FinalizePsbt(packet *psbt.Packet, accountName string) error 
 func (b *BtcWallet) DecorateInputs(packet *psbt.Packet,
 	failOnUnknown bool) error {
 
-	return b.wallet.DecorateInputs(packet, failOnUnknown)
+	if err := psbt.VerifyInputOutputLen(packet, true, false); err != nil {
+		return err
+	}
+	// Read metadata without lease admission: coin_select intentionally
+	// passes owned inputs already reserved under the caller's lease ID.
+	// Decorating those inputs must neither release nor replace that
+	// reservation.
+	for index, txIn := range packet.UnsignedTx.TxIn {
+		utxo, err := b.wallet.GetUtxo(
+			context.Background(),
+			txIn.PreviousOutPoint,
+		)
+		if errors.Is(err, wallet.ErrUnknownOutput) && !failOnUnknown {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		parent, err := b.FetchTx(txIn.PreviousOutPoint.Hash)
+		if err != nil {
+			return err
+		}
+		info, err := b.ScriptForOutput(&wire.TxOut{
+			Value:    int64(utxo.Amount),
+			PkScript: utxo.PkScript,
+		})
+		if err != nil {
+			return err
+		}
+		derivation, taproot, _, err := Bip32DerivationFromAddress(
+			&info.AddressInfo,
+		)
+		if err != nil {
+			return err
+		}
+		in := &packet.Inputs[index]
+		in.WitnessUtxo = &wire.TxOut{
+			Value:    int64(utxo.Amount),
+			PkScript: utxo.PkScript,
+		}
+		if txscript.IsPayToTaproot(utxo.PkScript) {
+			in.TaprootBip32Derivation =
+				[]*psbt.TaprootBip32Derivation{taproot}
+			in.TaprootInternalKey = schnorr.SerializePubKey(
+				info.PubKey,
+			)
+		} else {
+			in.Bip32Derivation = []*psbt.Bip32Derivation{derivation}
+			in.NonWitnessUtxo = parent
+			in.RedeemScript = info.RedeemScript
+			// An omitted sighash means ALL for SegWit v0. Preserve
+			// an explicit caller choice; zero is valid only for
+			// Taproot.
+			if in.SighashType == txscript.SigHashDefault {
+				in.SighashType = txscript.SigHashAll
+			}
+		}
+	}
+
+	return nil
 }
 
 // lookupFirstCustomAccount returns the first custom account found. In theory,
@@ -627,29 +763,28 @@ func (b *BtcWallet) DecorateInputs(packet *psbt.Packet,
 func (b *BtcWallet) lookupFirstCustomAccount(
 	name string) (waddrmgr.KeyScope, uint32, error) {
 
-	var (
-		account  *waddrmgr.AccountProperties
-		keyScope waddrmgr.KeyScope
-	)
+	// Retain canonical scope order for historical duplicate names, while
+	// current CreateAccount and ImportAccount keep new names unambiguous.
 	for _, scope := range waddrmgr.DefaultKeyScopes {
-		var err error
-		account, err = b.wallet.AccountPropertiesByName(scope, name)
-		if waddrmgr.IsError(err, waddrmgr.ErrAccountNotFound) {
+		account, err := b.wallet.GetAccount(
+			context.Background(),
+			scope,
+			name,
+		)
+		if errors.Is(err, wallet.ErrAccountNotFound) {
 			continue
 		}
 		if err != nil {
-			return keyScope, 0, err
+			return waddrmgr.KeyScope{}, 0, err
+		}
+		if account.AccountNumber == nil {
+			return scope, importedAccount, nil
 		}
 
-		keyScope = scope
-
-		break
-	}
-	if account == nil {
-		return waddrmgr.KeyScope{}, 0, newAccountNotFoundError(name)
+		return scope, uint32(*account.AccountNumber), nil
 	}
 
-	return keyScope, account.AccountNumber, nil
+	return waddrmgr.KeyScope{}, 0, newAccountNotFoundError(name)
 }
 
 // Bip32DerivationFromKeyDesc returns the default and Taproot BIP-0032 key
@@ -686,27 +821,31 @@ func Bip32DerivationFromKeyDesc(keyDesc keychain.KeyDescriptor,
 // Bip32DerivationFromAddress returns the default and Taproot BIP-0032 key
 // derivation information from the given managed address.
 func Bip32DerivationFromAddress(
-	addr waddrmgr.ManagedAddress) (*psbt.Bip32Derivation,
+	addr *wallet.AddressInfo) (*psbt.Bip32Derivation,
 	*psbt.TaprootBip32Derivation, string, error) {
 
-	pubKeyAddr, ok := addr.(waddrmgr.ManagedPubKeyAddress)
-	if !ok {
-		return nil, nil, "", fmt.Errorf("address is not a pubkey " +
-			"address")
+	// Imported keys may have no root origin. Do not invent a signing path
+	// from an account display number when metadata is absent.
+	if addr.PubKey == nil {
+		return nil, nil, "", fmt.Errorf(
+			"address is not a pubkey address",
+		)
 	}
-
-	scope, derivationInfo, haveInfo := pubKeyAddr.DerivationInfo()
-	if !haveInfo {
-		return nil, nil, "", fmt.Errorf("address is an imported " +
-			"public key, can't derive BIP32 path")
+	if addr.Derivation == nil {
+		return nil, nil, "", fmt.Errorf(
+			"address has no BIP32 derivation path",
+		)
 	}
+	scope := addr.Derivation.KeyScope
+	derivationInfo := addr.Derivation
 
 	bip32Derivation := &psbt.Bip32Derivation{
-		PubKey: pubKeyAddr.PubKey().SerializeCompressed(),
+		PubKey:               addr.PubKey.SerializeCompressed(),
+		MasterKeyFingerprint: derivationInfo.MasterKeyFingerprint,
 		Bip32Path: []uint32{
 			scope.Purpose + hdkeychain.HardenedKeyStart,
 			scope.Coin + hdkeychain.HardenedKeyStart,
-			derivationInfo.InternalAccount +
+			derivationInfo.Account +
 				hdkeychain.HardenedKeyStart,
 			derivationInfo.Branch,
 			derivationInfo.Index,
@@ -715,7 +854,7 @@ func Bip32DerivationFromAddress(
 
 	derivationPath := fmt.Sprintf(
 		"m/%d'/%d'/%d'/%d/%d", scope.Purpose, scope.Coin,
-		derivationInfo.InternalAccount, derivationInfo.Branch,
+		derivationInfo.Account, derivationInfo.Branch,
 		derivationInfo.Index,
 	)
 

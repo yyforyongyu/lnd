@@ -1,16 +1,65 @@
 package lnd
 
 import (
+	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"testing"
 
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lncfg"
+	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/tor"
 	"github.com/stretchr/testify/require"
 )
+
+// TestWalletSignetChallengeDigest verifies that lnd's challenge selection
+// supplies the network identity required by native wallet storage.
+func TestWalletSignetChallengeDigest(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		t.Run(fmt.Sprintf("custom=%v", custom), func(t *testing.T) {
+			// Arrange the default or a custom signet using lnd's
+			// challenge option and chaincfg's network magic.
+			cfg := DefaultConfig()
+			cfg.Bitcoin.SigNet = true
+			challenge := chaincfg.DefaultSignetChallenge
+			if custom {
+				challenge = []byte{0x51}
+				encoded := hex.EncodeToString(challenge)
+				cfg.Bitcoin.SigNetChallenge = encoded
+			}
+			source := &lnmock.MockChain{}
+			params := chaincfg.CustomSignetParams(challenge, nil)
+
+			// Act by constructing the real SQL Manager with the
+			// adapter's identity. Construction validates storage
+			// identity without starting or querying the chain.
+			digest, err := walletSignetChallengeDigest(&cfg)
+			require.NoError(t, err)
+			manager, err := wallet.NewManager(
+				t.Context(), wallet.ManagerConfig{
+					Backend: wallet.DBBackendSQLite,
+					DataSource: filepath.Join(
+						t.TempDir(), "wallet.sqlite",
+					),
+					ChainParams:           params,
+					ChainSource:           source,
+					SignetChallengeDigest: digest,
+				},
+			)
+
+			// Assert both identities are accepted and release the
+			// database without transferring chain ownership.
+			require.NoError(t, err)
+			require.NoError(t, manager.Stop())
+			source.AssertExpectations(t)
+		})
+	}
+}
 
 var (
 	testPassword     = "testpassword"

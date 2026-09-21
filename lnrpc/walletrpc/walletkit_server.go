@@ -532,6 +532,17 @@ func (w *WalletKit) LeaseOutput(ctx context.Context,
 				lockID, *op, duration, leaseOpts,
 			)
 		} else {
+			// A legacy renewal has no readable depth policy.
+			// Prove freshness before mutation. Native SQL only
+			// supports timed leases and needs no such lookup.
+			if !w.cfg.NativeSQLWallet {
+				_, err := storedLeaseDepth(
+					w.cfg.Wallet, lockID, *op,
+				)
+				if err != nil {
+					return err
+				}
+			}
 			expiration, err = w.cfg.Wallet.LeaseOutput(
 				lockID, *op, duration,
 			)
@@ -543,28 +554,15 @@ func (w *WalletKit) LeaseOutput(ctx context.Context,
 		return nil, err
 	}
 
-	// A zero-depth same-owner renewal preserves any existing confirmation
-	// depth. Read it after the lease succeeds so this informational field
-	// cannot prevent a legacy lease or extend the coin selection lock.
-	if releaseAfterSpendConfs == 0 {
-		depth, err := storedLeaseDepth(w.cfg.Wallet, lockID, *op)
-		if err != nil {
-			log.Warnf("Unable to report retained confirmation "+
-				"depth for lease %v: %v", op, err)
-		} else {
-			releaseAfterSpendConfs = depth
-		}
-	}
-
 	return &LeaseOutputResponse{
 		Expiration:             uint64(expiration.Unix()),
 		ReleaseAfterSpendConfs: releaseAfterSpendConfs,
 	}, nil
 }
 
-// storedLeaseDepth returns the confirmation depth of an existing lease owned
-// by lockID. It lets a zero-depth renewal report the depth that the legacy
-// wallet lease method preserves.
+// storedLeaseDepth checks whether a same-owner lease can report its depth.
+// Callers hold the coin-selection lock so an ambiguous legacy renewal is
+// rejected before mutating storage or returning a fabricated zero depth.
 func storedLeaseDepth(wallet lnwallet.WalletController, lockID wtxmgr.LockID,
 	op wire.OutPoint) (uint32, error) {
 
@@ -575,7 +573,12 @@ func storedLeaseDepth(wallet lnwallet.WalletController, lockID wtxmgr.LockID,
 
 	for _, lease := range leases {
 		if lease.Outpoint == op && lease.LockID == lockID {
-			return lease.ReleaseAfterSpendConfs, nil
+			// The maintained lease result has no spend-depth
+			// metadata. A matching lease therefore cannot prove a
+			// zero depth.
+			return 0, fmt.Errorf("stored confirmation-depth " +
+				"lease " +
+				"metadata is unavailable")
 		}
 	}
 
@@ -620,6 +623,14 @@ func (w *WalletKit) ListLeases(ctx context.Context,
 	leases, err := w.cfg.Wallet.ListLeasedOutputs()
 	if err != nil {
 		return nil, err
+	}
+
+	// Legacy records can carry depth metadata absent from the maintained
+	// result. Refuse ambiguous public reporting while other lease consumers
+	// can still use available values, identities and expiration times.
+	if !w.cfg.NativeSQLWallet && len(leases) != 0 {
+		return nil, fmt.Errorf("managed wallet cannot report legacy " +
+			"lease spend-depth metadata")
 	}
 
 	return &ListLeasesResponse{
@@ -2454,11 +2465,9 @@ func marshallLeases(locks []*base.ListLeasedOutputResult) []*UtxoLease {
 			Outpoint: lnrpc.MarshalOutPoint(
 				&lock.Outpoint,
 			),
-			Expiration:             uint64(lock.Expiration.Unix()),
-			PkScript:               lock.PkScript,
-			Value:                  uint64(lock.Value),
-			ReleaseAfterSpendConfs: lock.ReleaseAfterSpendConfs,
-			ConfirmedSpendHeight:   lock.ConfirmedSpendHeight,
+			Expiration: uint64(lock.Expiration.Unix()),
+			PkScript:   lock.PkScript,
+			Value:      uint64(lock.Value),
 		}
 	}
 
@@ -2990,7 +2999,7 @@ const msgSignaturePrefix = "Bitcoin Signed Message:\n"
 
 // SignMessageWithAddr signs a message with the private key of the provided
 // address. The address needs to belong to the lnd wallet.
-func (w *WalletKit) SignMessageWithAddr(_ context.Context,
+func (w *WalletKit) SignMessageWithAddr(ctx context.Context,
 	req *SignMessageWithAddrRequest) (*SignMessageWithAddrResponse, error) {
 
 	addr, err := address.DecodeAddress(req.Addr, w.cfg.ChainParams)
@@ -3011,11 +3020,19 @@ func (w *WalletKit) SignMessageWithAddr(_ context.Context,
 			"wallet database: %w", err)
 	}
 
-	// Verifying by checking the interface type that the wallet knows about
-	// the public and private keys so it can sign the message with the
-	// private key of this address.
-	pubKey, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
-	if !ok {
+	// Existing wrappers expose their underlying controller. Resolve the
+	// local managed wallet to perform the same private-address signing; a
+	// remote watch-only wallet cannot export this private key.
+	controller := w.cfg.Wallet
+	for {
+		wrapper, ok := controller.(lnwallet.WalletControllerWrapper)
+		if !ok {
+			break
+		}
+		controller = wrapper.UnwrapWalletController()
+	}
+	localWallet, ok := controller.(*btcwallet.BtcWallet)
+	if !ok || managedAddr.PubKey == nil {
 		return nil, fmt.Errorf("private key to address is unknown")
 	}
 
@@ -3029,13 +3046,15 @@ func (w *WalletKit) SignMessageWithAddr(_ context.Context,
 	// ECDSA is used to create a compact signature which makes the public
 	// key of the signature recoverable. For Schnorr no known compact
 	// signing algorithm exists yet.
-	privKey, err := pubKey.PrivKey()
+	privKey, err := localWallet.InternalWallet().GetPrivKeyForAddress(
+		ctx, addr,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("no private key could be "+
 			"fetched from wallet database: %w", err)
 	}
 
-	sigBytes := ecdsa.SignCompact(privKey, digest, pubKey.Compressed())
+	sigBytes := ecdsa.SignCompact(privKey, digest, managedAddr.Compressed)
 
 	// Bitcoin signatures are base64 encoded (being compatible with
 	// bitcoin-core and btcd).
@@ -3347,6 +3366,6 @@ func (w *WalletKit) ImportTapscript(_ context.Context,
 	}
 
 	return &ImportTapscriptResponse{
-		P2TrAddress: addr.Address().String(),
+		P2TrAddress: addr.Addr.String(),
 	}, nil
 }

@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -21,7 +22,6 @@ import (
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
 	"github.com/btcsuite/btcwallet/chain"
-	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/walletdb"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -340,7 +340,7 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		cleanUpTasks []func()
 		earlyExit    = true
 		cleanUp      = func() {
-			for _, fn := range cleanUpTasks {
+			for _, fn := range slices.Backward(cleanUpTasks) {
 				if fn == nil {
 					continue
 				}
@@ -392,7 +392,109 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 	// this information.
 	walletInitParams.Birthday = time.Now()
 
-	d.pwService.SetLoaderOpts([]btcwallet.LoaderOption{dbs.WalletDB})
+	// With the information parsed from the configuration, create valid
+	// instances of the pertinent interfaces required to operate the
+	// Lightning Network Daemon.
+	//
+	// When we create the chain control, we need storage for the height
+	// hints and also the wallet itself, for these two we want them to be
+	// replicated, so we'll pass in the remote channel DB instance.
+	chainControlCfg := &chainreg.Config{
+		Bitcoin:                     d.cfg.Bitcoin,
+		HeightHintCacheQueryDisable: d.cfg.HeightHintCacheQueryDisable,
+		NeutrinoMode:                d.cfg.NeutrinoMode,
+		BitcoindMode:                d.cfg.BitcoindMode,
+		BtcdMode:                    d.cfg.BtcdMode,
+		HeightHintDB:                dbs.HeightHintDB,
+		ChanStateDB:                 dbs.ChanStateDB.ChannelStateDB(),
+		NeutrinoCS:                  neutrinoCS,
+		AuxLeafStore:                aux.AuxLeafStore,
+		AuxSigner:                   aux.AuxSigner,
+		ActiveNetParams:             d.cfg.ActiveNetParams,
+		FeeURL:                      d.cfg.FeeURL,
+		Fee: &lncfg.Fee{
+			URL:              d.cfg.Fee.URL,
+			MinUpdateTimeout: d.cfg.Fee.MinUpdateTimeout,
+			MaxUpdateTimeout: d.cfg.Fee.MaxUpdateTimeout,
+		},
+		Dialer: func(addr string) (net.Conn, error) {
+			return d.cfg.net.Dial(
+				"tcp", addr, d.cfg.ConnectionTimeout,
+			)
+		},
+		BlockCache:         blockCache,
+		WalletUnlockParams: &walletInitParams,
+	}
+
+	// Let's go ahead and create the partial chain control now that is only
+	// dependent on our configuration and doesn't require any wallet
+	// specific information.
+	partialChainControl, pccCleanup, err := chainreg.NewPartialChainControl(
+		chainControlCfg,
+	)
+	cleanUpTasks = append(cleanUpTasks, pccCleanup)
+	if err != nil {
+		err := fmt.Errorf("unable to create partial chain control: %w",
+			err)
+		d.logger.Error(err)
+
+		return nil, nil, nil, err
+	}
+
+	// Manager borrows a started source. Cleanup runs in reverse acquisition
+	// order so wallet work and storage close before the chain connection.
+	err = partialChainControl.ChainSource.Start(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cleanUpTasks = append(
+		cleanUpTasks,
+		partialChainControl.ChainSource.Stop,
+	)
+	managerConfig := dbs.WalletDB
+	managerConfig.ChainParams = *d.cfg.ActiveNetParams.Params
+	managerConfig.ChainSource = partialChainControl.ChainSource
+	managerConfig.SignetChallengeDigest, err =
+		walletSignetChallengeDigest(d.cfg)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// SQL exposes wallet existence through Start's durable result, not the
+	// presence of a database file. Keep this one runtime across RPC retries
+	// and publish successful Create results into the same atomic slot.
+	var currentWallet atomic.Pointer[wallet.Wallet]
+	var manager *wallet.Manager
+	if managerConfig.Backend != wallet.DBBackendKVDB {
+		manager, err = wallet.NewManager(ctx, managerConfig)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		cleanUpTasks = append(cleanUpTasks, func() {
+			if err := manager.Stop(); err != nil {
+				d.logger.Errorf(
+					"Could not stop wallet "+
+						"manager: %v",
+					err,
+				)
+			}
+		})
+		wallets, err := manager.Start(ctx)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if len(wallets) > 1 {
+			return nil, nil, nil, fmt.Errorf(
+				"lnd requires a single wallet",
+			)
+		}
+		if len(wallets) == 1 {
+			currentWallet.Store(wallets[0])
+		}
+		walletInitParams.Manager = manager
+		walletInitParams.Wallet = currentWallet.Load()
+	}
+	d.pwService.SetManagerConfig(managerConfig, manager, &currentWallet)
 	d.pwService.SetMacaroonDB(dbs.MacaroonDB)
 	walletExists, err := d.pwService.WalletExists()
 	if err != nil {
@@ -423,8 +525,53 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 	switch {
 	// No seed backup means we're also using the default password.
 	case d.cfg.NoSeedBackup:
-		// We continue normally, the default password has already been
-		// set above.
+		// Local walletdb needs its public credential before
+		// Manager.Start. SQL already owns a runtime; both modes reuse
+		// Create for an empty wallet set and leave normal private
+		// unlocking to BtcWallet.Start.
+		if manager == nil {
+			managerConfig.KVDBPubPassphrase = publicWalletPw
+			manager, err = wallet.NewManager(ctx, managerConfig)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			cleanUpTasks = append(cleanUpTasks, func() {
+				if err := manager.Stop(); err != nil {
+					d.logger.Errorf(
+						"Could not stop wallet "+
+							"manager: %v",
+						err,
+					)
+				}
+			})
+			wallets, err := manager.Start(ctx)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if len(wallets) > 1 {
+				return nil, nil, nil, fmt.Errorf(
+					"lnd requires a single wallet",
+				)
+			}
+			if len(wallets) == 1 {
+				walletInitParams.Wallet = wallets[0]
+			}
+			walletInitParams.Manager = manager
+		}
+		if walletInitParams.Wallet == nil {
+			params := wallet.CreateWalletParams{
+				Name:              "lnd",
+				Mode:              wallet.ModeGenSeed,
+				Birthday:          walletInitParams.Birthday,
+				PubPassphrase:     publicWalletPw,
+				PrivatePassphrase: privateWalletPw,
+			}
+			walletInitParams.Wallet, err = manager.Create(params)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			currentWallet.Store(walletInitParams.Wallet)
+		}
 
 	// A password for unlocking is provided in a file.
 	case d.cfg.WalletUnlockPasswordFile != "" && walletExists:
@@ -444,9 +591,8 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 
 		// We have the password now, we can ask the unlocker service to
 		// do the unlock for us.
-		unlockedWallet, unloadWalletFn, err := d.pwService.LoadAndUnlock(
-			pwBytes, 0,
-		)
+		unlockedWallet, walletManager, unloadWalletFn, err :=
+			d.pwService.LoadAndUnlock(pwBytes, 0)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("error unlocking "+
 				"wallet with password from file: %v", err)
@@ -462,6 +608,7 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		privateWalletPw = pwBytes
 		publicWalletPw = pwBytes
 		walletInitParams.Wallet = unlockedWallet
+		walletInitParams.Manager = walletManager
 		walletInitParams.UnloadWallet = unloadWalletFn
 
 	// If none of the automatic startup options are selected, we fall back
@@ -473,7 +620,8 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		}
 
 		params, err := waitForWalletPassword(
-			d.cfg, d.pwService, []btcwallet.LoaderOption{dbs.WalletDB},
+			d.cfg, d.pwService, managerConfig,
+			manager, &currentWallet,
 			d.interceptor.ShutdownChannel(),
 		)
 		if err != nil {
@@ -634,54 +782,6 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		}
 	}
 
-	// With the information parsed from the configuration, create valid
-	// instances of the pertinent interfaces required to operate the
-	// Lightning Network Daemon.
-	//
-	// When we create the chain control, we need storage for the height
-	// hints and also the wallet itself, for these two we want them to be
-	// replicated, so we'll pass in the remote channel DB instance.
-	chainControlCfg := &chainreg.Config{
-		Bitcoin:                     d.cfg.Bitcoin,
-		HeightHintCacheQueryDisable: d.cfg.HeightHintCacheQueryDisable,
-		NeutrinoMode:                d.cfg.NeutrinoMode,
-		BitcoindMode:                d.cfg.BitcoindMode,
-		BtcdMode:                    d.cfg.BtcdMode,
-		HeightHintDB:                dbs.HeightHintDB,
-		ChanStateDB:                 dbs.ChanStateDB.ChannelStateDB(),
-		NeutrinoCS:                  neutrinoCS,
-		AuxLeafStore:                aux.AuxLeafStore,
-		AuxSigner:                   aux.AuxSigner,
-		ActiveNetParams:             d.cfg.ActiveNetParams,
-		FeeURL:                      d.cfg.FeeURL,
-		Fee: &lncfg.Fee{
-			URL:              d.cfg.Fee.URL,
-			MinUpdateTimeout: d.cfg.Fee.MinUpdateTimeout,
-			MaxUpdateTimeout: d.cfg.Fee.MaxUpdateTimeout,
-		},
-		Dialer: func(addr string) (net.Conn, error) {
-			return d.cfg.net.Dial(
-				"tcp", addr, d.cfg.ConnectionTimeout,
-			)
-		},
-		BlockCache:         blockCache,
-		WalletUnlockParams: &walletInitParams,
-	}
-
-	// Let's go ahead and create the partial chain control now that is only
-	// dependent on our configuration and doesn't require any wallet
-	// specific information.
-	partialChainControl, pccCleanup, err := chainreg.NewPartialChainControl(
-		chainControlCfg,
-	)
-	cleanUpTasks = append(cleanUpTasks, pccCleanup)
-	if err != nil {
-		err := fmt.Errorf("unable to create partial chain control: %w",
-			err)
-		d.logger.Error(err)
-		return nil, nil, nil, err
-	}
-
 	walletConfig := &btcwallet.Config{
 		PrivatePass:      privateWalletPw,
 		PublicPass:       publicWalletPw,
@@ -690,7 +790,8 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 		NetParams:        d.cfg.ActiveNetParams.Params,
 		CoinType:         d.cfg.ActiveNetParams.CoinType,
 		Wallet:           walletInitParams.Wallet,
-		LoaderOptions:    []btcwallet.LoaderOption{dbs.WalletDB},
+		ManagerConfig:    managerConfig,
+		Manager:          walletInitParams.Manager,
 		ChainSource:      partialChainControl.ChainSource,
 		WatchOnly:        d.watchOnly,
 		MigrateWatchOnly: d.migrateWatchOnly,
@@ -1020,9 +1121,8 @@ type DatabaseInstances struct {
 	// configuration.
 	TowerServerDB watchtower.DB
 
-	// WalletDB is the configuration for loading the wallet database using
-	// the btcwallet's loader.
-	WalletDB btcwallet.LoaderOption
+	// WalletDB configures the database owned by the wallet Manager.
+	WalletDB wallet.ManagerConfig
 
 	// NativeSQLStore holds a reference to the native SQL store that can
 	// be used for native SQL queries for tables that already support it.
@@ -1506,7 +1606,8 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 // this RPC server.
 func waitForWalletPassword(cfg *Config,
 	pwService *walletunlocker.UnlockerService,
-	loaderOpts []btcwallet.LoaderOption, shutdownChan <-chan struct{}) (
+	managerConfig wallet.ManagerConfig, manager *wallet.Manager,
+	current *atomic.Pointer[wallet.Wallet], shutdownChan <-chan struct{}) (
 	*walletunlocker.WalletUnlockParams, error) {
 
 	// Wait for user to provide the password.
@@ -1542,74 +1643,70 @@ func waitForWalletPassword(cfg *Config,
 				keychain.CurrentKeyDerivationVersion)
 		}
 
-		loader, err := btcwallet.NewWalletLoader(
-			cfg.ActiveNetParams.Params, recoveryWindow,
-			loaderOpts...,
-		)
-		if err != nil {
-			return nil, err
+		// The SQL Manager started before RPC admission with zero
+		// lookahead. It cannot recover accounts installed after
+		// scanning has begun.
+		if managerConfig.Backend != wallet.DBBackendKVDB &&
+			recoveryWindow != 0 {
+
+			return nil, fmt.Errorf("native wallet historical " +
+				"recovery requires accounts to exist before " +
+				"synchronization")
 		}
-
-		// With the seed, we can now use the wallet loader to create
-		// the wallet, then pass it back to avoid unlocking it again.
-		var (
-			birthday  time.Time
-			newWallet *wallet.Wallet
-		)
-		switch {
-		// A normal cipher seed was given, use the birthday encoded in
-		// it and create the wallet from that.
-		case cipherSeed != nil:
-			birthday = cipherSeed.BirthdayTime()
-			newWallet, err = loader.CreateNewWallet(
-				password, password, cipherSeed.Entropy[:],
-				birthday,
-			)
-
-		// No seed was given, we're importing a wallet from its extended
-		// private key.
-		case extendedKey != nil:
-			birthday = initMsg.ExtendedKeyBirthday
-			newWallet, err = loader.CreateNewWalletExtendedKey(
-				password, password, extendedKey, birthday,
-			)
-
-		// Neither seed nor extended private key was given, so maybe the
-		// third option was chosen, the watch-only initialization. In
-		// this case we need to import each of the xpubs individually.
-		case watchOnlyAccounts != nil:
-			if !cfg.RemoteSigner.Enable {
-				return nil, fmt.Errorf("cannot initialize " +
-					"watch only wallet with remote " +
-					"signer config disabled")
-			}
-
-			birthday = initMsg.WatchOnlyBirthday
-			newWallet, err = loader.CreateNewWatchingOnlyWallet(
-				password, birthday,
+		if watchOnlyAccounts != nil {
+			return nil, importWatchOnlyAccounts(nil, initMsg)
+		}
+		if manager == nil {
+			managerConfig.KVDBPubPassphrase = password
+			managerConfig.RecoveryWindow = recoveryWindow
+			var err error
+			manager, err = wallet.NewManager(
+				context.Background(),
+				managerConfig,
 			)
 			if err != nil {
-				break
+				return nil, err
 			}
+			wallets, err := manager.Start(context.Background())
+			if err != nil || len(wallets) != 0 {
+				_ = manager.Stop()
+				if err != nil {
+					return nil, err
+				}
 
-			err = importWatchOnlyAccounts(newWallet, initMsg)
-
-		default:
-			// The unlocker service made sure either the cipher seed
-			// or the extended key is set so, we shouldn't get here.
-			// The default case is just here for readability and
-			// completeness.
-			err = fmt.Errorf("cannot create wallet, neither seed " +
-				"nor extended key was given")
+				return nil, fmt.Errorf("wallet already exists")
+			}
 		}
+
+		// Use the same aezeed entropy or root XPrv as before. Create
+		// owns runtime startup; lnd publishes its result before the RPC
+		// response.
+		params := wallet.CreateWalletParams{
+			Name:              "lnd",
+			PubPassphrase:     password,
+			PrivatePassphrase: password,
+		}
+		switch {
+		case cipherSeed != nil:
+			params.Mode = wallet.ModeImportSeed
+			params.Seed = cipherSeed.Entropy[:]
+			params.Birthday = cipherSeed.BirthdayTime()
+		case extendedKey != nil:
+			params.Mode = wallet.ModeImportExtKey
+			params.RootKey = extendedKey
+			params.Birthday = initMsg.ExtendedKeyBirthday
+		default:
+			_ = manager.Stop()
+			return nil, fmt.Errorf("cannot create wallet " +
+				"without seed or root key")
+		}
+		newWallet, err := manager.Create(params)
 		if err != nil {
-			// Don't leave the file open in case the new wallet
-			// could not be created for whatever reason.
-			if err := loader.UnloadWallet(); err != nil {
-				ltndLog.Errorf("Could not unload new "+
-					"wallet: %v", err)
-			}
+			_ = manager.Stop()
 			return nil, err
+		}
+		if current != nil {
+			current.Store(newWallet)
 		}
 
 		// For new wallets, the ResetWalletTransactions flag is a no-op.
@@ -1620,11 +1717,12 @@ func waitForWalletPassword(cfg *Config,
 
 		return &walletunlocker.WalletUnlockParams{
 			Password:        password,
-			Birthday:        birthday,
+			Birthday:        params.Birthday,
 			RecoveryWindow:  recoveryWindow,
 			Wallet:          newWallet,
 			ChansToRestore:  initMsg.ChanBackups,
-			UnloadWallet:    loader.UnloadWallet,
+			UnloadWallet:    manager.Stop,
+			Manager:         manager,
 			StatelessInit:   initMsg.StatelessInit,
 			MacResponseChan: pwService.MacResponseChan,
 			MacRootKey:      initMsg.MacRootKey,
@@ -1648,6 +1746,7 @@ func waitForWalletPassword(cfg *Config,
 			Password:        unlockMsg.Passphrase,
 			RecoveryWindow:  unlockMsg.RecoveryWindow,
 			Wallet:          unlockMsg.Wallet,
+			Manager:         unlockMsg.Manager,
 			ChansToRestore:  unlockMsg.ChanBackups,
 			UnloadWallet:    unlockMsg.UnloadWallet,
 			StatelessInit:   unlockMsg.StatelessInit,
@@ -1665,51 +1764,35 @@ func waitForWalletPassword(cfg *Config,
 func importWatchOnlyAccounts(wallet *wallet.Wallet,
 	initMsg *walletunlocker.WalletInitMsg) error {
 
-	scopes := make([]waddrmgr.ScopedIndex, 0, len(initMsg.WatchOnlyAccounts))
-	for scope := range initMsg.WatchOnlyAccounts {
-		scopes = append(scopes, scope)
+	// Imported accounts must retain their exact purpose/coin/account path.
+	// Numberless XPub imports cannot stand in for those signing
+	// coordinates.
+	return fmt.Errorf("managed wallet cannot import exact " +
+		"watch-only account paths")
+}
+
+// walletSignetChallengeDigest binds native wallet storage to the configured
+// signet challenge using the same prefixed hash that defines its network magic.
+func walletSignetChallengeDigest(cfg *Config) ([]byte, error) {
+	if !cfg.Bitcoin.SigNet {
+		return nil, nil
 	}
-
-	// We need to import the accounts in the correct order, otherwise the
-	// indices will be incorrect.
-	sort.Slice(scopes, func(i, j int) bool {
-		return scopes[i].Scope.Purpose < scopes[j].Scope.Purpose ||
-			scopes[i].Index < scopes[j].Index
-	})
-
-	for _, scope := range scopes {
-		addrSchema := waddrmgr.ScopeAddrMap[waddrmgr.KeyScopeBIP0084]
-
-		// We want witness pubkey hash by default, except for BIP49
-		// where we want mixed and BIP86 where we want taproot address
-		// formats.
-		switch scope.Scope.Purpose {
-		case waddrmgr.KeyScopeBIP0049Plus.Purpose,
-			waddrmgr.KeyScopeBIP0086.Purpose:
-
-			addrSchema = waddrmgr.ScopeAddrMap[scope.Scope]
-		}
-
-		// We want a human-readable account name. But for the default
-		// on-chain wallet we actually need to call it "default" to make
-		// sure everything works correctly.
-		name := fmt.Sprintf("%s/%d'", scope.Scope.String(), scope.Index)
-		if scope.Index == 0 {
-			name = "default"
-		}
-
-		_, err := wallet.ImportAccountWithScope(
-			name, initMsg.WatchOnlyAccounts[scope],
-			initMsg.WatchOnlyMasterFingerprint, scope.Scope,
-			addrSchema,
-		)
+	challenge := chaincfg.DefaultSignetChallenge
+	if cfg.Bitcoin.SigNetChallenge != "" {
+		var err error
+		challenge, err = hex.DecodeString(cfg.Bitcoin.SigNetChallenge)
 		if err != nil {
-			return fmt.Errorf("could not import account %v: %w",
-				name, err)
+			return nil, fmt.Errorf(
+				"decode signet challenge: %w",
+				err,
+			)
 		}
 	}
+	digest := chainhash.DoubleHashB(
+		append([]byte{byte(len(challenge))}, challenge...),
+	)
 
-	return nil
+	return digest, nil
 }
 
 // handleNeutrinoPostgresDBMigration handles the migration of the neutrino db

@@ -7,6 +7,7 @@ import (
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcjson"
+	"github.com/btcsuite/btcd/btcutil/v2/gcs"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
@@ -235,3 +236,57 @@ func (n *NoChainSource) MapRPCErr(err error) error {
 }
 
 var _ chain.Interface = (*NoChainSource)(nil)
+
+// GetCFilter rejects single-filter requests because the offline source has no
+// chain data to supply to the wallet synchronizer.
+func (n *NoChainSource) GetCFilter(hash *chainhash.Hash,
+	filterType wire.FilterType) (*gcs.Filter, error) {
+
+	return nil, errNotImplemented
+}
+
+// GetBlockHashes rejects height-range requests because the offline source has
+// no chain data to supply to the wallet synchronizer.
+func (n *NoChainSource) GetBlockHashes(startHeight,
+	endHeight int64) ([]chainhash.Hash, error) {
+
+	return nil, errNotImplemented
+}
+
+// GetCFilters rejects filter-batch requests because the offline source has no
+// chain data to supply to the wallet synchronizer.
+func (n *NoChainSource) GetCFilters(hashes []chainhash.Hash,
+	filterType wire.FilterType) ([]*gcs.Filter, error) {
+
+	return nil, errNotImplemented
+}
+
+// GetBlocks rejects block-batch requests because the offline source has no
+// chain data to supply to the wallet synchronizer.
+func (n *NoChainSource) GetBlocks(hashes []chainhash.Hash) (
+	[]*wire.MsgBlock, error) {
+
+	return nil, errNotImplemented
+}
+
+// GetBlockHeaders rejects header-batch requests because the offline source has
+// no chain data to supply to the wallet synchronizer.
+func (n *NoChainSource) GetBlockHeaders(hashes []chainhash.Hash) (
+	[]*wire.BlockHeader, error) {
+
+	return nil, errNotImplemented
+}
+
+// NotifySpent rejects spend tracking because the offline source cannot deliver
+// chain events for an installed watch.
+func (n *NoChainSource) NotifySpent([]*wire.OutPoint) error {
+	return errNotImplemented
+}
+
+// WatchAddrsFromTip rejects watch admission because there is no real chain tip
+// or event source in offline mode.
+func (n *NoChainSource) WatchAddrsFromTip(context.Context,
+	[]address.Address) error {
+
+	return errNotImplemented
+}

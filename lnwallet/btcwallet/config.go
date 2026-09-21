@@ -65,8 +65,11 @@ type Config struct {
 	// normally when creating the BtcWallet.
 	Wallet *wallet.Wallet
 
-	// LoaderOptions holds functional wallet db loader options.
-	LoaderOptions []LoaderOption
+	// ManagerConfig supplies storage and runtime policy for direct startup.
+	ManagerConfig wallet.ManagerConfig
+
+	// Manager owns Wallet when startup already ran through the unlocker.
+	Manager *wallet.Manager
 
 	// CoinSelectionStrategy is the strategy that is used for selecting
 	// coins when funding a transaction.

@@ -614,10 +614,11 @@ func TestBip32DerivationFromAddress(t *testing.T) {
 
 		addrInfo, err := w.AddressInfo(addr)
 		require.NoError(t, err)
-		managedAddr, ok := addrInfo.(waddrmgr.ManagedPubKeyAddress)
-		require.True(t, ok)
 
-		d, trD, path, err := Bip32DerivationFromAddress(managedAddr)
+		// Read derivation metadata from the maintained address DTO,
+		// which must preserve both ordinary and Taproot PSBT key
+		// origins.
+		d, trD, path, err := Bip32DerivationFromAddress(addrInfo)
 		require.NoError(t, err)
 
 		require.Equal(t, tc.expectedPath, path)

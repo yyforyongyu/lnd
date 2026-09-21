@@ -281,7 +281,10 @@ func (r *RPCKeyRing) FinalizePsbt(packet *psbt.Packet, _ string) error {
 	// ones to sign. If there is any input without witness data that we
 	// cannot sign because it's not our UTXO, this will be a hard failure.
 	tx := packet.UnsignedTx
-	prevOutFetcher := basewallet.PsbtPrevOutputFetcher(packet)
+	prevOutFetcher, err := basewallet.PsbtPrevOutputFetcher(packet)
+	if err != nil {
+		return err
+	}
 	sigHashes := txscript.NewTxSigHashes(tx, prevOutFetcher)
 	for idx, txIn := range tx.TxIn {
 		in := packet.Inputs[idx]
@@ -613,17 +616,17 @@ func (r *RPCKeyRing) SignOutputRaw(tx *wire.MsgTx,
 func (r *RPCKeyRing) ComputeInputScript(tx *wire.MsgTx,
 	signDesc *input.SignDescriptor) (*input.Script, error) {
 
-	addr, witnessProgram, sigScript, err := r.WalletController.ScriptForOutput(
+	info, err := r.WalletController.ScriptForOutput(
 		signDesc.Output,
 	)
 	if err != nil {
 		return nil, err
 	}
-	signDesc.WitnessScript = witnessProgram
+	signDesc.WitnessScript = info.WitnessProgram
 
 	// If this is a p2tr address, then it must be a BIP0086 key spend if we
 	// are coming through this path (instead of SignOutputRaw).
-	switch addr.AddrType() {
+	switch info.AddrType {
 	case waddrmgr.TaprootPubKey:
 		signDesc.SignMethod = input.TaprootKeySpendBIP0086SignMethod
 		signDesc.WitnessScript = nil
@@ -652,7 +655,7 @@ func (r *RPCKeyRing) ComputeInputScript(tx *wire.MsgTx,
 
 	// Let's give the TX to the remote instance now, so it can sign the
 	// input.
-	sig, err := r.remoteSign(tx, signDesc, witnessProgram)
+	sig, err := r.remoteSign(tx, signDesc, info.WitnessProgram)
 	if err != nil {
 		return nil, fmt.Errorf("error signing with remote instance: %w",
 			err)
@@ -664,9 +667,9 @@ func (r *RPCKeyRing) ComputeInputScript(tx *wire.MsgTx,
 	return &input.Script{
 		Witness: wire.TxWitness{
 			append(sig.Serialize(), byte(signDesc.HashType)),
-			addr.PubKey().SerializeCompressed(),
+			info.PubKey.SerializeCompressed(),
 		},
-		SigScript: sigScript,
+		SigScript: info.SigScript,
 	}, nil
 }
 
@@ -1031,13 +1034,16 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 				"for public key %x: %v", pubKeyBytes, err)
 		}
 
-		pubKeyAddr, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
-		if !ok {
-			return nil, fmt.Errorf("address derived for public "+
-				"key %x is not a p2wkh address", pubKeyBytes)
+		// Remote signing needs the persisted origin, not an inferred
+		// account number for an imported key that happens to produce
+		// this address.
+		if managedAddr.PubKey == nil || managedAddr.Derivation == nil {
+			return nil, fmt.Errorf(
+				"address has no key derivation metadata",
+			)
 		}
-
-		scope, path, _ := pubKeyAddr.DerivationInfo()
+		path := managedAddr.Derivation
+		scope := path.KeyScope
 		if scope.Purpose != keychain.BIP0043Purpose {
 			return nil, fmt.Errorf("address derived for public "+
 				"key %x is not in custom key scope %d'",
@@ -1047,7 +1053,7 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 		// We now have all the information we need to complete our key
 		// locator information.
 		signDesc.KeyDesc.KeyLocator = keychain.KeyLocator{
-			Family: keychain.KeyFamily(path.InternalAccount),
+			Family: keychain.KeyFamily(path.Account),
 			Index:  path.Index,
 		}
 

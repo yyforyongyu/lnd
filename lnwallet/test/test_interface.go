@@ -27,6 +27,7 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/walletdb"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
@@ -1422,13 +1423,10 @@ func testListTransactionDetailsOffset(miner *rpctest.Harness,
 func testTransactionSubscriptions(miner *rpctest.Harness,
 	alice, _ *lnwallet.LightningWallet, t *testing.T) {
 
-	// First, check to see if this wallet meets the TransactionNotifier
-	// interface, if not then we'll skip this test for this particular
-	// implementation of the WalletController.
+	// Subscription delivery is part of the wallet contract. Failure to
+	// create the subscription must fail this case on every storage backend.
 	txClient, err := alice.SubscribeTransactions()
-	if err != nil {
-		t.Skipf("unable to generate tx subscription: %v", err)
-	}
+	require.NoError(t, err)
 	defer txClient.Cancel()
 
 	const (
@@ -2667,7 +2665,18 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 			outputs[i] = output
 		}
 
-		// Now try creating a tx spending to these outputs.
+		// Arrange the public change cursor before authoring. A dry run
+		// must predict fees without consuming the next change address.
+		scope := waddrmgr.KeyScopeBIP0086
+		before, err := w.ListAccounts(
+			lnwallet.DefaultAccountName,
+			&scope,
+		)
+		require.NoError(t, err)
+		require.Len(t, before, 1)
+
+		// Act through the same authoring entry point used by fee
+		// estimates.
 		createTx, createErr := w.CreateSimpleTx(
 			nil, outputs, feeRate, minConfs,
 			w.Cfg.CoinSelectionStrategy, true,
@@ -2682,6 +2691,20 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 			t.Fatalf("test #%v should have failed on tx "+
 				"creation", i)
 		}
+
+		// Assert the dry run left the durable cursor intact before the
+		// existing send comparison consumes actual change.
+		after, err := w.ListAccounts(
+			lnwallet.DefaultAccountName,
+			&scope,
+		)
+		require.NoError(t, err)
+		require.Len(t, after, 1)
+		require.Equal(
+			t,
+			before[0].InternalKeyCount,
+			after[0].InternalKeyCount,
+		)
 
 		// Also send to these outputs. This should result in a tx
 		// _very_ similar to the one we just created being sent. The
@@ -3296,10 +3319,25 @@ func TestLightningWallet(t *testing.T, targetBackEnd string) {
 				continue
 			}
 
-			if !runTests(t, walletDriver, backEnd, miningNode,
-				rpcConfig, chainNotifier) {
-
-				return
+			// Keep fresh SQL, persisted bbolt and fresh bbolt
+			// outcomes separate so a missing creation capability
+			// stays visible without preventing the supported
+			// storage from being tried.
+			for _, storage := range []string{
+				"sqlite", "bbolt-reopen", "bbolt-fresh",
+			} {
+				name := fmt.Sprintf(
+					"%s/%s:%s", walletDriver.WalletType,
+					backEnd, storage,
+				)
+				t.Run(name, func(t *testing.T) {
+					runTests(
+						t, walletDriver,
+						backEnd, storage,
+						miningNode, rpcConfig,
+						chainNotifier,
+					)
+				})
 			}
 		}
 	}
@@ -3310,7 +3348,7 @@ func TestLightningWallet(t *testing.T, targetBackEnd string) {
 // factoring out the test logic from the loop which cycles through the
 // interface implementations.
 func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
-	backEnd string, miningNode *rpctest.Harness,
+	backEnd, storage string, miningNode *rpctest.Harness,
 	rpcConfig rpcclient.ConnConfig,
 	chainNotifier chainntnfs.ChainNotifier) bool {
 
@@ -3436,8 +3474,10 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 
 			// Create a btcwallet bitcoind client for both Alice and
 			// Bob.
-			aliceClient = chainConn.NewBitcoindClient()
-			bobClient = chainConn.NewBitcoindClient()
+			aliceClient, err = chainConn.NewBitcoindClient()
+			require.NoError(t, err)
+			bobClient, err = chainConn.NewBitcoindClient()
+			require.NoError(t, err)
 
 		case "bitcoind-rpc-polling":
 			// Start a bitcoind instance.
@@ -3447,15 +3487,91 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 
 			// Create a btcwallet bitcoind client for both Alice and
 			// Bob.
-			aliceClient = chainConn.NewBitcoindClient()
-			bobClient = chainConn.NewBitcoindClient()
+			aliceClient, err = chainConn.NewBitcoindClient()
+			require.NoError(t, err)
+			bobClient, err = chainConn.NewBitcoindClient()
+			require.NoError(t, err)
 
 		default:
 			t.Fatalf("unknown chain driver: %v", backEnd)
 		}
 
+		// Arrange each storage profile at the existing constructor
+		// boundary. Only the reopen profile uses legacy setup, solely
+		// to persist the 1017 accounts that fresh managed kvdb cannot
+		// create yet.
+		newController := func(
+			cfg *btcwallet.Config,
+		) lnwallet.WalletController {
+
+			managerCfg := &cfg.ManagerConfig
+			dir := filepath.Dir(managerCfg.DataSource)
+			if storage == "sqlite" {
+				managerCfg.Backend = wallet.DBBackendSQLite
+				cfg.ManagerConfig.DataSource = filepath.Join(
+					dir,
+					"wallet.sqlite",
+				)
+				cfg.RecoveryWindow = 0
+			}
+			if storage == "bbolt-reopen" {
+				loader := wallet.NewLoader(netParams,
+					dir,
+					true, time.Minute, 0)
+				legacy, err := loader.CreateNewWallet(
+					[]byte(wallet.InsecurePubPassphrase),
+					cfg.PrivatePass, cfg.HdSeed, time.Now(),
+				)
+				require.NoError(t, err)
+				unlock := func(tx walletdb.ReadTx) error {
+					bucket := tx.ReadBucket(
+						[]byte("waddrmgr"),
+					)
+
+					return legacy.AddrManager().Unlock(
+						bucket, cfg.PrivatePass,
+					)
+				}
+				err = walletdb.View(legacy.Database(), unlock)
+				require.NoError(t, err)
+				keyScope := waddrmgr.KeyScope{
+					Purpose: keychain.BIP0043Purpose,
+					Coin:    keychain.CoinTypeTestnet,
+				}
+				schemaScope := waddrmgr.KeyScopeBIP0084
+				schema := waddrmgr.ScopeAddrMap[schemaScope]
+				scope, err := legacy.AddScopeManager(
+					keyScope, schema,
+				)
+				require.NoError(t, err)
+				legacyScope, ok :=
+					scope.(*waddrmgr.ScopedKeyManager)
+				require.True(t, ok)
+				require.NoError(t, legacy.InitAccounts(
+					legacyScope, false, 255,
+				))
+				require.NoError(t, loader.UnloadWallet())
+			}
+
+			// All operations under test run on Manager-owned
+			// storage; cleanup also covers startup failures before
+			// LightningWallet registers its ordinary shutdown
+			// callback.
+			controller, err := walletDriver.New(cfg, blockCache)
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, controller.Stop())
+			})
+
+			return controller
+		}
+
 		aliceSeed := sha256.New()
 		aliceSeed.Write([]byte(backEnd))
+		// Each storage profile shares the miner but owns distinct
+		// addresses, so a later profile cannot recover an earlier
+		// profile's funding.
+		aliceSeed.Write([]byte(storage))
 		aliceSeed.Write(aliceHDSeed[:])
 		aliceSeedBytes := aliceSeed.Sum(nil)
 
@@ -3467,18 +3583,15 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 			CoinType:    keychain.CoinTypeTestnet,
 			// wallet starts in recovery mode
 			RecoveryWindow: 2,
-			LoaderOptions: []btcwallet.LoaderOption{
-				btcwallet.LoaderWithLocalWalletDB(
-					tempTestDirAlice, false, time.Minute,
+			ManagerConfig: wallet.ManagerConfig{
+				Backend: wallet.DBBackendKVDB,
+				DataSource: filepath.Join(
+					tempTestDirAlice, "wallet.db",
 				),
+				Timeout: time.Minute,
 			},
 		}
-		aliceWalletController, err = walletDriver.New(
-			aliceWalletConfig, blockCache,
-		)
-		if err != nil {
-			t.Fatalf("unable to create btcwallet: %v", err)
-		}
+		aliceWalletController = newController(aliceWalletConfig)
 		aliceSigner = aliceWalletController.(*btcwallet.BtcWallet)
 		aliceKeyRing = keychain.NewBtcWalletKeyRing(
 			aliceWalletController.(*btcwallet.BtcWallet).InternalWallet(),
@@ -3487,6 +3600,7 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 
 		bobSeed := sha256.New()
 		bobSeed.Write([]byte(backEnd))
+		bobSeed.Write([]byte(storage))
 		bobSeed.Write(bobHDSeed[:])
 		bobSeedBytes := bobSeed.Sum(nil)
 
@@ -3498,18 +3612,15 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 			CoinType:    keychain.CoinTypeTestnet,
 			// wallet starts without recovery mode
 			RecoveryWindow: 0,
-			LoaderOptions: []btcwallet.LoaderOption{
-				btcwallet.LoaderWithLocalWalletDB(
-					tempTestDirBob, false, time.Minute,
+			ManagerConfig: wallet.ManagerConfig{
+				Backend: wallet.DBBackendKVDB,
+				DataSource: filepath.Join(
+					tempTestDirBob, "wallet.db",
 				),
+				Timeout: time.Minute,
 			},
 		}
-		bobWalletController, err = walletDriver.New(
-			bobWalletConfig, blockCache,
-		)
-		if err != nil {
-			t.Fatalf("unable to create btcwallet: %v", err)
-		}
+		bobWalletController = newController(bobWalletConfig)
 		bobSigner = bobWalletController.(*btcwallet.BtcWallet)
 		bobKeyRing = keychain.NewBtcWalletKeyRing(
 			bobWalletController.(*btcwallet.BtcWallet).InternalWallet(),
@@ -3541,9 +3652,7 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 	// wallet state after each step.
 	for _, walletTest := range walletTests {
 
-		testName := fmt.Sprintf("%v/%v:%v", walletType, backEnd,
-			walletTest.name)
-		success := t.Run(testName, func(t *testing.T) {
+		success := t.Run(walletTest.name, func(t *testing.T) {
 			if backEnd == "neutrino" &&
 				strings.Contains(walletTest.name, "dual funder") {
 

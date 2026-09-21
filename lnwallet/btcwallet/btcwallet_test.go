@@ -1,176 +1,414 @@
 package btcwallet
 
 import (
+	"bytes"
+	"context"
 	"math"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcjson"
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/wallet"
+	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnmock"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-// lockedOutpointWallet simulates an output held by btcwallet's memory locker.
-type lockedOutpointWallet struct {
-	wallet.Interface
-	leaseCalled bool
+// walletControllerMock records calls at the maintained adapter boundary;
+// unused embedded operations have no implementation and fail if invoked.
+type walletControllerMock struct {
+	walletAPI
+	mock.Mock
 }
 
-// LockedOutpoint reports that the test output is already locked in memory.
-func (w *lockedOutpointWallet) LockedOutpoint(wire.OutPoint) bool {
-	return true
+// LeaseOutput returns the wallet's ownership conflict to test error mapping.
+func (w *walletControllerMock) LeaseOutput(ctx context.Context,
+	id wtxmgr.LockID, op wire.OutPoint,
+	duration time.Duration) (time.Time, error) {
+
+	args := w.Called(ctx, id, op, duration)
+	expiry, _ := args.Get(0).(time.Time)
+	return expiry, args.Error(1)
 }
 
-// LeaseOutput records an unexpected attempt to lease the locked output.
-func (w *lockedOutpointWallet) LeaseOutput(wtxmgr.LockID, wire.OutPoint,
-	time.Duration) (time.Time, error) {
+// ListLeasedOutputs exposes only the maintained lease fields to the adapter.
+func (w *walletControllerMock) ListLeasedOutputs(ctx context.Context) (
+	[]*wallet.LeasedOutput, error) {
 
-	w.leaseCalled = true
-	return time.Time{}, nil
+	args := w.Called(ctx)
+	leases, _ := args.Get(0).([]*wallet.LeasedOutput)
+
+	return leases, args.Error(1)
 }
 
-// TestLeaseOutputRejectsInMemoryLock verifies that the legacy lease path
-// preserves the in-memory double-lock guard.
-func TestLeaseOutputRejectsInMemoryLock(t *testing.T) {
+// ListUnspent returns the arranged wallet view, including custody and locks.
+func (w *walletControllerMock) ListUnspent(ctx context.Context,
+	query wallet.UtxoQuery) ([]*wallet.Utxo, error) {
+
+	args := w.Called(ctx, query)
+	utxos, _ := args.Get(0).([]*wallet.Utxo)
+
+	return utxos, args.Error(1)
+}
+
+// GetTx supplies parent transactions for the adapter's maturity check.
+func (w *walletControllerMock) GetTx(ctx context.Context,
+	hash chainhash.Hash) (*wallet.TxDetail, error) {
+
+	args := w.Called(ctx, hash)
+	tx, _ := args.Get(0).(*wallet.TxDetail)
+
+	return tx, args.Error(1)
+}
+
+// CreateTransaction checks selection before returning the unsigned handoff.
+func (w *walletControllerMock) CreateTransaction(ctx context.Context,
+	intent *wallet.TxIntent) (*txauthor.AuthoredTx, error) {
+
+	args := w.Called(ctx, intent)
+	tx, _ := args.Get(0).(*txauthor.AuthoredTx)
+
+	return tx, args.Error(1)
+}
+
+// GetPrivKeyForAddress supplies the maintained signer's ambiguous key error.
+func (w *walletControllerMock) GetPrivKeyForAddress(ctx context.Context,
+	addr address.Address) (*btcec.PrivateKey, error) {
+
+	args := w.Called(ctx, addr)
+	key, _ := args.Get(0).(*btcec.PrivateKey)
+
+	return key, args.Error(1)
+}
+
+// GetAddressInfo distinguishes unknown addresses from owned public imports.
+func (w *walletControllerMock) GetAddressInfo(ctx context.Context,
+	addr address.Address) (wallet.AddressInfo, error) {
+
+	args := w.Called(ctx, addr)
+	info, _ := args.Get(0).(wallet.AddressInfo)
+
+	return info, args.Error(1)
+}
+
+// DerivePrivKey records whether the legacy zero-locator fallback was allowed.
+func (w *walletControllerMock) DerivePrivKey(ctx context.Context,
+	path wallet.BIP32Path) (*btcec.PrivateKey, error) {
+
+	args := w.Called(ctx, path)
+	key, _ := args.Get(0).(*btcec.PrivateKey)
+
+	return key, args.Error(1)
+}
+
+// TestWatchOnlySendOutputs preserves balances and unsigned transaction
+// handoff while excluding locked outputs and immature coinbase outputs.
+func TestWatchOnlySendOutputs(t *testing.T) {
 	t.Parallel()
 
-	backend := &lockedOutpointWallet{}
-	wallet := &BtcWallet{wallet: backend}
+	// Arrange a real watch-only wallet so custody uses the same immutable
+	// Manager result as production. Its unsynced chain mock keeps runtime
+	// work bounded by Manager.Stop; transaction reads use the adapter mock.
+	params := &chaincfg.RegressionNetParams
+	source := &lnmock.MockChain{}
+	source.On("IsCurrent").Return(false).Maybe()
+	source.On("GetBestBlock").
+		Return(params.GenesisHash, int32(0), nil).Maybe()
+	source.On("GetBlockHash", int64(0)).
+		Return(params.GenesisHash, nil).Maybe()
+	source.On("GetBlockHeader", params.GenesisHash).
+		Return(&params.GenesisBlock.Header, nil).Maybe()
+	source.On("BackEnd").Return("mock").Maybe()
+	manager, err := wallet.NewManager(t.Context(), wallet.ManagerConfig{
+		Backend:     wallet.DBBackendSQLite,
+		DataSource:  filepath.Join(t.TempDir(), "wallet.sqlite"),
+		ChainParams: *params,
+		ChainSource: source,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, manager.Stop())
+		source.AssertExpectations(t)
+	})
+	_, err = manager.Start(t.Context())
+	require.NoError(t, err)
+	watchOnly, err := manager.Create(wallet.CreateWalletParams{
+		Name:              "lnd",
+		Mode:              wallet.ModeShell,
+		WatchOnly:         true,
+		PrivatePassphrase: []byte("test-password"),
+	})
+	require.NoError(t, err)
+	backend := &walletControllerMock{}
+	controller := &BtcWallet{
+		wallet:    backend,
+		netParams: params,
+		cfg: &Config{
+			WatchOnly: true,
+			Wallet:    watchOnly,
+		},
+	}
 
-	_, err := wallet.LeaseOutput(
+	// Supply an ordinary witness credit and an immature coinbase credit.
+	// Both lack local keys, but only the ordinary credit is eligible for
+	// remote signing. A third locked credit must also stay excluded.
+	_, pubKey := btcec.PrivKeyFromBytes([]byte{1})
+	script, err := input.WitnessPubKeyHash(
+		pubKey.SerializeCompressed(),
+	)
+	require.NoError(t, err)
+	var utxos []*wallet.Utxo
+	for _, coinbase := range []bool{false, true} {
+		parent := wire.NewMsgTx(2)
+		prev := wire.OutPoint{Index: 1}
+		if coinbase {
+			prev.Index = math.MaxUint32
+		}
+		parent.AddTxIn(wire.NewTxIn(&prev, nil, nil))
+		parent.AddTxOut(&wire.TxOut{Value: 100000, PkScript: script})
+		var raw bytes.Buffer
+		require.NoError(t, parent.Serialize(&raw))
+		hash := parent.TxHash()
+		utxos = append(utxos, &wallet.Utxo{
+			OutPoint:      wire.OutPoint{Hash: hash},
+			Amount:        100000,
+			PkScript:      script,
+			Confirmations: 1,
+			Spendable:     false,
+		})
+		backend.On("GetTx", mock.Anything, hash).
+			Return(&wallet.TxDetail{
+				RawTx: raw.Bytes(),
+			}, nil).Twice()
+	}
+	utxos = append(utxos, &wallet.Utxo{Locked: true})
+	backend.On("ListUnspent", mock.Anything, wallet.UtxoQuery{
+		Account:  lnwallet.DefaultAccountName,
+		MinConfs: 1,
+		MaxConfs: math.MaxInt32,
+	}).Return(utxos, nil).Twice()
+	unsigned := wire.NewMsgTx(2)
+	unsigned.AddTxIn(wire.NewTxIn(&utxos[0].OutPoint, nil, nil))
+	output := &wire.TxOut{Value: 50000, PkScript: script}
+	unsigned.AddTxOut(output)
+	backend.On("CreateTransaction", mock.Anything,
+		mock.MatchedBy(func(intent *wallet.TxIntent) bool {
+			policy, ok := intent.Inputs.(*wallet.InputsPolicy)
+			if !ok {
+				return false
+			}
+			pool, ok := policy.Source.(*wallet.CoinSourceUTXOs)
+
+			return ok && len(pool.UTXOs) == 1 &&
+				pool.UTXOs[0] == utxos[0].OutPoint
+		})).Return(&txauthor.AuthoredTx{Tx: unsigned}, nil).Once()
+
+	// Act through the public balance and send methods used by lnd and
+	// RPCKeyRing. The send must return before any local signing/publishing.
+	balance, err := controller.ConfirmedBalance(
+		1, lnwallet.DefaultAccountName,
+	)
+	require.NoError(t, err)
+	tx, err := controller.SendOutputs(
+		nil, []*wire.TxOut{output}, 2500, 1, "", nil,
+	)
+
+	// Assert only remote-signable unlocked value is counted and the exact
+	// authored transaction reaches the remote signer's established handoff.
+	require.Equal(t, btcutil.Amount(100000), balance)
+	require.ErrorIs(t, err, wallet.ErrTxUnsigned)
+	require.Same(t, unsigned, tx)
+	backend.AssertExpectations(t)
+}
+
+// TestLeaseOutputRejectsLockedOutput preserves WalletController's conflict
+// sentinel when the maintained wallet rejects an already reserved outpoint.
+func TestLeaseOutputRejectsLockedOutput(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a wallet reservation conflict for the exact lease request.
+	// The adapter delegates reservation ownership to the maintained wallet.
+	backend := &walletControllerMock{}
+	backend.On(
+		"LeaseOutput", mock.Anything, wtxmgr.LockID{},
+		wire.OutPoint{}, time.Minute,
+	).Return(time.Time{}, wallet.ErrOutputAlreadyLocked).Once()
+	controller := &BtcWallet{wallet: backend}
+
+	// Act through WalletController, as callers do when reserving an input.
+	_, err := controller.LeaseOutput(
 		wtxmgr.LockID{}, wire.OutPoint{}, time.Minute,
 	)
+
+	// Assert the public lnd sentinel and that only the declared call
+	// occurred.
 	require.ErrorIs(t, err, wtxmgr.ErrOutputAlreadyLocked)
-	require.False(t, backend.leaseCalled)
+	backend.AssertExpectations(t)
 }
 
-type previousOutpointsTest struct {
-	name     string
-	tx       *wire.MsgTx
-	myInputs []wallet.TransactionSummaryInput
-	expRes   []lnwallet.PreviousOutPoint
+// TestListLeasedOutputs preserves the bbolt lease values needed for balances
+// without requiring unavailable spend-depth metadata from the wallet.
+func TestListLeasedOutputs(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a persisted lease and its serialized parent output. The
+	// existing mock supplies the maintained reader results, while the
+	// legacy controller previously rejected these available values.
+	parent := wire.NewMsgTx(2)
+	parent.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: 1}, nil, nil))
+	parent.AddTxOut(wire.NewTxOut(12345, []byte{0x51}))
+	var raw bytes.Buffer
+	require.NoError(t, parent.Serialize(&raw))
+	lease := &wallet.LeasedOutput{
+		OutPoint:   wire.OutPoint{Hash: parent.TxHash()},
+		LockID:     wtxmgr.LockID{1},
+		Expiration: time.Unix(123, 0),
+	}
+	backend := &walletControllerMock{}
+	backend.On("ListLeasedOutputs", mock.Anything).
+		Return([]*wallet.LeasedOutput{lease}, nil).Once()
+	backend.On("GetTx", mock.Anything, lease.OutPoint.Hash).
+		Return(&wallet.TxDetail{RawTx: raw.Bytes()}, nil).Once()
+	controller := &BtcWallet{
+		wallet: backend,
+		cfg: &Config{
+			ManagerConfig: wallet.ManagerConfig{
+				Backend: wallet.DBBackendKVDB,
+			},
+		},
+	}
+
+	// Act through the public adapter method used by WalletBalance.
+	leases, err := controller.ListLeasedOutputs()
+
+	// Assert the available identity, expiration and output values survive
+	// conversion, so the balance caller can sum the actual locked amount.
+	require.NoError(t, err)
+	require.Len(t, leases, 1)
+	require.Equal(t, lease.OutPoint, leases[0].Outpoint)
+	require.Equal(t, lease.LockID, leases[0].LockID)
+	require.Equal(t, lease.Expiration, leases[0].Expiration)
+	require.Equal(t, parent.TxOut[0].Value, leases[0].Value)
+	require.Equal(t, parent.TxOut[0].PkScript, leases[0].PkScript)
+	backend.AssertExpectations(t)
 }
 
-var previousOutpointsTests = []previousOutpointsTest{{
-	name: "both outpoints are wallet controlled",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{{
-			PreviousOutPoint: wire.OutPoint{Index: 0},
-		}, {
-			PreviousOutPoint: wire.OutPoint{Index: 1},
-		}},
-	},
-	myInputs: []wallet.TransactionSummaryInput{{
-		Index: 0,
-	}, {
-		Index: 1,
-	}},
-	expRes: []lnwallet.PreviousOutPoint{{
-		OutPoint:    wire.OutPoint{Index: 0}.String(),
-		IsOurOutput: true,
-	}, {
-		OutPoint:    wire.OutPoint{Index: 1}.String(),
-		IsOurOutput: true,
-	}},
-}, {
-	name: "only one outpoint is wallet controlled",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{{
-			PreviousOutPoint: wire.OutPoint{Index: 0},
-		}, {
-			PreviousOutPoint: wire.OutPoint{Index: 1},
-		}},
-	},
-	myInputs: []wallet.TransactionSummaryInput{{
-		Index: 0,
-	}, {
-		Index: 2,
-	}},
-	expRes: []lnwallet.PreviousOutPoint{{
-		OutPoint:    wire.OutPoint{Index: 0}.String(),
-		IsOurOutput: true,
-	}, {
-		OutPoint:    wire.OutPoint{Index: 1}.String(),
-		IsOurOutput: false,
-	}},
-}, {
-	name: "no outpoint is wallet controlled",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{{
-			PreviousOutPoint: wire.OutPoint{Index: 0},
-		}, {
-			PreviousOutPoint: wire.OutPoint{Index: 1},
-		}},
-	},
-	myInputs: []wallet.TransactionSummaryInput{{
-		Index: 2,
-	}, {
-		Index: 3,
-	}},
-	expRes: []lnwallet.PreviousOutPoint{{
-		OutPoint:    wire.OutPoint{Index: 0}.String(),
-		IsOurOutput: false,
-	}, {
-		OutPoint:    wire.OutPoint{Index: 1}.String(),
-		IsOurOutput: false,
-	}},
-}, {
-	name: "tx is empty",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{},
-	},
-	myInputs: []wallet.TransactionSummaryInput{{
-		Index: 2,
-	}, {
-		Index: 3,
-	}},
-	expRes: []lnwallet.PreviousOutPoint{},
-}, {
-	name: "wallet controlled input set is empty",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{{
-			PreviousOutPoint: wire.OutPoint{Index: 0},
-		}, {
-			PreviousOutPoint: wire.OutPoint{Index: 1},
-		}},
-	},
-	myInputs: []wallet.TransactionSummaryInput{},
-	expRes: []lnwallet.PreviousOutPoint{{
-		OutPoint:    wire.OutPoint{Index: 0}.String(),
-		IsOurOutput: false,
-	}, {
-		OutPoint:    wire.OutPoint{Index: 1}.String(),
-		IsOurOutput: false,
-	}},
-}}
-
-// TestPreviousOutpoints tests if we are able to get the previous
-// outpoints correctly.
+// TestPreviousOutpoints preserves input order and ownership in lnd's
+// transaction details using the maintained reader's resolved previous outputs.
 func TestPreviousOutpoints(t *testing.T) {
-	for _, test := range previousOutpointsTests {
-		t.Run(test.name, func(t *testing.T) {
-			respOutpoints := getPreviousOutpoints(
-				test.tx, test.myInputs,
-			)
+	t.Parallel()
 
-			for idx, respOutpoint := range respOutpoints {
-				expRes := test.expRes[idx]
-				require.Equal(
-					t, expRes.OutPoint,
-					respOutpoint.OutPoint,
-				)
-				require.Equal(
-					t, expRes.IsOurOutput,
-					respOutpoint.IsOurOutput,
-				)
-			}
+	// Arrange the existing ownership cases as maintained reader snapshots.
+	// The expected lnd result keeps every input, including external inputs.
+	first := wire.OutPoint{Index: 0}
+	second := wire.OutPoint{Index: 1}
+	tests := []struct {
+		name     string
+		previous []wallet.PrevOut
+		expected []lnwallet.PreviousOutPoint
+	}{
+		{
+			name: "both outpoints are wallet controlled",
+			previous: []wallet.PrevOut{
+				{
+					OutPoint: wire.OutPoint{Index: 0},
+					IsOurs:   true,
+				},
+				{
+					OutPoint: wire.OutPoint{Index: 1},
+					IsOurs:   true,
+				},
+			},
+			expected: []lnwallet.PreviousOutPoint{
+				{
+					OutPoint:    first.String(),
+					IsOurOutput: true,
+				},
+				{
+					OutPoint:    second.String(),
+					IsOurOutput: true,
+				},
+			},
+		},
+		{
+			name: "only one outpoint is wallet controlled",
+			previous: []wallet.PrevOut{
+				{
+					OutPoint: wire.OutPoint{Index: 0},
+					IsOurs:   true,
+				},
+				{
+					OutPoint: wire.OutPoint{Index: 1},
+					IsOurs:   false,
+				},
+			},
+			expected: []lnwallet.PreviousOutPoint{
+				{
+					OutPoint:    first.String(),
+					IsOurOutput: true,
+				},
+				{
+					OutPoint:    second.String(),
+					IsOurOutput: false,
+				},
+			},
+		},
+		{
+			name: "no outpoint is wallet controlled",
+			previous: []wallet.PrevOut{
+				{
+					OutPoint: wire.OutPoint{Index: 0},
+					IsOurs:   false,
+				},
+				{
+					OutPoint: wire.OutPoint{Index: 1},
+					IsOurs:   false,
+				},
+			},
+			expected: []lnwallet.PreviousOutPoint{
+				{
+					OutPoint:    first.String(),
+					IsOurOutput: false,
+				},
+				{
+					OutPoint:    second.String(),
+					IsOurOutput: false,
+				},
+			},
+		},
+		{
+			name: "tx is empty",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Act through the conversion used by both history
+			// readers.
+			detail := transactionDetail(&wallet.TxDetail{
+				PrevOuts: test.previous,
+			})
+
+			// Assert all previous outputs survive in their original
+			// order with wallet ownership supplied by the
+			// maintained snapshot.
+			require.Equal(
+				t,
+				test.expected,
+				detail.PreviousOutpoints,
+			)
 		})
 	}
 }

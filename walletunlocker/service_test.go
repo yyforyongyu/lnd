@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
 	"github.com/btcsuite/btcwallet/snacl"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
@@ -47,10 +49,32 @@ var (
 	)
 )
 
-func testLoaderOpts(testDir string) []btcwallet.LoaderOption {
-	dbDir := btcwallet.NetworkDir(testDir, testNetParams)
-	return []btcwallet.LoaderOption{
-		btcwallet.LoaderWithLocalWalletDB(dbDir, true, time.Minute),
+// testManagerConfig supplies a real local walletdb and an existing strict chain
+// mock. Background synchronization waits until Manager.Stop joins it; genesis
+// reads allow wallet unlock and password operations to run normally.
+func testManagerConfig(t *testing.T, testDir string) *wallet.ManagerConfig {
+	t.Helper()
+	chainMock := &bwmock.Chain{}
+	chainMock.On("IsCurrent").Return(false).Maybe()
+	chainMock.On("GetBestBlock").
+		Return(testNetParams.GenesisHash, int32(0), nil).Maybe()
+	chainMock.On("GetBlockHash", int64(0)).
+		Return(testNetParams.GenesisHash, nil).Maybe()
+	chainMock.On("GetBlockHeader", testNetParams.GenesisHash).
+		Return(&testNetParams.GenesisBlock.Header, nil).Maybe()
+	chainMock.On("BackEnd").Return("mock").Maybe()
+	t.Cleanup(func() { chainMock.AssertExpectations(t) })
+
+	return &wallet.ManagerConfig{
+		Backend: wallet.DBBackendKVDB,
+		DataSource: path.Join(
+			btcwallet.NetworkDir(testDir, testNetParams),
+			"wallet.db",
+		),
+		ChainParams:    *testNetParams,
+		ChainSource:    chainMock,
+		NoFreelistSync: true,
+		Timeout:        time.Minute,
 	}
 }
 
@@ -150,7 +174,7 @@ func TestGenSeed(t *testing.T) {
 	testDir := t.TempDir()
 
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir),
 	)
 
 	// Now that the service has been created, we'll ask it to generate a
@@ -183,7 +207,7 @@ func TestGenSeedGenerateEntropy(t *testing.T) {
 	// that directory.
 	testDir := t.TempDir()
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir),
 	)
 
 	// Now that the service has been created, we'll ask it to generate a
@@ -215,7 +239,7 @@ func TestGenSeedInvalidEntropy(t *testing.T) {
 	// that directory.
 	testDir := t.TempDir()
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir),
 	)
 
 	// Now that the service has been created, we'll ask it to generate a
@@ -244,7 +268,7 @@ func TestInitWallet(t *testing.T) {
 
 	// Create new UnlockerService.
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir),
 	)
 
 	// Once we have the unlocker service created, we'll now instantiate a
@@ -328,7 +352,7 @@ func TestCreateWalletInvalidEntropy(t *testing.T) {
 
 	// Create new UnlockerService.
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir),
 	)
 
 	// We'll attempt to init the wallet with an invalid cipher seed and
@@ -344,6 +368,93 @@ func TestCreateWalletInvalidEntropy(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestCreateWalletSQLite keeps an empty SQL database usable after a failed
+// creation and a process restart, through the ordinary initialization handoff.
+func TestCreateWalletSQLite(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a failed creation that leaves the database file intact. A new
+	// Manager must discover no wallet rather than infer one from that file.
+	cfg := testManagerConfig(t, t.TempDir())
+	cfg.Backend = wallet.DBBackendSQLite
+	cfg.DataSource = path.Join(t.TempDir(), "wallet.sqlite")
+	manager, err := wallet.NewManager(
+		t.Context(), *cfg,
+	)
+	require.NoError(t, err)
+	wallets, err := manager.Start(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, wallets)
+	_, err = manager.Create(wallet.CreateWalletParams{
+		Name: "lnd",
+		Mode: wallet.
+			ModeImportSeed,
+		Seed:              []byte{1},
+		PrivatePassphrase: testPassword,
+	})
+	require.Error(t, err)
+	require.NoError(t, manager.Stop())
+	require.FileExists(t, cfg.DataSource)
+	manager, err = wallet.NewManager(t.Context(), *cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, manager.Stop())
+	})
+	wallets, err = manager.Start(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, wallets)
+	current := &atomic.Pointer[wallet.Wallet]{}
+	service := walletunlocker.New(testNetParams, nil, false, cfg)
+	service.SetManagerConfig(*cfg, manager, current)
+	exists, err := service.WalletExists()
+	require.NoError(t, err)
+	require.False(t, exists)
+	seed, err := service.GenSeed(t.Context(), &lnrpc.GenSeedRequest{})
+	require.NoError(t, err)
+
+	// Act through InitWallet and the same Manager.Create handoff used by
+	// the daemon. The request goroutine exits on response or context
+	// cancellation.
+	ctx, cancel := context.WithTimeout(
+		t.Context(), defaultTestTimeout,
+	)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := service.InitWallet(ctx, &lnrpc.InitWalletRequest{
+			WalletPassword:     testPassword,
+			CipherSeedMnemonic: seed.CipherSeedMnemonic,
+		})
+		result <- err
+	}()
+	select {
+	case msg := <-service.InitMsgs:
+		created, err := manager.Create(wallet.CreateWalletParams{
+			Name: "lnd",
+			Mode: wallet.
+				ModeImportSeed,
+			Seed:              msg.WalletSeed.Entropy[:],
+			Birthday:          msg.WalletSeed.BirthdayTime(),
+			PrivatePassphrase: msg.Passphrase,
+		})
+		require.NoError(t, err)
+		current.Store(created)
+		service.MacResponseChan <- testMac
+	case err := <-result:
+		t.Fatalf("initialization ended before handoff: %v", err)
+	case <-ctx.Done():
+		t.Fatal("initialization handoff timed out")
+	}
+
+	// Assert creation becomes visible only after publishing its wallet and
+	// the accepted request completes successfully without deleting storage.
+	require.NoError(t, <-result)
+	exists, err = service.WalletExists()
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.FileExists(t, cfg.DataSource)
+}
+
 // TestUnlockWallet checks that trying to unlock non-existing wallet fails, that
 // unlocking existing wallet with wrong passphrase fails, and that unlocking
 // existing wallet with correct passphrase succeeds.
@@ -356,7 +467,7 @@ func TestUnlockWallet(t *testing.T) {
 	// Create new UnlockerService that'll also drop the wallet's history on
 	// unlock.
 	service := walletunlocker.New(
-		testNetParams, nil, true, testLoaderOpts(testDir),
+		testNetParams, nil, true, testManagerConfig(t, testDir),
 	)
 
 	ctx := t.Context()
@@ -444,7 +555,7 @@ func TestChangeWalletPasswordNewRootKey(t *testing.T) {
 
 	// Create a new UnlockerService with our temp files.
 	service := walletunlocker.New(
-		testNetParams, tempFiles, false, testLoaderOpts(testDir),
+		testNetParams, tempFiles, false, testManagerConfig(t, testDir),
 	)
 	service.SetMacaroonDB(store.Backend)
 
@@ -571,7 +682,7 @@ func TestChangeWalletPasswordStateless(t *testing.T) {
 	service := walletunlocker.New(
 		testNetParams, []string{
 			tempMacFile, nonExistingFile,
-		}, false, testLoaderOpts(testDir),
+		}, false, testManagerConfig(t, testDir),
 	)
 	service.SetMacaroonDB(store.Backend)
 
@@ -644,6 +755,8 @@ func TestChangeWalletPasswordStateless(t *testing.T) {
 	assertPasswordChanged(t, testDir, req.NewPassword)
 }
 
+// doChangePassword completes the RPC response and returns its error to the
+// owning test goroutine, which performs all assertions.
 func doChangePassword(service *walletunlocker.UnlockerService,
 	req *lnrpc.ChangePasswordRequest, errChan chan error) {
 

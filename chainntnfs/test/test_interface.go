@@ -1938,7 +1938,7 @@ func TestInterfaces(t *testing.T, targetBackEnd string) {
 				return bitcoindnotify.New(
 					bitcoindConn, unittest.NetParams,
 					hintCache, hintCache, blockCache,
-				), nil
+				)
 			}
 
 		case "bitcoind-rpc-polling":
@@ -1950,7 +1950,7 @@ func TestInterfaces(t *testing.T, targetBackEnd string) {
 				return bitcoindnotify.New(
 					bitcoindConn, unittest.NetParams,
 					hintCache, hintCache, blockCache,
-				), nil
+				)
 			}
 
 		case "btcd":

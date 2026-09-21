@@ -279,8 +279,7 @@ type WalletController interface {
 	// ScriptForOutput returns the address, witness program and redeem
 	// script for a given UTXO. An error is returned if the UTXO does not
 	// belong to our wallet or it is not a managed pubKey address.
-	ScriptForOutput(output *wire.TxOut) (waddrmgr.ManagedPubKeyAddress,
-		[]byte, []byte, error)
+	ScriptForOutput(output *wire.TxOut) (*base.OutputScriptInfo, error)
 
 	// ConfirmedBalance returns the sum of all the wallet's unspent outputs
 	// that have at least confs confirmations. If confs is set to zero,
@@ -321,7 +320,7 @@ type WalletController interface {
 
 	// AddressInfo returns the information about an address, if it's known
 	// to this wallet.
-	AddressInfo(a address.Address) (waddrmgr.ManagedAddress, error)
+	AddressInfo(a address.Address) (*base.AddressInfo, error)
 
 	// ListAccounts retrieves all accounts belonging to the wallet by
 	// default. A name and key scope filter can be provided to filter
@@ -399,7 +398,7 @@ type WalletController interface {
 	// used for funding PSBTs. Only tracking the balance and UTXOs is
 	// currently supported.
 	ImportTaprootScript(scope waddrmgr.KeyScope,
-		tapscript *waddrmgr.Tapscript) (waddrmgr.ManagedAddress, error)
+		tapscript *waddrmgr.Tapscript) (*base.AddressInfo, error)
 
 	// SendOutputs funds, signs, and broadcasts a Bitcoin transaction paying
 	// out to the specified outputs. In the case the wallet has insufficient
@@ -718,9 +717,9 @@ func InternalKeyForAddr(wallet WalletController, netParams *chaincfg.Params,
 		// with the address. Callers can use the .Option() method to get
 		// an option value.
 		var managerErr waddrmgr.ManagerError
-		if errors.As(err, &managerErr) &&
-			managerErr.ErrorCode == waddrmgr.ErrAddressNotFound {
-
+		legacyMissing := errors.As(err, &managerErr) &&
+			managerErr.ErrorCode == waddrmgr.ErrAddressNotFound
+		if errors.Is(err, base.ErrAddressNotFound) || legacyMissing {
 			return none, nil
 		}
 
@@ -735,24 +734,25 @@ func InternalKeyForAddr(wallet WalletController, netParams *chaincfg.Params,
 
 	// Imported addresses do not provide private keys, so they do not
 	// implement waddrmgr.ManagedPubKeyAddress. See RPC ImportTapscript.
-	if walletAddr.Imported() {
+	if walletAddr.Imported {
 		return none, nil
 	}
 
-	pubKeyAddr, ok := walletAddr.(waddrmgr.ManagedPubKeyAddress)
-	if !ok {
-		return none, fmt.Errorf("expected pubkey addr, got %T",
-			walletAddr)
+	// Derived taproot outputs must carry an internal key and full origin;
+	// imported outputs above intentionally do not promise either value.
+	if walletAddr.PubKey == nil || walletAddr.Derivation == nil {
+		return none, fmt.Errorf(
+			"address has no key derivation metadata",
+		)
 	}
-
-	_, derivationPath, _ := pubKeyAddr.DerivationInfo()
+	derivationPath := walletAddr.Derivation
 
 	return fn.Some[keychain.KeyDescriptor](keychain.KeyDescriptor{
 		KeyLocator: keychain.KeyLocator{
 			Family: keychain.KeyFamily(derivationPath.Account),
 			Index:  derivationPath.Index,
 		},
-		PubKey: pubKeyAddr.PubKey(),
+		PubKey: walletAddr.PubKey,
 	}), nil
 }
 

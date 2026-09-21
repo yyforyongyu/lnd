@@ -65,9 +65,9 @@ func (w *WalletController) FetchOutpointInfo(
 // given UTXO. An error is returned if the UTXO does not belong to our wallet or
 // it is not a managed pubKey address.
 func (w *WalletController) ScriptForOutput(*wire.TxOut) (
-	waddrmgr.ManagedPubKeyAddress, []byte, []byte, error) {
+	*base.OutputScriptInfo, error) {
 
-	return nil, nil, nil, nil
+	return nil, nil
 }
 
 // ConfirmedBalance currently returns dummy values.
@@ -100,7 +100,7 @@ func (w *WalletController) IsOurAddress(address.Address) bool {
 
 // AddressInfo currently returns a dummy value.
 func (w *WalletController) AddressInfo(
-	address.Address) (waddrmgr.ManagedAddress, error) {
+	address.Address) (*base.AddressInfo, error) {
 
 	return nil, nil
 }
@@ -148,7 +148,7 @@ func (w *WalletController) ImportPublicKey(*btcec.PublicKey,
 
 // ImportTaprootScript currently returns a dummy value.
 func (w *WalletController) ImportTaprootScript(waddrmgr.KeyScope,
-	*waddrmgr.Tapscript) (waddrmgr.ManagedAddress, error) {
+	*waddrmgr.Tapscript) (*base.AddressInfo, error) {
 
 	return nil, nil
 }
