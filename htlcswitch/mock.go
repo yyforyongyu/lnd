@@ -181,6 +181,8 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 		FetchAllChannels:     db.ChannelStateDB().FetchAllChannels,
 		FetchClosedChannels:  db.ChannelStateDB().FetchClosedChannels,
 		SwitchPackager:       channeldb.NewSwitchPackager(),
+		LookupPreimage: db.NewWitnessCache().
+			LookupSha256Witness,
 		FwdingLog: &mockForwardingLog{
 			events: make(map[time.Time]channeldb.ForwardingEvent),
 		},

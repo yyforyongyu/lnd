@@ -895,6 +895,7 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 		return nil, err
 	}
 
+	witnessCache := dbs.ChanStateDB.NewWitnessCache()
 	s.htlcSwitch, err = htlcswitch.New(htlcswitch.Config{
 		DB:                   dbs.ChanStateDB,
 		FetchAllOpenChannels: s.chanStateDB.FetchAllOpenChannels,
@@ -916,6 +917,7 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 		},
 		FwdingLog:              dbs.ChanStateDB.ForwardingLog(),
 		SwitchPackager:         channeldb.NewSwitchPackager(),
+		LookupPreimage:         witnessCache.LookupSha256Witness,
 		ExtractErrorEncrypter:  s.sphinxPayment.ExtractErrorEncrypter,
 		FetchLastChannelUpdate: s.fetchLastChanUpdate(),
 		Notifier:               s.cc.ChainNotifier,
@@ -948,7 +950,7 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 	}
 
 	s.witnessBeacon = newPreimageBeacon(
-		dbs.ChanStateDB.NewWitnessCache(),
+		witnessCache,
 		s.interceptableSwitch.ForwardPacket,
 		s.interceptableSwitch.RemoveOnChainIntercept,
 	)

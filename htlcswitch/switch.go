@@ -167,6 +167,9 @@ type Config struct {
 	// forwarding packages, and ack settles and fails contained within them.
 	SwitchPackager channeldb.FwdOperator
 
+	// LookupPreimage looks up a preimage in the witness cache.
+	LookupPreimage func(lntypes.Hash) (lntypes.Preimage, error)
+
 	// ExtractErrorEncrypter is an interface allowing switch to reextract
 	// error encrypters stored in the circuit map on restarts, since they
 	// are not stored directly within the database.
@@ -756,7 +759,7 @@ func (s *Switch) ForwardPackets(linkQuit <-chan struct{},
 	// NOTE: This assumes each list is guaranteed to be a subsequence of the
 	// circuits, and that the union of the sets results in the original set
 	// of circuits.
-	var addedPackets, failedPackets []*htlcPacket
+	var addedPackets, droppedPackets, failedPackets []*htlcPacket
 	for _, packet := range addBatch {
 		switch {
 		case len(actions.Adds) > 0 && packet.circuit == actions.Adds[0]:
@@ -764,6 +767,7 @@ func (s *Switch) ForwardPackets(linkQuit <-chan struct{},
 			actions.Adds = actions.Adds[1:]
 
 		case len(actions.Drops) > 0 && packet.circuit == actions.Drops[0]:
+			droppedPackets = append(droppedPackets, packet)
 			actions.Drops = actions.Drops[1:]
 
 		case len(actions.Fails) > 0 && packet.circuit == actions.Fails[0]:
@@ -781,6 +785,39 @@ func (s *Switch) ForwardPackets(linkQuit <-chan struct{},
 		}
 		numSent++
 	}
+
+	// Settle replayed Adds dropped because their full circuits survived a
+	// switch restart. Live circuits must retain their queued outgoing Adds.
+	var replayErr error
+	for _, packet := range droppedPackets {
+		circuit := s.circuits.LookupCircuit(packet.inKey())
+		if circuit == nil || !circuit.LoadedFromDisk {
+			continue
+		}
+
+		_, err := s.settleReplayedAdd(packet, true)
+		if err != nil && replayErr == nil {
+			replayErr = err
+		}
+	}
+
+	// Before failing incomplete forwards, settle replayed Adds for which we
+	// already know the preimage.
+	var unresolvedPackets []*htlcPacket
+	for _, packet := range failedPackets {
+		settled, err := s.settleReplayedAdd(packet, false)
+		if err != nil {
+			if replayErr == nil {
+				replayErr = err
+			}
+
+			continue
+		}
+		if !settled {
+			unresolvedPackets = append(unresolvedPackets, packet)
+		}
+	}
+	failedPackets = unresolvedPackets
 
 	// Lastly, for any packets that failed, this implies that they were
 	// left in a half added state, which can happen when recovering from
@@ -820,7 +857,7 @@ func (s *Switch) ForwardPackets(linkQuit <-chan struct{},
 		}
 	}
 
-	return nil
+	return replayErr
 }
 
 // logFwdErrs logs any errors received on `fwdChan`.
@@ -1276,6 +1313,109 @@ func (s *Switch) failAddPacket(packet *htlcPacket, failure *LinkError) error {
 	}
 
 	return failure
+}
+
+// settleReplayedAdd settles a replayed Add if its preimage is already in the
+// witness cache. If claimCircuit is set, it first atomically claims the
+// existing circuit and restores its persisted metadata. A true result means
+// either the replay was settled or another response already claimed it.
+func (s *Switch) settleReplayedAdd(packet *htlcPacket,
+	claimCircuit bool) (bool, error) {
+
+	if !packet.isReplay {
+		return false, nil
+	}
+
+	add, ok := packet.htlc.(*lnwire.UpdateAddHTLC)
+	if !ok {
+		return false, nil
+	}
+
+	preimage, err := s.cfg.LookupPreimage(add.PaymentHash)
+	if errors.Is(err, channeldb.ErrNoWitnesses) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"unable to look up replay preimage: %w", err,
+		)
+	}
+	if !preimage.Matches(add.PaymentHash) {
+		return false, errors.New(
+			"replay preimage does not match payment hash",
+		)
+	}
+
+	if claimCircuit {
+		circuit, err := s.circuits.FailCircuit(packet.inKey())
+		switch {
+		case errors.Is(err, ErrCircuitClosing),
+			errors.Is(err, ErrUnknownCircuit):
+
+			// Another response has already claimed or removed it.
+			return true, nil
+
+		case err != nil:
+			return false, fmt.Errorf(
+				"unable to claim replay circuit: %w", err,
+			)
+		}
+
+		packet.sourceRef = &circuit.AddRef
+		packet.incomingChanID = circuit.Incoming.ChanID
+		packet.incomingHTLCID = circuit.Incoming.HtlcID
+		packet.incomingAmount = circuit.IncomingAmount
+		packet.amount = circuit.OutgoingAmount
+		packet.circuit = circuit
+		packet.obfuscator = circuit.ErrorEncrypter
+		if circuit.Outgoing != nil {
+			packet.outgoingChanID = circuit.Outgoing.ChanID
+			packet.outgoingHTLCID = circuit.Outgoing.HtlcID
+		}
+	}
+
+	settlePkt := &htlcPacket{
+		sourceRef:       packet.sourceRef,
+		incomingChanID:  packet.incomingChanID,
+		incomingHTLCID:  packet.incomingHTLCID,
+		outgoingChanID:  packet.outgoingChanID,
+		outgoingHop:     packet.outgoingHop,
+		outgoingHTLCID:  packet.outgoingHTLCID,
+		incomingAmount:  packet.incomingAmount,
+		amount:          packet.amount,
+		incomingTimeout: packet.incomingTimeout,
+		outgoingTimeout: packet.outgoingTimeout,
+		circuit:         packet.circuit,
+		obfuscator:      packet.obfuscator,
+		htlc: &lnwire.UpdateFulfillHTLC{
+			PaymentPreimage: preimage,
+		},
+	}
+
+	err = s.mailOrchestrator.Deliver(settlePkt.incomingChanID, settlePkt)
+	if err != nil {
+		return false, fmt.Errorf(
+			"unable to deliver replay settle: %w", err,
+		)
+	}
+
+	return true, nil
+}
+
+// failUnknownNextPeer settles a replayed Add if its preimage is known before
+// otherwise failing it because its next peer is unavailable.
+func (s *Switch) failUnknownNextPeer(packet *htlcPacket) error {
+	settled, err := s.settleReplayedAdd(packet, false)
+	if err != nil {
+		return err
+	}
+	if settled {
+		return nil
+	}
+
+	return s.failAddPacket(packet, NewLinkError(
+		&lnwire.FailUnknownNextPeer{},
+	))
 }
 
 // closeCircuit accepts a settle or fail htlc and the associated htlc packet and
@@ -2900,11 +3040,7 @@ func (s *Switch) handlePacketAdd(packet *htlcPacket,
 			// If packet was forwarded from another channel link
 			// then we should notify this link that some error
 			// occurred.
-			linkError := NewLinkError(
-				&lnwire.FailUnknownNextPeer{},
-			)
-
-			return s.failAddPacket(packet, linkError)
+			return s.failUnknownNextPeer(packet)
 		}
 
 		// NOTE: for the SCID path, we fetch all links to the target
@@ -2947,9 +3083,7 @@ func (s *Switch) handlePacketAdd(packet *htlcPacket,
 			log.Debugf("no usable link to peer %x for blinded "+
 				"next hop", peerKey)
 
-			return s.failAddPacket(packet, NewLinkError(
-				&lnwire.FailUnknownNextPeer{},
-			))
+			return s.failUnknownNextPeer(packet)
 		}
 	}
 
