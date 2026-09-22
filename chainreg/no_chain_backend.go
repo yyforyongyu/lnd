@@ -162,7 +162,12 @@ func (n *NoChainSource) GetBlock(*chainhash.Hash) (*wire.MsgBlock, error) {
 	}, nil
 }
 
-func (n *NoChainSource) GetBlockHash(int64) (*chainhash.Hash, error) {
+func (n *NoChainSource) GetBlockHash(height int64) (*chainhash.Hash, error) {
+	// Diagnostic: SQL block identity requires distinct hashes for virtual
+	// genesis and tip; the original point stub returns one hash for both.
+	if height == 0 {
+		return &chainhash.Hash{}, nil
+	}
 	return noChainBackendBestHash, nil
 }
 
@@ -249,8 +254,18 @@ func (n *NoChainSource) GetCFilter(hash *chainhash.Hash,
 // no chain data to supply to the wallet synchronizer.
 func (n *NoChainSource) GetBlockHashes(startHeight,
 	endHeight int64) ([]chainhash.Hash, error) {
+	// The offline adapter models one stationary virtual chain; batch reads
+	// must expose the same values as its existing point reads.
+	var hashes []chainhash.Hash
+	for height := startHeight; height <= endHeight; height++ {
+		hash, err := n.GetBlockHash(height)
+		if err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, *hash)
+	}
+	return hashes, nil
 
-	return nil, errNotImplemented
 }
 
 // GetCFilters rejects filter-batch requests because the offline source has no
@@ -273,20 +288,33 @@ func (n *NoChainSource) GetBlocks(hashes []chainhash.Hash) (
 // no chain data to supply to the wallet synchronizer.
 func (n *NoChainSource) GetBlockHeaders(hashes []chainhash.Hash) (
 	[]*wire.BlockHeader, error) {
+	// Reuse point reads so modern synchronization sees the same virtual
+	// headers that the legacy offline adapter already supplies.
+	var headers []*wire.BlockHeader
+	for _, hash := range hashes {
+		header, err := n.GetBlockHeader(&hash)
+		if err != nil {
+			return nil, err
+		}
+		headers = append(headers, header)
+	}
+	return headers, nil
 
-	return nil, errNotImplemented
 }
 
 // NotifySpent rejects spend tracking because the offline source cannot deliver
 // chain events for an installed watch.
 func (n *NoChainSource) NotifySpent([]*wire.OutPoint) error {
-	return errNotImplemented
+	// A stationary offline chain has no events, matching NotifyReceived.
+	return nil
+
 }
 
 // WatchAddrsFromTip rejects watch admission because there is no real chain tip
 // or event source in offline mode.
 func (n *NoChainSource) WatchAddrsFromTip(context.Context,
 	[]address.Address) error {
+	// Reuse offline watch admission; the virtual chain never advances.
+	return n.NotifyReceived(nil)
 
-	return errNotImplemented
 }
