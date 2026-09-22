@@ -47,6 +47,10 @@ type Config struct {
 	// default BIP44 derivation paths.
 	RecoveryWindow uint32
 
+	// ResetWalletTransactions requests a whole-wallet Resync after the
+	// managed wallet has installed its lnd accounts.
+	ResetWalletTransactions bool
+
 	// ChainSource is the primary chain interface. This is used to operate
 	// the wallet and do things such as rescanning, sending transactions,
 	// notifications for received funds, etc.

@@ -679,11 +679,6 @@ func (u *UnlockerService) LoadAndUnlock(password []byte,
 	recoveryWindow uint32) (*wallet.Wallet, *wallet.Manager, func() error,
 	error) {
 
-	if u.resetWalletTransactions {
-		return nil, nil, nil, fmt.Errorf("managed wallet " +
-			"does not support " +
-			"transaction-history reset")
-	}
 	exists, err := u.WalletExists()
 	if err != nil {
 		return nil, nil, nil, err

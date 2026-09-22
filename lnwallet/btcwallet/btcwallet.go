@@ -340,7 +340,7 @@ func (b *BtcWallet) Start() error {
 	}
 	// PoC: newly installed accounts can be scanned only after the
 	// initially started wallet reaches a state that admits Resync.
-	if b.cfg.RecoveryWindow > 0 {
+	if b.cfg.RecoveryWindow > 0 || b.cfg.ResetWalletTransactions {
 		deadline := time.Now().Add(20 * time.Second)
 		for {
 			info, err = b.wallet.Info(ctx)
@@ -1419,9 +1419,9 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32,
 	witnessOutputs := make([]*lnwallet.Utxo, 0, len(unspentOutputs))
 	for _, output := range unspentOutputs {
 		// Local key availability does not determine spendability when
-		// RPCKeyRing supplies signatures. Keep locks and local-wallet
-		// exclusions while exposing remote-signable witness outputs.
-		if output.Locked || (!output.Spendable && !b.cfg.WatchOnly) {
+		// RPCKeyRing or a PSBT signer supplies signatures for imported
+		// outputs, so only a lock excludes a tracked output here.
+		if output.Locked {
 			continue
 		}
 		// Spendable also encodes coinbase maturity. The maintained UTXO

@@ -783,18 +783,19 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 	}
 
 	walletConfig := &btcwallet.Config{
-		PrivatePass:      privateWalletPw,
-		PublicPass:       publicWalletPw,
-		Birthday:         walletInitParams.Birthday,
-		RecoveryWindow:   walletInitParams.RecoveryWindow,
-		NetParams:        d.cfg.ActiveNetParams.Params,
-		CoinType:         d.cfg.ActiveNetParams.CoinType,
-		Wallet:           walletInitParams.Wallet,
-		ManagerConfig:    managerConfig,
-		Manager:          walletInitParams.Manager,
-		ChainSource:      partialChainControl.ChainSource,
-		WatchOnly:        d.watchOnly,
-		MigrateWatchOnly: d.migrateWatchOnly,
+		PrivatePass:             privateWalletPw,
+		PublicPass:              publicWalletPw,
+		Birthday:                walletInitParams.Birthday,
+		RecoveryWindow:          walletInitParams.RecoveryWindow,
+		ResetWalletTransactions: d.cfg.ResetWalletTransactions,
+		NetParams:               d.cfg.ActiveNetParams.Params,
+		CoinType:                d.cfg.ActiveNetParams.CoinType,
+		Wallet:                  walletInitParams.Wallet,
+		ManagerConfig:           managerConfig,
+		Manager:                 walletInitParams.Manager,
+		ChainSource:             partialChainControl.ChainSource,
+		WatchOnly:               d.watchOnly,
+		MigrateWatchOnly:        d.migrateWatchOnly,
 	}
 
 	// Parse coin selection strategy.
@@ -1723,12 +1724,6 @@ func waitForWalletPassword(cfg *Config,
 			current.Store(newWallet)
 		}
 
-		// For new wallets, the ResetWalletTransactions flag is a no-op.
-		if cfg.ResetWalletTransactions {
-			ltndLog.Warnf("Ignoring reset-wallet-transactions " +
-				"flag for new wallet as it has no effect")
-		}
-
 		return &walletunlocker.WalletUnlockParams{
 			Password:        password,
 			Birthday:        params.Birthday,
@@ -1750,10 +1745,8 @@ func waitForWalletPassword(cfg *Config,
 		// remind the user to turn off the setting again after
 		// successful completion.
 		if cfg.ResetWalletTransactions {
-			ltndLog.Warnf("Dropped all transaction history from " +
-				"on-chain wallet. Remember to disable " +
-				"reset-wallet-transactions flag for next " +
-				"start of lnd")
+			ltndLog.Warnf("Resyncing on-chain wallet. Remember to " +
+				"disable reset-wallet-transactions after completion")
 		}
 
 		return &walletunlocker.WalletUnlockParams{

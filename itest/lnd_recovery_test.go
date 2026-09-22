@@ -354,24 +354,27 @@ func testRescanAddressDetection(ht *lntest.HarnessTest) {
 	})
 	ht.MineBlocksAndAssertNumTxes(1, 1)
 
-	// Make sure we see the change output in our list of unspent outputs.
-	// We _don't_ expect to see the ghost UTXO here as in this step it's
-	// ignored as an internal address correctly.
-	ht.AssertNumUTXOsConfirmed(carol, 1)
+	// PoC: NoChainSync skips automatic watches but retains ownership when
+	// an already-relevant transaction exposes a 1017 output. Check that
+	// a later spend removes this tracked output.
+	ht.AssertNumUTXOsConfirmed(carol, 2)
 	unspent := carol.RPC.ListUnspent(&walletrpc.ListUnspentRequest{
 		MinConfs: 1,
 	})
 
-	// Which one was the change output and which one the ghost UTXO output?
 	var ghostUtxoIndex uint32
-	if unspent.Utxos[0].Outpoint.OutputIndex == 0 {
-		ghostUtxoIndex = 1
+	var ghostUtxoHash *chainhash.Hash
+	for _, utxo := range unspent.Utxos {
+		if utxo.Address != ghostUtxoAddr.String() {
+			continue
+		}
+		ghostUtxoIndex = utxo.Outpoint.OutputIndex
+		ghostUtxoHash, err = chainhash.NewHash(
+			utxo.Outpoint.TxidBytes,
+		)
+		require.NoError(ht, err)
 	}
-
-	ghostUtxoHash, err := chainhash.NewHash(
-		unspent.Utxos[0].Outpoint.TxidBytes,
-	)
-	require.NoError(ht, err)
+	require.NotNil(ht, ghostUtxoHash)
 
 	burnScript, _ := ht.CreateBurnAddr(AddrTypeWitnessPubkeyHash)
 
