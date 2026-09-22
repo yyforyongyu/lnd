@@ -307,14 +307,16 @@ func (s *InterceptableSwitch) run() error {
 			s.setInterceptor(interceptor)
 
 		case packets := <-s.intercepted:
+			for _, p := range packets.packets {
+				p.isReplay = packets.isReplay
+			}
+
 			var notIntercepted []*htlcPacket
 			if packets.isReplay {
 				s.reconcileReplays(packets)
 			}
 
 			for _, p := range packets.packets {
-				p.isReplay = packets.isReplay
-
 				intercepted, err := s.interceptForward(
 					p, packets.isReplay,
 				)
@@ -618,6 +620,9 @@ func (s *InterceptableSwitch) interceptForward(packet *htlcPacket,
 				"that expires too soon: circuit=%v, "+
 				"incoming_timeout=%v, err=%v",
 				packet.inKey(), packet.incomingTimeout, err)
+			if handled {
+				return true, nil
+			}
 
 			// Return false so that the packet is offered as normal
 			// to the switch. This isn't ideal because interception
@@ -752,33 +757,34 @@ func (s *InterceptableSwitch) handleExpired(fwd *interceptedForward) (
 	// reject delta and is exposed as an int32 block height. Calculate it in
 	// int64 so that we can check the representable range before conversion.
 	autoFailHeight := int64(incomingTimeout) - int64(s.cltvRejectDelta)
+	failureCode := lnwire.CodeExpiryTooFar
 	if autoFailHeight > math.MaxInt32 {
 		log.Debugf("Interception rejected because htlc expires too "+
 			"far in the future: circuit=%v, height=%v, "+
 			"incoming_timeout=%v", fwd.packet.inKey(), height,
 			incomingTimeout)
-
-		err := fwd.FailWithCode(lnwire.CodeExpiryTooFar)
-		if err != nil {
-			return false, err
+	} else {
+		if incomingTimeout >= height+s.cltvInterceptDelta {
+			return false, nil
 		}
 
+		failureCode = lnwire.CodeExpiryTooSoon
+		log.Debugf("Interception rejected because htlc "+
+			"expires too soon: circuit=%v, "+
+			"height=%v, incoming_timeout=%v",
+			fwd.packet.inKey(), height,
+			incomingTimeout)
+	}
+
+	settled, err := s.htlcSwitch.settleReplayedAdd(fwd.packet, false)
+	if err != nil {
+		return true, err
+	}
+	if settled {
 		return true, nil
 	}
 
-	if incomingTimeout >= height+s.cltvInterceptDelta {
-		return false, nil
-	}
-
-	log.Debugf("Interception rejected because htlc "+
-		"expires too soon: circuit=%v, "+
-		"height=%v, incoming_timeout=%v",
-		fwd.packet.inKey(), height,
-		incomingTimeout)
-
-	err := fwd.FailWithCode(
-		lnwire.CodeExpiryTooSoon,
-	)
+	err = fwd.FailWithCode(failureCode)
 	if err != nil {
 		return false, err
 	}
