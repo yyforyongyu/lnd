@@ -224,6 +224,114 @@ func TestSwitchSendPending(t *testing.T) {
 	}
 }
 
+// TestSwitchSettleReplayWithoutLink tests that a replayed Add is settled from
+// the witness cache before an absent outgoing path or CLTV deadline fails it.
+func TestSwitchSettleReplayWithoutLink(t *testing.T) {
+	t.Parallel()
+
+	tempPath := t.TempDir()
+	cdb := channeldb.OpenForTesting(t, tempPath)
+	preimage := lntypes.Preimage{1}
+	require.NoError(t, cdb.NewWitnessCache().
+		AddSha256Witnesses(preimage))
+
+	s, err := initSwitchWithDB(testStartingHeight, cdb)
+	require.NoError(t, err)
+	require.NoError(t, s.Start())
+	defer func() { require.NoError(t, s.Stop()) }()
+
+	notifier := &mock.ChainNotifier{
+		EpochChan: make(chan *chainntnfs.BlockEpoch, 1),
+	}
+	notifier.EpochChan <- &chainntnfs.BlockEpoch{
+		Height: testStartingHeight,
+	}
+	interceptable, err := NewInterceptableSwitch(
+		&InterceptableSwitchConfig{
+			Switch:             s,
+			CltvRejectDelta:    10,
+			CltvInterceptDelta: 13,
+			Notifier:           notifier,
+		},
+	)
+	require.NoError(t, err)
+	require.NoError(t, interceptable.Start())
+	defer func() { require.NoError(t, interceptable.Stop()) }()
+
+	chanID, _, incomingScid, outgoingScid := genIDs()
+	incomingPeer, err := newMockServer(
+		t, "incoming", testStartingHeight, nil, testDefaultDelta,
+	)
+	require.NoError(t, err)
+	incomingLink := newMockChannelLink(
+		s, chanID, incomingScid, emptyScid, incomingPeer, true, false,
+		false, false,
+	)
+	require.NoError(t, s.AddLink(incomingLink))
+
+	tests := []struct {
+		name            string
+		outgoingHop     fn.Either[lnwire.ShortChannelID, [33]byte]
+		incomingTimeout uint32
+	}{
+		{
+			name:            "MissingChannel",
+			outgoingHop:     hop.NewChannelNextHop(outgoingScid),
+			incomingTimeout: testStartingHeight + 14,
+		},
+		{
+			name:            "MissingBlindedPeer",
+			outgoingHop:     hop.NewNodeNextHop([33]byte{2}),
+			incomingTimeout: testStartingHeight + 14,
+		},
+		{
+			name:            "NearExpiry",
+			outgoingHop:     hop.NewChannelNextHop(outgoingScid),
+			incomingTimeout: testStartingHeight + 12,
+		},
+	}
+
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			packet := &htlcPacket{
+				incomingChanID:  incomingScid,
+				incomingHTLCID:  uint64(i),
+				incomingTimeout: test.incomingTimeout,
+				outgoingChanID:  outgoingScid,
+				outgoingHop:     test.outgoingHop,
+				obfuscator:      NewMockObfuscator(),
+				htlc: &lnwire.UpdateAddHTLC{
+					PaymentHash: preimage.Hash(),
+					Amount:      1,
+				},
+			}
+			err := interceptable.ForwardPackets(nil, true, packet)
+			require.NoError(t, err)
+
+			select {
+			case response := <-incomingLink.packets:
+				assertReplayFulfill(
+					t, response, [32]byte(preimage),
+				)
+
+			case <-time.After(time.Second):
+				t.Fatal("no timely replay response")
+			}
+		})
+	}
+}
+
+// assertReplayFulfill checks that a replay response fulfills with the expected
+// preimage.
+func assertReplayFulfill(t *testing.T, packet *htlcPacket,
+	preimage [32]byte) {
+
+	fulfill, ok := packet.htlc.(*lnwire.UpdateFulfillHTLC)
+	require.True(t, ok)
+	require.Equal(t, preimage, fulfill.PaymentPreimage)
+	require.Nil(t, packet.linkFailure)
+}
+
 // TestSwitchForwardMapping checks that the Switch properly consults its maps
 // when forwarding packets.
 func TestSwitchForwardMapping(t *testing.T) {
@@ -1511,8 +1619,25 @@ func TestSwitchForwardDropAfterFullAdd(t *testing.T) {
 	}
 }
 
-func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
+// TestSwitchForwardAfterHalfAdd tests replaying an Add whose circuit was left
+// half-open, both with and without a cached preimage.
+func TestSwitchForwardAfterHalfAdd(t *testing.T) {
 	t.Parallel()
+
+	t.Run("FailWithoutWitness", func(t *testing.T) {
+		testSwitchForwardAfterHalfAdd(t, false, false)
+	})
+	t.Run("SettleWithWitness", func(t *testing.T) {
+		testSwitchForwardAfterHalfAdd(t, true, false)
+	})
+	t.Run("ContinueAfterLookupError", func(t *testing.T) {
+		testSwitchForwardAfterHalfAdd(t, true, true)
+	})
+}
+
+// testSwitchForwardAfterHalfAdd runs a half-open circuit replay test.
+func testSwitchForwardAfterHalfAdd(t *testing.T, cachePreimages,
+	lookupError bool) {
 
 	chanID1, chanID2, aliceChanID, bobChanID := genIDs()
 
@@ -1557,17 +1682,22 @@ func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
 
 	// Create request which should be forwarded from Alice channel link to
 	// bob channel link.
-	preimage := [sha256.Size]byte{1}
-	rhash := sha256.Sum256(preimage[:])
-	ogPacket := &htlcPacket{
-		incomingChanID: aliceChannelLink.ShortChanID(),
-		incomingHTLCID: 0,
-		outgoingChanID: bobChannelLink.ShortChanID(),
-		obfuscator:     NewMockObfuscator(),
-		htlc: &lnwire.UpdateAddHTLC{
-			PaymentHash: rhash,
-			Amount:      1,
-		},
+	preimages := [][sha256.Size]byte{{1}, {2}}
+	ogPackets := make([]*htlcPacket, 0, len(preimages))
+	for i, preimage := range preimages {
+		ogPackets = append(ogPackets, &htlcPacket{
+			incomingChanID: aliceChannelLink.ShortChanID(),
+			incomingHTLCID: uint64(i),
+			outgoingChanID: bobChannelLink.ShortChanID(),
+			outgoingHop: hop.NewChannelNextHop(
+				bobChannelLink.ShortChanID(),
+			),
+			obfuscator: NewMockObfuscator(),
+			htlc: &lnwire.UpdateAddHTLC{
+				PaymentHash: sha256.Sum256(preimage[:]),
+				Amount:      1,
+			},
+		})
 	}
 
 	if s.circuits.NumPending() != 0 {
@@ -1578,11 +1708,11 @@ func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
 	}
 
 	// Handle the request and checks that bob channel link received it.
-	if err := s.ForwardPackets(nil, ogPacket); err != nil {
+	if err := s.ForwardPackets(nil, ogPackets...); err != nil {
 		t.Fatal(err)
 	}
 
-	if s.circuits.NumPending() != 1 {
+	if s.circuits.NumPending() != len(ogPackets) {
 		t.Fatalf("wrong amount of half circuits")
 	}
 	if s.circuits.NumOpen() != 0 {
@@ -1590,10 +1720,21 @@ func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
 	}
 
 	// Pull packet from bob's link, but do not perform a full add.
-	select {
-	case <-bobChannelLink.packets:
-	case <-time.After(time.Second):
-		t.Fatal("request was not propagated to destination")
+	for range ogPackets {
+		select {
+		case <-bobChannelLink.packets:
+		case <-time.After(time.Second):
+			t.Fatal("request was not propagated to destination")
+		}
+	}
+
+	if cachePreimages {
+		witnessCache := cdb.NewWitnessCache()
+		for _, preimage := range preimages {
+			require.NoError(t, witnessCache.AddSha256Witnesses(
+				lntypes.Preimage(preimage),
+			))
+		}
 	}
 
 	// Now we will restart bob, leaving the forwarding decision for this
@@ -1610,6 +1751,21 @@ func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
 
 	s2, err := initSwitchWithDB(testStartingHeight, cdb2)
 	require.NoError(t, err, "unable reinit switch")
+	var lookupErr error
+	if lookupError {
+		lookupErr = errors.New("lookup failed")
+		lookupPreimage := s2.cfg.LookupPreimage
+		firstHash := sha256.Sum256(preimages[0][:])
+		s2.cfg.LookupPreimage = func(hash lntypes.Hash) (
+			lntypes.Preimage, error) {
+
+			if hash == firstHash {
+				return lntypes.Preimage{}, lookupErr
+			}
+
+			return lookupPreimage(hash)
+		}
+	}
 	if err := s2.Start(); err != nil {
 		t.Fatalf("unable to restart switch: %v", err)
 	}
@@ -1634,31 +1790,85 @@ func TestSwitchForwardFailAfterHalfAdd(t *testing.T) {
 		t.Fatalf("unable to add bob link: %v", err)
 	}
 
-	if s2.circuits.NumPending() != 1 {
+	if s2.circuits.NumPending() != len(ogPackets) {
 		t.Fatalf("wrong amount of half circuits")
 	}
 	if s2.circuits.NumOpen() != 0 {
 		t.Fatalf("wrong amount of half circuits")
 	}
 
-	// Resend the failed htlc, it should be returned to alice since the
-	// switch will detect that it has been half added previously.
-	err = s2.ForwardPackets(nil, ogPacket)
-	if err != nil {
-		t.Fatal(err)
+	// Resend the failed htlc through the public replay path. The switch
+	// should settle it from the witness cache when possible, and otherwise
+	// reproduce the existing failure.
+	notifier := &mock.ChainNotifier{
+		EpochChan: make(chan *chainntnfs.BlockEpoch, 1),
+	}
+	notifier.EpochChan <- &chainntnfs.BlockEpoch{
+		Height: testStartingHeight,
+	}
+	interceptable, err := NewInterceptableSwitch(
+		&InterceptableSwitchConfig{
+			Switch:             s2,
+			CltvRejectDelta:    10,
+			CltvInterceptDelta: 13,
+			Notifier:           notifier,
+		},
+	)
+	require.NoError(t, err)
+	require.NoError(t, interceptable.Start())
+	defer func() { require.NoError(t, interceptable.Stop()) }()
+
+	err = interceptable.ForwardPackets(nil, true, ogPackets...)
+	if lookupError {
+		require.ErrorIs(t, err, lookupErr)
+	} else {
+		require.NoError(t, err)
 	}
 
-	// After detecting an incomplete forward, the fail packet should have
-	// been returned to the sender.
-	select {
-	case pkt := <-aliceChannelLink.packets:
-		linkErr := pkt.linkFailure
-		if linkErr.FailureDetail != OutgoingFailureIncompleteForward {
-			t.Fatalf("expected incomplete forward, got: %v",
-				linkErr.FailureDetail)
+	// Every replay except the packet whose lookup errored should return a
+	// response to the sender.
+	expectedResponses := len(ogPackets)
+	if lookupError {
+		expectedResponses--
+	}
+	for range expectedResponses {
+		select {
+		case pkt := <-aliceChannelLink.packets:
+			if cachePreimages {
+				if lookupError {
+					require.Equal(
+						t, uint64(1),
+						pkt.incomingHTLCID,
+					)
+				}
+
+				assertReplayFulfill(
+					t, pkt,
+					preimages[pkt.incomingHTLCID],
+				)
+
+				continue
+			}
+
+			linkErr := pkt.linkFailure
+			if linkErr.FailureDetail !=
+				OutgoingFailureIncompleteForward {
+
+				t.Fatalf("expected incomplete forward, got: %v",
+					linkErr.FailureDetail)
+			}
+
+		case <-time.After(time.Second):
+			t.Fatal("request was not propagated to destination")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("request was not propagated to destination")
+	}
+
+	if lookupError {
+		select {
+		case <-aliceChannelLink.packets:
+			t.Fatal("lookup error packet should be withheld")
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
