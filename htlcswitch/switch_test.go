@@ -1467,9 +1467,22 @@ func TestSwitchForwardSettleAfterFullAdd(t *testing.T) {
 	}
 }
 
+// TestSwitchForwardDropAfterFullAdd tests replaying an Add whose full circuit
+// survived a restart.
 func TestSwitchForwardDropAfterFullAdd(t *testing.T) {
 	t.Parallel()
 
+	t.Run("ReplayClaimsCircuit", func(t *testing.T) {
+		testSwitchForwardDropAfterFullAdd(t, false)
+	})
+	t.Run("ResponseClaimsCircuit", func(t *testing.T) {
+		testSwitchForwardDropAfterFullAdd(t, true)
+	})
+}
+
+// testSwitchForwardDropAfterFullAdd tests a full-circuit replay with or without
+// a downstream response claiming the circuit first.
+func testSwitchForwardDropAfterFullAdd(t *testing.T, responseFirst bool) {
 	chanID1, chanID2, aliceChanID, bobChanID := genIDs()
 
 	alicePeer, err := newMockServer(
@@ -1602,14 +1615,27 @@ func TestSwitchForwardDropAfterFullAdd(t *testing.T) {
 		t.Fatalf("wrong amount of half circuits")
 	}
 
-	// Resend the failed htlc. The packet will be dropped silently since the
-	// switch will detect that it has been half added previously.
-	if err := s2.ForwardPackets(nil, ogPacket); err != nil {
-		t.Fatal(err)
+	notifier := &mock.ChainNotifier{
+		EpochChan: make(chan *chainntnfs.BlockEpoch, 1),
 	}
+	notifier.EpochChan <- &chainntnfs.BlockEpoch{
+		Height: testStartingHeight,
+	}
+	interceptable, err := NewInterceptableSwitch(
+		&InterceptableSwitchConfig{
+			Switch:             s2,
+			CltvRejectDelta:    10,
+			CltvInterceptDelta: 13,
+			Notifier:           notifier,
+		},
+	)
+	require.NoError(t, err)
+	require.NoError(t, interceptable.Start())
+	defer func() { require.NoError(t, interceptable.Stop()) }()
 
-	// After detecting an incomplete forward, the fail packet should have
-	// been returned to the sender.
+	// Without a cached witness, the existing full circuit still causes the
+	// replay to be dropped.
+	require.NoError(t, interceptable.ForwardPackets(nil, true, ogPacket))
 	select {
 	case <-aliceChannelLink.packets:
 		t.Fatal("request should not have returned to source")
@@ -1617,6 +1643,86 @@ func TestSwitchForwardDropAfterFullAdd(t *testing.T) {
 		t.Fatal("request should not have forwarded to destination")
 	case <-time.After(time.Second):
 	}
+
+	// Once the witness is cached, replaying the same Add should return the
+	// fulfill unless a downstream response has already claimed the circuit.
+	require.NoError(t, cdb2.NewWitnessCache().AddSha256Witnesses(
+		lntypes.Preimage(preimage),
+	))
+	circuit := s2.circuits.LookupCircuit(ogPacket.inKey())
+	require.NotNil(t, circuit)
+	if responseFirst {
+		_, err := s2.circuits.CloseCircuit(circuit.OutKey())
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, interceptable.ForwardPackets(nil, true, ogPacket))
+	_, err = s2.circuits.CloseCircuit(circuit.OutKey())
+	require.ErrorIs(t, err, ErrCircuitClosing)
+
+	select {
+	case packet := <-aliceChannelLink.packets:
+		require.False(t, responseFirst, "duplicate response")
+		assertReplayFulfill(t, packet, preimage)
+		require.Same(t, circuit, packet.circuit)
+		require.Equal(t, circuit.AddRef, *packet.sourceRef)
+		require.Equal(t, circuit.OutKey(), packet.outKey())
+		require.Equal(t, circuit.IncomingAmount, packet.incomingAmount)
+		require.Equal(t, circuit.OutgoingAmount, packet.amount)
+		require.Same(t, circuit.ErrorEncrypter, packet.obfuscator)
+
+	case <-time.After(time.Second):
+		require.True(t, responseFirst, "request did not reach source")
+	}
+}
+
+// TestSwitchReplayPreservesLiveHalfCircuit checks that an incoming-link replay
+// leaves a queued outgoing Add untouched, even when its preimage is cached.
+func TestSwitchReplayPreservesLiveHalfCircuit(t *testing.T) {
+	t.Parallel()
+
+	c := newInterceptableSwitchTestContext(t)
+	defer c.finish()
+
+	db, ok := c.s.cfg.DB.(*channeldb.DB)
+	require.True(t, ok)
+	require.NoError(t, db.NewWitnessCache().AddSha256Witnesses(
+		lntypes.Preimage(c.preimage),
+	))
+
+	notifier := &mock.ChainNotifier{
+		EpochChan: make(chan *chainntnfs.BlockEpoch, 1),
+	}
+	notifier.EpochChan <- &chainntnfs.BlockEpoch{Height: testStartingHeight}
+	interceptable, err := NewInterceptableSwitch(
+		&InterceptableSwitchConfig{
+			Switch:             c.s,
+			CltvRejectDelta:    c.cltvRejectDelta,
+			CltvInterceptDelta: c.cltvInterceptDelta,
+			Notifier:           notifier,
+		},
+	)
+	require.NoError(t, err)
+	require.NoError(t, interceptable.Start())
+	defer func() { require.NoError(t, interceptable.Stop()) }()
+
+	packet := c.createTestPacket()
+	replay := *packet
+	require.NoError(t, c.s.ForwardPackets(nil, packet))
+	queued := assertOutgoingLinkReceiveIntercepted(t, c.bobChannelLink)
+	circuit := c.s.circuits.LookupCircuit(packet.inKey())
+	require.NotNil(t, circuit)
+	require.False(t, circuit.LoadedFromDisk)
+	require.False(t, circuit.HasKeystone())
+
+	// Replay only the incoming link, leaving the outgoing Add queued.
+	require.NoError(t, interceptable.ForwardPackets(nil, true, &replay))
+
+	require.False(t, c.aliceChannelLink.mailBox.HasPacket(packet.inKey()))
+	require.Same(t, circuit, c.s.circuits.LookupCircuit(packet.inKey()))
+	require.NoError(t, c.bobChannelLink.completeCircuit(queued))
+	_, err = c.s.circuits.CloseCircuit(queued.outKey())
+	require.NoError(t, err, "replay must not claim the live circuit")
 }
 
 // TestSwitchForwardAfterHalfAdd tests replaying an Add whose circuit was left
