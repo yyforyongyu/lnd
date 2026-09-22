@@ -3512,7 +3512,6 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 					dir,
 					"wallet.sqlite",
 				)
-				cfg.RecoveryWindow = 0
 			}
 			if storage == "bbolt-reopen" {
 				loader := wallet.NewLoader(netParams,

@@ -89,6 +89,7 @@ type walletAPI interface {
 	base.TxReader
 	base.TxWriter
 	base.PsbtManager
+	base.TxSubscriber
 }
 
 var _ walletAPI = (*base.Wallet)(nil)
@@ -133,16 +134,6 @@ var _ lnwallet.BlockChainIO = (*BtcWallet)(nil)
 // New returns a new fully initialized instance of BtcWallet given a valid
 // configuration struct.
 func New(cfg Config, blockCache *blockcache.BlockCache) (*BtcWallet, error) {
-	// SQL scanning starts before canonical account creation, so a nonzero
-	// recovery window cannot guarantee historical discovery on direct
-	// startup.
-	if cfg.ManagerConfig.Backend != base.DBBackendKVDB &&
-		cfg.RecoveryWindow != 0 {
-
-		return nil, fmt.Errorf("native wallet historical recovery " +
-			"requires accounts to exist before synchronization")
-	}
-
 	// Create the key scope for the coin type being managed by this wallet.
 	chainKeyScope := waddrmgr.KeyScope{
 		Purpose: keychain.BIP0043Purpose,
@@ -346,6 +337,25 @@ func (b *BtcWallet) Start() error {
 		if err != nil {
 			return err
 		}
+	}
+	// PoC: newly installed accounts can be scanned only after the
+	// initially started wallet reaches a state that admits Resync.
+	if b.cfg.RecoveryWindow > 0 {
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			info, err = b.wallet.Info(ctx)
+			if err != nil {
+				return err
+			}
+			if info.Synced {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("wallet did not admit recovery resync")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		return b.wallet.Resync(ctx, uint32(info.BirthdayBlock.Height))
 	}
 
 	return nil
@@ -1889,10 +1899,74 @@ func (b *BtcWallet) ListTransactionDetails(startHeight, endHeight int32,
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) SubscribeTransactions() (lnwallet.TransactionSubscription, error) {
-	// Managed wallet runtimes do not publish legacy notification events. A
-	// snapshot reader cannot supply the promised transient event stream.
-	return nil, fmt.Errorf("managed wallet does not expose " +
-		"transaction events")
+	events, err := b.wallet.SubscribeTxns()
+	if err != nil {
+		return nil, err
+	}
+	sub := &managedTxSubscription{
+		events:      events,
+		confirmed:   make(chan *lnwallet.TransactionDetail, 64),
+		unconfirmed: make(chan *lnwallet.TransactionDetail, 64),
+		quit:        make(chan struct{}),
+		done:        make(chan struct{}),
+	}
+	go sub.run()
+	return sub, nil
+}
+
+// managedTxSubscription maps the diagnostic btcwallet stream to lnd's wallet
+// contract while allowing cancellation to release the forwarding goroutine.
+type managedTxSubscription struct {
+	events      *base.TxSubscription
+	confirmed   chan *lnwallet.TransactionDetail
+	unconfirmed chan *lnwallet.TransactionDetail
+	quit        chan struct{}
+	done        chan struct{}
+	once        sync.Once
+}
+
+// ConfirmedTransactions returns confirmed wallet transaction notifications.
+func (s *managedTxSubscription) ConfirmedTransactions() chan *lnwallet.TransactionDetail {
+	return s.confirmed
+}
+
+// UnconfirmedTransactions returns unconfirmed wallet transaction notifications.
+func (s *managedTxSubscription) UnconfirmedTransactions() chan *lnwallet.TransactionDetail {
+	return s.unconfirmed
+}
+
+// Cancel stops forwarding and unregisters the wallet subscription.
+func (s *managedTxSubscription) Cancel() {
+	s.once.Do(func() {
+		close(s.quit)
+		s.events.Done()
+		<-s.done
+	})
+}
+
+// run forwards committed wallet details until cancellation or wallet shutdown.
+func (s *managedTxSubscription) run() {
+	defer close(s.done)
+	for {
+		select {
+		case <-s.quit:
+			return
+		case tx, ok := <-s.events.C:
+			if !ok {
+				return
+			}
+			detail := transactionDetail(tx)
+			out := s.unconfirmed
+			if tx.Block != nil {
+				out = s.confirmed
+			}
+			select {
+			case out <- detail:
+			case <-s.quit:
+				return
+			}
+		}
+	}
 }
 
 // IsSynced returns a boolean indicating if from the PoV of the wallet, it has

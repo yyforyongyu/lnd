@@ -1642,17 +1642,31 @@ func waitForWalletPassword(cfg *Config,
 				cipherSeed.InternalVersion,
 				keychain.CurrentKeyDerivationVersion)
 		}
-
-		// The SQL Manager started before RPC admission with zero
-		// lookahead. It cannot recover accounts installed after
-		// scanning has begun.
-		if managerConfig.Backend != wallet.DBBackendKVDB &&
-			recoveryWindow != 0 {
-
-			return nil, fmt.Errorf("native wallet historical " +
-				"recovery requires accounts to exist before " +
-				"synchronization")
+		// PoC: reopen the still-empty native wallet manager with the RPC's
+		// lookahead before Create starts the recovering wallet.
+		if manager != nil && recoveryWindow > 0 {
+			if err := manager.Stop(); err != nil {
+				return nil, err
+			}
+			managerConfig.RecoveryWindow = recoveryWindow
+			var err error
+			manager, err = wallet.NewManager(
+				context.Background(), managerConfig,
+			)
+			if err != nil {
+				return nil, err
+			}
+			wallets, err := manager.Start(context.Background())
+			if err != nil || len(wallets) != 0 {
+				_ = manager.Stop()
+				if err != nil {
+					return nil, err
+				}
+				return nil, fmt.Errorf("wallet already exists")
+			}
+			pwService.SetManagerConfig(managerConfig, manager, current)
 		}
+
 		if watchOnlyAccounts != nil {
 			return nil, importWatchOnlyAccounts(nil, initMsg)
 		}
