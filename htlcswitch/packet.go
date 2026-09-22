@@ -98,6 +98,10 @@ type htlcPacket struct {
 	// hop.
 	isResolution bool
 
+	// isReplay is set when an Add is reconstructed from a processed
+	// forwarding package after restart.
+	isReplay bool
+
 	// circuit holds a reference to an Add's circuit which is persisted in
 	// the switch during successful forwarding.
 	circuit *PaymentCircuit

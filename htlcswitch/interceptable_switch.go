@@ -313,6 +313,8 @@ func (s *InterceptableSwitch) run() error {
 			}
 
 			for _, p := range packets.packets {
+				p.isReplay = packets.isReplay
+
 				intercepted, err := s.interceptForward(
 					p, packets.isReplay,
 				)
