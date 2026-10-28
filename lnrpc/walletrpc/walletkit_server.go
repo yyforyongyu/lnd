@@ -1992,51 +1992,9 @@ func (w *WalletKit) FundPsbt(_ context.Context,
 	// The template is specified as a RPC message. We need to create a new
 	// PSBT and copy the RPC information over.
 	case req.GetRaw() != nil:
-		tpl := req.GetRaw()
-
-		txOut := make([]*wire.TxOut, 0, len(tpl.Outputs))
-		for addrStr, amt := range tpl.Outputs {
-			addr, err := address.DecodeAddress(
-				addrStr, w.cfg.ChainParams,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing address "+
-					"%s for network %s: %v", addrStr,
-					w.cfg.ChainParams.Name, err)
-			}
-
-			if !addr.IsForNet(w.cfg.ChainParams) {
-				return nil, fmt.Errorf("address is not for %s",
-					w.cfg.ChainParams.Name)
-			}
-
-			pkScript, err := txscript.PayToAddrScript(addr)
-			if err != nil {
-				return nil, fmt.Errorf("error getting pk "+
-					"script for address %s: %w", addrStr,
-					err)
-			}
-
-			txOut = append(txOut, &wire.TxOut{
-				Value:    int64(amt),
-				PkScript: pkScript,
-			})
-		}
-
-		txIn := make([]*wire.OutPoint, len(tpl.Inputs))
-		for idx, in := range tpl.Inputs {
-			op, err := UnmarshallOutPoint(in)
-			if err != nil {
-				return nil, fmt.Errorf("error parsing "+
-					"outpoint: %w", err)
-			}
-			txIn[idx] = op
-		}
-
-		sequences := make([]uint32, len(txIn))
-		packet, err := psbt.New(txIn, txOut, 2, 0, sequences)
+		packet, err := w.psbtFromRawTemplate(req.GetRaw())
 		if err != nil {
-			return nil, fmt.Errorf("could not create PSBT: %w", err)
+			return nil, err
 		}
 
 		// Run the actual funding process now, using the internal
@@ -2052,6 +2010,57 @@ func (w *WalletKit) FundPsbt(_ context.Context,
 		return nil, fmt.Errorf("transaction template missing, need " +
 			"to specify either PSBT or raw TX template")
 	}
+}
+
+// psbtFromRawTemplate projects the existing raw RPC template into a PSBT.
+// Address and network validation stay here; Wallet owns subsequent funding.
+func (w *WalletKit) psbtFromRawTemplate(tpl *TxTemplate) (*psbt.Packet, error) {
+	txOut := make([]*wire.TxOut, 0, len(tpl.Outputs))
+	for addrStr, amt := range tpl.Outputs {
+		addr, err := address.DecodeAddress(
+			addrStr, w.cfg.ChainParams,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing address "+
+				"%s for network %s: %v", addrStr,
+				w.cfg.ChainParams.Name, err)
+		}
+
+		if !addr.IsForNet(w.cfg.ChainParams) {
+			return nil, fmt.Errorf("address is not for %s",
+				w.cfg.ChainParams.Name)
+		}
+
+		pkScript, err := txscript.PayToAddrScript(addr)
+		if err != nil {
+			return nil, fmt.Errorf("error getting pk "+
+				"script for address %s: %w", addrStr,
+				err)
+		}
+
+		txOut = append(txOut, &wire.TxOut{
+			Value:    int64(amt),
+			PkScript: pkScript,
+		})
+	}
+
+	txIn := make([]*wire.OutPoint, len(tpl.Inputs))
+	for idx, in := range tpl.Inputs {
+		op, err := UnmarshallOutPoint(in)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing "+
+				"outpoint: %w", err)
+		}
+		txIn[idx] = op
+	}
+
+	sequences := make([]uint32, len(txIn))
+	packet, err := psbt.New(txIn, txOut, 2, 0, sequences)
+	if err != nil {
+		return nil, fmt.Errorf("could not create PSBT: %w", err)
+	}
+
+	return packet, nil
 }
 
 // fundPsbtInternalWallet uses the "old" PSBT funding method of the internal
