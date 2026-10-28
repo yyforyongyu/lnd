@@ -1047,7 +1047,7 @@
         "UNUSED_TAPROOT_PUBKEY"
       ],
       "default": "WITNESS_PUBKEY_HASH",
-      "description": "- `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)\n- `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)\n- `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)",
+      "description": "- `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)\n- `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)\n- `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)\n\nUNUSED variants follow the same receiving-address policy as their corresponding\naddress type. SQL wallets reuse the oldest unused address in the selected\naccount and branch; kvdb wallets allocate the next address on each call.",
       "title": "`AddressType` has to be one of:"
     },
     "lnrpcChannelPoint": {
@@ -2520,7 +2520,7 @@
       "properties": {
         "name": {
           "type": "string",
-          "description": "The name to identify the new account with. The name must not be empty and\nmust not already be in use by another account, in any key scope. The\nnames of the wallet's built-in accounts (\"default\" and \"imported\") are\nreserved and cannot be used."
+          "description": "The name to identify the new account with. The name must not be empty\nand must be unique within the selected key scope. Other key scopes may\ncontain the same name; name-only spending requests require an unambiguous\naccount name. The built-in names \"default\" and \"imported\" are reserved."
         },
         "address_type": {
           "$ref": "#/definitions/walletrpcAddressType",

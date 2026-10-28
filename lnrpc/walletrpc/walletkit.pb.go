@@ -1391,10 +1391,10 @@ func (x *ListAccountsResponse) GetAccounts() []*Account {
 
 type XCreateAccountRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The name to identify the new account with. The name must not be empty and
-	// must not already be in use by another account, in any key scope. The
-	// names of the wallet's built-in accounts ("default" and "imported") are
-	// reserved and cannot be used.
+	// The name to identify the new account with. The name must not be empty
+	// and must be unique within the selected key scope. Other key scopes may
+	// contain the same name; name-only spending requests require an unambiguous
+	// account name. The built-in names "default" and "imported" are reserved.
 	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// The type of addresses the account should hold, which selects the BIP-0043
 	// key scope the account is created under. A custom account only ever exists

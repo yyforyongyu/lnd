@@ -149,6 +149,10 @@ func (CoinSelectionStrategy) EnumDescriptor() ([]byte, []int) {
 // - `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)
 // - `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)
 // - `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)
+//
+// UNUSED variants follow the same receiving-address policy as their corresponding
+// address type. SQL wallets reuse the oldest unused address in the selected
+// account and branch; kvdb wallets allocate the next address on each call.
 type AddressType int32
 
 const (
@@ -3907,11 +3911,12 @@ func (x *ListUnspentResponse) GetUtxos() []*Utxo {
 
 type NewAddressRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The type of address to generate.
+	// The receiving address type and account key scope.
 	Type AddressType `protobuf:"varint,1,opt,name=type,proto3,enum=lnrpc.AddressType" json:"type,omitempty"`
 	//
-	//The name of the account to generate a new address for. If empty, the
-	//default wallet account is used.
+	//The account name within the key scope selected by type. If empty, the
+	//default wallet account is used. The wallet selects a receiving address
+	//according to its backend policy; the returned address may be reused.
 	Account       string `protobuf:"bytes,2,opt,name=account,proto3" json:"account,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -3963,7 +3968,7 @@ func (x *NewAddressRequest) GetAccount() string {
 
 type NewAddressResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The newly generated wallet address
+	// The receiving address selected by the wallet.
 	Address       string `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
