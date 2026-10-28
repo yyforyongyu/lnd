@@ -4,6 +4,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
@@ -22,7 +23,7 @@ type Wallet interface {
 	// and maximum number of confirmations an output needs in order to be
 	// returned by this method.
 	ListUnspentWitnessFromDefaultAccount(minConfs, maxConfs int32) (
-		[]*lnwallet.Utxo, error)
+		[]*base.Utxo, error)
 
 	// WithCoinSelectLock will execute the passed function closure in a
 	// synchronized manner preventing any coin selection operations from
@@ -31,30 +32,17 @@ type Wallet interface {
 	// selection lock.
 	WithCoinSelectLock(f func() error) error
 
-	// RemoveDescendants removes any wallet transactions that spends
-	// outputs created by the specified transaction.
-	RemoveDescendants(*wire.MsgTx) error
-
-	// FetchTx returns the transaction that corresponds to the transaction
-	// hash passed in. If the transaction can't be found then a nil
-	// transaction pointer is returned.
-	FetchTx(chainhash.Hash) (*wire.MsgTx, error)
+	// Native transaction capabilities retain Wallet ownership of history
+	// reads, root-and-descendant deletion, and acceptance validation.
+	base.TxReader
+	base.TxWriter
+	base.TxPublisher
 
 	// CancelRebroadcast is used to inform the rebroadcaster sub-system
 	// that it no longer needs to try to rebroadcast a transaction. This is
 	// used to ensure that invalid transactions (inputs spent) aren't
 	// retried in the background.
 	CancelRebroadcast(tx chainhash.Hash)
-
-	// CheckMempoolAcceptance checks whether a transaction follows mempool
-	// policies and returns an error if it cannot be accepted into the
-	// mempool.
-	CheckMempoolAcceptance(tx *wire.MsgTx) error
-
-	// GetTransactionDetails returns a detailed description of a tx given
-	// its transaction hash.
-	GetTransactionDetails(txHash *chainhash.Hash) (
-		*lnwallet.TransactionDetail, error)
 
 	// BackEnd returns a name for the wallet's backing chain service,
 	// which could be e.g. btcd, bitcoind, neutrino, or another consensus

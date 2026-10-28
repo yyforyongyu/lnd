@@ -5,6 +5,7 @@ import (
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcjson"
+	"github.com/btcsuite/btcd/btcutil/v2/gcs"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
@@ -188,5 +189,86 @@ func (m *MockChain) SubmitPackage(txns []*wire.MsgTx,
 func (m *MockChain) MapRPCErr(err error) error {
 	args := m.Called(err)
 
+	return args.Error(0)
+}
+
+// GetCFilter lets tests specify single-filter requests. Tests arrange the
+// returned chain data or error without starting a backend.
+func (m *MockChain) GetCFilter(hash *chainhash.Hash,
+	filterType wire.FilterType) (*gcs.Filter, error) {
+
+	args := m.Called(hash, filterType)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*gcs.Filter), args.Error(1)
+}
+
+// GetBlockHashes lets tests specify height-range requests. Tests arrange the
+// returned chain data or error without starting a backend.
+func (m *MockChain) GetBlockHashes(startHeight,
+	endHeight int64) ([]chainhash.Hash, error) {
+
+	args := m.Called(startHeight, endHeight)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]chainhash.Hash), args.Error(1)
+}
+
+// GetCFilters lets tests specify filter-batch requests. Tests arrange the
+// returned chain data or error without starting a backend.
+func (m *MockChain) GetCFilters(hashes []chainhash.Hash,
+	filterType wire.FilterType) ([]*gcs.Filter, error) {
+
+	args := m.Called(hashes, filterType)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*gcs.Filter), args.Error(1)
+}
+
+// GetBlocks lets tests specify block-batch requests. Tests arrange the returned
+// chain data or error without starting a backend.
+func (m *MockChain) GetBlocks(hashes []chainhash.Hash) (
+	[]*wire.MsgBlock, error) {
+
+	args := m.Called(hashes)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*wire.MsgBlock), args.Error(1)
+}
+
+// GetBlockHeaders lets tests specify header-batch requests. Tests arrange the
+// returned chain data or error without starting a backend.
+func (m *MockChain) GetBlockHeaders(hashes []chainhash.Hash) (
+	[]*wire.BlockHeader, error) {
+
+	args := m.Called(hashes)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]*wire.BlockHeader), args.Error(1)
+}
+
+// NotifySpent records watch installation so tests can require its success or
+// propagate a backend failure through the consumer.
+func (m *MockChain) NotifySpent(outpoints []*wire.OutPoint) error {
+	args := m.Called(outpoints)
+	return args.Error(0)
+}
+
+// WatchAddrsFromTip records the subscription context and addresses to let tests
+// distinguish watch admission from historical scanning.
+func (m *MockChain) WatchAddrsFromTip(ctx context.Context,
+	addrs []address.Address) error {
+
+	args := m.Called(ctx, addrs)
 	return args.Error(0)
 }

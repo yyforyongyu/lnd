@@ -1,6 +1,7 @@
 package lnrpc
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -11,7 +12,9 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/aliasmgr"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -91,30 +94,46 @@ func ParseConfs(min, max int32) (int32, int32, error) {
 	}
 }
 
-// MarshalUtxos translates a []*lnwallet.Utxo into a []*lnrpc.Utxo.
-func MarshalUtxos(utxos []*lnwallet.Utxo, activeNetParams *chaincfg.Params) (
-	[]*Utxo, error) {
+// MarshalUtxos projects unlocked, mature tracked outputs into the RPC view.
+// Imported funds remain visible even when they require external signatures.
+func MarshalUtxos(ctx context.Context, w lnwallet.WalletAPI,
+	utxos []*base.Utxo, activeNetParams *chaincfg.Params) ([]*Utxo, error) {
 
 	res := make([]*Utxo, 0, len(utxos))
 	for _, utxo := range utxos {
+		// The wire UTXO has no lock or maturity flag; omit unavailable
+		// outputs while leaving custody decisions to actual spenders.
+		if utxo.Locked {
+			continue
+		}
+		mature, err := lnwallet.UtxoMature(
+			ctx, w, utxo, activeNetParams.CoinbaseMaturity,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !mature {
+			continue
+		}
+
 		// Translate lnwallet address type to the proper gRPC proto
 		// address type.
 		var addrType AddressType
 		switch utxo.AddressType {
-		case lnwallet.WitnessPubKey:
+		case waddrmgr.WitnessPubKey:
 			addrType = AddressType_WITNESS_PUBKEY_HASH
 
-		case lnwallet.NestedWitnessPubKey:
+		case waddrmgr.NestedWitnessPubKey:
 			addrType = AddressType_NESTED_PUBKEY_HASH
 
-		case lnwallet.TaprootPubkey:
+		case waddrmgr.TaprootPubKey, waddrmgr.TaprootScript:
 			addrType = AddressType_TAPROOT_PUBKEY
 
-		case lnwallet.UnknownAddressType:
-			continue
-
 		default:
-			return nil, fmt.Errorf("invalid utxo address type")
+			// The existing RPC enum represents witness payment
+			// forms. Other native output types still contribute to
+			// WalletBalance.
+			continue
 		}
 
 		// Now that we know we have a proper mapping to an address,
@@ -123,10 +142,10 @@ func MarshalUtxos(utxos []*lnwallet.Utxo, activeNetParams *chaincfg.Params) (
 
 		utxoResp := Utxo{
 			AddressType:   addrType,
-			AmountSat:     int64(utxo.Value),
+			AmountSat:     int64(utxo.Amount),
 			PkScript:      hex.EncodeToString(utxo.PkScript),
 			Outpoint:      outpoint,
-			Confirmations: utxo.Confirmations,
+			Confirmations: int64(utxo.Confirmations),
 		}
 
 		// Finally, we'll attempt to extract the raw address from the

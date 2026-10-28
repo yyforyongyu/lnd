@@ -2,6 +2,7 @@ package lnd
 
 import (
 	"github.com/btcsuite/btcd/chainhash/v2"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/lnwallet"
 )
 
@@ -9,6 +10,14 @@ import (
 // sweeper's Wallet interface.
 type sweeperWallet struct {
 	*lnwallet.LightningWallet
+
+	// Borrowed native views provide storage/relay capabilities directly;
+	// LightningWallet retains channel-specific selection and
+	// rebroadcasting.
+	base.TxReader
+	base.TxWriter
+	base.TxPublisher
+	lnwallet.WalletServices
 }
 
 // newSweeperWallet creates a new sweeper wallet from the given
@@ -16,6 +25,10 @@ type sweeperWallet struct {
 func newSweeperWallet(w *lnwallet.LightningWallet) *sweeperWallet {
 	return &sweeperWallet{
 		LightningWallet: w,
+		TxReader:        w.Cfg.Wallet,
+		TxWriter:        w.Cfg.Wallet,
+		TxPublisher:     w.Cfg.Wallet,
+		WalletServices:  w.Cfg.WalletServices,
 	}
 }
 

@@ -207,7 +207,7 @@ type ChainControl struct {
 	// Wc is an abstraction over some basic wallet commands. This base set
 	// of commands will be provided to the Wallet *LightningWallet raw
 	// pointer below.
-	Wc lnwallet.WalletController
+	Wc lnwallet.WalletServices
 
 	// MsgSigner is used to sign arbitrary messages.
 	MsgSigner lnwallet.MessageSigner
@@ -371,18 +371,33 @@ func NewPartialChainControl(cfg *Config) (*PartialChainControl, func(), error) {
 				"bitcoind: %v", err)
 		}
 
-		chainNotifier := bitcoindnotify.New(
+		chainNotifier, err := bitcoindnotify.New(
 			bitcoindConn, cfg.ActiveNetParams.Params, hintCache,
 			hintCache, cfg.BlockCache,
 		)
+		if err != nil {
+			bitcoindConn.Stop()
+			return nil, nil, err
+		}
 
 		cc.ChainNotifier = chainNotifier
 		cc.MempoolNotifier = chainNotifier
 
-		cc.ChainView = chainview.NewBitcoindFilteredChainView(
+		cc.ChainView, err = chainview.NewBitcoindFilteredChainView(
 			bitcoindConn, cfg.BlockCache,
 		)
-		cc.ChainSource = bitcoindConn.NewBitcoindClient()
+		if err != nil {
+			bitcoindConn.Stop()
+			return nil, nil, err
+		}
+
+		// All three clients borrow the same connection. If registration
+		// fails, close that connection before abandoning partial setup.
+		cc.ChainSource, err = bitcoindConn.NewBitcoindClient()
+		if err != nil {
+			bitcoindConn.Stop()
+			return nil, nil, err
+		}
 
 		// Initialize config to connect to bitcoind RPC.
 		rpcConfig := &rpcclient.ConnConfig{
@@ -757,7 +772,7 @@ func NewChainControl(walletConfig lnwallet.Config,
 		MsgSigner:           msgSigner,
 		Signer:              walletConfig.Signer,
 		ChainIO:             walletConfig.ChainIO,
-		Wc:                  walletConfig.WalletController,
+		Wc:                  walletConfig.WalletServices,
 		KeyRing:             walletConfig.SecretKeyRing,
 	}
 

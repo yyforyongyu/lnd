@@ -2,6 +2,7 @@ package sweep
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -11,11 +12,15 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -151,66 +156,115 @@ func TestFeeEstimateInfo(t *testing.T) {
 }
 
 type mockUtxoSource struct {
-	outputs []*lnwallet.Utxo
+	testifymock.Mock
 }
 
-func newMockUtxoSource(utxos []*lnwallet.Utxo) *mockUtxoSource {
-	return &mockUtxoSource{
-		outputs: utxos,
-	}
+// newMockUtxoSource arranges the existing sweep's native output snapshot.
+func newMockUtxoSource(t *testing.T, utxos []*wallet.Utxo,
+	calls int) *mockUtxoSource {
+
+	t.Helper()
+	m := &mockUtxoSource{}
+	m.On(
+		"ListUnspentWitnessFromDefaultAccount",
+		int32(0),
+		int32(2147483647),
+	).
+		Return(utxos, nil).
+		Times(calls)
+	t.Cleanup(func() { m.AssertExpectations(t) })
+
+	return m
 }
 
+// ListUnspentWitnessFromDefaultAccount returns the arranged sweep inputs.
 func (m *mockUtxoSource) ListUnspentWitnessFromDefaultAccount(minConfs int32,
-	maxConfs int32) ([]*lnwallet.Utxo, error) {
+	maxConfs int32) ([]*wallet.Utxo, error) {
 
-	return m.outputs, nil
+	args := m.Called(minConfs, maxConfs)
+	utxos, _ := args.Get(0).([]*wallet.Utxo)
+
+	return utxos, args.Error(1)
 }
 
 type mockCoinSelectionLocker struct {
-	fail bool
+	testifymock.Mock
 }
 
+// WithCoinSelectLock injects the arranged failure after the selection closure.
 func (m *mockCoinSelectionLocker) WithCoinSelectLock(f func() error) error {
+	args := m.Called(f)
 	if err := f(); err != nil {
 		return err
 	}
 
-	if m.fail {
-		return fmt.Errorf("kek")
-	}
-
-	return nil
-
+	return args.Error(0)
 }
 
 type mockOutputLeaser struct {
+	wallet.UtxoManager
+	testifymock.Mock
 	leasedOutputs map[wire.OutPoint]struct{}
 
 	releasedOutputs map[wire.OutPoint]struct{}
 }
 
-func newMockOutputLeaser() *mockOutputLeaser {
-	return &mockOutputLeaser{
+// newMockOutputLeaser verifies each native lease and cancellation once.
+func newMockOutputLeaser(t *testing.T, utxos []*wallet.Utxo) *mockOutputLeaser {
+	t.Helper()
+	m := &mockOutputLeaser{
 		leasedOutputs: make(map[wire.OutPoint]struct{}),
 
 		releasedOutputs: make(map[wire.OutPoint]struct{}),
 	}
+	for _, utxo := range utxos {
+		m.On(
+			"LeaseOutput",
+			testifymock.Anything,
+			chanfunding.LndInternalLockID,
+			utxo.OutPoint,
+			chanfunding.DefaultLockDuration,
+			[]wallet.LeaseOption(nil),
+		).
+			Return(time.Unix(123, 0), nil).
+			Once()
+		m.On(
+			"ReleaseOutput",
+			testifymock.Anything,
+			chanfunding.LndInternalLockID,
+			utxo.OutPoint,
+		).
+			Return(nil).
+			Once()
+	}
+	t.Cleanup(func() { m.AssertExpectations(t) })
+
+	return m
 }
 
-func (m *mockOutputLeaser) LeaseOutput(_ wtxmgr.LockID, o wire.OutPoint,
-	t time.Duration) (time.Time, error) {
+// LeaseOutput records acquisition while preserving the native response.
+func (m *mockOutputLeaser) LeaseOutput(ctx context.Context, id wtxmgr.LockID,
+	o wire.OutPoint, duration time.Duration,
+	opts ...wallet.LeaseOption) (time.Time, error) {
+
+	args := m.Called(ctx, id, o, duration, opts)
 
 	m.leasedOutputs[o] = struct{}{}
 
-	return time.Now().Add(t), nil
+	expiry, _ := args.Get(0).(time.Time)
+
+	return expiry, args.Error(1)
 }
 
-func (m *mockOutputLeaser) ReleaseOutput(_ wtxmgr.LockID,
+// ReleaseOutput records cancellation under the acquired lease owner.
+func (m *mockOutputLeaser) ReleaseOutput(ctx context.Context, id wtxmgr.LockID,
 	o wire.OutPoint) error {
+
+	args := m.Called(ctx, id, o)
 
 	m.releasedOutputs[o] = struct{}{}
 
-	return nil
+	return args.Error(0)
 }
 
 var sweepScript = []byte{
@@ -230,16 +284,16 @@ var deliveryAddr = func() address.Address {
 	return addrs[0]
 }()
 
-var testUtxos = []*lnwallet.Utxo{
+var testUtxos = []*wallet.Utxo{
 	{
 		// A p2wkh output.
-		AddressType: lnwallet.WitnessPubKey,
+		AddressType: waddrmgr.WitnessPubKey,
 		PkScript: []byte{
 			0x0, 0x14, 0x64, 0x3d, 0x8b, 0x15, 0x69, 0x4a, 0x54,
 			0x7d, 0x57, 0x33, 0x6e, 0x51, 0xdf, 0xfd, 0x38, 0xe3,
 			0xe, 0x6e, 0xf7, 0xef,
 		},
-		Value: 1000,
+		Amount: 1000,
 		OutPoint: wire.OutPoint{
 			Index: 1,
 		},
@@ -247,13 +301,13 @@ var testUtxos = []*lnwallet.Utxo{
 
 	{
 		// A np2wkh output.
-		AddressType: lnwallet.NestedWitnessPubKey,
+		AddressType: waddrmgr.NestedWitnessPubKey,
 		PkScript: []byte{
 			0xa9, 0x14, 0x97, 0x17, 0xf7, 0xd1, 0x5f, 0x6f, 0x8b,
 			0x7, 0xe3, 0x58, 0x43, 0x19, 0xb9, 0x7e, 0xa9, 0x20,
 			0x18, 0xc3, 0x17, 0xd7, 0x87,
 		},
-		Value: 2000,
+		Amount: 2000,
 		OutPoint: wire.OutPoint{
 			Index: 2,
 		},
@@ -261,14 +315,44 @@ var testUtxos = []*lnwallet.Utxo{
 
 	// A p2wsh output.
 	{
-		AddressType: lnwallet.UnknownAddressType,
+		AddressType: waddrmgr.AddressType(255),
 		PkScript: []byte{
-			0x0, 0x20, 0x70, 0x1a, 0x8d, 0x40, 0x1c, 0x84, 0xfb, 0x13,
-			0xe6, 0xba, 0xf1, 0x69, 0xd5, 0x96, 0x84, 0xe2, 0x7a, 0xbd,
-			0x9f, 0xa2, 0x16, 0xc8, 0xbc, 0x5b, 0x9f, 0xc6, 0x3d, 0x62,
-			0x2f, 0xf8, 0xc5, 0x8c,
+			0x0,
+			0x20,
+			0x70,
+			0x1a,
+			0x8d,
+			0x40,
+			0x1c,
+			0x84,
+			0xfb,
+			0x13,
+			0xe6,
+			0xba,
+			0xf1,
+			0x69,
+			0xd5,
+			0x96,
+			0x84,
+			0xe2,
+			0x7a,
+			0xbd,
+			0x9f,
+			0xa2,
+			0x16,
+			0xc8,
+			0xbc,
+			0x5b,
+			0x9f,
+			0xc6,
+			0x3d,
+			0x62,
+			0x2f,
+			0xf8,
+			0xc5,
+			0x8c,
 		},
-		Value: 3000,
+		Amount: 3000,
 		OutPoint: wire.OutPoint{
 			Index: 3,
 		},
@@ -276,7 +360,7 @@ var testUtxos = []*lnwallet.Utxo{
 }
 
 func assertUtxosLeased(t *testing.T, utxoLeaser *mockOutputLeaser,
-	utxos []*lnwallet.Utxo) {
+	utxos []*wallet.Utxo) {
 
 	t.Helper()
 
@@ -289,7 +373,7 @@ func assertUtxosLeased(t *testing.T, utxoLeaser *mockOutputLeaser,
 }
 
 func assertNoUtxosReleased(t *testing.T, utxoLeaser *mockOutputLeaser,
-	utxos []*lnwallet.Utxo) {
+	utxos []*wallet.Utxo) {
 
 	t.Helper()
 
@@ -299,7 +383,7 @@ func assertNoUtxosReleased(t *testing.T, utxoLeaser *mockOutputLeaser,
 }
 
 func assertUtxosReleased(t *testing.T, utxoLeaser *mockOutputLeaser,
-	utxos []*lnwallet.Utxo) {
+	utxos []*wallet.Utxo) {
 
 	t.Helper()
 
@@ -311,7 +395,7 @@ func assertUtxosReleased(t *testing.T, utxoLeaser *mockOutputLeaser,
 }
 
 func assertUtxosLeasedAndReleased(t *testing.T, utxoLeaser *mockOutputLeaser,
-	utxos []*lnwallet.Utxo) {
+	utxos []*wallet.Utxo) {
 
 	t.Helper()
 
@@ -331,11 +415,12 @@ func assertUtxosLeasedAndReleased(t *testing.T, utxoLeaser *mockOutputLeaser,
 func TestCraftSweepAllTxCoinSelectFail(t *testing.T) {
 	t.Parallel()
 
-	utxoSource := newMockUtxoSource(testUtxos)
-	coinSelectLocker := &mockCoinSelectionLocker{
-		fail: true,
-	}
-	utxoLeaser := newMockOutputLeaser()
+	utxoSource := newMockUtxoSource(t, testUtxos, 1)
+	coinSelectLocker := &mockCoinSelectionLocker{}
+	coinSelectLocker.On("WithCoinSelectLock", testifymock.Anything).
+		Return(fmt.Errorf("selection failed")).Once()
+	t.Cleanup(func() { coinSelectLocker.AssertExpectations(t) })
+	utxoLeaser := newMockOutputLeaser(t, testUtxos)
 
 	_, err := CraftSweepAllTx(
 		0, 0, 10, nil, nil, coinSelectLocker, utxoSource, utxoLeaser,
@@ -359,9 +444,9 @@ func TestCraftSweepAllTxCoinSelectFail(t *testing.T) {
 func TestCraftSweepAllTxUnknownWitnessType(t *testing.T) {
 	t.Parallel()
 
-	utxoSource := newMockUtxoSource(testUtxos)
-	coinSelectLocker := &mockCoinSelectionLocker{}
-	utxoLeaser := newMockOutputLeaser()
+	utxoSource := newMockUtxoSource(t, testUtxos, 1)
+	coinSelectLocker := &lnwallet.LightningWallet{}
+	utxoLeaser := newMockOutputLeaser(t, testUtxos)
 
 	_, err := CraftSweepAllTx(
 		0, 0, 10, nil, nil, coinSelectLocker, utxoSource, utxoLeaser,
@@ -393,9 +478,9 @@ func TestCraftSweepAllTx(t *testing.T) {
 	// For our UTXO source, we'll pass in all the UTXOs that we know of,
 	// other than the final one which is of an unknown witness type.
 	targetUTXOs := testUtxos[:2]
-	utxoSource := newMockUtxoSource(targetUTXOs)
-	coinSelectLocker := &mockCoinSelectionLocker{}
-	utxoLeaser := newMockOutputLeaser()
+	utxoSource := newMockUtxoSource(t, targetUTXOs, 1)
+	coinSelectLocker := &lnwallet.LightningWallet{}
+	utxoLeaser := newMockOutputLeaser(t, targetUTXOs)
 
 	sweepPkg, err := CraftSweepAllTx(
 		0, 0, 10, nil, deliveryAddr, coinSelectLocker, utxoSource,
@@ -453,9 +538,9 @@ func TestCraftSweepAllTxWithSelectedUTXO(t *testing.T) {
 
 	// Grab the first UTXO from the test UTXOs.
 	utxo1 := testUtxos[0]
-	utxoSource := newMockUtxoSource([]*lnwallet.Utxo{utxo1})
-	coinSelectLocker := &mockCoinSelectionLocker{}
-	utxoLeaser := newMockOutputLeaser()
+	utxoSource := newMockUtxoSource(t, []*wallet.Utxo{utxo1}, 2)
+	coinSelectLocker := &lnwallet.LightningWallet{}
+	utxoLeaser := newMockOutputLeaser(t, []*wallet.Utxo{utxo1})
 
 	// Create an unknown utxo.
 	outpointUknown := wire.OutPoint{Index: 4}
@@ -476,8 +561,8 @@ func TestCraftSweepAllTxWithSelectedUTXO(t *testing.T) {
 	require.NoError(t, err)
 
 	// At this point utxo1 should be locked.
-	assertUtxosLeased(t, utxoLeaser, []*lnwallet.Utxo{utxo1})
-	assertNoUtxosReleased(t, utxoLeaser, []*lnwallet.Utxo{utxo1})
+	assertUtxosLeased(t, utxoLeaser, []*wallet.Utxo{utxo1})
+	assertNoUtxosReleased(t, utxoLeaser, []*wallet.Utxo{utxo1})
 
 	// Validate the sweeping tx has the expected shape.
 	sweepTx := sweepPkg.SweepTx
@@ -486,12 +571,12 @@ func TestCraftSweepAllTxWithSelectedUTXO(t *testing.T) {
 
 	// We should have a single output that pays to our sweep script
 	// generated above.
-	expectedSweepValue := utxo1.Value
+	expectedSweepValue := utxo1.Amount
 	require.Equal(t, sweepScript, sweepTx.TxOut[0].PkScript)
 	require.EqualValues(t, expectedSweepValue, sweepTx.TxOut[0].Value)
 
 	// If we cancel the sweep attempt, then we should find utxo1 to be
 	// unlocked.
 	sweepPkg.CancelSweepAttempt()
-	assertUtxosReleased(t, utxoLeaser, []*lnwallet.Utxo{utxo1})
+	assertUtxosReleased(t, utxoLeaser, []*wallet.Utxo{utxo1})
 }

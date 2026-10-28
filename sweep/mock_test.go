@@ -1,9 +1,12 @@
 package sweep
 
 import (
+	"context"
+
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
@@ -106,6 +109,9 @@ func (m *mockUtxoAggregator) ClusterInputs(inputs InputsMap) []InputSet {
 
 // MockWallet is a mock implementation of the Wallet interface.
 type MockWallet struct {
+	wallet.TxReader
+	wallet.TxWriter
+	wallet.TxPublisher
 	mock.Mock
 }
 
@@ -122,8 +128,10 @@ func (m *MockWallet) BackEnd() string {
 
 // CheckMempoolAcceptance checks if the transaction can be accepted to the
 // mempool.
-func (m *MockWallet) CheckMempoolAcceptance(tx *wire.MsgTx) error {
-	args := m.Called(tx)
+func (m *MockWallet) CheckMempoolAcceptance(ctx context.Context,
+	tx *wire.MsgTx) error {
+
+	args := m.Called(ctx, tx)
 
 	return args.Error(0)
 }
@@ -141,14 +149,14 @@ func (m *MockWallet) PublishTransaction(tx *wire.MsgTx, label string) error {
 // and 'maxConfs' parameters indicate the minimum and maximum number of
 // confirmations an output needs in order to be returned by this method.
 func (m *MockWallet) ListUnspentWitnessFromDefaultAccount(
-	minConfs, maxConfs int32) ([]*lnwallet.Utxo, error) {
+	minConfs, maxConfs int32) ([]*wallet.Utxo, error) {
 
 	args := m.Called(minConfs, maxConfs)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 
-	return args.Get(0).([]*lnwallet.Utxo), args.Error(1)
+	return args.Get(0).([]*wallet.Utxo), args.Error(1)
 }
 
 // WithCoinSelectLock will execute the passed function closure in a
@@ -161,47 +169,12 @@ func (m *MockWallet) WithCoinSelectLock(f func() error) error {
 	return f()
 }
 
-// RemoveDescendants removes any wallet transactions that spends
-// outputs created by the specified transaction.
-func (m *MockWallet) RemoveDescendants(tx *wire.MsgTx) error {
-	args := m.Called(tx)
-
-	return args.Error(0)
-}
-
-// FetchTx returns the transaction that corresponds to the transaction
-// hash passed in. If the transaction can't be found then a nil
-// transaction pointer is returned.
-func (m *MockWallet) FetchTx(txid chainhash.Hash) (*wire.MsgTx, error) {
-	args := m.Called(txid)
-
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
-	}
-
-	return args.Get(0).(*wire.MsgTx), args.Error(1)
-}
-
 // CancelRebroadcast is used to inform the rebroadcaster sub-system
 // that it no longer needs to try to rebroadcast a transaction. This is
 // used to ensure that invalid transactions (inputs spent) aren't
 // retried in the background.
 func (m *MockWallet) CancelRebroadcast(tx chainhash.Hash) {
 	m.Called(tx)
-}
-
-// GetTransactionDetails returns a detailed description of a tx given its
-// transaction hash.
-func (m *MockWallet) GetTransactionDetails(txHash *chainhash.Hash) (
-	*lnwallet.TransactionDetail, error) {
-
-	args := m.Called(txHash)
-
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
-	}
-
-	return args.Get(0).(*lnwallet.TransactionDetail), args.Error(1)
 }
 
 // MockInputSet is a mock implementation of the InputSet interface.

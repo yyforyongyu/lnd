@@ -1,6 +1,8 @@
 package sweep
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -9,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/fn/v2"
@@ -593,18 +596,31 @@ func (s *UtxoSweeper) removeConflictSweepDescendants(
 	// TODO(roasbeef): need to start to remove all transaction hashes after
 	// every N blocks (assumed point of no return)
 	for _, sweepHash := range pastSweepHashes {
-		sweepTx, err := s.cfg.Wallet.FetchTx(sweepHash)
-		if err != nil {
+		detail, err := s.cfg.Wallet.GetTx(
+			context.Background(),
+			sweepHash,
+		)
+		if err != nil && !errors.Is(err, base.ErrTxNotFound) {
 			return err
 		}
 
-		// Transaction wasn't found in the wallet, may have already
-		// been replaced/removed.
-		if sweepTx == nil {
+		// A previously removed transaction needs no further deletion,
+		// but
+		// the application rebroadcaster must stop retrying it.
+		if errors.Is(err, base.ErrTxNotFound) {
 			// If it was removed, then we'll play it safe and mark
 			// it as no longer need to be rebroadcasted.
 			s.cfg.Wallet.CancelRebroadcast(sweepHash)
 			continue
+		}
+
+		// Decode the native history snapshot only for existing conflict
+		// checks.
+		sweepTx := wire.NewMsgTx(2)
+		if err := sweepTx.Deserialize(
+			bytes.NewReader(detail.RawTx),
+		); err != nil {
+			return err
 		}
 
 		// Check to see if this past sweep transaction spent any of the
@@ -627,7 +643,10 @@ func (s *UtxoSweeper) removeConflictSweepDescendants(
 		log.Debugf("Removing sweep txid=%v from wallet: %v",
 			sweepTx.TxHash(), lnutils.SpewLogClosure(sweepTx))
 
-		err = s.cfg.Wallet.RemoveDescendants(sweepTx)
+		err = s.cfg.Wallet.DeleteUnconfirmedTx(
+			context.Background(),
+			sweepHash,
+		)
 		if err != nil {
 			log.Warnf("Unable to remove descendants: %v", err)
 		}
@@ -1162,7 +1181,7 @@ func (s *UtxoSweeper) handleUpdateReq(req *updateReq) (
 	// sweeping transaction.
 	sweeperInput, ok := s.inputs[req.input]
 	if !ok {
-		return nil, lnwallet.ErrNotMine
+		return nil, base.ErrUnknownOutput
 	}
 
 	// Create the updated parameters struct. Leave the exclusive group

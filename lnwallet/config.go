@@ -1,7 +1,10 @@
 package lnwallet
 
 import (
+	"context"
+
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
@@ -33,9 +36,22 @@ type Config struct {
 	// deterministic.
 	SecretKeyRing keychain.SecretKeyRing
 
-	// WalletController is the core wallet, all non Lightning Network
-	// specific interaction is proxied to the internal wallet.
-	WalletController WalletController
+	// Wallet is the single Manager-owned wallet. Ordinary wallet operations
+	// use its maintained capabilities directly, including in remote mode.
+	Wallet WalletAPI
+
+	// WalletServices owns application startup and chain/status integration.
+	WalletServices WalletServices
+
+	// SignPsbt supplies Lightning tweaks locally or transports signing to
+	// the
+	// configured remote signer without exposing private callbacks over RPC.
+	SignPsbt func(context.Context, *psbt.Packet) ([]uint32, error)
+
+	// FinalizePsbt binds native local finalization or existing remote
+	// script signing. SignPsbt has different metadata requirements and
+	// cannot replace it.
+	FinalizePsbt func(context.Context, *psbt.Packet) error
 
 	// Signer is the wallet's current Signer implementation. This Signer is
 	// used to generate signature for all inputs to potential funding

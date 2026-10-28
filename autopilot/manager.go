@@ -7,8 +7,8 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	base "github.com/btcsuite/btcwallet/wallet"
 	graphdb "github.com/lightningnetwork/lnd/graph/db"
-	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -33,7 +33,8 @@ type ManagerCfg struct {
 
 	// SubscribeTransactions is used to get a subscription for transactions
 	// relevant to this node's wallet.
-	SubscribeTransactions func() (lnwallet.TransactionSubscription, error)
+	SubscribeTransactions func(context.Context) (
+		<-chan *base.TxEvent, func(), error)
 
 	// SubscribeTopology is used to get a subscription for topology changes
 	// on the network.
@@ -127,14 +128,16 @@ func (m *Manager) StartAgent() error {
 	// Finally, we'll need to subscribe to two things: incoming
 	// transactions that modify the wallet's balance, and also any graph
 	// topology updates.
-	txnSubscription, err := m.cfg.SubscribeTransactions()
+	txnSubscription, cancelTxns, err := m.cfg.SubscribeTransactions(
+		context.Background(),
+	)
 	if err != nil {
 		pilot.Stop()
 		return err
 	}
 	graphSubscription, err := m.cfg.SubscribeTopology()
 	if err != nil {
-		txnSubscription.Cancel()
+		cancelTxns()
 		pilot.Stop()
 		return err
 	}
@@ -146,20 +149,22 @@ func (m *Manager) StartAgent() error {
 	// TODO(halseth): can lead to panic if in process of shutting down.
 	m.wg.Add(1)
 	go func() {
-		defer txnSubscription.Cancel()
+		defer cancelTxns()
 		defer m.wg.Done()
 
 		for {
 			select {
-			case <-txnSubscription.ConfirmedTransactions():
-				pilot.OnBalanceChange()
+			case event, ok := <-txnSubscription:
+				// Wallet closes its own stream on
+				// stop/cancellation. Only confirmed
+				// observations can change fundable balance.
+				if !ok {
+					return
+				}
+				if event.Detail.Block != nil {
+					pilot.OnBalanceChange()
+				}
 
-			// We won't act upon new unconfirmed transaction, as
-			// we'll only use confirmed outputs when funding.
-			// However, we will still drain this request in order
-			// to avoid goroutine leaks, and ensure we promptly
-			// read from the channel if available.
-			case <-txnSubscription.UnconfirmedTransactions():
 			case <-pilot.quit:
 				return
 			case <-m.quit:

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -26,6 +27,8 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/actor"
 	"github.com/lightningnetwork/lnd/aliasmgr"
@@ -1340,7 +1343,7 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 
 	s.txPublisher = sweep.NewTxPublisher(sweep.TxPublisherConfig{
 		Signer:     cc.Wallet.Cfg.Signer,
-		Wallet:     cc.Wallet,
+		Wallet:     newSweeperWallet(cc.Wallet),
 		Estimator:  cc.FeeEstimator,
 		Notifier:   cc.ChainNotifier,
 		AuxSweeper: s.implCfg.AuxSweeper,
@@ -1349,7 +1352,7 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 	s.sweeper = sweep.New(&sweep.UtxoSweeperConfig{
 		FeeEstimator: cc.FeeEstimator,
 		GenSweepScript: newSweepPkScriptGen(
-			cc.Wallet, s.cfg.ActiveNetParams.Params,
+			cc.Wallet.Cfg.Wallet, s.cfg.ActiveNetParams.Params,
 		),
 		Signer:               cc.Wallet.Cfg.Signer,
 		Wallet:               newSweeperWallet(cc.Wallet),
@@ -1413,7 +1416,8 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 			DB:        s.chanStateDB,
 			Estimator: s.cc.FeeEstimator,
 			GenSweepScript: newSweepPkScriptGen(
-				cc.Wallet, s.cfg.ActiveNetParams.Params,
+				cc.Wallet.Cfg.Wallet,
+				s.cfg.ActiveNetParams.Params,
 			),
 			Notifier:           cc.ChainNotifier,
 			PublishTransaction: cc.Wallet.PublishTransaction,
@@ -1438,7 +1442,7 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 		)(s.implCfg.TrafficShaper),
 		NewSweepAddr: func() ([]byte, error) {
 			addr, err := newSweepPkScriptGen(
-				cc.Wallet, netParams,
+				cc.Wallet.Cfg.Wallet, netParams,
 			)().Unpack()
 			if err != nil {
 				return nil, err
@@ -1480,7 +1484,13 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 			s.htlcSwitch.RemoveLink(chanID)
 			return nil
 		},
-		IsOurAddress: cc.Wallet.IsOurAddress,
+		IsOurAddress: func(addr address.Address) bool {
+			_, err := cc.Wallet.Cfg.Wallet.GetAddressInfo(
+				context.Background(), addr,
+			)
+
+			return err == nil
+		},
 		ContractBreach: func(chanPoint wire.OutPoint,
 			breachRet *lnwallet.BreachRetribution) error {
 
@@ -1657,7 +1667,11 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 		Wallet:             cc.Wallet,
 		PublishTransaction: cc.Wallet.PublishTransaction,
 		UpdateLabel: func(hash chainhash.Hash, label string) error {
-			return cc.Wallet.LabelTransaction(hash, label, true)
+			return cc.Wallet.Cfg.Wallet.LabelTx(
+				context.Background(),
+				hash,
+				label,
+			)
 		},
 		Notifier:     cc.ChainNotifier,
 		ChannelDB:    s.chanStateDB,
@@ -1941,7 +1955,7 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 			Signer: cc.Wallet.Cfg.Signer,
 			NewAddress: func() ([]byte, error) {
 				addr, err := newSweepPkScriptGen(
-					cc.Wallet, netParams,
+					cc.Wallet.Cfg.Wallet, netParams,
 				)().Unpack()
 				if err != nil {
 					return nil, err
@@ -5681,19 +5695,19 @@ func (s *server) SendToPeer(pubKey [33]byte,
 // Specifically, the script generated is a version 0, pay-to-witness-pubkey-hash
 // (p2wkh) output.
 func newSweepPkScriptGen(
-	wallet lnwallet.WalletController,
+	wallet lnwallet.WalletAPI,
 	netParams *chaincfg.Params) func() fn.Result[lnwallet.AddrWithKey] {
 
 	return func() fn.Result[lnwallet.AddrWithKey] {
-		sweepAddr, err := wallet.NewAddress(
-			lnwallet.TaprootPubkey, false,
-			lnwallet.DefaultAccountName,
+		sweepAddr, err := wallet.NewAddress(context.Background(),
+			base.NewAccountSelectorByName(waddrmgr.KeyScopeBIP0086,
+				lnwallet.DefaultAccountName), false,
 		)
 		if err != nil {
 			return fn.Err[lnwallet.AddrWithKey](err)
 		}
 
-		addr, err := txscript.PayToAddrScript(sweepAddr)
+		addr, err := txscript.PayToAddrScript(sweepAddr.Addr)
 		if err != nil {
 			return fn.Err[lnwallet.AddrWithKey](err)
 		}

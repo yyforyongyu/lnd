@@ -6,47 +6,87 @@ package walletrpc
 import (
 	"testing"
 
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/build"
+	"github.com/lightningnetwork/lnd/lntest/mock"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-// TestXCreateAccountExperimentalGate asserts the acknowledgement gate, which is
-// what keeps an operator from creating an unrecoverable account by accident.
-//
-// The gate has to admit two callers: a dev build, and a release build whose
-// caller has explicitly attested. Getting this wrong in the strict direction
-// makes the RPC unusable on the release images real deployments run; getting
-// it wrong in the loose direction silently drops the warning entirely.
+// TestXCreateAccountExperimentalGate checks release and dev admission.
 func TestXCreateAccountExperimentalGate(t *testing.T) {
 	t.Parallel()
-
-	if build.IsDevBuild() {
-		// A dev build lets the call through, so it would reach the
-		// wallet and there is nothing to assert here without one. That
-		// direction is covered by the itest, whose binaries are built
-		// with this tag.
-		t.Skip("gate is open on dev builds; covered by the itest")
+	testCases := []struct {
+		name string
+		ack  bool
+	}{
+		{
+			name: "without acknowledgement",
+		},
+		{
+			name: "explicit acknowledgement",
+			ack:  true,
+		},
 	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange native creation only when the public gate
+			// admits it. A strict mock proves rejected release
+			// requests do not reach Wallet.
+			w := &mock.WalletController{}
+			t.Cleanup(func() { w.AssertExpectations(t) })
+			allowed := tc.ack || build.IsDevBuild()
+			scope := waddrmgr.KeyScopeBIP0086
+			addrType := AddressType_TAPROOT_PUBKEY
+			schema := waddrmgr.ScopeAddrMap[scope]
+			if allowed {
+				w.On(
+					"NewAccount",
+					testifymock.Anything,
+					wallet.NewAccountParams{
+						Scope: waddrmgr.KeyScopeBIP0086,
+						Name:  "custom",
+					},
+				).
+					Return(&wallet.AccountInfo{
+						AccountName: "custom",
+						KeyScope:    scope,
+						AddrSchema:  schema,
+					}, nil).
+					Once()
+			}
+			server := &WalletKit{cfg: &Config{
+				Wallet: w, ChainParams: &chaincfg.MainNetParams,
+			}}
 
-	// The wallet is never reached when the gate refuses, so a nil config
-	// is enough to prove the refusal happens first.
-	w := &WalletKit{}
+			// Act with the same request under the actual build's
+			// gate.
+			resp, err := server.XCreateAccount(
+				t.Context(),
+				&XCreateAccountRequest{
+					Name:              "custom",
+					AddressType:       addrType,
+					IKnowWhatIAmDoing: tc.ack,
+				},
+			)
 
-	_, err := w.XCreateAccount(t.Context(), &XCreateAccountRequest{
-		Name:        "custom",
-		AddressType: AddressType_TAPROOT_PUBKEY,
-	})
-	require.ErrorIs(t, err, errAccountCreationNotAcked)
+			// Assert refusal stays explicit while admitted calls
+			// return real account metadata, without panic
+			// assertions or skipped dev coverage.
+			if !allowed {
+				require.ErrorIs(
+					t,
+					err,
+					errAccountCreationNotAcked,
+				)
+				require.Nil(t, resp)
 
-	// The same request with the acknowledgement set gets past the gate,
-	// which on a nil wallet means it panics rather than returning the
-	// refusal — so assert on the gate, not on what follows it.
-	require.Panics(t, func() {
-		//nolint:errcheck // Panics past the gate, which is the point.
-		w.XCreateAccount(t.Context(), &XCreateAccountRequest{
-			Name:              "custom",
-			AddressType:       AddressType_TAPROOT_PUBKEY,
-			IKnowWhatIAmDoing: true,
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "custom", resp.Account.Name)
 		})
-	}, "acknowledged request must get past the gate")
+	}
 }

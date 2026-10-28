@@ -2,6 +2,7 @@ package lnwallettest
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -27,6 +28,8 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/pkg/btcunit"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/walletdb"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
@@ -41,6 +44,7 @@ import (
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/labels"
+	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest/unittest"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
@@ -151,13 +155,17 @@ func mineAndAssertTxInBlock(t *testing.T, miner *rpctest.Harness,
 
 // newPkScript generates a new public key script of the given address type.
 func newPkScript(t *testing.T, w *lnwallet.LightningWallet,
-	addrType lnwallet.AddressType) []byte {
+	addrType waddrmgr.KeyScope) []byte {
 
 	t.Helper()
 
-	addr, err := w.NewAddress(addrType, false, lnwallet.DefaultAccountName)
+	addr, err := w.Cfg.Wallet.NewAddress(t.Context(),
+		wallet.NewAccountSelectorByName(
+			addrType, lnwallet.DefaultAccountName,
+		), false,
+	)
 	require.NoError(t, err, "unable to create new address")
-	pkScript, err := txscript.PayToAddrScript(addr)
+	pkScript, err := txscript.PayToAddrScript(addr.Addr)
 	require.NoError(t, err, "unable to create output script")
 
 	return pkScript
@@ -165,16 +173,29 @@ func newPkScript(t *testing.T, w *lnwallet.LightningWallet,
 
 // sendCoins is a helper function that encompasses all the things needed for two
 // parties to send on-chain funds to each other.
-func sendCoins(t *testing.T, miner *rpctest.Harness,
-	sender, receiver *lnwallet.LightningWallet, output *wire.TxOut,
-	feeRate chainfee.SatPerKWeight, mineBlock bool, minConf int32) *wire.MsgTx { //nolint:unparam
+func sendCoins(
+	t *testing.T,
+	miner *rpctest.Harness,
+	sender, receiver *lnwallet.LightningWallet,
+	output *wire.TxOut,
+	feeRate chainfee.SatPerKWeight,
+	mineBlock bool,
+	minConf int32,
+) *wire.MsgTx { //nolint:unparam
 
 	t.Helper()
 
-	tx, err := sender.SendOutputs(
-		nil, []*wire.TxOut{output}, feeRate, minConf, labels.External,
-		sender.Cfg.CoinSelectionStrategy,
-	)
+	tx, err := sender.SendOutputs(t.Context(), &wallet.TxIntent{
+		Outputs: []wire.TxOut{*output},
+		Inputs: &wallet.InputsPolicy{
+			MinConfs: uint32(minConf),
+			Strategy: sender.Cfg.CoinSelectionStrategy,
+		},
+		FeeRate: btcunit.NewSatPerKVByte(
+			btcutil.Amount(feeRate.FeePerKVByte()),
+		),
+		Label: labels.External,
+	})
 	require.NoError(t, err, "unable to send transaction")
 
 	if mineBlock {
@@ -201,19 +222,17 @@ func assertTxInWallet(t *testing.T, w *lnwallet.LightningWallet,
 	// We'll fetch all of our transaction and go through each one until
 	// finding the expected transaction with its expected confirmation
 	// status.
-	txs, _, _, err := w.ListTransactionDetails(
-		0, btcwallet.UnconfirmedHeight, "", 0, 1000,
-	)
+	txs, err := w.Cfg.Wallet.ListTxns(t.Context(), 0, int32(-1))
 	require.NoError(t, err, "unable to retrieve transactions")
 	for _, tx := range txs {
 		if tx.Hash != txHash {
 			continue
 		}
-		if tx.NumConfirmations <= 0 && confirmed {
+		if tx.Confirmations <= 0 && confirmed {
 			t.Fatalf("expected transaction %v to be confirmed",
 				txHash)
 		}
-		if tx.NumConfirmations > 0 && !confirmed {
+		if tx.Confirmations > 0 && !confirmed {
 			t.Fatalf("expected transaction %v to be unconfirmed",
 				txHash)
 		}
@@ -231,8 +250,7 @@ func loadTestCredits(miner *rpctest.Harness, w *lnwallet.LightningWallet,
 
 	// For initial neutrino connection, wait a second.
 	// TODO(aakselrod): Eliminate the need for this.
-	switch w.BackEnd() {
-	case "neutrino":
+	if w.Cfg.WalletServices.BackEnd() == "neutrino" {
 		time.Sleep(time.Second)
 	}
 	// Using the mining node, spend from a coinbase output numOutputs to
@@ -241,28 +259,35 @@ func loadTestCredits(miner *rpctest.Harness, w *lnwallet.LightningWallet,
 	if err != nil {
 		return fmt.Errorf("unable to create amt: %w", err)
 	}
-	expectedBalance, err := w.ConfirmedBalance(1, lnwallet.DefaultAccountName)
+	expectedBalance, err := w.ConfirmedBalance(
+		1,
+		lnwallet.DefaultAccountName,
+	)
 	if err != nil {
 		return err
 	}
-	expectedBalance += btcutil.Amount(int64(satoshiPerOutput) * int64(numOutputs))
+	expectedBalance += btcutil.Amount(
+		int64(satoshiPerOutput) * int64(numOutputs),
+	)
 	addrs := make([]address.Address, 0, numOutputs)
 	for i := 0; i < numOutputs; i++ {
 		// Grab a fresh address from the wallet to house this output.
-		walletAddr, err := w.NewAddress(
-			lnwallet.WitnessPubKey, false,
-			lnwallet.DefaultAccountName,
+		walletAddr, err := w.Cfg.Wallet.NewAddress(context.Background(),
+			wallet.NewAccountSelectorByName(
+				waddrmgr.KeyScopeBIP0084,
+				lnwallet.DefaultAccountName,
+			), false,
 		)
 		if err != nil {
 			return err
 		}
 
-		script, err := txscript.PayToAddrScript(walletAddr)
+		script, err := txscript.PayToAddrScript(walletAddr.Addr)
 		if err != nil {
 			return err
 		}
 
-		addrs = append(addrs, walletAddr)
+		addrs = append(addrs, walletAddr.Addr)
 
 		output := &wire.TxOut{
 			Value:    int64(satoshiPerOutput),
@@ -296,7 +321,8 @@ func loadTestCredits(miner *rpctest.Harness, w *lnwallet.LightningWallet,
 		}
 		select {
 		case <-timeout:
-			synced, _, err := w.IsSynced()
+			info, err := w.Cfg.Wallet.Info(context.Background())
+			synced := info != nil && info.Synced
 			if err != nil {
 				return err
 			}
@@ -315,7 +341,7 @@ func loadTestCredits(miner *rpctest.Harness, w *lnwallet.LightningWallet,
 // available for funding channels.
 func createTestWallet(t *testing.T, tempTestDir string,
 	miningNode *rpctest.Harness, netParams *chaincfg.Params,
-	notifier chainntnfs.ChainNotifier, wc lnwallet.WalletController,
+	notifier chainntnfs.ChainNotifier, wc *btcwallet.BtcWallet,
 	keyRing keychain.SecretKeyRing, signer input.Signer,
 	bio lnwallet.BlockChainIO) *lnwallet.LightningWallet {
 
@@ -326,7 +352,10 @@ func createTestWallet(t *testing.T, tempTestDir string,
 		Database:              fullDB.ChannelStateDB(),
 		Notifier:              notifier,
 		SecretKeyRing:         keyRing,
-		WalletController:      wc,
+		Wallet:                wc.InternalWallet(),
+		WalletServices:        wc,
+		SignPsbt:              wc.SignPsbt,
+		FinalizePsbt:          wc.InternalWallet().FinalizePsbt,
 		Signer:                signer,
 		ChainIO:               bio,
 		FeeEstimator:          chainfee.NewStaticEstimator(2500, 0),
@@ -356,7 +385,8 @@ func testGetRecoveryInfo(miner *rpctest.Harness,
 	expectedRecoveryMode := true
 	expectedProgress := float64(1)
 
-	isRecoveryMode, progress, err := alice.GetRecoveryInfo()
+	isRecoveryMode, progress, err := alice.Cfg.
+		WalletServices.GetRecoveryInfo()
 	require.NoError(t, err, "unable to get alice's recovery info")
 
 	require.Equal(t,
@@ -373,7 +403,8 @@ func testGetRecoveryInfo(miner *rpctest.Harness,
 	err = waitForWalletSync(miner, alice)
 	require.NoError(t, err, "Couldn't sync Alice's wallet")
 
-	isRecoveryMode, progress, err = alice.GetRecoveryInfo()
+	isRecoveryMode, progress, err = alice.Cfg.
+		WalletServices.GetRecoveryInfo()
 	require.NoError(t, err, "unable to get alice's recovery info")
 
 	require.Equal(t,
@@ -385,7 +416,7 @@ func testGetRecoveryInfo(miner *rpctest.Harness,
 	expectedRecoveryMode = false
 	expectedProgress = float64(0)
 
-	isRecoveryMode, progress, err = bob.GetRecoveryInfo()
+	isRecoveryMode, progress, err = bob.Cfg.WalletServices.GetRecoveryInfo()
 	require.NoError(t, err, "unable to get bob's recovery info")
 
 	require.Equal(t,
@@ -1057,15 +1088,17 @@ func testListTransactionDetails(miner *rpctest.Harness,
 	isOurAddress := make(map[string]bool)
 	txids := make(map[chainhash.Hash]struct{})
 	for i := 0; i < numTxns; i++ {
-		addr, err := alice.NewAddress(
-			lnwallet.WitnessPubKey, false,
-			lnwallet.DefaultAccountName,
+		addr, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+			wallet.NewAccountSelectorByName(
+				waddrmgr.KeyScopeBIP0084,
+				lnwallet.DefaultAccountName,
+			), false,
 		)
 		if err != nil {
 			t.Fatalf("unable to create new address: %v", err)
 		}
-		isOurAddress[addr.EncodeAddress()] = true
-		script, err := txscript.PayToAddrScript(addr)
+		isOurAddress[addr.Addr.EncodeAddress()] = true
+		script, err := txscript.PayToAddrScript(addr.Addr)
 		if err != nil {
 			t.Fatalf("unable to create output script: %v", err)
 		}
@@ -1101,8 +1134,8 @@ func testListTransactionDetails(miner *rpctest.Harness,
 	// should be confirmed.
 	err = waitForWalletSync(miner, alice)
 	require.NoError(t, err, "Couldn't sync Alice's wallet")
-	txDetails, _, _, err := alice.ListTransactionDetails(
-		startHeight, chainTip, "", 0, 1000,
+	txDetails, err := alice.Cfg.Wallet.ListTxns(
+		t.Context(), startHeight, chainTip,
 	)
 	require.NoError(t, err, "unable to fetch tx details")
 
@@ -1117,25 +1150,28 @@ func testListTransactionDetails(miner *rpctest.Harness,
 			continue
 		}
 
-		if txDetail.NumConfirmations != numBlocksMined {
+		if txDetail.Confirmations != numBlocksMined {
 			t.Fatalf("num confs incorrect, got %v expected %v",
-				txDetail.NumConfirmations, numBlocksMined)
+				txDetail.Confirmations, numBlocksMined)
 		}
 		if txDetail.Value != outputAmt {
 			t.Fatalf("tx value incorrect, got %v expected %v",
 				txDetail.Value, outputAmt)
 		}
 
-		if !bytes.Equal(txDetail.BlockHash[:], blocks[0][:]) {
+		if !bytes.Equal(txDetail.Block.Hash[:], blocks[0][:]) {
 			t.Fatalf("block hash mismatch, got %v expected %v",
-				txDetail.BlockHash, blocks[0])
+				txDetail.Block.Hash, blocks[0])
 		}
 
-		// This fetches the transactions in a block so that we can compare the
-		// txouts stored in the mined transaction against the ones in the transaction
+		// This fetches the transactions in a block so that we can
+		// compare the txouts stored in the mined transaction against
+		// the ones in the transaction
 		// details
-		if _, ok := blockTxOuts[*txDetail.BlockHash]; !ok {
-			fetchedBlock, err := alice.Cfg.ChainIO.GetBlock(txDetail.BlockHash)
+		if _, ok := blockTxOuts[txDetail.Block.Hash]; !ok {
+			fetchedBlock, err := alice.Cfg.ChainIO.GetBlock(
+				&txDetail.Block.Hash,
+			)
 			if err != nil {
 				t.Fatalf("err fetching block: %s", err)
 			}
@@ -1151,31 +1187,51 @@ func testListTransactionDetails(miner *rpctest.Harness,
 			blockTxOuts[fetchedBlock.BlockHash()] = transactions
 		}
 
-		if txOuts, ok := blockTxOuts[*txDetail.BlockHash][txDetail.Hash]; !ok {
+		txOuts, ok := blockTxOuts[txDetail.Block.Hash][txDetail.Hash]
+		if !ok {
 			t.Fatalf("tx (%v) not found in block (%v)",
-				txDetail.Hash, txDetail.BlockHash)
+				txDetail.Hash, txDetail.Block.Hash)
 		} else {
-			var destinationOutputs []lnwallet.OutputDetail
+			var destinationOutputs []wallet.Output
 
 			for i, txOut := range txOuts {
 				sc, addrs, _, err :=
-					txscript.ExtractPkScriptAddrs(txOut.PkScript, &alice.Cfg.NetParams)
+					txscript.ExtractPkScriptAddrs(
+						txOut.PkScript,
+						&alice.Cfg.NetParams,
+					)
 				if err != nil {
-					t.Fatalf("err extract script addresses: %s", err)
+					t.Fatalf(
+						"err extract script "+
+							"addresses: %s",
+						err,
+					)
 				}
-				destinationOutputs = append(destinationOutputs, lnwallet.OutputDetail{
-					OutputType:   sc,
-					Addresses:    addrs,
-					PkScript:     txOut.PkScript,
-					OutputIndex:  i,
-					Value:        btcutil.Amount(txOut.Value),
-					IsOurAddress: isOurAddress[addrs[0].EncodeAddress()],
-				})
+				addr := addrs[0].EncodeAddress()
+				output := wallet.Output{
+					Addresses: addrs,
+					PkScript:  txOut.PkScript,
+					Type:      sc,
+					Index:     i,
+					Amount:    btcutil.Amount(txOut.Value),
+					IsOurs:    isOurAddress[addr],
+				}
+				destinationOutputs = append(
+					destinationOutputs,
+					output,
+				)
 			}
 
-			if !reflect.DeepEqual(txDetail.OutputDetails, destinationOutputs) {
-				t.Fatalf("destination outputs mismatch, got %v expected %v",
-					txDetail.OutputDetails, destinationOutputs)
+			if !reflect.DeepEqual(
+				txDetail.Outputs, destinationOutputs,
+			) {
+
+				t.Fatalf(
+					"destination outputs mismatch, got "+
+						"%v expected %v",
+					txDetail.Outputs,
+					destinationOutputs,
+				)
 			}
 		}
 
@@ -1194,10 +1250,15 @@ func testListTransactionDetails(miner *rpctest.Harness,
 	outputScript, err := txscript.PayToAddrScript(minerAddr)
 	require.NoError(t, err, "unable to make output script")
 	burnOutput := wire.NewTxOut(outputAmt, outputScript)
-	burnTX, err := alice.SendOutputs(
-		nil, []*wire.TxOut{burnOutput}, 2500, 1, labels.External,
-		alice.Cfg.CoinSelectionStrategy,
-	)
+	burnTX, err := alice.SendOutputs(t.Context(), &wallet.TxIntent{
+		Outputs: []wire.TxOut{*burnOutput},
+		Inputs: &wallet.InputsPolicy{
+			MinConfs: 1,
+			Strategy: alice.Cfg.CoinSelectionStrategy,
+		},
+		FeeRate: btcunit.NewSatPerKVByte(10_000),
+		Label:   labels.External,
+	})
 	require.NoError(t, err, "unable to create burn tx")
 	burnTXID := burnTX.TxHash()
 	err = waitForMempoolTx(miner, &burnTXID)
@@ -1213,8 +1274,8 @@ func testListTransactionDetails(miner *rpctest.Harness,
 	// unconfirmed transactions. The transaction above should be included
 	// with a confirmation height of 0, indicating that it has not been
 	// mined yet.
-	txDetails, _, _, err = alice.ListTransactionDetails(
-		chainTip, btcwallet.UnconfirmedHeight, "", 0, 1000,
+	txDetails, err = alice.Cfg.Wallet.ListTxns(
+		t.Context(), chainTip, int32(-1),
 	)
 	require.NoError(t, err, "unable to fetch tx details")
 	var mempoolTxFound bool
@@ -1227,20 +1288,20 @@ func testListTransactionDetails(miner *rpctest.Harness,
 		// negative number of confirmations to indicate that it's
 		// unconfirmed.
 		mempoolTxFound = true
-		if txDetail.NumConfirmations != 0 {
+		if txDetail.Confirmations != 0 {
 			t.Fatalf("num confs incorrect, got %v expected %v",
-				txDetail.NumConfirmations, 0)
+				txDetail.Confirmations, 0)
 		}
 
-		// We test that each txDetail has destination addresses. This ensures
-		// that even when we have 0 confirmation transactions, the destination
+		// We test that each txDetail has destination addresses. This
+		// ensures that even when we have 0 confirmation transactions,
+		// the destination
 		// addresses are returned.
 		var match bool
-		for _, o := range txDetail.OutputDetails {
+		for _, o := range txDetail.Outputs {
 			for _, addr := range o.Addresses {
 				if addr.String() == minerAddr.String() {
 					match = true
-					break
 				}
 			}
 		}
@@ -1266,8 +1327,8 @@ func testListTransactionDetails(miner *rpctest.Harness,
 	// transactions from the last block.
 	err = waitForWalletSync(miner, alice)
 	require.NoError(t, err, "Couldn't sync Alice's wallet")
-	txDetails, _, _, err = alice.ListTransactionDetails(
-		chainTip, chainTip, "", 0, 1000,
+	txDetails, err = alice.Cfg.Wallet.ListTxns(
+		t.Context(), chainTip, chainTip,
 	)
 	require.NoError(t, err, "unable to fetch tx details")
 	var burnTxFound bool
@@ -1277,9 +1338,9 @@ func testListTransactionDetails(miner *rpctest.Harness,
 		}
 
 		burnTxFound = true
-		if txDetail.NumConfirmations != 1 {
+		if txDetail.Confirmations != 1 {
 			t.Fatalf("num confs incorrect, got %v expected %v",
-				txDetail.NumConfirmations, 1)
+				txDetail.Confirmations, 1)
 		}
 
 		// We assert that the value is greater than the amount we
@@ -1290,9 +1351,9 @@ func testListTransactionDetails(miner *rpctest.Harness,
 			t.Fatalf("tx value incorrect, got %v expected %v",
 				int64(txDetail.Value), -int64(outputAmt))
 		}
-		if !bytes.Equal(txDetail.BlockHash[:], burnBlock[0][:]) {
+		if !bytes.Equal(txDetail.Block.Hash[:], burnBlock[0][:]) {
 			t.Fatalf("block hash mismatch, got %v expected %v",
-				txDetail.BlockHash, burnBlock[0])
+				txDetail.Block.Hash, burnBlock[0])
 		}
 	}
 	if !burnTxFound {
@@ -1309,8 +1370,8 @@ func testListTransactionDetails(miner *rpctest.Harness,
 
 	// Query for transactions only in the latest block. We do not expect
 	// any transactions to be returned.
-	txDetails, _, _, err = alice.ListTransactionDetails(
-		chainTip, chainTip, "", 0, 1000,
+	txDetails, err = alice.Cfg.Wallet.ListTxns(
+		t.Context(), chainTip, chainTip,
 	)
 	require.NoError(t, err, "unexpected error")
 	if len(txDetails) != 0 {
@@ -1327,14 +1388,16 @@ func testListTransactionDetailsOffset(miner *rpctest.Harness,
 	isOurAddress := make(map[string]bool)
 	txids := make(map[chainhash.Hash]struct{})
 	for i := 0; i < numTxns; i++ {
-		addr, err := alice.NewAddress(
-			lnwallet.WitnessPubKey, false,
-			lnwallet.DefaultAccountName,
+		addr, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+			wallet.NewAccountSelectorByName(
+				waddrmgr.KeyScopeBIP0084,
+				lnwallet.DefaultAccountName,
+			), false,
 		)
 		require.NoError(t, err)
 
-		isOurAddress[addr.EncodeAddress()] = true
-		script, err := txscript.PayToAddrScript(addr)
+		isOurAddress[addr.Addr.EncodeAddress()] = true
+		script, err := txscript.PayToAddrScript(addr.Addr)
 		require.NoError(t, err)
 
 		output := &wire.TxOut{
@@ -1362,91 +1425,95 @@ func testListTransactionDetailsOffset(miner *rpctest.Harness,
 	err = waitForWalletSync(miner, alice)
 	require.NoError(t, err, "Couldn't sync Alice's wallet")
 
-	// Query for transactions, setting max_transactions to 5. We expect 5
-	// transactions to be returned.
-	txDetails, firstIdx, lastIdx, err := alice.ListTransactionDetails(
-		startHeight, chainTip, "", 0, 5,
+	// Native history owns storage; the existing RPC formatter owns
+	// pagination.
+	history, err := alice.Cfg.Wallet.ListTxns(
+		t.Context(), startHeight, chainTip,
 	)
 	require.NoError(t, err)
-	require.Len(t, txDetails, 5)
-	require.EqualValues(t, 0, firstIdx)
-	require.EqualValues(t, 4, lastIdx)
+
+	// Query for transactions, setting max_transactions to 5. We expect 5
+	// transactions to be returned.
+	page := lnrpc.RPCTransactionDetails(history, 0, 5)
+	require.NoError(t, err)
+	require.Len(t, page.Transactions, 5)
+	require.EqualValues(t, 0, page.FirstIndex)
+	require.EqualValues(t, 4, page.LastIndex)
 
 	// Query for transactions, setting max_transactions to less than the
 	// number of transactions we have (5).
-	txDetails, _, _, err = alice.ListTransactionDetails(
-		startHeight, chainTip, "", 0, 1,
-	)
+	page = lnrpc.RPCTransactionDetails(history, 0, 1)
 	require.NoError(t, err)
-	require.Len(t, txDetails, 1)
+	require.Len(t, page.Transactions, 1)
 
 	// Query for transactions, setting indexOffset to 5 (equal to number
 	// of transactions we have) and max_transactions to 0.
-	txDetails, _, _, err = alice.ListTransactionDetails(
-		startHeight, chainTip, "", 5, 0,
-	)
+	page = lnrpc.RPCTransactionDetails(history, 5, 0)
 	require.NoError(t, err)
-	require.Len(t, txDetails, 0)
+	require.Len(t, page.Transactions, 0)
 
 	// Query for transactions, setting indexOffset to 4 (edge offset) and
 	// max_transactions to 0.
-	txDetails, _, _, err = alice.ListTransactionDetails(
-		startHeight, chainTip, "", 4, 0,
-	)
+	page = lnrpc.RPCTransactionDetails(history, 4, 0)
 	require.NoError(t, err)
-	require.Len(t, txDetails, 1)
+	require.Len(t, page.Transactions, 1)
 
 	// Query for transactions, setting max_transactions to 0.
-	txDetails, _, _, err = alice.ListTransactionDetails(
-		startHeight, chainTip, "", 0, 0,
-	)
+	page = lnrpc.RPCTransactionDetails(history, 0, 0)
 	require.NoError(t, err)
-	require.Len(t, txDetails, 5)
+	require.Len(t, page.Transactions, 5)
 
 	// Query for transactions, more than we have in the wallet (5).
-	txDetails, _, _, err = alice.ListTransactionDetails(
-		startHeight, chainTip, "", 0, 10,
-	)
+	page = lnrpc.RPCTransactionDetails(history, 0, 10)
 	require.NoError(t, err)
-	require.Len(t, txDetails, 5)
+	require.Len(t, page.Transactions, 5)
 
 	// Query for transactions where the offset is greater than the number
 	// of transactions available.
-	txDetails, _, _, err = alice.ListTransactionDetails(
-		startHeight, chainTip, "", 10, 100,
-	)
+	page = lnrpc.RPCTransactionDetails(history, 10, 100)
 	require.NoError(t, err)
-	require.Len(t, txDetails, 0)
+	require.Len(t, page.Transactions, 0)
 }
 
 func testTransactionSubscriptions(miner *rpctest.Harness,
 	alice, _ *lnwallet.LightningWallet, t *testing.T) {
 
-	// First, check to see if this wallet meets the TransactionNotifier
-	// interface, if not then we'll skip this test for this particular
-	// implementation of the WalletController.
-	txClient, err := alice.SubscribeTransactions()
-	if err != nil {
-		t.Skipf("unable to generate tx subscription: %v", err)
-	}
-	defer txClient.Cancel()
+	// Subscription delivery remains part of the wallet contract. Report
+	// unavailable event support at setup so the existing assertions remain
+	// a visible runtime gate for the maintained wallet pin.
+	events, cancel, err := alice.Cfg.Wallet.SubscribeTxns(t.Context())
+	require.NoError(t, err)
+	defer cancel()
 
 	const (
 		outputAmt = btcutil.SatoshiPerBitcoin
 		numTxns   = 3
 	)
 	errCh1 := make(chan error, 1)
-	switch alice.BackEnd() {
+	switch alice.Cfg.WalletServices.BackEnd() {
 	case "neutrino":
 		// Neutrino doesn't listen for unconfirmed transactions.
 	default:
 		go func() {
 			for i := 0; i < numTxns; i++ {
-				txDetail := <-txClient.UnconfirmedTransactions()
-				if txDetail.NumConfirmations != 0 {
+				var event *wallet.TxEvent
+				select {
+				case event = <-events:
+				case <-t.Context().Done():
+					return
+				}
+				if event == nil {
+					errCh1 <- errors.New(
+						"wallet stream closed",
+					)
+
+					return
+				}
+				txDetail := event.Detail
+				if txDetail.Confirmations != 0 {
 					errCh1 <- fmt.Errorf("incorrect number of confs, "+
 						"expected %v got %v", 0,
-						txDetail.NumConfirmations)
+						txDetail.Confirmations)
 					return
 				}
 				if txDetail.Value != outputAmt {
@@ -1455,10 +1522,10 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 						txDetail.Value)
 					return
 				}
-				if txDetail.BlockHash != nil {
+				if txDetail.Block != nil {
 					errCh1 <- fmt.Errorf("block hash should be nil, "+
 						"is instead %v",
-						txDetail.BlockHash)
+						txDetail.Block)
 					return
 				}
 			}
@@ -1469,14 +1536,16 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 	// Next, fetch a fresh address from the wallet, create 3 new outputs
 	// with the pkScript.
 	for i := 0; i < numTxns; i++ {
-		addr, err := alice.NewAddress(
-			lnwallet.WitnessPubKey, false,
-			lnwallet.DefaultAccountName,
+		addr, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+			wallet.NewAccountSelectorByName(
+				waddrmgr.KeyScopeBIP0084,
+				lnwallet.DefaultAccountName,
+			), false,
 		)
 		if err != nil {
 			t.Fatalf("unable to create new address: %v", err)
 		}
-		script, err := txscript.PayToAddrScript(addr)
+		script, err := txscript.PayToAddrScript(addr.Addr)
 		if err != nil {
 			t.Fatalf("unable to create output script: %v", err)
 		}
@@ -1495,7 +1564,7 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 		}
 	}
 
-	switch alice.BackEnd() {
+	switch alice.Cfg.WalletServices.BackEnd() {
 	case "neutrino":
 		// Neutrino doesn't listen for on unconfirmed transactions.
 	default:
@@ -1514,10 +1583,21 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 	errCh2 := make(chan error, 1)
 	go func() {
 		for i := 0; i < numTxns; i++ {
-			txDetail := <-txClient.ConfirmedTransactions()
-			if txDetail.NumConfirmations != 1 {
+			var event *wallet.TxEvent
+			select {
+			case event = <-events:
+			case <-t.Context().Done():
+				return
+			}
+			if event == nil {
+				errCh2 <- errors.New("wallet stream closed")
+				return
+			}
+			txDetail := event.Detail
+			if txDetail.Confirmations != 1 {
 				errCh2 <- fmt.Errorf("incorrect number of confs for %s, expected %v got %v",
-					txDetail.Hash, 1, txDetail.NumConfirmations)
+					txDetail.Hash, 1,
+					txDetail.Confirmations)
 				return
 			}
 			if txDetail.Value != outputAmt {
@@ -1549,20 +1629,27 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 	// We'll also ensure that the client is able to send our new
 	// notifications when we _create_ transactions ourselves that spend our
 	// own outputs.
-	addr, err := alice.NewAddress(
-		lnwallet.WitnessPubKey, false,
-		lnwallet.DefaultAccountName,
+	addr, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+		wallet.NewAccountSelectorByName(
+			waddrmgr.KeyScopeBIP0084,
+			lnwallet.DefaultAccountName,
+		), false,
 	)
 	require.NoError(t, err)
 
-	outputScript, err := txscript.PayToAddrScript(addr)
+	outputScript, err := txscript.PayToAddrScript(addr.Addr)
 	require.NoError(t, err)
 
 	burnOutput := wire.NewTxOut(outputAmt, outputScript)
-	tx, err := alice.SendOutputs(
-		nil, []*wire.TxOut{burnOutput}, 2500, 1, labels.External,
-		alice.Cfg.CoinSelectionStrategy,
-	)
+	tx, err := alice.SendOutputs(t.Context(), &wallet.TxIntent{
+		Outputs: []wire.TxOut{*burnOutput},
+		Inputs: &wallet.InputsPolicy{
+			MinConfs: 1,
+			Strategy: alice.Cfg.CoinSelectionStrategy,
+		},
+		FeeRate: btcunit.NewSatPerKVByte(10_000),
+		Label:   labels.External,
+	})
 	require.NoError(t, err, "unable to create tx")
 	txid := tx.TxHash()
 	err = waitForMempoolTx(miner, &txid)
@@ -1579,7 +1666,9 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 	select {
 	case <-time.After(time.Second * 10):
 		t.Fatalf("transactions not received after 10 seconds")
-	case unConfTx := <-txClient.UnconfirmedTransactions():
+	case event := <-events:
+		require.NotNil(t, event)
+		unConfTx := event.Detail
 		if unConfTx.Hash != txid {
 			t.Fatalf("wrong txn notified: expected %v got %v",
 				txid, unConfTx.Hash)
@@ -1748,10 +1837,15 @@ func newTx(t *testing.T, r *rpctest.Harness, pubKey *btcec.PublicKey,
 		Value:    btcutil.SatoshiPerBitcoin,
 		PkScript: keyScript,
 	}
-	tx, err := alice.SendOutputs(
-		nil, []*wire.TxOut{newOutput}, 2500, 1, labels.External,
-		alice.Cfg.CoinSelectionStrategy,
-	)
+	tx, err := alice.SendOutputs(t.Context(), &wallet.TxIntent{
+		Outputs: []wire.TxOut{*newOutput},
+		Inputs: &wallet.InputsPolicy{
+			MinConfs: 1,
+			Strategy: alice.Cfg.CoinSelectionStrategy,
+		},
+		FeeRate: btcunit.NewSatPerKVByte(10_000),
+		Label:   labels.External,
+	})
 	require.NoError(t, err, "unable to create output")
 
 	// Query for the transaction generated above so we can located the
@@ -1779,7 +1873,7 @@ func testGetTransactionDetails(r *rpctest.Harness,
 
 	const txFee = int64(14500)
 
-	bobPkScript := newPkScript(t, bob, lnwallet.WitnessPubKey)
+	bobPkScript := newPkScript(t, bob, waddrmgr.KeyScopeBIP0084)
 	txFeeRate := chainfee.SatPerKWeight(2500)
 	amountSats := btcutil.Amount(btcutil.SatoshiPerBitcoin - txFee)
 	output := &wire.TxOut{
@@ -1791,7 +1885,7 @@ func testGetTransactionDetails(r *rpctest.Harness,
 	assertTxInWallet(t, alice, txHash, true)
 	assertTxInWallet(t, bob, txHash, true)
 
-	txDetails, err := bob.GetTransactionDetails(&txHash)
+	txDetails, err := bob.Cfg.Wallet.GetTx(t.Context(), txHash)
 	require.NoError(t, err, "unable to receive transaction details")
 	require.Equal(t, txDetails.Value, amountSats, "tx value")
 }
@@ -1955,7 +2049,7 @@ func testPublishTransaction(r *rpctest.Harness,
 		// the backing btcd node will consider the tx being an orphan,
 		// and will accept it. Should look into if this is the behavior
 		// also for bitcoind, and update test accordingly.
-		if alice.BackEnd() != "neutrino" {
+		if alice.Cfg.WalletServices.BackEnd() != "neutrino" {
 			// Create another tx spending tx3.
 			pubKey4, err := alice.DeriveNextKey(
 				keychain.KeyFamilyMultiSig,
@@ -1970,7 +2064,7 @@ func testPublishTransaction(r *rpctest.Harness,
 
 			// Expect rejection.
 			err = alice.PublishTransaction(tx7, labels.External)
-			require.ErrorIs(t, err, lnwallet.ErrDoubleSpend)
+			require.ErrorIs(t, err, chain.ErrMempoolConflict)
 		}
 	})
 
@@ -2055,10 +2149,15 @@ func testSignOutputUsingTweaks(r *rpctest.Harness,
 			Value:    btcutil.SatoshiPerBitcoin,
 			PkScript: keyScript,
 		}
-		tx, err := alice.SendOutputs(
-			nil, []*wire.TxOut{newOutput}, 2500, 1, labels.External,
-			alice.Cfg.CoinSelectionStrategy,
-		)
+		tx, err := alice.SendOutputs(t.Context(), &wallet.TxIntent{
+			Outputs: []wire.TxOut{*newOutput},
+			Inputs: &wallet.InputsPolicy{
+				MinConfs: 1,
+				Strategy: alice.Cfg.CoinSelectionStrategy,
+			},
+			FeeRate: btcunit.NewSatPerKVByte(10_000),
+			Label:   labels.External,
+		})
 		if err != nil {
 			t.Fatalf("unable to create output: %v", err)
 		}
@@ -2174,10 +2273,15 @@ func testReorgWalletBalance(r *rpctest.Harness, w *lnwallet.LightningWallet,
 		Value:    1e8,
 		PkScript: script,
 	}
-	tx, err := w.SendOutputs(
-		nil, []*wire.TxOut{output}, 2500, 1, labels.External,
-		w.Cfg.CoinSelectionStrategy,
-	)
+	tx, err := w.SendOutputs(t.Context(), &wallet.TxIntent{
+		Outputs: []wire.TxOut{*output},
+		Inputs: &wallet.InputsPolicy{
+			MinConfs: 1,
+			Strategy: w.Cfg.CoinSelectionStrategy,
+		},
+		FeeRate: btcunit.NewSatPerKVByte(10_000),
+		Label:   labels.External,
+	})
 	require.NoError(t, err, "unable to send outputs")
 	txid := tx.TxHash()
 	err = waitForMempoolTx(r, &txid)
@@ -2305,9 +2409,12 @@ func testChangeOutputSpendConfirmation(r *rpctest.Harness,
 	// Assuming a balance of 80 BTC and a transaction fee of 2500 sat/kw,
 	// we'll craft the following transaction so that Alice doesn't have any
 	// UTXOs left.
-	aliceBalance, err := alice.ConfirmedBalance(0, lnwallet.DefaultAccountName)
+	aliceBalance, err := alice.ConfirmedBalance(
+		0,
+		lnwallet.DefaultAccountName,
+	)
 	require.NoError(t, err, "unable to retrieve alice's balance")
-	bobPkScript := newPkScript(t, bob, lnwallet.WitnessPubKey)
+	bobPkScript := newPkScript(t, bob, waddrmgr.KeyScopeBIP0084)
 
 	// We'll use a transaction fee of 14380 satoshis, which will allow us to
 	// sweep all of Alice's balance in one transaction containing 1 input
@@ -2336,7 +2443,7 @@ func testChangeOutputSpendConfirmation(r *rpctest.Harness,
 	}
 
 	// Now, we'll send an output back to Alice from Bob of 1 BTC.
-	alicePkScript := newPkScript(t, alice, lnwallet.WitnessPubKey)
+	alicePkScript := newPkScript(t, alice, waddrmgr.KeyScopeBIP0084)
 	output = &wire.TxOut{
 		Value:    btcutil.SatoshiPerBitcoin,
 		PkScript: alicePkScript,
@@ -2376,8 +2483,8 @@ func testChangeOutputSpendConfirmation(r *rpctest.Harness,
 func testSpendUnconfirmed(miner *rpctest.Harness,
 	alice, bob *lnwallet.LightningWallet, t *testing.T) {
 
-	bobPkScript := newPkScript(t, bob, lnwallet.WitnessPubKey)
-	alicePkScript := newPkScript(t, alice, lnwallet.WitnessPubKey)
+	bobPkScript := newPkScript(t, bob, waddrmgr.KeyScopeBIP0084)
+	alicePkScript := newPkScript(t, alice, waddrmgr.KeyScopeBIP0084)
 	txFeeRate := chainfee.SatPerKWeight(2500)
 
 	// First we will empty out bob's wallet, sending the entire balance
@@ -2399,12 +2506,23 @@ func testSpendUnconfirmed(miner *rpctest.Harness,
 		Value:    btcutil.SatoshiPerBitcoin * 0.5,
 		PkScript: alicePkScript,
 	}
-	_, err = bob.SendOutputs(
-		nil, []*wire.TxOut{output}, txFeeRate, 0, labels.External,
-		bob.Cfg.CoinSelectionStrategy,
-	)
+	_, err = bob.SendOutputs(t.Context(), &wallet.TxIntent{
+		Outputs: []wire.TxOut{*output},
+		Inputs: &wallet.InputsPolicy{
+			MinConfs: 0,
+			Strategy: bob.Cfg.CoinSelectionStrategy,
+		},
+		FeeRate: btcunit.NewSatPerKVByte(
+			btcutil.Amount(txFeeRate.FeePerKVByte()),
+		),
+		Label: labels.External,
+	})
 	if err == nil {
-		t.Fatalf("should have not been able to pay due to insufficient balance: %v", err)
+		t.Fatalf(
+			"should have not been able to pay due to "+
+				"insufficient balance: %v",
+			err,
+		)
 	}
 
 	// Next we will send a transaction to bob but leave it in an
@@ -2426,12 +2544,23 @@ func testSpendUnconfirmed(miner *rpctest.Harness,
 
 	// First, verify that we don't have enough balance to send the coins
 	// using confirmed outputs only.
-	_, err = bob.SendOutputs(
-		nil, []*wire.TxOut{output}, txFeeRate, 1, labels.External,
-		bob.Cfg.CoinSelectionStrategy,
-	)
+	_, err = bob.SendOutputs(t.Context(), &wallet.TxIntent{
+		Outputs: []wire.TxOut{*output},
+		Inputs: &wallet.InputsPolicy{
+			MinConfs: 1,
+			Strategy: bob.Cfg.CoinSelectionStrategy,
+		},
+		FeeRate: btcunit.NewSatPerKVByte(
+			btcutil.Amount(txFeeRate.FeePerKVByte()),
+		),
+		Label: labels.External,
+	})
 	if err == nil {
-		t.Fatalf("should have not been able to pay due to insufficient balance: %v", err)
+		t.Fatalf(
+			"should have not been able to pay due to "+
+				"insufficient balance: %v",
+			err,
+		)
 	}
 
 	// Now try the send again using unconfirmed outputs.
@@ -2477,18 +2606,22 @@ func testLastUnusedAddr(miner *rpctest.Harness,
 
 	// We'll repeat this test for each address type to ensure they're all
 	// rotated properly.
-	addrTypes := []lnwallet.AddressType{
-		lnwallet.WitnessPubKey, lnwallet.NestedWitnessPubKey,
+	addrTypes := []waddrmgr.KeyScope{
+		waddrmgr.KeyScopeBIP0084, waddrmgr.KeyScopeBIP0049Plus,
 	}
 	for _, addrType := range addrTypes {
-		addr1, err := alice.LastUnusedAddress(
-			addrType, lnwallet.DefaultAccountName,
+		addr1, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+			wallet.NewAccountSelectorByName(
+				addrType, lnwallet.DefaultAccountName,
+			), false,
 		)
 		if err != nil {
 			t.Fatalf("unable to get addr: %v", err)
 		}
-		addr2, err := alice.LastUnusedAddress(
-			addrType, lnwallet.DefaultAccountName,
+		addr2, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+			wallet.NewAccountSelectorByName(
+				addrType, lnwallet.DefaultAccountName,
+			), false,
 		)
 		if err != nil {
 			t.Fatalf("unable to get addr: %v", err)
@@ -2496,13 +2629,17 @@ func testLastUnusedAddr(miner *rpctest.Harness,
 
 		// If we generate two addresses back to back, then we should
 		// get the same addr, as none of them have been used yet.
-		if addr1.String() != addr2.String() {
-			t.Fatalf("addresses changed w/o use: %v vs %v", addr1, addr2)
+		if addr1.Addr.String() != addr2.Addr.String() {
+			t.Fatalf(
+				"addresses changed w/o use: %v vs %v",
+				addr1,
+				addr2,
+			)
 		}
 
 		// Next, we'll have Bob pay to Alice's new address. This should
 		// trigger address rotation at the backend wallet.
-		addrScript, err := txscript.PayToAddrScript(addr1)
+		addrScript, err := txscript.PayToAddrScript(addr1.Addr)
 		if err != nil {
 			t.Fatalf("unable to convert addr to script: %v", err)
 		}
@@ -2515,13 +2652,15 @@ func testLastUnusedAddr(miner *rpctest.Harness,
 
 		// If we make a new address, then it should be brand new, as
 		// the prior address has been used.
-		addr3, err := alice.LastUnusedAddress(
-			addrType, lnwallet.DefaultAccountName,
+		addr3, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+			wallet.NewAccountSelectorByName(
+				addrType, lnwallet.DefaultAccountName,
+			), false,
 		)
 		if err != nil {
 			t.Fatalf("unable to get addr: %v", err)
 		}
-		if addr1.String() == addr3.String() {
+		if addr1.Addr.String() == addr3.Addr.String() {
 			t.Fatalf("address should have changed but didn't")
 		}
 	}
@@ -2668,9 +2807,23 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 		}
 
 		// Now try creating a tx spending to these outputs.
-		createTx, createErr := w.CreateSimpleTx(
-			nil, outputs, feeRate, minConfs,
-			w.Cfg.CoinSelectionStrategy, true,
+		createTx, createErr := w.Cfg.Wallet.CreateTransaction(
+			t.Context(), &wallet.TxIntent{
+				Outputs: fn.Map(
+					outputs,
+					func(o *wire.TxOut) wire.TxOut {
+						return *o
+					},
+				),
+				Inputs: &wallet.InputsPolicy{
+					MinConfs: uint32(minConfs),
+					Strategy: w.Cfg.CoinSelectionStrategy,
+				},
+				FeeRate: btcunit.NewSatPerKVByte(
+					btcutil.Amount(feeRate.FeePerKVByte()),
+				),
+				Label: labels.External,
+			},
 		)
 		switch {
 		case test.valid && createErr != nil:
@@ -2687,10 +2840,19 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 		// _very_ similar to the one we just created being sent. The
 		// only difference is that the dry run tx is not signed, and
 		// that the change output position might be different.
-		tx, sendErr := w.SendOutputs(
-			nil, outputs, feeRate, minConfs, labels.External,
-			w.Cfg.CoinSelectionStrategy,
-		)
+		tx, sendErr := w.SendOutputs(t.Context(), &wallet.TxIntent{
+			Outputs: fn.Map(outputs,
+				func(o *wire.TxOut) wire.TxOut { return *o },
+			),
+			Inputs: &wallet.InputsPolicy{
+				MinConfs: uint32(minConfs),
+				Strategy: w.Cfg.CoinSelectionStrategy,
+			},
+			FeeRate: btcunit.NewSatPerKVByte(
+				btcutil.Amount(feeRate.FeePerKVByte()),
+			),
+			Label: labels.External,
+		})
 		switch {
 		case test.valid && sendErr != nil:
 			t.Fatalf("got unexpected error when sending tx: %v",
@@ -3110,7 +3272,8 @@ func waitForWalletSync(r *rpctest.Harness, w *lnwallet.LightningWallet) error {
 
 		// Layer 2 check: verify btcwallet has processed all
 		// transactions in the new blocks and considers itself synced.
-		synced, _, err = w.IsSynced()
+		info, infoErr := w.Cfg.Wallet.Info(context.Background())
+		synced, err = info != nil && info.Synced, infoErr
 		if err != nil {
 			return err
 		}
@@ -3125,7 +3288,7 @@ func testSingleFunderExternalFundingTx(miner *rpctest.Harness,
 	alice, bob *lnwallet.LightningWallet, t *testing.T) {
 
 	// Define a filter function without any restrictions.
-	allowUtxo := func(lnwallet.Utxo) bool {
+	allowUtxo := func(wallet.Utxo) bool {
 		return true
 	}
 
@@ -3149,7 +3312,7 @@ func testSingleFunderExternalFundingTx(miner *rpctest.Harness,
 				alice, allowUtxo,
 			),
 			CoinSelectLocker:      alice,
-			CoinLeaser:            alice,
+			CoinLeaser:            alice.Cfg.Wallet,
 			Signer:                alice.Cfg.Signer,
 			DustLimit:             600,
 			CoinSelectionStrategy: wallet.CoinSelectionLargest,
@@ -3165,10 +3328,15 @@ func testSingleFunderExternalFundingTx(miner *rpctest.Harness,
 			MinConfs: 1,
 			FeeRate:  253,
 			ChangeAddr: func() (address.Address, error) {
-				return alice.NewAddress(
-					lnwallet.WitnessPubKey, true,
-					lnwallet.DefaultAccountName,
+				wc := alice.Cfg.Wallet
+				info, err := wc.NewAddress(t.Context(),
+					wallet.NewAccountSelectorByName(
+						waddrmgr.KeyScopeBIP0084,
+						lnwallet.DefaultAccountName,
+					), true,
 				)
+
+				return info.Addr, err
 			},
 		},
 	)
@@ -3212,10 +3380,14 @@ func testSingleFunderExternalFundingTx(miner *rpctest.Harness,
 		MinConfs: 1,
 		FeeRate:  253,
 		ChangeAddr: func() (address.Address, error) {
-			return bob.NewAddress(
-				lnwallet.WitnessPubKey, true,
-				lnwallet.DefaultAccountName,
+			info, err := bob.Cfg.Wallet.NewAddress(t.Context(),
+				wallet.NewAccountSelectorByName(
+					waddrmgr.KeyScopeBIP0084,
+					lnwallet.DefaultAccountName,
+				), true,
 			)
+
+			return info.Addr, err
 		},
 	})
 	require.NoError(t, err, "unable to create shim intent for bob")
@@ -3290,17 +3462,13 @@ func TestLightningWallet(t *testing.T, targetBackEnd string) {
 		t.Fatalf("unable to start notifier: %v", err)
 	}
 
-	for _, walletDriver := range lnwallet.RegisteredWallets() {
-		for _, backEnd := range walletDriver.BackEnds() {
-			if backEnd != targetBackEnd {
-				continue
-			}
-
-			if !runTests(t, walletDriver, backEnd, miningNode,
-				rpcConfig, chainNotifier) {
-
-				return
-			}
+	// Retain the existing chain backend matrix without a wallet registry.
+	for _, backEnd := range chain.BackEnds() {
+		if backEnd != targetBackEnd {
+			continue
+		}
+		if !runTests(t, backEnd, miningNode, rpcConfig, chainNotifier) {
+			return
 		}
 	}
 }
@@ -3309,8 +3477,7 @@ func TestLightningWallet(t *testing.T, targetBackEnd string) {
 // chain back-end combination. This makes it easier to use `defer` as well as
 // factoring out the test logic from the loop which cycles through the
 // interface implementations.
-func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
-	backEnd string, miningNode *rpctest.Harness,
+func runTests(t *testing.T, backEnd string, miningNode *rpctest.Harness,
 	rpcConfig rpcclient.ConnConfig,
 	chainNotifier chainntnfs.ChainNotifier) bool {
 
@@ -3323,8 +3490,8 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 		aliceKeyRing keychain.SecretKeyRing
 		bobKeyRing   keychain.SecretKeyRing
 
-		aliceWalletController lnwallet.WalletController
-		bobWalletController   lnwallet.WalletController
+		aliceWalletController *btcwallet.BtcWallet
+		bobWalletController   *btcwallet.BtcWallet
 
 		err error
 	)
@@ -3334,9 +3501,10 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 
 	blockCache := blockcache.NewBlockCache(10000)
 
-	walletType := walletDriver.WalletType
-	switch walletType {
-	case "btcwallet":
+	walletType := "btcwallet"
+	{
+		// Exercise the maintained wallet directly with every chain
+		// backend.
 		var aliceClient, bobClient chain.Interface
 		switch backEnd {
 		case "btcd":
@@ -3436,8 +3604,10 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 
 			// Create a btcwallet bitcoind client for both Alice and
 			// Bob.
-			aliceClient = chainConn.NewBitcoindClient()
-			bobClient = chainConn.NewBitcoindClient()
+			aliceClient, err = chainConn.NewBitcoindClient()
+			require.NoError(t, err)
+			bobClient, err = chainConn.NewBitcoindClient()
+			require.NoError(t, err)
 
 		case "bitcoind-rpc-polling":
 			// Start a bitcoind instance.
@@ -3447,8 +3617,10 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 
 			// Create a btcwallet bitcoind client for both Alice and
 			// Bob.
-			aliceClient = chainConn.NewBitcoindClient()
-			bobClient = chainConn.NewBitcoindClient()
+			aliceClient, err = chainConn.NewBitcoindClient()
+			require.NoError(t, err)
+			bobClient, err = chainConn.NewBitcoindClient()
+			require.NoError(t, err)
 
 		default:
 			t.Fatalf("unknown chain driver: %v", backEnd)
@@ -3467,21 +3639,23 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 			CoinType:    keychain.CoinTypeTestnet,
 			// wallet starts in recovery mode
 			RecoveryWindow: 2,
-			LoaderOptions: []btcwallet.LoaderOption{
-				btcwallet.LoaderWithLocalWalletDB(
-					tempTestDirAlice, false, time.Minute,
+			ManagerConfig: wallet.ManagerConfig{
+				Backend: wallet.DBBackendKVDB,
+				DataSource: filepath.Join(
+					tempTestDirAlice, "wallet.db",
 				),
+				Timeout: time.Minute,
 			},
 		}
-		aliceWalletController, err = walletDriver.New(
-			aliceWalletConfig, blockCache,
+		aliceWalletController, err = btcwallet.New(
+			*aliceWalletConfig, blockCache,
 		)
 		if err != nil {
 			t.Fatalf("unable to create btcwallet: %v", err)
 		}
-		aliceSigner = aliceWalletController.(*btcwallet.BtcWallet)
+		aliceSigner = aliceWalletController
 		aliceKeyRing = keychain.NewBtcWalletKeyRing(
-			aliceWalletController.(*btcwallet.BtcWallet).InternalWallet(),
+			aliceWalletController.InternalWallet(),
 			keychain.CoinTypeTestnet,
 		)
 
@@ -3498,26 +3672,26 @@ func runTests(t *testing.T, walletDriver *lnwallet.WalletDriver,
 			CoinType:    keychain.CoinTypeTestnet,
 			// wallet starts without recovery mode
 			RecoveryWindow: 0,
-			LoaderOptions: []btcwallet.LoaderOption{
-				btcwallet.LoaderWithLocalWalletDB(
-					tempTestDirBob, false, time.Minute,
+			ManagerConfig: wallet.ManagerConfig{
+				Backend: wallet.DBBackendKVDB,
+				DataSource: filepath.Join(
+					tempTestDirBob, "wallet.db",
 				),
+				Timeout: time.Minute,
 			},
 		}
-		bobWalletController, err = walletDriver.New(
-			bobWalletConfig, blockCache,
+		bobWalletController, err = btcwallet.New(
+			*bobWalletConfig, blockCache,
 		)
 		if err != nil {
 			t.Fatalf("unable to create btcwallet: %v", err)
 		}
-		bobSigner = bobWalletController.(*btcwallet.BtcWallet)
+		bobSigner = bobWalletController
 		bobKeyRing = keychain.NewBtcWalletKeyRing(
-			bobWalletController.(*btcwallet.BtcWallet).InternalWallet(),
+			bobWalletController.InternalWallet(),
 			keychain.CoinTypeTestnet,
 		)
-		bio = bobWalletController.(*btcwallet.BtcWallet)
-	default:
-		t.Fatalf("unknown wallet driver: %v", walletType)
+		bio = bobWalletController
 	}
 
 	// Funding via 20 outputs with 4BTC each.

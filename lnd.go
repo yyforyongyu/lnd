@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/build"
@@ -549,7 +551,7 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 	// We'll wait until the wallet is fully ready to be used before we
 	// proceed to derive keys from it.
 	select {
-	case err = <-activeChainControl.Wallet.WalletController.ReadySignal(
+	case err = <-activeChainControl.Wallet.Cfg.WalletServices.ReadySignal(
 		ctx,
 	):
 		if err != nil {
@@ -638,10 +640,19 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 			EpochRegistrar: activeChainControl.ChainNotifier,
 			Net:            cfg.net,
 			NewAddress: func() (address.Address, error) {
-				return activeChainControl.Wallet.NewAddress(
-					lnwallet.TaprootPubkey, false,
-					lnwallet.DefaultAccountName,
+				wc := activeChainControl.Wallet.Cfg.Wallet
+				info, err := wc.NewAddress(
+					context.Background(),
+					base.NewAccountSelectorByName(
+						waddrmgr.KeyScopeBIP0086,
+						lnwallet.DefaultAccountName,
+					), false,
 				)
+				if err != nil {
+					return nil, err
+				}
+
+				return info.Addr, nil
 			},
 			NodeKeyECDH: keychain.NewPubKeyECDH(
 				towerKeyDesc, activeChainControl.KeyRing,
@@ -777,9 +788,21 @@ func Main(cfg *Config, lisCfg ListenerCfg, implCfg *ImplementationCfg,
 		// the call is blocking, and we want to be able to interrupt it
 		// if the daemon is shutting down.
 		go func() {
-			synced, bestBlockTime, err := activeChainControl.Wallet.
-				IsSynced()
-			syncedResChan <- syncResult{synced, bestBlockTime, err}
+			// Wallet binds sync readiness to its observed chain
+			// tip; the
+			// application only projects that snapshot for startup
+			// progress.
+			info, err := activeChainControl.Wallet.Cfg.Wallet.Info(
+				ctx,
+			)
+			if err != nil {
+				syncedResChan <- syncResult{err: err}
+				return
+			}
+			syncedResChan <- syncResult{
+				info.Synced,
+				info.SyncedTo.Timestamp.Unix(), nil,
+			}
 		}()
 
 		select {

@@ -148,13 +148,17 @@ func testXCreateAccountRejections(ht *lntest.HarnessTest) {
 		AddressType: walletrpc.AddressType_TAPROOT_PUBKEY,
 	})
 
-	// The same name a second time, even under a different address type.
-	// Coin selection resolves a custom account name to whichever key scope
-	// matches first, so a duplicate would make later funding ambiguous.
+	// Names are scoped by the native account API, so another scope may use
+	// this name. Repeating the original scope must still fail.
+	created := alice.RPC.XCreateAccount(&walletrpc.XCreateAccountRequest{
+		Name:        createAccountName,
+		AddressType: walletrpc.AddressType_WITNESS_PUBKEY_HASH,
+	})
+	require.Equal(ht, createAccountName, created.Account.Name)
 	err := alice.RPC.XCreateAccountAssertErr(
 		&walletrpc.XCreateAccountRequest{
 			Name:        createAccountName,
-			AddressType: walletrpc.AddressType_WITNESS_PUBKEY_HASH,
+			AddressType: walletrpc.AddressType_TAPROOT_PUBKEY,
 		},
 	)
 	require.ErrorContains(ht, err, "already exists")

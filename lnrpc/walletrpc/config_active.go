@@ -46,7 +46,12 @@ type Config struct {
 
 	// Wallet is the primary wallet that the WalletKit will use to proxy
 	// any relevant requests to.
-	Wallet lnwallet.WalletController
+	Wallet lnwallet.WalletAPI
+
+	// LightningWallet supplies shared send/reserve/signing application
+	// flows.
+	// Its Wallet capability is the same borrowed instance as Wallet above.
+	LightningWallet *lnwallet.LightningWallet
 
 	// CoinSelectionLocker allows the caller to perform an operation, which
 	// is synchronized with all coin selection attempts. This can be used

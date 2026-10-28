@@ -1,6 +1,7 @@
 package chanfunding
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"time"
@@ -62,9 +63,9 @@ type FullIntent struct {
 	// change from the main funding transaction.
 	ChangeOutputs []*wire.TxOut
 
-	// coinLeaser is the Assembler's instance of the OutputLeaser
+	// coinLeaser is the Assembler's instance of the wallet.UtxoManager
 	// interface.
-	coinLeaser OutputLeaser
+	coinLeaser wallet.UtxoManager
 
 	// coinSource is the Assembler's instance of the CoinSource interface.
 	coinSource CoinSource
@@ -220,7 +221,7 @@ func (f *FullIntent) Outputs() []*wire.TxOut {
 func (f *FullIntent) Cancel() {
 	for _, coin := range f.InputCoins {
 		err := f.coinLeaser.ReleaseOutput(
-			LndInternalLockID, coin.OutPoint,
+			context.Background(), LndInternalLockID, coin.OutPoint,
 		)
 		if err != nil {
 			log.Warnf("Failed to release UTXO %s (%v))",
@@ -249,7 +250,7 @@ type WalletConfig struct {
 
 	// CoinLeaser is what the WalletAssembler uses to lease coins that may
 	// be used as inputs for a new funding transaction.
-	CoinLeaser OutputLeaser
+	CoinLeaser wallet.UtxoManager
 
 	// Signer allows the WalletAssembler to sign inputs on any potential
 	// funding transactions.
@@ -528,7 +529,9 @@ func (w *WalletAssembler) ProvisionChannel(r *Request) (Intent, error) {
 			outpoint := coin.OutPoint
 
 			_, err = w.cfg.CoinLeaser.LeaseOutput(
-				LndInternalLockID, outpoint,
+				context.Background(),
+				LndInternalLockID,
+				outpoint,
 				DefaultReservationTimeout,
 			)
 			if err != nil {

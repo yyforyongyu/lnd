@@ -1,6 +1,7 @@
 package sweep
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -565,8 +566,7 @@ func (t *TxPublisher) createRBFCompliantTx(
 
 		// If the error indicates the fees paid is not enough, we will
 		// ask the fee function to increase the fee rate and retry.
-		case errors.Is(err, lnwallet.ErrMempoolFee),
-			errors.Is(err, chain.ErrMinRelayFeeNotMet),
+		case errors.Is(err, chain.ErrMinRelayFeeNotMet),
 			errors.Is(err, chain.ErrMempoolMinFeeNotMet):
 
 			// We should at least start with a feerate above the
@@ -639,7 +639,10 @@ func (t *TxPublisher) createAndCheckTx(r *monitorRecord) (*sweepTxCtx, error) {
 	req.ExtraTxOut = sweepCtx.extraTxOut
 
 	// Validate the tx's mempool acceptance.
-	err = t.cfg.Wallet.CheckMempoolAcceptance(sweepCtx.tx)
+	err = t.cfg.Wallet.CheckMempoolAcceptance(
+		context.Background(),
+		sweepCtx.tx,
+	)
 
 	// Exit early if the tx is valid.
 	if err == nil {
@@ -1338,7 +1341,8 @@ func (t *TxPublisher) createAndPublishTx(
 	// NOTE: we may get this error if we've bypassed the mempool check,
 	// which means we are using neutrino backend.
 	if errors.Is(result.Err, chain.ErrInsufficientFee) ||
-		errors.Is(result.Err, lnwallet.ErrMempoolFee) {
+		errors.Is(result.Err, chain.ErrMinRelayFeeNotMet) ||
+		errors.Is(result.Err, chain.ErrMempoolMinFeeNotMet) {
 
 		log.Debugf("Failed to bump tx %v: %v", oldTx.TxHash(),
 			result.Err)
@@ -1841,7 +1845,8 @@ func (t *TxPublisher) handleReplacementTxError(r *monitorRecord,
 	//   higher fee rate. If the fee rate cannot satisfy the RBF rules, it
 	//   means the budget is not enough.
 	if errors.Is(err, chain.ErrInsufficientFee) ||
-		errors.Is(err, lnwallet.ErrMempoolFee) {
+		errors.Is(err, chain.ErrMinRelayFeeNotMet) ||
+		errors.Is(err, chain.ErrMempoolMinFeeNotMet) {
 
 		log.Debugf("Failed to bump tx %v: %v", oldTx.TxHash(), err)
 		return fn.None[BumpResult]()

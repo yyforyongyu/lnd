@@ -12,6 +12,10 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/wallet"
+	graphdb "github.com/lightningnetwork/lnd/graph/db"
+	"github.com/lightningnetwork/lnd/lntest/mock"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1348,4 +1352,111 @@ func TestAgentChannelSizeAllocation(t *testing.T) {
 		btcutil.Amount(numNewChannels)
 
 	checkChannelOpens(t, testCtx, expectedAllocation, numNewChannels)
+}
+
+// TestManagerWalletEvents checks confirmed notifications and stream closure.
+func TestManagerWalletEvents(t *testing.T) {
+	t.Parallel()
+	testCases := []struct {
+		name  string
+		block *wallet.BlockDetails
+	}{
+		{
+			name: "unconfirmed observation",
+		},
+		{
+			name:  "confirmed observation",
+			block: &wallet.BlockDetails{Height: 1},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange the existing agent fixture's policy and
+			// graph. Stop its standalone agent so the manager is
+			// the only notification consumer.
+			fixture := setup(t, nil)
+			respondMoreChans(t, fixture, moreChansResp{})
+			require.NoError(t, fixture.agent.Stop())
+			cfg := fixture.agent.cfg
+			balance := &testifymock.Mock{}
+			t.Cleanup(func() { balance.AssertExpectations(t) })
+			queries := 1
+			if tc.block != nil {
+				queries++
+			}
+			balance.On("Balance").
+				Return(btcutil.Amount(0), nil).
+				Times(queries)
+			cfg.WalletBalance = func() (btcutil.Amount, error) {
+				args := balance.MethodCalled("Balance")
+				amount, _ := args.Get(0).(btcutil.Amount)
+
+				return amount, args.Error(1)
+			}
+			events, canceled := make(
+				chan *wallet.TxEvent,
+			), make(
+				chan struct{},
+			)
+			w := &mock.WalletController{}
+			t.Cleanup(func() { w.AssertExpectations(t) })
+			w.On("SubscribeTxns", testifymock.Anything).Return(
+				(<-chan *wallet.TxEvent)(
+					events,
+				), func() { close(canceled) }, nil,
+			).
+				Once()
+			channelState := func() ([]LocalChannel, error) {
+				return nil, nil
+			}
+			subscribeTopology := func() (
+				*graphdb.TopologyClient, error) {
+
+				// Wallet events need no topology updates, but
+				// the existing manager still cancels its
+				// subscription.
+				return &graphdb.TopologyClient{
+					Cancel: func() {},
+				}, nil
+			}
+			manager, err := NewManager(&ManagerCfg{
+				PilotCfg:              &cfg,
+				ChannelState:          channelState,
+				SubscribeTransactions: w.SubscribeTxns,
+				SubscribeTopology:     subscribeTopology,
+			})
+			require.NoError(t, err)
+			require.NoError(t, manager.StartAgent())
+			t.Cleanup(func() { require.NoError(t, manager.Stop()) })
+			respondMoreChans(t, fixture, moreChansResp{})
+
+			// Act with one native observation, then let Wallet
+			// close its stream.
+			event := &wallet.TxEvent{
+				Detail: &wallet.TxDetail{Block: tc.block},
+			}
+			select {
+			case events <- event:
+			case <-time.After(3 * time.Second):
+				t.Fatal("manager did not consume wallet event")
+			}
+			if tc.block != nil {
+				respondMoreChans(t, fixture, moreChansResp{})
+			}
+			close(events)
+
+			// Assert closure releases the subscription without
+			// spinning. Stopping joins both existing workers before
+			// strict balance-call verification.
+			select {
+			case <-canceled:
+			case <-time.After(3 * time.Second):
+				t.Fatal(
+					"manager did not release closed " +
+						"wallet stream",
+				)
+			}
+			require.NoError(t, manager.Stop())
+		})
+	}
 }
