@@ -2,6 +2,7 @@ package contractcourt
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -123,9 +124,9 @@ func (h *htlcSuccessResolver) ResolverKey() []byte {
 // Resolve attempts to resolve an unresolved incoming HTLC that we know the
 // preimage to. If the HTLC is on the commitment of the remote party, then we'll
 // simply sweep it directly. Otherwise, we'll hand this off to the utxo nursery
-// to do its duty. There is no need to make a call to the invoice registry
-// anymore. Every HTLC has already passed through the incoming contest resolver
-// and in there the invoice was already marked as settled.
+// to do its duty. Every HTLC has already passed through the incoming contest
+// resolver and requested settlement from the invoice registry. The invoice is
+// finalized once this resolver determines the on-chain outcome.
 //
 // NOTE: Part of the ContractResolver interface.
 //
@@ -287,6 +288,13 @@ func (h *htlcSuccessResolver) checkpointClaim(claimOutpoint wire.OutPoint,
 		return err
 	}
 
+	// The claim is final. Let the registry retry failed invoice writes
+	// without blocking this resolver's durable checkpoint.
+	err = h.notifyInvoiceHtlcFinalized(true)
+	if err != nil {
+		h.log.Warnf("Unable to finalize invoice HTLC outcome: %v", err)
+	}
+
 	// Send notification.
 	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
 		models.CircuitKey{
@@ -334,6 +342,17 @@ func (h *htlcSuccessResolver) checkpointClaim(claimOutpoint wire.OutPoint,
 	return h.Checkpoint(h, reports...)
 }
 
+// notifyInvoiceHtlcFinalized marks the invoice settlement outcome final if the
+// HTLC belongs to an exit-hop invoice.
+func (h *htlcSuccessResolver) notifyInvoiceHtlcFinalized(settled bool) error {
+	return h.Registry.NotifyExitHopHtlcFinalized(
+		context.Background(), models.CircuitKey{
+			ChanID: h.ShortChanID,
+			HtlcID: h.htlc.HtlcIndex,
+		}, settled,
+	)
+}
+
 // checkpointForeignSpend checkpoints an HTLC spend as failed when it occurred
 // outside the expected success path. Persisting the cleared
 // outputIncubating state prevents a restored resolver from offering a phantom
@@ -349,6 +368,13 @@ func (h *htlcSuccessResolver) checkpointForeignSpend(
 	)
 	if err != nil {
 		return err
+	}
+
+	// A foreign spend also fails a pending exit invoice; transient invoice
+	// errors must not delay this resolver's checkpoint.
+	err = h.notifyInvoiceHtlcFinalized(false)
+	if err != nil {
+		h.log.Warnf("Unable to finalize invoice HTLC outcome: %v", err)
 	}
 
 	// The final outcome is a separate durable write. If the resolver
@@ -423,6 +449,7 @@ func (h *htlcSuccessResolver) report() *ContractReport {
 	h.reportLock.Lock()
 	defer h.reportLock.Unlock()
 	cpy := h.currentReport
+
 	return &cpy
 }
 

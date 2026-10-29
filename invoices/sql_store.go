@@ -67,9 +67,10 @@ type SQLInvoiceQueries interface { //nolint:interfacebloat
 	InsertInvoiceHTLCCustomRecord(ctx context.Context,
 		arg sqlc.InsertInvoiceHTLCCustomRecordParams) error
 
-	// FetchPendingInvoices returns all open/accepted invoices ordered by
-	// id ascending. It replaces the old catch-all FilterInvoices for the
-	// pending-only path and lets the planner use invoices_state_idx.
+	// FetchPendingInvoices returns all open/accepted/pending-settle
+	// invoices ordered by id ascending. It replaces the old catch-all
+	// FilterInvoices for the pending-only path and lets the planner use
+	// invoices_state_idx.
 	FetchPendingInvoices(ctx context.Context,
 		arg sqlc.FetchPendingInvoicesParams) ([]sqlc.Invoice, error)
 
@@ -708,6 +709,9 @@ func fetchAmpState(ctx context.Context, db SQLInvoiceQueries, invoiceID int64,
 
 	if len(ampHtlcs) > 0 {
 		for setID := range ampState {
+			setState := ampState[setID]
+			pending := setState.State == HtlcStatePendingSettle
+			canceled := setState.State == HtlcStateCanceled
 			var amtPaid lnwire.MilliSatoshi
 			invoiceKeys := make(
 				map[models.CircuitKey]struct{},
@@ -720,12 +724,22 @@ func fetchAmpState(ctx context.Context, db SQLInvoiceQueries, invoiceID int64,
 
 				invoiceKeys[key] = struct{}{}
 
-				if htlc.State != HtlcStateCanceled {
+				// Count released shards until the whole set is
+				// final, including a previously failed sibling.
+				pendingRelease := pending &&
+					htlc.AMP.Preimage != nil
+
+				// Exclude successful shards of a failed set;
+				// retain pre-release cancellation accounting.
+				settledInFailedSet := canceled &&
+					htlc.State == HtlcStateSettled
+				countPaid := htlc.State != HtlcStateCanceled
+				countPaid = countPaid || pendingRelease
+				if countPaid && !settledInFailedSet {
 					amtPaid += htlc.Amt
 				}
 			}
 
-			setState := ampState[setID]
 			setState.InvoiceKeys = invoiceKeys
 			setState.AmtPaid = amtPaid
 			ampState[setID] = setState

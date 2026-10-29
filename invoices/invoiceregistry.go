@@ -36,6 +36,14 @@ const (
 	// DefaultHtlcHoldDuration defines the default for how long mpp htlcs
 	// are held while waiting for the other set members to arrive.
 	DefaultHtlcHoldDuration = 120 * time.Second
+
+	// DefaultHtlcFinalizationRetryDelay defines how long to wait before
+	// retrying a failed invoice HTLC finalization.
+	DefaultHtlcFinalizationRetryDelay = time.Second
+
+	// DefaultHtlcFinalizationRetryMaxDelay defines the maximum delay
+	// between failed invoice HTLC finalization retries.
+	DefaultHtlcFinalizationRetryMaxDelay = time.Minute
 )
 
 // RegistryConfig contains the configuration parameters for invoice registry.
@@ -94,12 +102,39 @@ type htlcReleaseEvent struct {
 	releaseTime time.Time
 }
 
+// htlcFinalizationRetryEvent describes an exit-hop HTLC finalization retry.
+type htlcFinalizationRetryEvent struct {
+	// key identifies the exit-hop HTLC to finalize.
+	key CircuitKey
+
+	// settled is the final outcome to record for the HTLC.
+	settled bool
+
+	// retryTime is when the retry should next be attempted.
+	retryTime time.Time
+
+	// attempts is the number of failed finalization attempts so far.
+	attempts uint32
+}
+
 // Less is used to order PriorityQueueItem's by their release time such that
 // items with the older release time are at the top of the queue.
 //
 // NOTE: Part of the queue.PriorityQueueItem interface.
 func (r *htlcReleaseEvent) Less(other queue.PriorityQueueItem) bool {
 	return r.releaseTime.Before(other.(*htlcReleaseEvent).releaseTime)
+}
+
+// Ensure retry events use the same heap contract as automatic HTLC releases.
+var _ queue.PriorityQueueItem = (*htlcFinalizationRetryEvent)(nil)
+
+// Less orders retry deadlines within the heap owned by invoiceEventLoop.
+func (r *htlcFinalizationRetryEvent) Less(
+	other queue.PriorityQueueItem) bool {
+
+	retry, ok := other.(*htlcFinalizationRetryEvent)
+
+	return ok && r.retryTime.Before(retry.retryTime)
 }
 
 // InvoiceRegistry is a central registry of all the outstanding invoices
@@ -148,14 +183,36 @@ type InvoiceRegistry struct {
 	// subscriber. This is used to unsubscribe from all hashes efficiently.
 	hodlReverseSubscriptions map[chan<- interface{}]map[CircuitKey]struct{}
 
+	// pendingSettleRefs maps pending-settle HTLCs back to the invoice
+	// update reference that should be used when their final outcome is
+	// reported.
+	pendingSettleRefs map[CircuitKey]pendingSettleRef
+
 	// htlcAutoReleaseChan contains the new htlcs that need to be
 	// auto-released.
 	htlcAutoReleaseChan chan *htlcReleaseEvent
+
+	// htlcFinalizationRetryChan contains exit-hop HTLC finalization
+	// retries.
+	htlcFinalizationRetryChan chan *htlcFinalizationRetryEvent
 
 	expiryWatcher *InvoiceExpiryWatcher
 
 	wg   sync.WaitGroup
 	quit chan struct{}
+}
+
+// pendingSettleRef records the invoice reference needed to finalize a pending
+// settle HTLC without scanning all pending invoices.
+type pendingSettleRef struct {
+	// invoiceRef identifies the invoice that owns the pending-settle HTLC.
+	invoiceRef InvoiceRef
+
+	// eventHash is the payment hash used for invoice notifications.
+	eventHash lntypes.Hash
+
+	// setID identifies the AMP set for AMP HTLCs.
+	setID *SetID
 }
 
 // NewRegistry creates a new invoice registry. The invoice registry
@@ -178,10 +235,14 @@ func NewRegistry(idb InvoiceDB, expiryWatcher *InvoiceExpiryWatcher,
 		hodlReverseSubscriptions: make(
 			map[chan<- interface{}]map[CircuitKey]struct{},
 		),
+		pendingSettleRefs:   make(map[CircuitKey]pendingSettleRef),
 		cfg:                 cfg,
 		htlcAutoReleaseChan: make(chan *htlcReleaseEvent),
-		expiryWatcher:       expiryWatcher,
-		quit:                make(chan struct{}),
+		htlcFinalizationRetryChan: make(
+			chan *htlcFinalizationRetryEvent,
+		),
+		expiryWatcher: expiryWatcher,
+		quit:          make(chan struct{}),
 	}
 }
 
@@ -196,6 +257,12 @@ func (i *InvoiceRegistry) scanInvoicesOnStart(ctx context.Context) error {
 
 	var pending []invoiceExpiry
 	for paymentHash, invoice := range pendingInvoices {
+		i.Lock()
+		i.recordPendingSettleRefsLocked(
+			paymentHash, InvoiceRefByHash(paymentHash), &invoice,
+		)
+		i.Unlock()
+
 		expiryRef := makeInvoiceExpiry(paymentHash, &invoice)
 		if expiryRef != nil {
 			pending = append(pending, expiryRef)
@@ -307,6 +374,9 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 	// Set up a heap for htlc auto-releases.
 	autoReleaseHeap := &queue.PriorityQueue{}
 
+	// Set up a heap for failed HTLC finalization retries.
+	finalizationRetryHeap := &queue.PriorityQueue{}
+
 	for {
 		// If there is something to release, set up a release tick
 		// channel.
@@ -316,16 +386,27 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 			nextReleaseTick = i.tickAt(head.releaseTime)
 		}
 
+		// If there is something to retry, set up a retry tick channel.
+		var nextFinalizationRetryTick <-chan time.Time
+		if finalizationRetryHeap.Len() > 0 {
+			retry := finalizationRetryHeap.Top()
+			head, ok := retry.(*htlcFinalizationRetryEvent)
+			if !ok {
+				log.Errorf("Unexpected retry type: %T", retry)
+				return
+			}
+
+			nextFinalizationRetryTick = i.tickAt(head.retryTime)
+		}
+
 		select {
 		// A sub-systems has just modified the invoice state, so we'll
 		// dispatch notifications to all registered clients.
 		case event := <-i.invoiceEvents:
 			// For backwards compatibility, do not notify all
-			// invoice subscribers of cancel and accept events.
-			state := event.invoice.State
-			if state != ContractCanceled &&
-				state != ContractAccepted {
-
+			// invoice subscribers of cancel, accept and
+			// pending-settle events.
+			if !event.suppressedForAllClients() {
 				i.dispatchToClients(event)
 			}
 			i.dispatchToSingleClients(event)
@@ -343,6 +424,14 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 			// channel is force closed.
 			autoReleaseHeap.Push(event)
 
+		// A failed final HTLC outcome needs to be retried later.
+		case event := <-i.htlcFinalizationRetryChan:
+			log.Debugf("Scheduling finalization retry for htlc: "+
+				"key=%v, settled=%v at %v",
+				event.key, event.settled, event.retryTime)
+
+			finalizationRetryHeap.Push(event)
+
 		// The htlc at the top of the heap needs to be auto-released.
 		case <-nextReleaseTick:
 			event := autoReleaseHeap.Pop().(*htlcReleaseEvent)
@@ -353,10 +442,47 @@ func (i *InvoiceRegistry) invoiceEventLoop() {
 				log.Errorf("HTLC timer: %v", err)
 			}
 
+		// The htlc at the top of the retry heap needs to be retried.
+		case <-nextFinalizationRetryTick:
+			retry := finalizationRetryHeap.Pop()
+			event, ok := retry.(*htlcFinalizationRetryEvent)
+			if !ok {
+				log.Errorf("Unexpected retry type: %T", retry)
+				return
+			}
+
+			i.wg.Add(1)
+			go i.retryHtlcFinalization(event)
+
 		case <-i.quit:
 			return
 		}
 	}
+}
+
+// suppressedForAllClients returns true for invoice events that should only be
+// sent to single-invoice subscribers for backwards compatibility.
+func (e *invoiceEvent) suppressedForAllClients() bool {
+	state := e.invoice.State
+	if state == ContractCanceled || state == ContractAccepted ||
+		state == ContractPendingSettle {
+
+		// These non-terminal or cancel events are only delivered to
+		// single-invoice subscribers for backwards compatibility.
+		return true
+	}
+
+	if e.setID == nil || state != ContractOpen {
+		// Open base invoices are new-invoice events, and settled events
+		// are safe for all-invoice subscribers.
+		return false
+	}
+
+	ampState, ok := e.invoice.AMPState[SetID(*e.setID)]
+
+	// AMP set updates keep the base invoice open until the AMP set settles.
+	// Suppress accepted, canceled and pending-settle set updates.
+	return ok && ampState.State != HtlcStateSettled
 }
 
 // dispatchToSingleClients passes the supplied event to all notification
@@ -897,7 +1023,7 @@ func (i *InvoiceRegistry) processAMP(ctx invoiceUpdateCtx) error {
 	}
 }
 
-// NotifyExitHopHtlc attempts to mark an invoice as settled. The return value
+// NotifyExitHopHtlc requests settlement of an invoice. The return value
 // describes how the htlc should be resolved.
 //
 // When the preimage of the invoice is not yet known (hodl invoice), this
@@ -1013,6 +1139,226 @@ func (i *InvoiceRegistry) NotifyExitHopHtlc(rHash lntypes.Hash,
 	default:
 		return nil, errors.New("invalid resolution type")
 	}
+}
+
+// NotifyExitHopHtlcFinalized marks a previously requested exit-hop HTLC
+// settlement as final. The invoice is only reported as settled after the HTLC
+// settle is locked in off-chain or claimed on-chain.
+//
+// Crash recovery before the settle/fail response is forwarding-package acked is
+// handled by the switch's replay: replayed exit-hop adds re-enter
+// NotifyExitHopHtlc, receive the pending-settle resolution again, and trigger a
+// new finalization callback once the response locks in. After that response is
+// acked, a failed finalization is retried from the registry's in-memory queue.
+// Recovery is best-effort: a restart can leave an invoice in
+// ContractPendingSettle if finalization did not complete. Channel finality
+// itself must not wait on invoice DB health.
+func (i *InvoiceRegistry) NotifyExitHopHtlcFinalized(ctx context.Context,
+	circuitKey CircuitKey, settled bool) error {
+
+	err := i.notifyExitHopHtlcFinalized(ctx, circuitKey, settled)
+	if err != nil {
+		i.queueHtlcFinalizationRetry(circuitKey, settled)
+	}
+
+	return err
+}
+
+// notifyExitHopHtlcFinalized applies the final outcome of a pending-settle
+// HTLC without queuing a retry on failure.
+func (i *InvoiceRegistry) notifyExitHopHtlcFinalized(ctx context.Context,
+	circuitKey CircuitKey, settled bool) error {
+
+	i.Lock()
+	defer i.Unlock()
+
+	// Non-exit circuits and already finalized callbacks have no pending
+	// reference, so they require neither a database read nor a new event.
+	pendingRef, ok := i.pendingSettleRefs[circuitKey]
+	if !ok {
+		return nil
+	}
+
+	var (
+		oldInvoiceState ContractState
+		oldAMPState     HtlcState
+		oldAMPStateOk   bool
+		updated         bool
+	)
+	// Recheck under the atomic update: a replay must not change an outcome
+	// already persisted by a prior final callback.
+	updateInvoice := func(invoice *Invoice) (*InvoiceUpdateDesc, error) {
+		htlc, ok := invoice.Htlcs[circuitKey]
+		if !ok || htlc.State != HtlcStatePendingSettle {
+			return nil, nil
+		}
+
+		// Save prior aggregate states so partial outcomes cannot emit
+		// settled events after the transaction commits.
+		updated = true
+		oldInvoiceState = invoice.State
+		if pendingRef.setID != nil {
+			ampState, ok := invoice.AMPState[*pendingRef.setID]
+			oldAMPStateOk = ok
+			oldAMPState = ampState.State
+		}
+
+		outcome := HtlcStateCanceled
+		if settled {
+			outcome = HtlcStateSettled
+		}
+
+		return &InvoiceUpdateDesc{
+			UpdateType: FinalizeHTLCsUpdate,
+			FinalizeHtlcs: map[CircuitKey]HtlcState{
+				circuitKey: outcome,
+			},
+			SetID: pendingRef.setID,
+		}, nil
+	}
+
+	// Apply the circuit outcome and its aggregate accounting together.
+	// Leave the pending reference intact on error so retry can find it.
+	invoice, err := i.idb.UpdateInvoice(
+		ctx, pendingRef.invoiceRef, pendingRef.setID, updateInvoice,
+	)
+	if err != nil {
+		return err
+	}
+	// Remove references only after the transaction commits, including
+	// the idempotent no-op case where storage was already final.
+	i.removeResolvedPendingSettleRefsLocked(invoice)
+	delete(i.pendingSettleRefs, circuitKey)
+
+	// Regular invoices notify on invoice-state changes. Reusable AMP
+	// parents stay open, so gate their events on the touched set instead.
+	updateSubscribers := updated && invoice.State != oldInvoiceState
+	if updated && pendingRef.setID != nil {
+		ampState, ok := invoice.AMPState[*pendingRef.setID]
+		updateSubscribers = oldAMPStateOk != ok ||
+			(ok && ampState.State != oldAMPState)
+	}
+
+	if updateSubscribers {
+		i.notifyClients(
+			pendingRef.eventHash, invoice,
+			(*[32]byte)(pendingRef.setID),
+		)
+	}
+
+	return nil
+}
+
+// queueHtlcFinalizationRetry hands a known final outcome to the existing
+// event loop after its transactional invoice update failed.
+func (i *InvoiceRegistry) queueHtlcFinalizationRetry(circuitKey CircuitKey,
+	settled bool) {
+
+	// The event loop owns scheduling and shutdown; callers outside its
+	// lifetime cannot enqueue work that would never be processed.
+	if !i.started.Load() || i.stopped.Load() {
+		return
+	}
+
+	retryTime := i.cfg.Clock.Now().Add(DefaultHtlcFinalizationRetryDelay)
+	event := &htlcFinalizationRetryEvent{
+		key:       circuitKey,
+		settled:   settled,
+		retryTime: retryTime,
+	}
+	i.enqueueHtlcFinalizationRetry(event)
+}
+
+// retryHtlcFinalization applies a due outcome outside the event loop because
+// a successful update can enqueue a subscriber notification back into it.
+func (i *InvoiceRegistry) retryHtlcFinalization(
+	event *htlcFinalizationRetryEvent) {
+
+	defer i.wg.Done()
+
+	err := i.notifyExitHopHtlcFinalized(
+		context.Background(), event.key, event.settled,
+	)
+	if err == nil {
+		return
+	}
+
+	// Keep the outcome until its invoice write succeeds, using the existing
+	// clock and heap rather than another delayed worker or overflow queue.
+	event.attempts++
+	delay := htlcFinalizationRetryDelay(event.attempts)
+	log.Warnf("Unable to finalize exit-hop htlc %v: %v; retrying in %v",
+		event.key, err, delay)
+	event.retryTime = i.cfg.Clock.Now().Add(delay)
+	i.enqueueHtlcFinalizationRetry(event)
+}
+
+// enqueueHtlcFinalizationRetry follows the auto-release handoff pattern so
+// stopping the registry also releases a caller waiting to schedule a retry.
+func (i *InvoiceRegistry) enqueueHtlcFinalizationRetry(
+	event *htlcFinalizationRetryEvent) {
+
+	select {
+	case i.htlcFinalizationRetryChan <- event:
+	case <-i.quit:
+	}
+}
+
+// htlcFinalizationRetryDelay returns the exponential backoff delay for a
+// failed finalization retry.
+func htlcFinalizationRetryDelay(attempts uint32) time.Duration {
+	delay := DefaultHtlcFinalizationRetryDelay
+	for ; attempts > 0; attempts-- {
+		delay *= 2
+		if delay >= DefaultHtlcFinalizationRetryMaxDelay {
+			return DefaultHtlcFinalizationRetryMaxDelay
+		}
+	}
+
+	return delay
+}
+
+// recordPendingSettleRefsLocked indexes all pending-settle HTLCs on an invoice
+// so that their final outcomes can be applied by circuit key.
+func (i *InvoiceRegistry) recordPendingSettleRefsLocked(eventHash lntypes.Hash,
+	invoiceRef InvoiceRef, invoice *Invoice) {
+
+	for key, htlc := range invoice.Htlcs {
+		if htlc.State != HtlcStatePendingSettle {
+			continue
+		}
+
+		i.pendingSettleRefs[key] = pendingSettleRef{
+			invoiceRef: invoiceRef,
+			eventHash:  eventHash,
+			setID:      pendingSettleSetID(htlc),
+		}
+	}
+}
+
+// removeResolvedPendingSettleRefsLocked removes index entries for HTLCs that
+// are no longer waiting for a final settle/fail outcome.
+func (i *InvoiceRegistry) removeResolvedPendingSettleRefsLocked(
+	invoice *Invoice) {
+
+	for key, htlc := range invoice.Htlcs {
+		if htlc.State == HtlcStatePendingSettle {
+			continue
+		}
+
+		delete(i.pendingSettleRefs, key)
+	}
+}
+
+// pendingSettleSetID returns the AMP set ID for a pending-settle HTLC.
+func pendingSettleSetID(htlc *InvoiceHTLC) *SetID {
+	if htlc.AMP == nil {
+		return nil
+	}
+
+	setID := SetID(htlc.AMP.Record.SetID())
+
+	return &setID
 }
 
 // notifyExitHopHtlcLocked is the internal implementation of NotifyExitHopHtlc
@@ -1195,6 +1541,7 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 			return nil, nil, err
 		}
 	}
+	i.recordPendingSettleRefsLocked(ctx.hash, invoiceRef, invoice)
 
 	var invoiceToExpire invoiceExpiry
 
@@ -1244,10 +1591,13 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 			res.Outcome, res.AcceptHeight))
 
 		// Also settle any previously accepted htlcs. If a htlc is
-		// marked as settled, we should follow now and settle the htlc
-		// with our peer.
+		// marked as pending settle, we should follow now and settle the
+		// htlc with our peer. The invoice will only become settled
+		// after the link or resolver reports a final outcome.
 		setID := ctx.setID()
-		settledHtlcSet := invoice.HTLCSet(setID, HtlcStateSettled)
+		settledHtlcSet := invoice.HTLCSet(
+			setID, HtlcStatePendingSettle,
+		)
 		for key, htlc := range settledHtlcSet {
 			preimage := res.Preimage
 			if htlc.AMP != nil && htlc.AMP.Preimage != nil {
@@ -1367,14 +1717,15 @@ func (i *InvoiceRegistry) SettleHodlInvoice(ctx context.Context,
 		case ContractCanceled:
 			return nil, ErrInvoiceAlreadyCanceled
 
-		case ContractSettled:
+		// A released preimage makes a repeat settle request idempotent.
+		case ContractSettled, ContractPendingSettle:
 			return nil, ErrInvoiceAlreadySettled
 		}
 
 		return &InvoiceUpdateDesc{
 			UpdateType: SettleHodlInvoiceUpdate,
 			State: &InvoiceStateUpdateDesc{
-				NewState: ContractSettled,
+				NewState: ContractPendingSettle,
 				Preimage: &preimage,
 			},
 		}, nil
@@ -1400,15 +1751,16 @@ func (i *InvoiceRegistry) SettleHodlInvoice(ctx context.Context,
 
 	log.Debugf("Invoice%v: settled with preimage %v", invoiceRef,
 		invoice.Terms.PaymentPreimage)
+	i.recordPendingSettleRefsLocked(hash, invoiceRef, invoice)
 
-	// In the callback, we marked the invoice as settled. UpdateInvoice will
-	// have seen this and should have moved all htlcs that were accepted to
-	// the settled state. In the loop below, we go through all of these and
-	// notify links and resolvers that are waiting for resolution. Any htlcs
-	// that were already settled before, will be notified again. This isn't
-	// necessary but doesn't hurt either.
+	// In the callback, we marked the invoice as pending settle.
+	// UpdateInvoice will have seen this and should have moved all htlcs
+	// that were accepted to the pending-settle state. In the loop below, we
+	// go through all of these and notify links and resolvers that are
+	// waiting for resolution. Any htlcs that were already pending before,
+	// will be notified again. This isn't necessary but doesn't hurt either.
 	for key, htlc := range invoice.Htlcs {
-		if htlc.State != HtlcStateSettled {
+		if htlc.State != HtlcStatePendingSettle {
 			continue
 		}
 
@@ -1459,6 +1811,17 @@ func (i *InvoiceRegistry) cancelInvoiceImpl(ctx context.Context,
 	log.Debugf("Invoice%v: canceling invoice", ref)
 
 	updateInvoice := func(invoice *Invoice) (*InvoiceUpdateDesc, error) {
+		// Preimage release commits to settlement. Final HTLC outcomes
+		// now decide the invoice or AMP set result.
+		if invoice.State == ContractPendingSettle {
+			return nil, ErrInvoiceAlreadySettled
+		}
+		for _, htlc := range invoice.Htlcs {
+			if htlc.State == HtlcStatePendingSettle {
+				return nil, ErrInvoiceAlreadySettled
+			}
+		}
+
 		if !shouldCancel(invoice.State, cancelAccepted) {
 			return nil, nil
 		}
@@ -1493,9 +1856,10 @@ func (i *InvoiceRegistry) cancelInvoiceImpl(ctx context.Context,
 		return err
 	}
 
-	// Return without cancellation if the invoice state is ContractAccepted.
+	// Return without cancellation if the invoice has accepted HTLCs and
+	// cancelAccepted wasn't set.
 	if invoice.State == ContractAccepted {
-		log.Debugf("Invoice%v: remains accepted as cancel wasn't"+
+		log.Debugf("Invoice%v: remains accepted as cancel wasn't "+
 			"explicitly requested.", ref)
 		return nil
 	}

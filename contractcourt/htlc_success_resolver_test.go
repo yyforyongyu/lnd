@@ -25,6 +25,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -45,6 +46,7 @@ type htlcResolverTestContext struct {
 
 	notifier           *mock.ChainNotifier
 	htlcNotifier       *mockHTLCNotifier
+	registry           *mockRegistry
 	resolverResultChan chan resolveResult
 	resolutionChan     chan ResolutionMsg
 
@@ -63,6 +65,8 @@ func newHtlcResolverTestContextFromReader(t *testing.T,
 	return ctx
 }
 
+// newHtlcResolverTestContext supplies the existing resolver dependencies and
+// verifies invoice-finality callback expectations once when each test ends.
 func newHtlcResolverTestContext(t *testing.T,
 	newResolver func(htlc channeldb.HTLC,
 		cfg ResolverConfig) ContractResolver) *htlcResolverTestContext {
@@ -74,10 +78,15 @@ func newHtlcResolverTestContext(t *testing.T,
 	}
 
 	htlcNotifier := &mockHTLCNotifier{}
+	registry := &mockRegistry{}
+	t.Cleanup(func() {
+		registry.AssertExpectations(t)
+	})
 	testCtx := &htlcResolverTestContext{
 		checkpoint:     nil,
 		notifier:       notifier,
 		htlcNotifier:   htlcNotifier,
+		registry:       registry,
 		resolutionChan: make(chan ResolutionMsg, 1),
 		t:              t,
 	}
@@ -86,6 +95,7 @@ func newHtlcResolverTestContext(t *testing.T,
 	chainCfg := ChannelArbitratorConfig{
 		ShortChanID: testShortChanID,
 		ChainArbitratorConfig: ChainArbitratorConfig{
+			Registry:   registry,
 			Notifier:   notifier,
 			PreimageDB: witnessBeacon,
 			PublishTx: func(_ *wire.MsgTx, _ string) error {
@@ -779,6 +789,14 @@ func TestHtlcSuccessForeignSpend(t *testing.T) {
 				return nil
 			}
 
+			// Arrange the final outcome for this circuit.
+			ctx.registry.On(
+				"NotifyExitHopHtlcFinalized",
+				testifymock.Anything,
+				testCircuitKey, false,
+			).Return(nil).Once()
+
+			// Act on the foreign spend, including replay.
 			ctx.resolve()
 			resolver := requireSuccessResolver(t, ctx.resolver)
 			sweeper, ok := resolver.Sweeper.(*mockSweeper)
@@ -805,6 +823,7 @@ func TestHtlcSuccessForeignSpend(t *testing.T) {
 			}()
 			ctx.waitForResult()
 
+			// Assert failure is stored without a sweep.
 			require.True(t, resolver.IsResolved())
 			require.False(t, resolver.outputIncubating)
 			require.Zero(t, resolver.currentReport.LimboBalance)
@@ -888,6 +907,14 @@ func TestHtlcSuccessForeignSpendCheckpointError(t *testing.T) {
 	}
 	spendTxID := foreignTx.TxHash()
 
+	// Arrange the final outcome for this circuit.
+	ctx.registry.On(
+		"NotifyExitHopHtlcFinalized",
+		testifymock.Anything,
+		testCircuitKey, false,
+	).Return(nil).Twice()
+
+	// Act through the failing checkpoint, then retry that same spend below.
 	err := resolver.checkpointForeignSpend(spendTxID)
 	require.ErrorIs(t, err, errCheckpoint)
 	require.False(t, resolver.IsResolved())
@@ -896,6 +923,7 @@ func TestHtlcSuccessForeignSpendCheckpointError(t *testing.T) {
 	require.Empty(t, ctx.htlcNotifier.finalHtlcEvents)
 
 	require.NoError(t, resolver.checkpointForeignSpend(spendTxID))
+	// Assert retry resolves the failure and emits one final event.
 	require.Equal(t, 2, checkpointCalls)
 	require.True(t, resolver.IsResolved())
 	require.False(t, resolver.outputIncubating)
@@ -1033,9 +1061,18 @@ func TestHtlcSuccessCheckpointClaim(t *testing.T) {
 		return nil
 	}
 
+	// Arrange the final outcome for this circuit.
+	ctx.registry.On(
+		"NotifyExitHopHtlcFinalized",
+		testifymock.Anything,
+		testCircuitKey, true,
+	).Return(nil).Once()
+
+	// Act by checkpointing the claim transaction that actually confirmed.
 	require.NoError(t, resolver.checkpointClaim(
 		secondLevelOutpoint, &spendTxID,
 	))
+	// Assert stored outcome and reports identify that successful claim.
 	require.True(t, resolver.IsResolved())
 	require.True(t, ctx.finalHtlcOutcomeStored)
 	require.Equal(t, []*channeldb.ResolverReport{
@@ -1366,6 +1403,21 @@ func runFromCheckpoint(t *testing.T, ctx *htlcResolverTestContext,
 	expectedCheckpoints []checkpoint) [][]byte {
 
 	defer timeout()()
+
+	// Arrange the invoice callback from the existing terminal checkpoint;
+	// restored terminal resolvers and outgoing HTLCs must not finalize it.
+	if _, incoming := ctx.resolver.(*htlcSuccessResolver); incoming &&
+		len(expectedCheckpoints) > 0 {
+
+		last := expectedCheckpoints[len(expectedCheckpoints)-1]
+		if last.finalHtlcStored {
+			ctx.registry.On(
+				"NotifyExitHopHtlcFinalized",
+				testifymock.Anything,
+				testCircuitKey, last.finalHtlcSettled,
+			).Return(nil).Once()
+		}
+	}
 
 	var checkpointedState [][]byte
 

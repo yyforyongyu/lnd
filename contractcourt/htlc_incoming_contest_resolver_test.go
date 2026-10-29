@@ -20,6 +20,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -88,6 +89,14 @@ func TestHtlcIncomingResolverFwdContestedTimeout(t *testing.T) {
 		return nil
 	}
 
+	// Arrange a failed invoice outcome for this circuit.
+	ctx.registry.On(
+		"NotifyExitHopHtlcFinalized",
+		testifymock.Anything,
+		models.CircuitKey{}, false,
+	).Return(nil).Once()
+
+	// Act by resolving the circuit with its arranged failure or expiry.
 	ctx.resolve()
 
 	// Simulate a new block coming in. HTLC expires.
@@ -113,7 +122,16 @@ func TestHtlcIncomingResolverFwdTimeout(t *testing.T) {
 	ctx := newIncomingResolverTestContext(t, true)
 	ctx.witnessBeacon.lookupPreimage[testResHash] = testResPreimage
 	ctx.resolver.htlcExpiry = 90
+	// Arrange a failed invoice outcome for this circuit.
+	ctx.registry.On(
+		"NotifyExitHopHtlcFinalized",
+		testifymock.Anything,
+		models.CircuitKey{}, false,
+	).Return(nil).Once()
+
+	// Act by resolving the circuit with its arranged failure or expiry.
 	ctx.resolve()
+	// Assert failure completes without handing off to a success resolver.
 	ctx.waitForResult(false)
 }
 
@@ -162,7 +180,16 @@ func TestHtlcIncomingResolverExitCancel(t *testing.T) {
 		invoices.ResultInvoiceAlreadyCanceled,
 	)
 
+	// Arrange a failed invoice outcome for this circuit.
+	ctx.registry.On(
+		"NotifyExitHopHtlcFinalized",
+		testifymock.Anything,
+		models.CircuitKey{}, false,
+	).Return(nil).Once()
+
+	// Act by resolving the circuit with its arranged failure or expiry.
 	ctx.resolve()
+	// Assert failure completes without handing off to a success resolver.
 	ctx.waitForResult(false)
 }
 
@@ -234,6 +261,14 @@ func TestHtlcIncomingResolverExitTimeoutHodl(t *testing.T) {
 		return nil
 	}
 
+	// Arrange a failed invoice outcome for this circuit.
+	ctx.registry.On(
+		"NotifyExitHopHtlcFinalized",
+		testifymock.Anything,
+		models.CircuitKey{}, false,
+	).Return(nil).Once()
+
+	// Act by resolving the circuit with its arranged failure or expiry.
 	ctx.resolve()
 	ctx.notifyEpoch(testHtlcExpiry)
 
@@ -271,6 +306,14 @@ func TestHtlcIncomingResolverExitCancelHodl(t *testing.T) {
 		return nil
 	}
 
+	// Arrange a failed invoice outcome for this circuit.
+	ctx.registry.On(
+		"NotifyExitHopHtlcFinalized",
+		testifymock.Anything,
+		models.CircuitKey{}, false,
+	).Return(nil).Once()
+
+	// Act by resolving the circuit with its arranged failure or expiry.
 	ctx.resolve()
 	notifyData := <-ctx.registry.notifyChan
 	notifyData.hodlChan <- invoices.NewFailResolution(
@@ -341,7 +384,16 @@ func TestHtlcIncomingResolverInvalidFinalHtlc(t *testing.T) {
 			)
 			ctx.registry.notifyResolution = resolution
 
+			// Arrange a failed invoice outcome for this circuit.
+			ctx.registry.On(
+				"NotifyExitHopHtlcFinalized",
+				testifymock.Anything,
+				models.CircuitKey{}, false,
+			).Return(nil).Once()
+
+			// Act by resolving the invalid exit HTLC.
 			ctx.resolve()
+			// Assert this invalid HTLC fails resolution.
 			ctx.waitForResult(false)
 
 			require.EqualValues(
@@ -451,6 +503,8 @@ type incomingResolverTestContext struct {
 	t                      *testing.T
 }
 
+// newIncomingResolverTestContext supplies the real resolution flow with a
+// registry whose finality expectations are checked at test cleanup.
 func newIncomingResolverTestContext(t *testing.T, isExit bool) *incomingResolverTestContext {
 	notifier := &mock.ChainNotifier{
 		EpochChan: make(chan *chainntnfs.BlockEpoch),
@@ -461,6 +515,9 @@ func newIncomingResolverTestContext(t *testing.T, isExit bool) *incomingResolver
 	registry := &mockRegistry{
 		notifyChan: make(chan notifyExitHopData, 1),
 	}
+	t.Cleanup(func() {
+		registry.AssertExpectations(t)
+	})
 
 	onionProcessor := &mockOnionProcessor{isExit: isExit}
 
