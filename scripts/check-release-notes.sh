@@ -24,7 +24,9 @@ fi
 # digit, so that e.g. PR 1132 isn't satisfied by a link to PR 11326. If the
 # PR's own fragment exists, the fragment checks below report a missing link.
 NOTES_DIR=docs/release-notes
-PR_LINK="lightningnetwork/lnd/pull/${PR_NUMBER}([^0-9]|$)"
+# Follow the repository owning the PR so fork links validate in Actions.
+# Keep the upstream default for local runs without the Actions environment.
+PR_LINK="${GITHUB_REPOSITORY:-lightningnetwork/lnd}/pull/${PR_NUMBER}([^0-9]|$)"
 if [[ ! -f "$NOTES_DIR/unreleased/$PR_NUMBER.md" ]] &&
     ! grep -r -q -E "$PR_LINK" "$NOTES_DIR/unreleased"; then
     echo "PR $PR_NUMBER didn't add a release note fragment"
