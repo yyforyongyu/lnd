@@ -281,14 +281,17 @@ func TestInvoices(t *testing.T) {
 	}
 }
 
-// TestInvoiceIsPending tests that pending invoices are those which are either
-// in ContractOpen or in ContractAccepted state.
+// TestInvoiceIsPending tests that pending invoices are those which are open,
+// accepted or pending settle.
 func TestInvoiceIsPending(t *testing.T) {
 	t.Parallel()
 
+	// Arrange every persisted state so the pending predicate includes the
+	// intermediate release phase while excluding terminal outcomes.
 	contractStates := []invpkg.ContractState{
 		invpkg.ContractOpen, invpkg.ContractSettled,
 		invpkg.ContractCanceled, invpkg.ContractAccepted,
+		invpkg.ContractPendingSettle,
 	}
 
 	for _, state := range contractStates {
@@ -296,13 +299,15 @@ func TestInvoiceIsPending(t *testing.T) {
 			State: state,
 		}
 
-		// We expect that an invoice is pending if it's either in
-		// ContractOpen or ContractAccepted state.
-		open := invpkg.ContractOpen
-		accepted := invpkg.ContractAccepted
-		pending := (state == open || state == accepted)
+		// Act by classifying the invoice through its public predicate.
+		isPending := invoice.IsPending()
 
-		require.Equal(t, pending, invoice.IsPending())
+		// Assert only states awaiting an outcome are selected for recovery.
+		pending := state == invpkg.ContractOpen ||
+			state == invpkg.ContractAccepted ||
+			state == invpkg.ContractPendingSettle
+
+		require.Equal(t, pending, isPending)
 	}
 }
 

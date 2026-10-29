@@ -231,6 +231,15 @@ const (
 	// ContractAccepted means the HTLC has been accepted but not settled
 	// yet.
 	ContractAccepted ContractState = 3
+
+	// ContractPendingSettle means settlement has been requested for the
+	// invoice, but the settling HTLC has not yet reached a final locked-in
+	// outcome.
+	//
+	// NOTE: This state is persisted. Do not downgrade to a binary that does
+	// not understand ContractPendingSettle while invoices may be in this
+	// state.
+	ContractPendingSettle ContractState = 4
 )
 
 // String returns a human readable identifier for the ContractState type.
@@ -247,6 +256,9 @@ func (c ContractState) String() string {
 
 	case ContractAccepted:
 		return "Accepted"
+
+	case ContractPendingSettle:
+		return "PendingSettle"
 	}
 
 	return "Unknown"
@@ -522,6 +534,10 @@ const (
 
 	// HtlcStateSettled indicates the htlc is settled.
 	HtlcStateSettled
+
+	// HtlcStatePendingSettle indicates that the htlc has a settle
+	// resolution, but the settlement is not yet locked in.
+	HtlcStatePendingSettle
 )
 
 // InvoiceHTLC contains details about an htlc paying to this invoice.
@@ -630,7 +646,8 @@ type InvoiceHtlcAMPData struct {
 	// Hash. The preimage will be derived either from secret share
 	// reconstruction of the shares in the AMP payload.
 	//
-	// NOTE: Preimage will only be present once the HTLC is in
+	// NOTE: Preimage will only be present once settlement has been
+	// requested and the HTLC is in HtlcStatePendingSettle or
 	// HtlcStateSettled.
 	Preimage *lntypes.Preimage
 }
@@ -705,6 +722,10 @@ const (
 	// CancelInvoiceUpdate indicates that this update is trying to cancel
 	// an invoice.
 	CancelInvoiceUpdate
+
+	// FinalizeHTLCsUpdate indicates that this update finalizes one or more
+	// HTLCs whose settlement was previously requested.
+	FinalizeHTLCsUpdate
 )
 
 // String returns a human readable string for the UpdateType.
@@ -721,6 +742,9 @@ func (u UpdateType) String() string {
 
 	case CancelInvoiceUpdate:
 		return "CancelInvoiceUpdate"
+
+	case FinalizeHTLCsUpdate:
+		return "FinalizeHTLCsUpdate"
 
 	default:
 		return fmt.Sprintf("unknown invoice update type: %d", u)
@@ -740,6 +764,9 @@ type InvoiceUpdateDesc struct {
 	// AddHtlcs describes the newly accepted htlcs that need to be added to
 	// the invoice.
 	AddHtlcs map[CircuitKey]*HtlcAcceptDesc
+
+	// FinalizeHtlcs maps HTLCs to their terminal settle/cancel outcome.
+	FinalizeHtlcs map[CircuitKey]HtlcState
 
 	// SetID is an optional set ID for AMP invoices that allows operations
 	// to be more efficient by ensuring we don't need to read out the
@@ -824,9 +851,11 @@ func (i *Invoice) requiresPreimage() bool {
 	return true
 }
 
-// IsPending returns true if the invoice is in ContractOpen state.
+// IsPending returns true if the invoice is in the open, accepted, or
+// pending-settle state.
 func (i *Invoice) IsPending() bool {
-	return i.State == ContractOpen || i.State == ContractAccepted
+	return i.State == ContractOpen || i.State == ContractAccepted ||
+		i.State == ContractPendingSettle
 }
 
 // copySlice allocates a new slice and copies the source into it.

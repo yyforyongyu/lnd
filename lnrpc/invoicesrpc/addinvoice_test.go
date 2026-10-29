@@ -4,14 +4,18 @@ import (
 	"encoding/hex"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/lightningnetwork/lnd/chanstate"
 	"github.com/lightningnetwork/lnd/graph/db/models"
 	"github.com/lightningnetwork/lnd/invoices"
+	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/zpay32"
 	"github.com/stretchr/testify/mock"
@@ -27,6 +31,85 @@ var (
 	_       = pubKeyY.SetByteSlice(pubkeyBytes)
 	pubkey  = btcec.NewPublicKey(new(btcec.FieldVal).SetInt(4), pubKeyY)
 )
+
+// TestCreateRPCInvoicePendingFinality verifies that releasing a preimage does
+// not expose a resolved invoice or HTLC before its final outcome arrives.
+func TestCreateRPCInvoicePendingFinality(t *testing.T) {
+	t.Parallel()
+
+	for _, ampInvoice := range []bool{false, true} {
+		// Arrange a pending regular or AMP payment with a nonzero
+		// internal timestamp to exercise the RPC suppression rule.
+		htlc := &invoices.InvoiceHTLC{
+			State:       invoices.HtlcStatePendingSettle,
+			ResolveTime: time.Unix(1234, 0),
+		}
+		invoice := &invoices.Invoice{
+			State: invoices.ContractPendingSettle,
+			Terms: invoices.ContractTerm{
+				Features: lnwire.EmptyFeatureVector(),
+			},
+			Htlcs: map[models.CircuitKey]*invoices.InvoiceHTLC{
+				{}: htlc,
+			},
+		}
+		wantPending := lnrpc.Invoice_ACCEPTED
+		if ampInvoice {
+			wantPending = lnrpc.Invoice_OPEN
+			invoice.State = invoices.ContractOpen
+			invoice.Terms.Features = lnwire.NewFeatureVector(
+				lnwire.NewRawFeatureVector(lnwire.AMPRequired),
+				lnwire.Features,
+			)
+			htlc.AMP = &invoices.InvoiceHtlcAMPData{
+				Record: *record.NewAMP(
+					[32]byte{}, [32]byte{}, 0,
+				),
+			}
+			invoice.AMPState = invoices.AMPInvoiceState{
+				{}: {
+					State: invoices.HtlcStatePendingSettle,
+				},
+			}
+		}
+
+		// Act through the conversion used by lookups/subscriptions.
+		pending, err := CreateRPCInvoice(
+			invoice, &chaincfg.MainNetParams,
+		)
+
+		// Assert preimage release still presents an unresolved payment.
+		require.NoError(t, err)
+		require.Equal(t, wantPending, pending.State)
+		require.Equal(
+			t, lnrpc.InvoiceHTLCState_ACCEPTED,
+			pending.Htlcs[0].State,
+		)
+		require.Zero(t, pending.Htlcs[0].ResolveTime)
+
+		// Act again after the invoice or AMP set reaches finality.
+		htlc.State = invoices.HtlcStateSettled
+		if ampInvoice {
+			ampState := invoice.AMPState[invoices.SetID{}]
+			ampState.State = invoices.HtlcStateSettled
+			invoice.AMPState[invoices.SetID{}] = ampState
+		} else {
+			invoice.State = invoices.ContractSettled
+		}
+		settled, err := CreateRPCInvoice(
+			invoice, &chaincfg.MainNetParams,
+		)
+
+		// Assert the same conversion now exposes final state/time.
+		require.NoError(t, err)
+		require.Equal(t, lnrpc.Invoice_SETTLED, settled.State)
+		require.Equal(
+			t, lnrpc.InvoiceHTLCState_SETTLED,
+			settled.Htlcs[0].State,
+		)
+		require.Equal(t, int64(1234), settled.Htlcs[0].ResolveTime)
+	}
+}
 
 // TestAddInvoiceRejectsCltvAboveMaxIncoming asserts that invoice creation
 // rejects final CLTV deltas above the supported maximum.
