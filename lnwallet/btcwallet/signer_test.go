@@ -3,7 +3,6 @@ package btcwallet
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"math"
 	"path/filepath"
 	"testing"
@@ -165,20 +164,24 @@ func TestScriptImport(t *testing.T) {
 	}, time.Minute, 50*time.Millisecond)
 	require.Equal(t, testTapscriptPkScript, utxos[0].PkScript)
 
-	// Now, as a last test, make sure that when we try adding an address
-	// with partial script reveal, we get an error that the address already
-	// exists.
+	// Arrange a partial reveal of the same output. The maintained import
+	// API retains the first representation and returns its stored metadata
+	// for repeats, so the caller need not emulate a legacy duplicate error.
 	inclusionProof := leaf2.TapHash()
 	tapscript2 := input.TapscriptPartialReveal(
 		testPubKey, leaf1, inclusionProof[:],
 	)
-	_, err = w.InternalWallet().
+	// Act by importing the equivalent output with less script information.
+	addr2, err := w.InternalWallet().
 		ImportTaprootScript(t.Context(), *tapscript2)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), fmt.Sprintf(
-		"address for script hash/key %x already exists",
-		schnorr.SerializePubKey(testTaprootKey),
-	))
+
+	// Assert that the duplicate returns the canonical existing metadata,
+	// rather than replacing it with the partial reveal's representation.
+	require.NoError(t, err)
+	require.Equal(t, addr1, addr2)
+	stored, err := w.InternalWallet().GetAddressInfo(t.Context(), addr1.Addr)
+	require.NoError(t, err)
+	require.Equal(t, addr1, stored)
 }
 
 // newTestWallet starts a fresh managed SQLite wallet for signing tests.
