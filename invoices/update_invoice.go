@@ -159,6 +159,14 @@ func UpdateInvoice(hash *lntypes.Hash, invoice *Invoice,
 			return nil, err
 		}
 
+	case FinalizeHTLCsUpdate:
+		err := finalizeHTLCs(
+			invoice, hash, updateTime, update, updater,
+		)
+		if err != nil {
+			return nil, err
+		}
+
 	case CancelInvoiceUpdate:
 		err := cancelInvoice(
 			invoice, hash, updateTime, update.State, updater,
@@ -531,6 +539,96 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 	}
 
 	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
+}
+
+// finalizeHTLCs records final HTLC outcomes and only finalizes the invoice or
+// AMP set once no HTLC in the set is still pending finality.
+func finalizeHTLCs(invoice *Invoice, hash *lntypes.Hash,
+	updateTime time.Time, update *InvoiceUpdateDesc,
+	updater InvoiceUpdater) error {
+
+	if update == nil {
+		return fmt.Errorf("unable to finalize invoice settlement: " +
+			"nil update")
+	}
+
+	if len(update.FinalizeHtlcs) == 0 {
+		return fmt.Errorf("unable to finalize invoice settlement: " +
+			"no htlcs provided")
+	}
+
+	// Replayed final callbacks must not rewrite an already final circuit.
+	for key, outcome := range update.FinalizeHtlcs {
+		htlc, ok := invoice.Htlcs[key]
+		if !ok || htlc.State != HtlcStatePendingSettle {
+			continue
+		}
+
+		// AMP validation needs its set; regular circuits have none.
+		setID := update.SetID
+		if htlc.AMP == nil {
+			setID = nil
+		}
+
+		// Validate the released preimage before recording a successful
+		// claim. Failures need only record the terminal canceled state.
+		switch outcome {
+		case HtlcStateSettled:
+			settled, htlcState, err := getUpdatedHtlcState(
+				htlc, ContractSettled, (*[32]byte)(setID),
+			)
+			if err != nil {
+				return err
+			}
+			if !settled || htlcState != HtlcStateSettled {
+				return fmt.Errorf(
+					"unable to finalize htlc %v as "+
+						"settled", key,
+				)
+			}
+
+			err = resolveHtlc(
+				key, htlc, HtlcStateSettled, updateTime,
+				updater,
+			)
+			if err != nil {
+				return err
+			}
+
+		case HtlcStateCanceled:
+			err := resolveHtlc(
+				key, htlc, HtlcStateCanceled, updateTime,
+				updater,
+			)
+			if err != nil {
+				return err
+			}
+
+		default:
+			return fmt.Errorf(
+				"unknown final htlc outcome: %v", outcome,
+			)
+		}
+
+		// AMP parents remain open; derive the touched set's result only
+		// after its released members have no pending outcomes.
+		if htlc.AMP != nil {
+			err := finalizeAmpSetIfComplete(
+				invoice, htlc.AMP.Record.SetID(), key, updater,
+			)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if invoice.IsAMP() {
+		return nil
+	}
+
+	// A regular invoice waits for every pending circuit, then uses only
+	// successful value to decide whether the requested amount was paid.
+	return finalizeInvoiceIfComplete(invoice, hash, updater)
 }
 
 // finalizeAmpSetIfComplete updates an AMP sub-invoice after one HTLC finalizes.
