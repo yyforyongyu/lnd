@@ -179,7 +179,9 @@ func TestScriptImport(t *testing.T) {
 	// rather than replacing it with the partial reveal's representation.
 	require.NoError(t, err)
 	require.Equal(t, addr1, addr2)
-	stored, err := w.InternalWallet().GetAddressInfo(t.Context(), addr1.Addr)
+	stored, err := w.InternalWallet().GetAddressInfo(
+		t.Context(), addr1.Addr,
+	)
 	require.NoError(t, err)
 	require.Equal(t, addr1, stored)
 }

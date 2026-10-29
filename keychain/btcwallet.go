@@ -138,16 +138,19 @@ func (b *BtcWalletKeyRing) createFamilyAccount(family KeyFamily) error {
 		ExternalAddrType: waddrmgr.WitnessPubKey,
 		InternalAddrType: waddrmgr.WitnessPubKey,
 	}
-	_, err := b.wallet.NewAccount(context.Background(), wallet.NewAccountParams{
-		Scope:         b.chainKeyScope,
-		Name:          name,
-		AccountNumber: &number,
-		AddrSchema:    &schema,
-		NoChainSync:   true,
-	})
+	_, err := b.wallet.NewAccount(
+		context.Background(), wallet.NewAccountParams{
+			Scope:         b.chainKeyScope,
+			Name:          name,
+			AccountNumber: &number,
+			AddrSchema:    &schema,
+			NoChainSync:   true,
+		},
+	)
 	if errors.Is(err, wallet.ErrAccountAlreadyExists) {
 		return nil
 	}
+
 	return err
 }
 

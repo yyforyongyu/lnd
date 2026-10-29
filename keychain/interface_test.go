@@ -293,14 +293,14 @@ func TestKeyRingSparseFamily(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Arrange: Reuse the real managed Wallet fixture, whose
-			// existing 0..255 families do not include the requested one.
+			// existing 0..255 families omit the requested family.
 			w, err := createTestBtcWallet(t, CoinTypeTestnet)
 			require.NoError(t, err)
 			ring := NewBtcWalletKeyRing(w, CoinTypeTestnet)
 			locator := KeyLocator{Family: tc.family}
 
-			// Act: Request the missing family through each public key
-			// entry point, then resolve the returned locator directly.
+			// Act: Request the family through each public entry
+			// point, then resolve the returned locator directly.
 			var key KeyDescriptor
 			if tc.allocate {
 				key, err = ring.DeriveNextKey(tc.family)
@@ -310,8 +310,8 @@ func TestKeyRingSparseFamily(t *testing.T) {
 			require.NoError(t, err)
 			again, err := ring.DeriveKey(locator)
 
-			// Assert: Provisioning uses the requested family and index,
-			// and the real stored account resolves the identical key.
+			// Assert: Provisioning preserves the family and index;
+			// the stored account resolves the identical key.
 			require.NoError(t, err)
 			require.Equal(t, locator, key.KeyLocator)
 			require.True(t, key.PubKey.IsEqual(again.PubKey))

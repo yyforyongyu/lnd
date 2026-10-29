@@ -1710,22 +1710,25 @@ func TestListAccountsBIP44(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Arrange: Return a native account alongside a normal
-			// payment account. Fixture cleanup owns mock verification.
+			// payment account. Cleanup verifies mock expectations.
 			w := &mock.WalletController{}
 			t.Cleanup(func() { w.AssertExpectations(t) })
 			zero := wallet.AccountNumber(0)
+			paymentScope := waddrmgr.KeyScopeBIP0084
 			w.On("ListAccounts", t.Context()).Return(
 				[]wallet.AccountInfo{
 					{
-						AccountName:      "default",
-						KeyScope:         tc.scope,
-						AccountNumber:    &zero,
-						PublicKey:        []byte("stored account xpub"),
+						AccountName:   "default",
+						KeyScope:      tc.scope,
+						AccountNumber: &zero,
+						PublicKey: []byte(
+							"stored account xpub",
+						),
 						ExternalKeyCount: 3,
 					},
 					{
 						AccountName: "default",
-						KeyScope:    waddrmgr.KeyScopeBIP0084,
+						KeyScope:    paymentScope,
 					},
 				}, nil,
 			).Once()
@@ -1740,19 +1743,33 @@ func TestListAccountsBIP44(t *testing.T) {
 				t.Context(), &ListAccountsRequest{},
 			)
 
-			// Assert: BIP44 metadata and the normal account survive;
-			// genuinely unsupported scope errors still reach the caller.
+			// Assert: Both accounts retain their metadata, while
+			// unsupported scope errors still reach the caller.
 			if tc.wantErr {
-				require.ErrorContains(t, err, "unsupported key scope")
+				require.ErrorContains(
+					t, err, "unsupported key scope",
+				)
 				require.Nil(t, resp)
+
 				return
 			}
 			require.NoError(t, err)
 			require.Len(t, resp.Accounts, 2)
-			require.Equal(t, AddressType_UNKNOWN, resp.Accounts[0].AddressType)
-			require.Equal(t, "m/44'/0'/0'", resp.Accounts[0].DerivationPath)
-			require.Equal(t, "stored account xpub", resp.Accounts[0].ExtendedPublicKey)
-			require.EqualValues(t, 3, resp.Accounts[0].ExternalKeyCount)
+			require.Equal(
+				t, AddressType_UNKNOWN,
+				resp.Accounts[0].AddressType,
+			)
+			require.Equal(
+				t, "m/44'/0'/0'",
+				resp.Accounts[0].DerivationPath,
+			)
+			require.Equal(
+				t, "stored account xpub",
+				resp.Accounts[0].ExtendedPublicKey,
+			)
+			require.EqualValues(
+				t, 3, resp.Accounts[0].ExternalKeyCount,
+			)
 			require.Equal(t, AddressType_WITNESS_PUBKEY_HASH,
 				resp.Accounts[1].AddressType)
 		})
