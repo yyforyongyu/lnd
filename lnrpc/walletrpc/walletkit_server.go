@@ -3606,14 +3606,17 @@ func (w *WalletKit) ImportAccount(ctx context.Context,
 		return nil, err
 	}
 
-	var mkfp uint32
+	var fingerprint *base.MasterFingerprint
 	switch len(req.MasterKeyFingerprint) {
 	// No master key fingerprint provided, which is fine as it's not
 	// required.
 	case 0:
 	// Expected length.
 	case 4:
-		mkfp = binary.BigEndian.Uint32(req.MasterKeyFingerprint)
+		mkfp := base.MasterFingerprint(binary.BigEndian.Uint32(
+			req.MasterKeyFingerprint,
+		))
+		fingerprint = &mkfp
 	default:
 		return nil, errors.New("invalid length for master key " +
 			"fingerprint, expected 4 bytes in big-endian")
@@ -3628,13 +3631,12 @@ func (w *WalletKit) ImportAccount(ctx context.Context,
 	if addrType != nil {
 		walletAddrType = *addrType
 	}
-	fingerprint := base.MasterFingerprint(mkfp)
 	accountProps, err := w.cfg.Wallet.ImportAccount(
 		ctx,
 		base.ImportAccountParams{
 			Name:                 req.Name,
 			XPub:                 accountPubKey,
-			MasterKeyFingerprint: &fingerprint,
+			MasterKeyFingerprint: fingerprint,
 			AddrType:             walletAddrType,
 		},
 		req.DryRun,

@@ -35,6 +35,17 @@ type WalletController struct {
 var _ lnwallet.WalletAPI = (*WalletController)(nil)
 var _ lnwallet.WalletServices = (*WalletController)(nil)
 
+// ImportAccount records declared origin metadata at the maintained Wallet
+// boundary, so RPC tests can distinguish omitted values from supplied zeroes.
+func (w *WalletController) ImportAccount(ctx context.Context,
+	params base.ImportAccountParams, dryRun bool) (
+	*base.AccountInfo, error) {
+
+	args := w.Called(ctx, params, dryRun)
+	account, _ := args.Get(0).(*base.AccountInfo)
+	return account, args.Error(1)
+}
+
 // NewBulkAddresses records deliberate fresh allocation for address RPCs using
 // the same mock expectation boundary as native receiving-address selection.
 func (w *WalletController) NewBulkAddresses(ctx context.Context,

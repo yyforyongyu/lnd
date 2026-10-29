@@ -16,6 +16,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/psbt/v2"
@@ -1890,6 +1891,108 @@ func TestListAddressesNativeKeys(t *testing.T) {
 					)
 				}
 			}
+		})
+	}
+}
+
+// TestImportAccountFingerprint preserves absent versus supplied-zero roots
+// without binding a generic imported xpub to a numbered local account slot.
+func TestImportAccountFingerprint(t *testing.T) {
+	t.Parallel()
+
+	// Arrange an account xpub shared by both metadata cases. Generic
+	// imports retain their numberless native selection semantics.
+	key, err := hdkeychain.NewMaster(bytes.Repeat([]byte{1}, 32),
+		&chaincfg.RegressionNetParams)
+	require.NoError(t, err)
+	for _, child := range []uint32{49, 0, 0} {
+		key, err = key.Derive(child + hdkeychain.HardenedKeyStart)
+		require.NoError(t, err)
+	}
+	pub, err := key.Neuter()
+	require.NoError(t, err)
+
+	xpub := pub.String()
+	params := chaincfg.RegressionNetParams
+	walletType := waddrmgr.NestedWitnessPubKey
+
+	for _, tc := range []struct {
+		name        string
+		fingerprint []byte
+	}{
+		{
+			name: "omitted fingerprint",
+		},
+		{
+			name:        "supplied zero fingerprint",
+			fingerprint: []byte{0, 0, 0, 0},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange one native import and defer its expectation
+			// check until the public RPC has completed.
+			controller := &mock.WalletController{}
+			defer controller.AssertExpectations(t)
+
+			var fingerprint *wallet.MasterFingerprint
+			if tc.fingerprint != nil {
+				zero := wallet.MasterFingerprint(0)
+				fingerprint = &zero
+			}
+			scope := waddrmgr.KeyScopeBIP0049Plus
+			schema := waddrmgr.KeyScopeBIP0049AddrSchema
+			controller.On("ImportAccount", t.Context(),
+				testifymock.MatchedBy(func(
+					p wallet.ImportAccountParams) bool {
+
+					fp := p.MasterKeyFingerprint
+					if (fp == nil) != (fingerprint == nil) {
+						return false
+					}
+					if fp != nil && *fp != *fingerprint {
+						return false
+					}
+
+					return p.Name == "external" &&
+						p.XPub.String() == xpub &&
+						p.Scope == nil &&
+						p.AddrSchema == nil &&
+						p.AddrType == walletType
+				}), false,
+			).Return(&wallet.AccountInfo{
+				AccountName:          "external",
+				KeyScope:             scope,
+				AddrSchema:           schema,
+				PublicKey:            []byte(pub.String()),
+				MasterKeyFingerprint: fingerprint,
+			}, nil).Once()
+			kit := &WalletKit{
+				cfg: &Config{
+					Wallet:      controller,
+					ChainParams: &params,
+				},
+			}
+
+			// Act through the public RPC with the caller's optional
+			// root fingerprint, including a valid supplied zero.
+			addrType := AddressType_NESTED_WITNESS_PUBKEY_HASH
+			resp, err := kit.ImportAccount(
+				t.Context(), &ImportAccountRequest{
+					Name:                 "external",
+					ExtendedPublicKey:    pub.String(),
+					AddressType:          addrType,
+					MasterKeyFingerprint: tc.fingerprint,
+				},
+			)
+
+			// Assert the response retains the optional fingerprint.
+			// The mock also checks the native import parameters.
+			require.NoError(t, err)
+			require.Equal(t, "external", resp.Account.Name)
+			require.Equal(t, tc.fingerprint,
+				resp.Account.MasterKeyFingerprint)
 		})
 	}
 }
