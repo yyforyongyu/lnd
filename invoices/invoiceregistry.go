@@ -36,6 +36,14 @@ const (
 	// DefaultHtlcHoldDuration defines the default for how long mpp htlcs
 	// are held while waiting for the other set members to arrive.
 	DefaultHtlcHoldDuration = 120 * time.Second
+
+	// DefaultHtlcFinalizationRetryDelay defines how long to wait before
+	// retrying a failed invoice HTLC finalization.
+	DefaultHtlcFinalizationRetryDelay = time.Second
+
+	// DefaultHtlcFinalizationRetryMaxDelay defines the maximum delay
+	// between failed invoice HTLC finalization retries.
+	DefaultHtlcFinalizationRetryMaxDelay = time.Minute
 )
 
 // RegistryConfig contains the configuration parameters for invoice registry.
@@ -94,12 +102,39 @@ type htlcReleaseEvent struct {
 	releaseTime time.Time
 }
 
+// htlcFinalizationRetryEvent describes an exit-hop HTLC finalization retry.
+type htlcFinalizationRetryEvent struct {
+	// key identifies the exit-hop HTLC to finalize.
+	key CircuitKey
+
+	// settled is the final outcome to record for the HTLC.
+	settled bool
+
+	// retryTime is when the retry should next be attempted.
+	retryTime time.Time
+
+	// attempts is the number of failed finalization attempts so far.
+	attempts uint32
+}
+
 // Less is used to order PriorityQueueItem's by their release time such that
 // items with the older release time are at the top of the queue.
 //
 // NOTE: Part of the queue.PriorityQueueItem interface.
 func (r *htlcReleaseEvent) Less(other queue.PriorityQueueItem) bool {
 	return r.releaseTime.Before(other.(*htlcReleaseEvent).releaseTime)
+}
+
+// Ensure retry events use the same heap contract as automatic HTLC releases.
+var _ queue.PriorityQueueItem = (*htlcFinalizationRetryEvent)(nil)
+
+// Less orders retry deadlines within the heap owned by invoiceEventLoop.
+func (r *htlcFinalizationRetryEvent) Less(
+	other queue.PriorityQueueItem) bool {
+
+	retry, ok := other.(*htlcFinalizationRetryEvent)
+
+	return ok && r.retryTime.Before(retry.retryTime)
 }
 
 // InvoiceRegistry is a central registry of all the outstanding invoices
@@ -157,6 +192,10 @@ type InvoiceRegistry struct {
 	// auto-released.
 	htlcAutoReleaseChan chan *htlcReleaseEvent
 
+	// htlcFinalizationRetryChan contains exit-hop HTLC finalization
+	// retries.
+	htlcFinalizationRetryChan chan *htlcFinalizationRetryEvent
+
 	expiryWatcher *InvoiceExpiryWatcher
 
 	wg   sync.WaitGroup
@@ -199,8 +238,11 @@ func NewRegistry(idb InvoiceDB, expiryWatcher *InvoiceExpiryWatcher,
 		pendingSettleRefs:   make(map[CircuitKey]pendingSettleRef),
 		cfg:                 cfg,
 		htlcAutoReleaseChan: make(chan *htlcReleaseEvent),
-		expiryWatcher:       expiryWatcher,
-		quit:                make(chan struct{}),
+		htlcFinalizationRetryChan: make(
+			chan *htlcFinalizationRetryEvent,
+		),
+		expiryWatcher: expiryWatcher,
+		quit:          make(chan struct{}),
 	}
 }
 
@@ -1078,7 +1120,12 @@ func (i *InvoiceRegistry) NotifyExitHopHtlc(rHash lntypes.Hash,
 func (i *InvoiceRegistry) NotifyExitHopHtlcFinalized(ctx context.Context,
 	circuitKey CircuitKey, settled bool) error {
 
-	return i.notifyExitHopHtlcFinalized(ctx, circuitKey, settled)
+	err := i.notifyExitHopHtlcFinalized(ctx, circuitKey, settled)
+	if err != nil {
+		i.queueHtlcFinalizationRetry(circuitKey, settled)
+	}
+
+	return err
 }
 
 // notifyExitHopHtlcFinalized applies the final outcome of a pending-settle
@@ -1164,6 +1211,37 @@ func (i *InvoiceRegistry) notifyExitHopHtlcFinalized(ctx context.Context,
 	}
 
 	return nil
+}
+
+// queueHtlcFinalizationRetry hands a known final outcome to the existing
+// event loop after its transactional invoice update failed.
+func (i *InvoiceRegistry) queueHtlcFinalizationRetry(circuitKey CircuitKey,
+	settled bool) {
+
+	// The event loop owns scheduling and shutdown; callers outside its
+	// lifetime cannot enqueue work that would never be processed.
+	if !i.started.Load() || i.stopped.Load() {
+		return
+	}
+
+	retryTime := i.cfg.Clock.Now().Add(DefaultHtlcFinalizationRetryDelay)
+	event := &htlcFinalizationRetryEvent{
+		key:       circuitKey,
+		settled:   settled,
+		retryTime: retryTime,
+	}
+	i.enqueueHtlcFinalizationRetry(event)
+}
+
+// enqueueHtlcFinalizationRetry follows the auto-release handoff pattern so
+// stopping the registry also releases a caller waiting to schedule a retry.
+func (i *InvoiceRegistry) enqueueHtlcFinalizationRetry(
+	event *htlcFinalizationRetryEvent) {
+
+	select {
+	case i.htlcFinalizationRetryChan <- event:
+	case <-i.quit:
+	}
 }
 
 // recordPendingSettleRefsLocked indexes all pending-settle HTLCs on an invoice
