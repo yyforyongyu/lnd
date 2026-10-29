@@ -396,6 +396,22 @@ func addHTLCs(invoice *Invoice, hash *lntypes.Hash, updateTime time.Time,
 			}
 		}
 
+		// Pending-settle HTLCs passed settle validation, but are
+		// not final until the link or resolver reports the committed
+		// outcome.
+		htlcPendingSettle := htlcStateChanged &&
+			htlcState == HtlcStatePendingSettle
+
+		// AMP HTLCs also need their per-set state updated because
+		// settlement metadata is stored separately from the invoice
+		// HTLC map.
+		if htlcPendingSettle && invoiceIsAMP {
+			err = pendingSettleHtlcsAmp(invoice, key, htlc, updater)
+			if err != nil {
+				return err
+			}
+		}
+
 		accepted := htlc.State == HtlcStateAccepted
 		pendingSettle := htlc.State == HtlcStatePendingSettle
 		settled := htlc.State == HtlcStateSettled
