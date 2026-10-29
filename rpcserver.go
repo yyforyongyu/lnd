@@ -1756,9 +1756,13 @@ func (r *rpcServer) NewAddress(ctx context.Context,
 	var err error
 
 	// Skipping fresh children must create gaps for later seed recovery.
-	// The maintained bulk allocator promises exactly one child on success;
-	// UNUSED requests instead retain native receiving-address reuse.
-	if in.Type == lnrpc.AddressType_UNUSED_WITNESS_PUBKEY_HASH ||
+	// SQL's bulk allocator promises exactly one child on success; kvdb's
+	// receiving API allocates fresh and does not support bulk calls.
+	// UNUSED requests retain their backend's receiving-address policy.
+	sqlWallet := r.cfg.DB.Backend == lncfg.SqliteBackend ||
+		r.cfg.DB.Backend == lncfg.PostgresBackend
+	if !sqlWallet ||
+		in.Type == lnrpc.AddressType_UNUSED_WITNESS_PUBKEY_HASH ||
 		in.Type == lnrpc.AddressType_UNUSED_NESTED_PUBKEY_HASH ||
 		in.Type == lnrpc.AddressType_UNUSED_TAPROOT_PUBKEY {
 

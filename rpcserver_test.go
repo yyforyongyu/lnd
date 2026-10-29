@@ -18,6 +18,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest/mock"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -248,6 +249,7 @@ func TestNewAddressNative(t *testing.T) {
 		addrType lnrpc.AddressType
 		scope    waddrmgr.KeyScope
 		unused   bool
+		kvdb     bool
 	}{
 		{
 			addrType: lnrpc.AddressType_WITNESS_PUBKEY_HASH,
@@ -276,9 +278,18 @@ func TestNewAddressNative(t *testing.T) {
 			scope:    waddrmgr.KeyScopeBIP0086,
 			unused:   true,
 		},
+		{
+			addrType: lnrpc.AddressType_WITNESS_PUBKEY_HASH,
+			scope:    waddrmgr.KeyScopeBIP0084,
+			kvdb:     true,
+		},
 	}
 	for _, tc := range testCases {
-		t.Run(tc.addrType.String(), func(t *testing.T) {
+		name := tc.addrType.String()
+		if tc.kvdb {
+			name += " kvdb"
+		}
+		t.Run(name, func(t *testing.T) {
 			// Arrange the native call for this wire mode.
 			// Fixture cleanup checks the single expected call.
 			w := &mock.WalletController{}
@@ -290,7 +301,7 @@ func TestNewAddressNative(t *testing.T) {
 			selector := wallet.NewAccountSelectorByName(
 				tc.scope, "custom",
 			)
-			if tc.unused {
+			if tc.unused || tc.kvdb {
 				w.On("NewAddress",
 					t.Context(), selector, false,
 				).Return(wallet.AddressInfo{
@@ -310,7 +321,14 @@ func TestNewAddressNative(t *testing.T) {
 					Wallet: w,
 				},
 			}
+			backend := lncfg.SqliteBackend
+			if tc.kvdb {
+				backend = lncfg.BoltBackend
+			}
 			r := &rpcServer{
+				cfg: &Config{
+					DB: &lncfg.DB{Backend: backend},
+				},
 				server: &server{
 					cc: &chainreg.ChainControl{
 						Wallet: lw,
