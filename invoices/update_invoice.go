@@ -510,6 +510,71 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
 }
 
+// finalizeInvoiceIfComplete derives the terminal non-AMP invoice state once all
+// pending-settle HTLCs have reported a final outcome.
+func finalizeInvoiceIfComplete(invoice *Invoice, hash *lntypes.Hash,
+	updater InvoiceUpdater) error {
+
+	var amtPaid lnwire.MilliSatoshi
+	// This helper is only called for non-AMP invoices, whose entire HTLC
+	// map belongs to this payment and can be inspected without copying it.
+	for _, htlc := range invoice.Htlcs {
+		switch htlc.State {
+		case HtlcStatePendingSettle:
+			return nil
+
+		case HtlcStateSettled:
+			amtPaid += htlc.Amt
+		}
+	}
+
+	// Failed duplicates do not erase enough successful value to pay the
+	// invoice; a zero-valued invoice still needs some successful payment.
+	paid := amtPaid > 0 && (invoice.Terms.Value == 0 ||
+		amtPaid >= invoice.Terms.Value)
+	if paid {
+		return finalizeInvoiceState(
+			invoice, hash, ContractSettled, amtPaid, updater,
+		)
+	}
+
+	return finalizeInvoiceState(
+		invoice, hash, ContractCanceled, amtPaid, updater,
+	)
+}
+
+// finalizeInvoiceState applies the final non-AMP invoice state and amount.
+func finalizeInvoiceState(invoice *Invoice, hash *lntypes.Hash,
+	state ContractState, amtPaid lnwire.MilliSatoshi,
+	updater InvoiceUpdater) error {
+
+	// Reuse the normal transition/preimage validation before committing
+	// the aggregate state and successful amount together.
+	update := InvoiceStateUpdateDesc{
+		NewState: state,
+	}
+	if state == ContractSettled {
+		update.Preimage = invoice.Terms.PaymentPreimage
+	}
+
+	newState, err := getUpdatedInvoiceState(invoice, hash, update)
+	if err != nil {
+		return err
+	}
+	if newState == nil || *newState != state {
+		return fmt.Errorf("unable to finalize invoice: new computed "+
+			"state is not %v: %s", state, newState)
+	}
+
+	err = updater.UpdateInvoiceState(state, update.Preimage)
+	if err != nil {
+		return err
+	}
+	invoice.State = state
+
+	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
+}
+
 // cancelInvoice attempts to cancel the given invoice. That includes changing
 // the invoice state and the state of any relevant HTLC.
 func cancelInvoice(invoice *Invoice, hash *lntypes.Hash,
