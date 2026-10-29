@@ -3,6 +3,7 @@ package itest
 import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lntest"
@@ -163,14 +164,15 @@ func testXCreateAccountRejections(ht *lntest.HarnessTest) {
 	)
 	require.ErrorContains(ht, err, "already exists")
 
-	// The wallet's own reserved account names.
+	// The default name is already occupied in this scope. The maintained
+	// Wallet owns name policy, so expose its collision identity directly.
 	err = alice.RPC.XCreateAccountAssertErr(
 		&walletrpc.XCreateAccountRequest{
 			Name:        lnwallet.DefaultAccountName,
 			AddressType: walletrpc.AddressType_TAPROOT_PUBKEY,
 		},
 	)
-	require.ErrorContains(ht, err, "reserved")
+	require.ErrorContains(ht, err, wallet.ErrAccountAlreadyExists.Error())
 
 	// An empty name.
 	err = alice.RPC.XCreateAccountAssertErr(
@@ -178,7 +180,8 @@ func testXCreateAccountRejections(ht *lntest.HarnessTest) {
 			AddressType: walletrpc.AddressType_TAPROOT_PUBKEY,
 		},
 	)
-	require.ErrorContains(ht, err, "account name is required")
+	require.ErrorContains(ht, err, wallet.ErrInvalidParam.Error())
+	require.ErrorContains(ht, err, "empty string")
 
 	// The strict nested-witness scheme, which a wallet-derived account
 	// cannot provide: it stores no address schema, so it would silently
