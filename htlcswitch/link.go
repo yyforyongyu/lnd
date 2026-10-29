@@ -4474,11 +4474,23 @@ func (l *channelLink) processRemoteCommitSig(ctx context.Context,
 
 	// Notify the incoming htlcs of which the resolutions were locked in.
 	for id, settled := range finalHTLCs {
+		circuitKey := models.CircuitKey{
+			ChanID: l.ShortChanID(),
+			HtlcID: id,
+		}
+
+		// Commitments are final; invoice retries must not fail the link
+		// or prevent final HTLC notifications.
+		err := l.cfg.Registry.NotifyExitHopHtlcFinalized(
+			ctx, circuitKey, settled,
+		)
+		if err != nil {
+			l.log.Warnf("Unable to finalize exit-hop htlc %v: %v",
+				circuitKey, err)
+		}
+
 		l.cfg.HtlcNotifier.NotifyFinalHtlcEvent(
-			models.CircuitKey{
-				ChanID: l.ShortChanID(),
-				HtlcID: id,
-			},
+			circuitKey,
 			channeldb.FinalHtlcInfo{
 				Settled:  settled,
 				Offchain: true,
