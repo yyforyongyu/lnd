@@ -28,6 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -831,6 +832,7 @@ func TestChannelArbitratorLocalForceClose(t *testing.T) {
 // is able to properly progress the breachResolver and anchorResolver to a
 // successful resolution.
 func TestChannelArbitratorBreachClose(t *testing.T) {
+	// Arrange a breach fixture with incoming and outgoing HTLCs.
 	log := &mockArbitratorLog{
 		state:     StateDefault,
 		newStates: make(chan ArbitratorState, 5),
@@ -841,7 +843,11 @@ func TestChannelArbitratorBreachClose(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb := chanArbCtx.chanArb
 	chanArb.cfg.PreimageDB = newMockWitnessBeacon()
-	chanArb.cfg.Registry = &mockRegistry{}
+	registry := &mockRegistry{}
+	t.Cleanup(func() {
+		registry.AssertExpectations(t)
+	})
+	chanArb.cfg.Registry = registry
 
 	beat := newBeatFromHeight(0)
 	if err := chanArb.Start(nil, beat); err != nil {
@@ -892,13 +898,27 @@ func TestChannelArbitratorBreachClose(t *testing.T) {
 		CommitSet: CommitSet{
 			ConfCommitKey: fn.Some(RemoteHtlcSet),
 			HtlcSets: map[HtlcSetKey][]channeldb.HTLC{
-				RemoteHtlcSet: {htlc1, htlc2},
+				RemoteHtlcSet:        {htlc1, htlc2},
+				RemotePendingHtlcSet: {htlc2},
 			},
 		},
 		CommitHash: chainhash.Hash{},
 	}
 
-	// Send a breach close event.
+	incomingCircuitKey := models.CircuitKey{
+		ChanID: chanArb.cfg.ShortChanID,
+		HtlcID: htlc2.HtlcIndex,
+	}
+
+	// Arrange one callback despite the incoming HTLC appearing in both
+	// remote sets; outgoing HTLCs must not reach invoice finality.
+	registry.On(
+		"NotifyExitHopHtlcFinalized",
+		testifymock.Anything,
+		incomingCircuitKey, false,
+	).Return(nil).Once()
+
+	// Act by confirming the breach with the duplicated incoming HTLC.
 	chanArb.cfg.ChainEvents.ContractBreach <- breachInfo
 
 	// It should transition StateDefault -> StateContractClosed.
@@ -935,6 +955,24 @@ func TestChannelArbitratorBreachClose(t *testing.T) {
 	}
 	require.True(t, anchorExists && breachExists)
 
+	// Assert that the breach path stores and emits the failed outcome for
+	// incoming HTLCs in addition to finalizing the invoice outcome.
+	require.Equal(t, map[uint64]bool{
+		htlc2.HtlcIndex: false,
+	}, chanArbCtx.finalHtlcs)
+
+	notifier, ok := chanArb.cfg.HtlcNotifier.(*mockHTLCNotifier)
+	require.True(t, ok)
+	require.Equal(t, []finalHtlcEvent{
+		{
+			key: incomingCircuitKey,
+			info: channeldb.FinalHtlcInfo{
+				Settled:  false,
+				Offchain: false,
+			},
+		},
+	}, notifier.finalHtlcEvents)
+
 	// The anchor resolver is expected to re-offer the anchor input to the
 	// sweeper.
 	<-chanArbCtx.sweeper.sweptInputs
@@ -957,6 +995,43 @@ func TestChannelArbitratorBreachClose(t *testing.T) {
 	}
 }
 
+// TestFailBreachedIncomingHtlcsStoreError asserts breached incoming HTLCs do
+// not notify invoice or final-HTLC subscribers if the final outcome cannot be
+// stored persistently.
+func TestFailBreachedIncomingHtlcsStoreError(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a failing outcome store and no expected invoice callback;
+	// persistence must succeed before either subscriber is notified.
+	storeErr := errors.New("store final htlc outcome")
+	registry := &mockRegistry{}
+	t.Cleanup(func() {
+		registry.AssertExpectations(t)
+	})
+	notifier := &mockHTLCNotifier{}
+	chanArb := &ChannelArbitrator{
+		cfg: ChannelArbitratorConfig{
+			ShortChanID: lnwire.NewShortChanIDFromInt(1),
+			ChainArbitratorConfig: ChainArbitratorConfig{
+				Registry:     registry,
+				HtlcNotifier: notifier,
+				PutFinalHtlcOutcome: func(
+					_ lnwire.ShortChannelID, _ uint64,
+					_ bool) error {
+
+					return storeErr
+				},
+			},
+		},
+	}
+
+	// Act through the failed store for this breached incoming HTLC.
+	err := chanArb.failBreachedIncomingHtlcs(fn.NewSet[uint64](3))
+	// Assert the error survives and no final event escapes the store.
+	require.ErrorIs(t, err, storeErr)
+	require.Empty(t, notifier.finalHtlcEvents)
+}
+
 // TestChannelArbitratorLocalForceClosePendingHtlc tests that the
 // ChannelArbitrator goes through the expected states in case we request it to
 // force close a channel that still has an HTLC pending.
@@ -969,7 +1044,11 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	require.NoError(t, err, "unable to create ChannelArbitrator")
 	chanArb := chanArbCtx.chanArb
 	chanArb.cfg.PreimageDB = newMockWitnessBeacon()
-	chanArb.cfg.Registry = &mockRegistry{}
+	registry := &mockRegistry{}
+	t.Cleanup(func() {
+		registry.AssertExpectations(t)
+	})
+	chanArb.cfg.Registry = registry
 
 	beat := newBeatFromHeight(0)
 	if err := chanArb.Start(nil, beat); err != nil {
@@ -1004,6 +1083,17 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 		OutputIndex: -1,
 	}
 
+	// Arrange one failed invoice outcome when the incoming dust HTLC
+	// disappears from the confirmed commitment.
+	registry.On(
+		"NotifyExitHopHtlcFinalized",
+		testifymock.Anything,
+		models.CircuitKey{
+			ChanID: chanArb.cfg.ShortChanID,
+			HtlcID: incomingDustHtlc.HtlcIndex,
+		}, false,
+	).Return(nil).Once()
+
 	htlcSet := []channeldb.HTLC{
 		htlc, outgoingDustHtlc, incomingDustHtlc,
 	}
@@ -1017,8 +1107,8 @@ func TestChannelArbitratorLocalForceClosePendingHtlc(t *testing.T) {
 	errChan := make(chan error, 1)
 	respChan := make(chan *wire.MsgTx, 1)
 
-	// With the channel found, and the request crafted, we'll send over a
-	// force close request to the arbitrator that watches this channel.
+	// Act by requesting a force close, then confirm its commitment below
+	// so that the dust HTLC has a final failed outcome.
 	chanArb.forceCloseReqs <- &forceCloseReq{
 		errResp: errChan,
 		closeTx: respChan,
