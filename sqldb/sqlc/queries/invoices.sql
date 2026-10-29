@@ -48,15 +48,16 @@ INNER JOIN amp_sub_invoices a
 ON i.id = a.invoice_id AND a.set_id = $1;
 
 -- name: FetchPendingInvoices :many
--- FetchPendingInvoices returns all invoices in a pending state (open or
--- accepted). The invoices_state_idx index on the state column makes this a
--- fast index scan rather than a full table scan. id_cursor is an exclusive
--- lower bound on the primary key used for cursor-based pagination; the caller
--- must supply 0 when starting from the beginning.
+-- FetchPendingInvoices returns all invoices in a pending state (open,
+-- accepted or pending settle). The invoices_state_idx index on the state
+-- column makes this a fast index scan rather than a full table scan.
+-- id_cursor is an exclusive lower bound on the primary key used for
+-- cursor-based pagination; the caller must supply 0 when starting from the
+-- beginning.
 SELECT
     invoices.*
 FROM invoices
-WHERE state IN (0, 3) -- 0 = ContractOpen, 3 = ContractAccepted
+WHERE state IN (0, 3, 4) -- 0 = ContractOpen, 3 = ContractAccepted, 4 = ContractPendingSettle
   AND id > @id_cursor
 ORDER BY id ASC
 LIMIT @num_limit;
@@ -103,7 +104,7 @@ SELECT
     invoices.*
 FROM invoices
 WHERE id >= @add_index_get
-  AND (NOT @pending_only OR state IN (0, 3)) -- 0 = ContractOpen, 3 = ContractAccepted
+  AND (NOT @pending_only OR state IN (0, 3, 4)) -- 0 = ContractOpen, 3 = ContractAccepted, 4 = ContractPendingSettle
   AND created_at >= @created_after
   AND created_at < @created_before
 ORDER BY id ASC
@@ -119,7 +120,7 @@ SELECT
     invoices.*
 FROM invoices
 WHERE id <= @add_index_let
-  AND (NOT @pending_only OR state IN (0, 3)) -- 0 = ContractOpen, 3 = ContractAccepted
+  AND (NOT @pending_only OR state IN (0, 3, 4)) -- 0 = ContractOpen, 3 = ContractAccepted, 4 = ContractPendingSettle
   AND created_at >= @created_after
   AND created_at < @created_before
 ORDER BY id DESC
