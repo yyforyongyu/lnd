@@ -1591,10 +1591,13 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 			res.Outcome, res.AcceptHeight))
 
 		// Also settle any previously accepted htlcs. If a htlc is
-		// marked as settled, we should follow now and settle the htlc
-		// with our peer.
+		// marked as pending settle, we should follow now and settle the
+		// htlc with our peer. The invoice will only become settled
+		// after the link or resolver reports a final outcome.
 		setID := ctx.setID()
-		settledHtlcSet := invoice.HTLCSet(setID, HtlcStateSettled)
+		settledHtlcSet := invoice.HTLCSet(
+			setID, HtlcStatePendingSettle,
+		)
 		for key, htlc := range settledHtlcSet {
 			preimage := res.Preimage
 			if htlc.AMP != nil && htlc.AMP.Preimage != nil {
@@ -1714,14 +1717,15 @@ func (i *InvoiceRegistry) SettleHodlInvoice(ctx context.Context,
 		case ContractCanceled:
 			return nil, ErrInvoiceAlreadyCanceled
 
-		case ContractSettled:
+		// A released preimage makes a repeat settle request idempotent.
+		case ContractSettled, ContractPendingSettle:
 			return nil, ErrInvoiceAlreadySettled
 		}
 
 		return &InvoiceUpdateDesc{
 			UpdateType: SettleHodlInvoiceUpdate,
 			State: &InvoiceStateUpdateDesc{
-				NewState: ContractSettled,
+				NewState: ContractPendingSettle,
 				Preimage: &preimage,
 			},
 		}, nil
@@ -1749,14 +1753,14 @@ func (i *InvoiceRegistry) SettleHodlInvoice(ctx context.Context,
 		invoice.Terms.PaymentPreimage)
 	i.recordPendingSettleRefsLocked(hash, invoiceRef, invoice)
 
-	// In the callback, we marked the invoice as settled. UpdateInvoice will
-	// have seen this and should have moved all htlcs that were accepted to
-	// the settled state. In the loop below, we go through all of these and
-	// notify links and resolvers that are waiting for resolution. Any htlcs
-	// that were already settled before, will be notified again. This isn't
-	// necessary but doesn't hurt either.
+	// In the callback, we marked the invoice as pending settle.
+	// UpdateInvoice will have seen this and should have moved all htlcs
+	// that were accepted to the pending-settle state. In the loop below, we
+	// go through all of these and notify links and resolvers that are
+	// waiting for resolution. Any htlcs that were already pending before,
+	// will be notified again. This isn't necessary but doesn't hurt either.
 	for key, htlc := range invoice.Htlcs {
-		if htlc.State != HtlcStateSettled {
+		if htlc.State != HtlcStatePendingSettle {
 			continue
 		}
 
@@ -1807,6 +1811,17 @@ func (i *InvoiceRegistry) cancelInvoiceImpl(ctx context.Context,
 	log.Debugf("Invoice%v: canceling invoice", ref)
 
 	updateInvoice := func(invoice *Invoice) (*InvoiceUpdateDesc, error) {
+		// Preimage release commits to settlement. Final HTLC outcomes
+		// now decide the invoice or AMP set result.
+		if invoice.State == ContractPendingSettle {
+			return nil, ErrInvoiceAlreadySettled
+		}
+		for _, htlc := range invoice.Htlcs {
+			if htlc.State == HtlcStatePendingSettle {
+				return nil, ErrInvoiceAlreadySettled
+			}
+		}
+
 		if !shouldCancel(invoice.State, cancelAccepted) {
 			return nil, nil
 		}
@@ -1841,15 +1856,15 @@ func (i *InvoiceRegistry) cancelInvoiceImpl(ctx context.Context,
 		return err
 	}
 
-	// Return without cancellation if the invoice state is ContractAccepted.
+	// Return without cancellation if the invoice has accepted HTLCs and
+	// cancelAccepted wasn't set.
 	if invoice.State == ContractAccepted {
-		log.Debugf("Invoice%v: remains accepted as cancel wasn't"+
+		log.Debugf("Invoice%v: remains accepted as cancel wasn't "+
 			"explicitly requested.", ref)
 		return nil
 	}
 
 	log.Debugf("Invoice%v: canceled", ref)
-	i.removeResolvedPendingSettleRefsLocked(invoice)
 
 	// In the callback, some htlcs may have been moved to the canceled
 	// state. We now go through all of these and notify links and resolvers

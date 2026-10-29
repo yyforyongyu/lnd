@@ -482,7 +482,7 @@ func updateInvoiceAmtPaid(invoice *Invoice, amt lnwire.MilliSatoshi,
 	return nil
 }
 
-// settleHodlInvoice marks a hodl invoice as settled.
+// settleHodlInvoice marks a hodl invoice as pending settle.
 //
 // NOTE: Currently it is not possible to have HODL AMP invoices.
 func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
@@ -494,13 +494,11 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 			"not a hodl invoice", invoice.AddIndex)
 	}
 
-	// TODO(positiveblue): because NewState can only be ContractSettled we
-	// can remove it from the API and set it here directly.
 	switch {
 	case update == nil:
 		fallthrough
 
-	case update.NewState != ContractSettled:
+	case update.NewState != ContractPendingSettle:
 		return fmt.Errorf("unable to settle hodl invoice: "+
 			"not valid InvoiceUpdateDesc.State: %v", update)
 
@@ -516,26 +514,27 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 		return err
 	}
 
-	if newState == nil || *newState != ContractSettled {
+	if newState == nil || *newState != ContractPendingSettle {
 		return fmt.Errorf("unable to settle hodl invoice: "+
-			"new computed state is not settled: %s", newState)
+			"new computed state is not pending settle: "+
+			"%s", newState)
 	}
 
 	err = updater.UpdateInvoiceState(
-		ContractSettled, update.Preimage,
+		ContractPendingSettle, update.Preimage,
 	)
 	if err != nil {
 		return err
 	}
 
-	invoice.State = ContractSettled
+	invoice.State = ContractPendingSettle
 	invoice.Terms.PaymentPreimage = update.Preimage
 
 	// TODO(positiveblue): this logic can be further simplified.
 	var amtPaid lnwire.MilliSatoshi
 	for key, htlc := range invoice.Htlcs {
 		settled, _, err := getUpdatedHtlcState(
-			htlc, ContractSettled, nil,
+			htlc, ContractPendingSettle, nil,
 		)
 		if err != nil {
 			return err
@@ -543,7 +542,7 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 
 		if settled {
 			err = resolveHtlc(
-				key, htlc, HtlcStateSettled, updateTime,
+				key, htlc, HtlcStatePendingSettle, updateTime,
 				updater,
 			)
 			if err != nil {

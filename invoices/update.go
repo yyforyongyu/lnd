@@ -127,7 +127,9 @@ func resolveReplayedHtlc(ctx *invoiceUpdateCtx, inv *Invoice) (bool,
 	case HtlcStateAccepted:
 		return true, ctx.acceptRes(resultReplayToAccepted), nil
 
-	case HtlcStateSettled:
+	// Replayed pending settlements release the same validated preimage
+	// while the link waits for the final commitment outcome.
+	case HtlcStateSettled, HtlcStatePendingSettle:
 		var preimage *lntypes.Preimage
 		switch {
 		// AMP invoices store a separate preimage on each HTLC.
@@ -365,7 +367,7 @@ func updateMpp(ctx *invoiceUpdateCtx, inv *Invoice) (*InvoiceUpdateDesc,
 	}
 
 	update.State = &InvoiceStateUpdateDesc{
-		NewState:      ContractSettled,
+		NewState:      ContractPendingSettle,
 		Preimage:      inv.Terms.PaymentPreimage,
 		HTLCPreimages: htlcPreimages,
 		SetID:         setID,
@@ -533,7 +535,7 @@ func updateLegacy(ctx *invoiceUpdateCtx,
 	case ContractAccepted:
 		return &update, ctx.acceptRes(resultDuplicateToAccepted), nil
 
-	case ContractSettled:
+	case ContractSettled, ContractPendingSettle:
 		// Legacy settlement uses the invoice-level payment preimage.
 		preimage := inv.Terms.PaymentPreimage
 		if preimage == nil {
@@ -564,7 +566,7 @@ func updateLegacy(ctx *invoiceUpdateCtx,
 	}
 
 	update.State = &InvoiceStateUpdateDesc{
-		NewState: ContractSettled,
+		NewState: ContractPendingSettle,
 		Preimage: preimage,
 	}
 

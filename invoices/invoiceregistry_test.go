@@ -620,6 +620,8 @@ func testSettleInvoice(t *testing.T,
 
 	t.Parallel()
 
+	// Arrange subscriptions and an invoice to observe preimage release
+	// separately from the final outcomes of its receiving circuits.
 	ctx := newTestContext(t, nil, makeDB)
 
 	ctxb := t.Context()
@@ -708,12 +710,12 @@ func testSettleInvoice(t *testing.T,
 	)
 	require.Equal(t, invpkg.ResultSettled, settleResolution.Outcome)
 
-	// We expect the settled state to be sent to the single invoice
+	// We expect the pending-settle state to be sent to the single invoice
 	// subscriber.
 	select {
 	case update := <-subscription.Updates:
-		if update.State != invpkg.ContractSettled {
-			t.Fatalf("expected state ContractOpen, but got %v",
+		if update.State != invpkg.ContractPendingSettle {
+			t.Fatalf("expected state PendingSettle, but got %v",
 				update.State)
 		}
 		if update.AmtPaid != amtPaid {
@@ -723,11 +725,63 @@ func testSettleInvoice(t *testing.T,
 		t.Fatal("no update received")
 	}
 
-	// We expect a settled notification to be sent out.
+	// Act by adding duplicates across partial finality. On the second pass,
+	// circuit zero is settled while another sibling remains pending.
+	duplicatePendingAmt := amtPaid + 600
+	for key := uint64(1); key <= 2; key++ {
+		resolution, err = ctx.registry.NotifyExitHopHtlc(
+			testInvoicePaymentHash, duplicatePendingAmt,
+			testHtlcExpiry,
+			testCurrentHeight, getCircuitKey(key), hodlChan,
+			nil, testPayload,
+		)
+		require.NoError(t, err)
+		settleResolution = checkSettleResolution(
+			t, resolution, testInvoicePreimage,
+		)
+		require.Equal(t, invpkg.ResultDuplicateToSettled,
+			settleResolution.Outcome)
+
+		// Assert duplicates preserve pending settlement and that
+		// settled siblings do not turn the next update into an error.
+		pending, err := ctx.registry.LookupInvoice(
+			ctxb, testInvoicePaymentHash,
+		)
+		require.NoError(t, err)
+		require.Equal(t, invpkg.ContractPendingSettle, pending.State)
+		require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+			ctxb, getCircuitKey(key-1), true,
+		))
+	}
+	require.ErrorIs(t, ctx.registry.CancelInvoice(
+		ctxb, testInvoicePaymentHash,
+	), invpkg.ErrInvoiceAlreadySettled)
+
+	// The final duplicate fails, but the successful siblings cover the
+	// invoice. Settlement must still wait for this last outcome.
+	err = ctx.registry.NotifyExitHopHtlcFinalized(
+		ctxb, getCircuitKey(2), false,
+	)
+	require.NoError(t, err)
+
+	// We expect the settled state to be sent to the single invoice
+	// subscriber.
+	select {
+	case update := <-subscription.Updates:
+		if update.State != invpkg.ContractSettled {
+			t.Fatalf("expected state ContractSettled, but got %v",
+				update.State)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("no update received")
+	}
+
+	// We expect a settled notification to be sent out for all invoice
+	// subscribers.
 	select {
 	case settledInvoice := <-allSubscriptions.SettledInvoices:
 		if settledInvoice.State != invpkg.ContractSettled {
-			t.Fatalf("expected state ContractOpen, but got %v",
+			t.Fatalf("expected state ContractSettled, but got %v",
 				settledInvoice.State)
 		}
 	case <-time.After(testTimeout):
@@ -751,9 +805,10 @@ func testSettleInvoice(t *testing.T,
 	// Try to settle again with a new higher-valued htlc. This payment
 	// should also be accepted, to prevent any change in behaviour for a
 	// paid invoice that may open up a probe vector.
+	duplicateSettledAmt := amtPaid + 700
 	resolution, err = ctx.registry.NotifyExitHopHtlc(
-		testInvoicePaymentHash, amtPaid+600, testHtlcExpiry,
-		testCurrentHeight, getCircuitKey(1), hodlChan,
+		testInvoicePaymentHash, duplicateSettledAmt, testHtlcExpiry,
+		testCurrentHeight, getCircuitKey(3), hodlChan,
 		nil, testPayload,
 	)
 	require.NoError(t, err, "unexpected NotifyExitHopHtlc error")
@@ -769,7 +824,7 @@ func testSettleInvoice(t *testing.T,
 	// would have failed if it were the first payment.
 	resolution, err = ctx.registry.NotifyExitHopHtlc(
 		testInvoicePaymentHash, amtPaid-600, testHtlcExpiry,
-		testCurrentHeight, getCircuitKey(2), hodlChan,
+		testCurrentHeight, getCircuitKey(4), hodlChan,
 		nil, testPayload,
 	)
 	require.NoError(t, err, "unexpected NotifyExitHopHtlc error")
@@ -777,14 +832,16 @@ func testSettleInvoice(t *testing.T,
 	checkFailResolution(t, resolution, invpkg.ResultAmountTooLow)
 
 	// Check that settled amount is equal to the sum of values of the htlcs
-	// 0 and 1.
+	// 0, 1 and 3; failed circuit 2 does not contribute.
 	inv, err := ctx.registry.LookupInvoice(ctxb, testInvoicePaymentHash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inv.AmtPaid != amtPaid+amtPaid+600 {
+	expectedAmtPaid := amtPaid + duplicatePendingAmt +
+		duplicateSettledAmt
+	if inv.AmtPaid != expectedAmtPaid {
 		t.Fatalf("amount incorrect: expected %v got %v",
-			amtPaid+amtPaid+600, inv.AmtPaid)
+			expectedAmtPaid, inv.AmtPaid)
 	}
 
 	// Try to cancel.
@@ -959,7 +1016,7 @@ func testSettleHoldInvoice(t *testing.T,
 
 	idb, clock := makeDB(t)
 
-	// Instantiate and start the invoice ctx.registry.
+	// Arrange a real registry and subscriptions for the held payment.
 	cfg := invpkg.RegistryConfig{
 		FinalCltvRejectDelta: testFinalCltvRejectDelta,
 		Clock:                clock,
@@ -1078,7 +1135,7 @@ func testSettleHoldInvoice(t *testing.T,
 		t.Fatal("invoice AmtPaid incorrect")
 	}
 
-	// Settling with preimage should succeed.
+	// Act by releasing the held preimage before channel finality.
 	err = registry.SettleHodlInvoice(ctxb, testInvoicePreimage)
 	require.NoError(t, err, "expected set preimage to succeed")
 
@@ -1089,6 +1146,26 @@ func testSettleHoldInvoice(t *testing.T,
 	)
 	require.Equal(t, testCurrentHeight, settleResolution.AcceptHeight)
 	require.Equal(t, invpkg.ResultSettled, settleResolution.Outcome)
+
+	// We expect a pending-settle notification for the single invoice
+	// subscriber. All invoice subscribers are only notified after finality.
+	update = <-subscription.Updates
+	if update.State != invpkg.ContractPendingSettle {
+		t.Fatalf("expected state ContractPendingSettle, but got %v",
+			update.State)
+	}
+
+	// Assert that preimage release cannot be undone by cancellation.
+	require.ErrorIs(t, registry.CancelInvoice(
+		ctxb, testInvoicePaymentHash,
+	), invpkg.ErrInvoiceAlreadySettled)
+
+	// Idempotency.
+	err = registry.SettleHodlInvoice(ctxb, testInvoicePreimage)
+	require.ErrorIs(t, err, invpkg.ErrInvoiceAlreadySettled)
+
+	err = registry.NotifyExitHopHtlcFinalized(ctxb, getCircuitKey(0), true)
+	require.NoError(t, err)
 
 	// We expect a settled notification to be sent out for both all and
 	// single invoice subscribers.
@@ -1107,10 +1184,6 @@ func testSettleHoldInvoice(t *testing.T,
 		t.Fatalf("expected state ContractSettled, but got %v",
 			update.State)
 	}
-
-	// Idempotency.
-	err = registry.SettleHodlInvoice(ctxb, testInvoicePreimage)
-	require.ErrorIs(t, err, invpkg.ErrInvoiceAlreadySettled)
 
 	// Try to cancel.
 	err = registry.CancelInvoice(ctxb, testInvoicePaymentHash)
@@ -1250,9 +1323,10 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	cfg := defaultRegistryConfig()
 	cfg.AcceptKeySend = keySendEnabled
 	ctx := newTestContext(t, &cfg, makeDB)
+	ctxb := t.Context()
 
 	allSubscriptions, err := ctx.registry.SubscribeNotifications(
-		t.Context(), 0, 0,
+		ctxb, 0, 0,
 	)
 	require.NoError(t, err)
 	defer allSubscriptions.Cancel()
@@ -1262,7 +1336,7 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	amt := lnwire.MilliSatoshi(1000)
 	expiry := uint32(testCurrentHeight + 20)
 
-	// Create key for keysend.
+	// Arrange a spontaneous preimage and its keysend payload.
 	preimage := lntypes.Preimage{1, 2, 3}
 	hash := preimage.Hash()
 
@@ -1289,7 +1363,7 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 		checkFailResolution(t, resolution, invpkg.ResultKeySendError)
 	}
 
-	// Try to settle invoice with a valid keysend htlc.
+	// Act by delivering the valid keysend HTLC to the registry.
 	keySendPayload := &mockPayload{
 		customRecords: map[uint64][]byte{
 			record.KeySendType: preimage[:],
@@ -1310,10 +1384,15 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 		return
 	}
 
-	checkSubscription := func() {
+	checkSubscription := func(circuitKey invpkg.CircuitKey) {
 		// We expect a new invoice notification to be sent out.
 		newInvoice := <-allSubscriptions.NewInvoices
 		require.Equal(t, newInvoice.State, invpkg.ContractOpen)
+
+		// Assert settlement follows the final HTLC outcome.
+		require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+			ctxb, circuitKey, true,
+		))
 
 		// We expect a settled notification to be sent out.
 		settledInvoice := <-allSubscriptions.SettledInvoices
@@ -1321,7 +1400,7 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	}
 
 	checkSettleResolution(t, resolution, preimage)
-	checkSubscription()
+	checkSubscription(getCircuitKey(10))
 
 	// Replay the same keysend payment. We expect an identical resolution,
 	// but no event should be generated.
@@ -1356,7 +1435,7 @@ func testKeySendImpl(t *testing.T, keySendEnabled bool,
 	require.Nil(t, err)
 
 	checkSettleResolution(t, resolution, preimage2)
-	checkSubscription()
+	checkSubscription(getCircuitKey(20))
 }
 
 // testHoldKeysend tests receiving a spontaneous payment that is held.
@@ -1397,7 +1476,7 @@ func testHoldKeysendImpl(t *testing.T, timeoutKeysend bool,
 	amt := lnwire.MilliSatoshi(1000)
 	expiry := uint32(testCurrentHeight + 20)
 
-	// Create key for keysend.
+	// Arrange a spontaneous preimage and the held-keysend policy.
 	preimage := lntypes.Preimage{1, 2, 3}
 	hash := preimage.Hash()
 
@@ -1455,12 +1534,24 @@ func testHoldKeysendImpl(t *testing.T, timeoutKeysend bool,
 		return
 	}
 
-	// Settle keysend payment manually.
+	// Act by releasing the held preimage before its final callback.
 	require.NoError(t, ctx.registry.SettleHodlInvoice(
 		ctxb, *newInvoice.Terms.PaymentPreimage,
 	))
 
-	// We expect a settled notification to be sent out.
+	htlcResolution, _ := (<-hodlChan).(invpkg.HtlcResolution)
+	require.NotNil(t, htlcResolution)
+	checkSettleResolution(t, htlcResolution, preimage)
+
+	inv, err := ctx.registry.LookupInvoice(ctxb, hash)
+	require.NoError(t, err)
+	require.Equal(t, invpkg.ContractPendingSettle, inv.State)
+
+	require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+		ctxb, getCircuitKey(10), true,
+	))
+
+	// Assert a final settlement event follows the callback.
 	settledInvoice := <-allSubscriptions.SettledInvoices
 	require.Equal(t, settledInvoice.State, invpkg.ContractSettled)
 }
@@ -1475,6 +1566,7 @@ func testMppPayment(t *testing.T,
 	defer timeout()()
 
 	ctx := newTestContext(t, nil, makeDB)
+	// Arrange a real backend and the existing multi-shard payment fixture.
 	ctxb := t.Context()
 
 	// Add the invoice.
@@ -1550,7 +1642,20 @@ func testMppPayment(t *testing.T,
 			settleResolution.Outcome)
 	}
 
-	// Check that settled amount is equal to the sum of values of the htlcs
+	// Act on one shard; the other still prevents SETTLED.
+	require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+		ctxb, getCircuitKey(12), true,
+	))
+	pending, err := ctx.registry.LookupInvoice(
+		ctxb, testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+	require.Equal(t, invpkg.ContractPendingSettle, pending.State)
+	require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+		ctxb, getCircuitKey(11), true,
+	))
+
+	// Assert that settled amount is equal to the sum of values of the htlcs
 	// 2 and 3.
 	inv, err := ctx.registry.LookupInvoice(ctxb, testInvoicePaymentHash)
 	require.NoError(t, err)
@@ -1571,6 +1676,7 @@ func testMppPaymentWithOverpayment(t *testing.T,
 
 	t.Parallel()
 
+	// Arrange a real backend and the existing multi-shard payment fixture.
 	ctxb := t.Context()
 	f := func(overpaymentRand uint64) bool {
 		ctx := newTestContext(t, nil, makeDB)
@@ -1625,7 +1731,20 @@ func testMppPaymentWithOverpayment(t *testing.T,
 				settleResolution.Outcome)
 		}
 
-		// Check that settled amount is equal to the sum of values of
+		// Act on one shard; the other still prevents SETTLED.
+		require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+			ctxb, getCircuitKey(12), true,
+		))
+		pending, err := ctx.registry.LookupInvoice(
+			ctxb, testInvoicePaymentHash,
+		)
+		require.NoError(t, err)
+		require.Equal(t, invpkg.ContractPendingSettle, pending.State)
+		require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+			ctxb, getCircuitKey(11), true,
+		))
+
+		// Assert that settled amount is equal to the sum of values of
 		// the htlcs 1 and 2.
 		inv, err := ctx.registry.LookupInvoice(
 			ctxb, testInvoicePaymentHash,
@@ -1855,6 +1974,8 @@ func testHeightExpiryWithRegistry(t *testing.T,
 	})
 }
 
+// testHeightExpiryWithRegistryImpl checks that active HTLC expiry respects
+// a preimage already released for settlement.
 func testHeightExpiryWithRegistryImpl(t *testing.T, numParts int, settle bool,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
@@ -1865,7 +1986,7 @@ func testHeightExpiryWithRegistryImpl(t *testing.T, numParts int, settle bool,
 
 	require.Greater(t, numParts, 0, "test requires at least one part")
 
-	// Add a hold invoice, we set a non-nil payment request so that this
+	// Arrange a hold invoice with a payment request so that this
 	// invoice is not considered a keysend by the expiry watcher.
 	testInvoice := newInvoice(t, false, false)
 	testInvoice.HodlInvoice = true
@@ -1941,14 +2062,14 @@ func testHeightExpiryWithRegistryImpl(t *testing.T, numParts int, settle bool,
 		}
 	}
 
-	// Now we mine our htlc's expiry height.
+	// Act by mining the HTLC expiry after any requested preimage release.
 	ctx.notifier.blockChan <- &chainntnfs.BlockEpoch{
 		Height: int32(testHtlcExpiry),
 	}
 
 	// If we did not settle the invoice before its expiry, we now expect
 	// a cancellation.
-	expectedState := invpkg.ContractSettled
+	expectedState := invpkg.ContractPendingSettle
 	if !settle {
 		expectedState = invpkg.ContractCanceled
 
@@ -1959,7 +2080,7 @@ func testHeightExpiryWithRegistryImpl(t *testing.T, numParts int, settle bool,
 		)
 	}
 
-	// Finally, lookup the invoice and assert that we have the state we
+	// Assert through public lookup that expiry preserves the state we
 	// expect.
 	inv, err := ctx.registry.LookupInvoice(ctxb, testInvoicePaymentHash)
 	require.NoError(t, err)
@@ -2197,8 +2318,8 @@ func testSettleInvoicePaymentAddrRequiredOptionalGrace(t *testing.T,
 		CreationDate: testInvoiceCreationDate,
 	}
 
-	// Add the invoice, which does not require the MPP payload to always be
-	// included due to its set of feature bits.
+	// Arrange an invoice whose feature bits permit omitting MPP,
+	// preserving compatibility with invoices already in the database.
 	addIdx, err := ctx.registry.AddInvoice(
 		ctxb, invoice, testInvoicePaymentHash,
 	)
@@ -2228,8 +2349,8 @@ func testSettleInvoicePaymentAddrRequiredOptionalGrace(t *testing.T,
 		t.Fatal("no update received")
 	}
 
-	// We'll now attempt to settle the invoice as normal, this should work
-	// no problem as we should allow these existing invoices to be settled.
+	// Act by requesting settlement without MPP; older invoices allow this
+	// while released preimages still wait for channel finality.
 	hodlChan := make(chan interface{}, 1)
 	resolution, err := ctx.registry.NotifyExitHopHtlc(
 		testInvoicePaymentHash, testInvoiceAmount, testHtlcExpiry,
@@ -2245,12 +2366,12 @@ func testSettleInvoicePaymentAddrRequiredOptionalGrace(t *testing.T,
 	}
 	require.Equal(t, settleResolution.Outcome, invpkg.ResultSettled)
 
-	// We expect the settled state to be sent to the single invoice
+	// Assert preimage release reports pending to the single invoice
 	// subscriber.
 	select {
 	case update := <-subscription.Updates:
-		if update.State != invpkg.ContractSettled {
-			t.Fatalf("expected state ContractOpen, but got %v",
+		if update.State != invpkg.ContractPendingSettle {
+			t.Fatalf("expected state PendingSettle, but got %v",
 				update.State)
 		}
 		if update.AmtPaid != invoice.Terms.Value {
@@ -2260,11 +2381,27 @@ func testSettleInvoicePaymentAddrRequiredOptionalGrace(t *testing.T,
 		t.Fatal("no update received")
 	}
 
+	require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+		ctxb, getCircuitKey(10), true,
+	))
+
+	// We expect the settled state to be sent to the single invoice
+	// subscriber.
+	select {
+	case update := <-subscription.Updates:
+		if update.State != invpkg.ContractSettled {
+			t.Fatalf("expected state ContractSettled, but got %v",
+				update.State)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("no update received")
+	}
+
 	// We expect a settled notification to be sent out.
 	select {
 	case settledInvoice := <-allSubscriptions.SettledInvoices:
 		if settledInvoice.State != invpkg.ContractSettled {
-			t.Fatalf("expected state ContractOpen, but got %v",
+			t.Fatalf("expected state ContractSettled, but got %v",
 				settledInvoice.State)
 		}
 	case <-time.After(testTimeout):
@@ -2402,7 +2539,7 @@ func testSpontaneousAmpPayment(t *testing.T,
 	}
 }
 
-// testSpontaneousAmpPayment runs a specific spontaneous AMP test case.
+// testSpontaneousAmpPaymentImpl runs a specific spontaneous AMP test case.
 func testSpontaneousAmpPaymentImpl(
 	t *testing.T, ampEnabled, failReconstruction bool, numShards int,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
@@ -2410,6 +2547,7 @@ func testSpontaneousAmpPaymentImpl(
 	t.Parallel()
 	defer timeout()()
 
+	// Arrange AMP shares on a real backend to observe shard finality.
 	cfg := defaultRegistryConfig()
 	cfg.AcceptAMP = ampEnabled
 	ctx := newTestContext(t, &cfg, makeDB)
@@ -2503,6 +2641,7 @@ func testSpontaneousAmpPaymentImpl(
 			amp: record.NewAMP(share, setID, uint32(i)),
 		}
 
+		// Act by submitting the next share through the public registry.
 		resolution, err := ctx.registry.NotifyExitHopHtlc(
 			child.Hash, shardAmt, expiry, testCurrentHeight,
 			getCircuitKey(uint64(i)), hodlChan, nil,
@@ -2544,28 +2683,28 @@ func testSpontaneousAmpPaymentImpl(
 			}
 		}
 
-		// Assert the behavior of the Open and Settle notifications.
-		// There should always be an open (keysend is enabled) followed
-		// by settle for valid AMP payments.
-		//
-		// NOTE: The cases are split in separate if conditions, rather
-		// than else-if, to properly handle the case when there is only
-		// one shard.
+		// Assert one invoice creation across all shares.
 		if i == 0 {
 			checkOpenSubscription()
-		}
-		if isFinalShard {
-			if failReconstruction {
-				checkNoSettleSubscription()
-			} else {
-				checkSettleSubscription()
-			}
 		}
 	}
 
 	// No need to check the hodl chans when keysend is not enabled.
 	if !ampEnabled {
 		return
+	}
+
+	// Assert that reconstruction failure cannot settle the set. Successful
+	// preimage release still waits for every circuit's final outcome.
+	if failReconstruction {
+		checkNoSettleSubscription()
+	} else {
+		for j := range numShards {
+			require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+				ctxb, getCircuitKey(uint64(j)), true,
+			))
+		}
+		checkSettleSubscription()
 	}
 
 	// For the non-final hodl chans, assert that they receive the expected
@@ -3043,6 +3182,7 @@ func testAmpReconstructionFailCancelsSetOnly(t *testing.T,
 	t.Parallel()
 	defer timeout()()
 
+	// Arrange independent payer sets on the same reusable AMP invoice.
 	ctx := newTestContext(t, nil, makeDB)
 	ctxb := t.Context()
 
@@ -3144,6 +3284,14 @@ func testAmpReconstructionFailCancelsSetOnly(t *testing.T,
 	require.NotNil(t, resolution)
 	checkSettleResolution(t, resolution, childA0.Preimage)
 
+	// Act on both released shares before expecting a settled set.
+	for _, key := range []uint64{1, 3} {
+		require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+			ctxb, getCircuitKey(key), true,
+		))
+	}
+
+	// Assert another payer's reconstruction failure preserves this set.
 	inv, err = ctx.registry.LookupInvoice(ctxb, testInvoicePaymentHash)
 	require.NoError(t, err)
 	require.Equal(t, invpkg.ContractOpen, inv.State,

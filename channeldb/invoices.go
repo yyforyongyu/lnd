@@ -981,14 +981,10 @@ func (k *kvInvoiceUpdater) storeAddHtlcsUpdate() error {
 	return nil
 }
 
-// storeSettleHodlInvoiceUpdate updates the invoice in the database after
-// settling a hodl invoice.
+// storeSettleHodlInvoiceUpdate updates the invoice in the database after a
+// hodl invoice settlement is requested. Settle metadata is only written once
+// the HTLC outcome is final.
 func (k *kvInvoiceUpdater) storeSettleHodlInvoiceUpdate() error {
-	err := k.setSettleMetaFields(nil)
-	if err != nil {
-		return err
-	}
-
 	return k.serializeAndStoreInvoice()
 }
 
