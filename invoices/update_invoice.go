@@ -333,8 +333,8 @@ func addHTLCs(invoice *Invoice, hash *lntypes.Hash, updateTime time.Time,
 		// while the contract state (on disk) is still in the accept
 		// state.
 		htlcContextState := invoice.State
-		if settleEligibleAMP {
-			htlcContextState = ContractSettled
+		if settleEligibleAMP && update.State != nil {
+			htlcContextState = update.State.NewState
 		}
 		htlcStateChanged, htlcState, err := getUpdatedHtlcState(
 			htlc, htlcContextState, setID,
@@ -366,8 +366,9 @@ func addHTLCs(invoice *Invoice, hash *lntypes.Hash, updateTime time.Time,
 		}
 
 		accepted := htlc.State == HtlcStateAccepted
+		pendingSettle := htlc.State == HtlcStatePendingSettle
 		settled := htlc.State == HtlcStateSettled
-		invoiceStateReady := accepted || settled
+		invoiceStateReady := accepted || pendingSettle || settled
 
 		if !invoiceIsAMP {
 			// Update the running amount paid to this invoice. We
@@ -603,6 +604,29 @@ func getUpdatedInvoiceState(invoice *Invoice, hash *lntypes.Hash,
 	}
 
 	switch invoice.State {
+	// Once settlement is pending, only the final HTLC outcome may move the
+	// invoice to settled or canceled.
+	case ContractPendingSettle:
+		if update.NewState == ContractPendingSettle {
+			return nil, ErrInvoiceCannotAccept
+		}
+
+		if update.NewState == ContractCanceled {
+			return &update.NewState, nil
+		}
+
+		if update.NewState == ContractSettled {
+			if update.SetID == nil &&
+				invoice.Terms.PaymentPreimage == nil {
+
+				return nil, errors.New("unknown preimage")
+			}
+
+			return &update.NewState, nil
+		}
+
+		return nil, errors.New("unknown state transition")
+
 	// Once a contract is accepted, we can only transition to settled or
 	// canceled. Forbid transitioning back into this state. Otherwise this
 	// state is identical to ContractOpen, so we fallthrough to apply the
@@ -614,9 +638,10 @@ func getUpdatedInvoiceState(invoice *Invoice, hash *lntypes.Hash,
 
 		fallthrough
 
-	// If a contract is open, permit a state transition to accepted, settled
-	// or canceled. The only restriction is on transitioning to settled
-	// where we ensure the preimage is valid.
+		// If a contract is open, permit a state transition to accepted,
+		// pending-settle, settled or canceled. The only restriction is
+		// on transitioning to a settle state where we ensure the
+		// preimage is valid.
 	case ContractOpen:
 		if update.NewState == ContractCanceled {
 			return &update.NewState, nil
@@ -660,7 +685,8 @@ func getUpdatedInvoiceState(invoice *Invoice, hash *lntypes.Hash,
 
 		// Fail if we still don't have a preimage when transitioning to
 		// settle the non-AMP invoice.
-		case update.NewState == ContractSettled &&
+		case (update.NewState == ContractSettled ||
+			update.NewState == ContractPendingSettle) &&
 			invoice.Terms.PaymentPreimage == nil:
 
 			return nil, errors.New("unknown preimage")
@@ -719,6 +745,11 @@ func getUpdatedInvoiceAmpState(invoice *Invoice, setID SetID,
 		ampState.State = HtlcStateCanceled
 		ampState.AmtPaid -= amt
 
+	// Pending-settle means the AMP set has released child preimages, but
+	// the final HTLC outcome is not known yet. Do not alter AmtPaid here.
+	case HtlcStatePendingSettle:
+		ampState.State = HtlcStatePendingSettle
+
 	case HtlcStateSettled:
 		ampState.State = HtlcStateSettled
 	}
@@ -754,8 +785,10 @@ func getUpdatedHtlcState(htlc *InvoiceHTLC,
 	invoiceState ContractState, setID *[32]byte) (
 	bool, HtlcState, error) {
 
-	trySettle := func(persist bool) (bool, HtlcState, error) {
-		if htlc.State != HtlcStateAccepted {
+	trySettle := func(newState HtlcState) (bool, HtlcState, error) {
+		if htlc.State != HtlcStateAccepted &&
+			htlc.State != HtlcStatePendingSettle {
+
 			return false, htlc.State, nil
 		}
 
@@ -794,28 +827,25 @@ func getUpdatedHtlcState(htlc *InvoiceHTLC,
 			settled = true
 		}
 
-		// Only persist the changes if the invoice is moving to the
-		// settled state, and we're actually updating the state to
-		// settled.
-		newState := htlc.State
-		if settled {
-			newState = HtlcStateSettled
+		if !settled || htlc.State == newState {
+			return false, htlc.State, nil
 		}
 
-		return persist && settled, newState, nil
+		return true, newState, nil
 	}
 
 	if invoiceState == ContractSettled {
 		// Check that we can settle the HTLCs. For legacy and MPP HTLCs
 		// this will be a NOP, but for AMP HTLCs this asserts that we
-		// have a valid hash/preimage pair. Passing true permits the
-		// method to update the HTLC to HtlcStateSettled.
-		return trySettle(true)
+		// have a valid hash/preimage pair.
+		return trySettle(HtlcStateSettled)
 	}
 
-	// We should never find a settled HTLC on an invoice that isn't in
-	// ContractSettled.
-	if htlc.State == HtlcStateSettled {
+	// A settled sibling can coexist with pending siblings while a duplicate
+	// is added. Preserve it; other non-final invoice states remain invalid.
+	if htlc.State == HtlcStateSettled &&
+		invoiceState != ContractPendingSettle {
+
 		return false, htlc.State, ErrHTLCAlreadySettled
 	}
 
@@ -824,14 +854,18 @@ func getUpdatedHtlcState(htlc *InvoiceHTLC,
 		htlcAlreadyCanceled := htlc.State == HtlcStateCanceled
 		return !htlcAlreadyCanceled, HtlcStateCanceled, nil
 
-	// TODO(roasbeef): never fully passed thru now?
+	// Pending-settle validates settle eligibility but keeps HTLCs in a
+	// non-final state until the link or resolver reports the outcome.
+	case ContractPendingSettle:
+		return trySettle(HtlcStatePendingSettle)
+
 	case ContractAccepted:
-		// Check that we can settle the HTLCs. For legacy and MPP HTLCs
-		// this will be a NOP, but for AMP HTLCs this asserts that we
-		// have a valid hash/preimage pair. Passing false prevents the
-		// method from putting the HTLC in HtlcStateSettled, leaving it
-		// in HtlcStateAccepted.
-		return trySettle(false)
+		// Check that we can settle the HTLCs. For legacy and MPP
+		// HTLCs this will be a NOP, but for AMP HTLCs this asserts
+		// that we have a valid hash/preimage pair. The method is
+		// called with the current state, leaving the HTLC in
+		// HtlcStateAccepted.
+		return trySettle(HtlcStateAccepted)
 
 	case ContractOpen:
 		return false, htlc.State, nil

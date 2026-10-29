@@ -878,6 +878,12 @@ func (k *kvInvoiceUpdater) Finalize(updateType invpkg.UpdateType) error {
 		// invoice. All HTLCs which were accepted are now canceled, so
 		// we persist this state.
 		return k.storeCancelHtlcsUpdate()
+
+	case invpkg.FinalizeHTLCsUpdate:
+		// Finalization converts pending-settle HTLCs into their
+		// terminal state, so persist the invoice and any updated
+		// AMP sub-invoices.
+		return k.storeAddHtlcsUpdate()
 	}
 
 	return fmt.Errorf("unknown update type: %v", updateType)

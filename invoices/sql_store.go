@@ -67,9 +67,10 @@ type SQLInvoiceQueries interface { //nolint:interfacebloat
 	InsertInvoiceHTLCCustomRecord(ctx context.Context,
 		arg sqlc.InsertInvoiceHTLCCustomRecordParams) error
 
-	// FetchPendingInvoices returns all open/accepted invoices ordered by
-	// id ascending. It replaces the old catch-all FilterInvoices for the
-	// pending-only path and lets the planner use invoices_state_idx.
+	// FetchPendingInvoices returns all open/accepted/pending-settle
+	// invoices ordered by id ascending. It replaces the old catch-all
+	// FilterInvoices for the pending-only path and lets the planner use
+	// invoices_state_idx.
 	FetchPendingInvoices(ctx context.Context,
 		arg sqlc.FetchPendingInvoicesParams) ([]sqlc.Invoice, error)
 
