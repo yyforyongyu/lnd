@@ -3,6 +3,7 @@ package keychain
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -24,8 +25,8 @@ const (
 )
 
 // BtcWalletKeyRing derives deterministic purpose-1017 keys through the managed
-// wallet. Wallet startup creates the family accounts; derivation here neither
-// creates accounts nor owns a second database transaction or scope cache.
+// wallet. Wallet startup creates the usual family accounts; explicit requests
+// provision missing families through Wallet without owning database state.
 type BtcWalletKeyRing struct {
 	wallet *wallet.Wallet
 
@@ -64,6 +65,18 @@ func (b *BtcWalletKeyRing) DeriveNextKey(keyFam KeyFamily) (KeyDescriptor, error
 			b.chainKeyScope, wallet.AccountNumber(keyFam),
 		), false,
 	)
+	// A requested family need not be in startup's initial range. Provision
+	// that exact account and let Wallet own the allocation and its cursor.
+	if errors.Is(err, wallet.ErrAccountNotFound) {
+		if err := b.createFamilyAccount(keyFam); err != nil {
+			return KeyDescriptor{}, err
+		}
+		key, err = b.wallet.AllocateNextKey(
+			context.Background(), wallet.NewAccountSelectorByNumber(
+				b.chainKeyScope, wallet.AccountNumber(keyFam),
+			), false,
+		)
+	}
 	if err != nil {
 		return KeyDescriptor{}, err
 	}
@@ -89,11 +102,53 @@ func (b *BtcWalletKeyRing) DeriveKey(keyLoc KeyLocator) (KeyDescriptor, error) {
 			Index:  keyLoc.Index,
 		},
 	)
+	// Reading a missing family requires explicit caller provisioning, not
+	// a fallback to another account inside Wallet's derivation API.
+	if errors.Is(err, wallet.ErrAccountNotInStore) {
+		if err := b.createFamilyAccount(keyLoc.Family); err != nil {
+			return KeyDescriptor{}, err
+		}
+		pubKey, err = b.wallet.DerivePubKey(
+			context.Background(), wallet.DerivePubKeyParams{
+				Account: wallet.NewAccountSelectorByNumber(
+					b.chainKeyScope,
+					wallet.AccountNumber(keyLoc.Family),
+				),
+				Branch: 0,
+				Index:  keyLoc.Index,
+			},
+		)
+	}
 	if err != nil {
 		return KeyDescriptor{}, err
 	}
 
 	return KeyDescriptor{PubKey: pubKey, KeyLocator: keyLoc}, nil
+}
+
+// createFamilyAccount provisions one exact off-chain family. Wallet serializes
+// creation, so a concurrent caller that already created it permits the retry.
+func (b *BtcWalletKeyRing) createFamilyAccount(family KeyFamily) error {
+	number := wallet.AccountNumber(family)
+	name := fmt.Sprintf("act:%d", family)
+	if family == 0 {
+		name = waddrmgr.DefaultAccountName
+	}
+	schema := waddrmgr.ScopeAddrSchema{
+		ExternalAddrType: waddrmgr.WitnessPubKey,
+		InternalAddrType: waddrmgr.WitnessPubKey,
+	}
+	_, err := b.wallet.NewAccount(context.Background(), wallet.NewAccountParams{
+		Scope:         b.chainKeyScope,
+		Name:          name,
+		AccountNumber: &number,
+		AddrSchema:    &schema,
+		NoChainSync:   true,
+	})
+	if errors.Is(err, wallet.ErrAccountAlreadyExists) {
+		return nil
+	}
+	return err
 }
 
 // DerivePrivKey resolves a known locator or scans its family's public keys when
