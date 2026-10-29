@@ -1684,6 +1684,81 @@ func TestFundPsbtRejectsAmbiguousAccount(t *testing.T) {
 	require.Nil(t, resp)
 }
 
+// TestListAccountsBIP44 checks that a fresh kvdb wallet's BIP44 account remains
+// visible even though the RPC enum has no P2PKH address type.
+func TestListAccountsBIP44(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		scope   waddrmgr.KeyScope
+		wantErr bool
+	}{
+		{
+			name:  "BIP44 metadata is visible",
+			scope: waddrmgr.KeyScopeBIP0044,
+		},
+		{
+			name: "unsupported scope remains an error",
+			scope: waddrmgr.KeyScope{
+				Purpose: 777,
+				Coin:    0,
+			},
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange: Return a native account alongside a normal
+			// payment account. Fixture cleanup owns mock verification.
+			w := &mock.WalletController{}
+			t.Cleanup(func() { w.AssertExpectations(t) })
+			zero := wallet.AccountNumber(0)
+			w.On("ListAccounts", t.Context()).Return(
+				[]wallet.AccountInfo{
+					{
+						AccountName:      "default",
+						KeyScope:         tc.scope,
+						AccountNumber:    &zero,
+						PublicKey:        []byte("stored account xpub"),
+						ExternalKeyCount: 3,
+					},
+					{
+						AccountName: "default",
+						KeyScope:    waddrmgr.KeyScopeBIP0084,
+					},
+				}, nil,
+			).Once()
+			server := &WalletKit{cfg: &Config{
+				Wallet:      w,
+				ChainParams: &chaincfg.MainNetParams,
+			}}
+
+			// Act: List all accounts through the public RPC without
+			// filtering out metadata that Wallet actually returned.
+			resp, err := server.ListAccounts(
+				t.Context(), &ListAccountsRequest{},
+			)
+
+			// Assert: BIP44 metadata and the normal account survive;
+			// genuinely unsupported scope errors still reach the caller.
+			if tc.wantErr {
+				require.ErrorContains(t, err, "unsupported key scope")
+				require.Nil(t, resp)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, resp.Accounts, 2)
+			require.Equal(t, AddressType_UNKNOWN, resp.Accounts[0].AddressType)
+			require.Equal(t, "m/44'/0'/0'", resp.Accounts[0].DerivationPath)
+			require.Equal(t, "stored account xpub", resp.Accounts[0].ExtendedPublicKey)
+			require.EqualValues(t, 3, resp.Accounts[0].ExternalKeyCount)
+			require.Equal(t, AddressType_WITNESS_PUBKEY_HASH,
+				resp.Accounts[1].AddressType)
+		})
+	}
+}
+
 // TestListAddressesNativeKeys preserves the custom-key listing using maintained
 // public derivation, while payment accounts retain native address enumeration.
 func TestListAddressesNativeKeys(t *testing.T) {

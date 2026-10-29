@@ -2940,6 +2940,12 @@ func marshalWalletAccount(internalScope waddrmgr.KeyScope,
 
 	var addrType AddressType
 	switch account.KeyScope {
+	case waddrmgr.KeyScopeBIP0044:
+		// Fresh kvdb storage also exposes its BIP44 account. The RPC
+		// enum has no P2PKH value; retain its path and xpub with UNKNOWN
+		// instead of failing the complete account listing.
+		addrType = AddressType_UNKNOWN
+
 	case waddrmgr.KeyScopeBIP0049Plus:
 		// No address schema present represents the traditional BIP-0049
 		// address derivation scheme.
