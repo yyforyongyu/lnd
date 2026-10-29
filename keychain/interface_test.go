@@ -270,6 +270,55 @@ func TestKeyRingDerivation(t *testing.T) {
 	}
 }
 
+// TestKeyRingSparseFamily checks that explicitly requested families beyond
+// startup's range are provisioned without changing their key locators.
+func TestKeyRingSparseFamily(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		family   KeyFamily
+		allocate bool
+	}{
+		{
+			name:   "derive exact key",
+			family: 9999,
+		},
+		{
+			name:     "allocate next key",
+			family:   10000,
+			allocate: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange: Reuse the real managed Wallet fixture, whose
+			// existing 0..255 families do not include the requested one.
+			w, err := createTestBtcWallet(t, CoinTypeTestnet)
+			require.NoError(t, err)
+			ring := NewBtcWalletKeyRing(w, CoinTypeTestnet)
+			locator := KeyLocator{Family: tc.family}
+
+			// Act: Request the missing family through each public key
+			// entry point, then resolve the returned locator directly.
+			var key KeyDescriptor
+			if tc.allocate {
+				key, err = ring.DeriveNextKey(tc.family)
+			} else {
+				key, err = ring.DeriveKey(locator)
+			}
+			require.NoError(t, err)
+			again, err := ring.DeriveKey(locator)
+
+			// Assert: Provisioning uses the requested family and index,
+			// and the real stored account resolves the identical key.
+			require.NoError(t, err)
+			require.Equal(t, locator, key.KeyLocator)
+			require.True(t, key.PubKey.IsEqual(again.PubKey))
+		})
+	}
+}
+
 // secretKeyRingConstructor is a function signature that's used as a generic
 // constructor for various implementations of the SecretKeyRing interface. A
 // string naming the returned interface, and the SecretKeyRing interface itself
