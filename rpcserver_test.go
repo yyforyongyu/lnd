@@ -241,12 +241,13 @@ func TestSubscribeTransactionsNative(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestNewAddressNative checks native receiving dispatch for both wire forms.
+// TestNewAddressNative checks fresh and reusable native address dispatch.
 func TestNewAddressNative(t *testing.T) {
 	t.Parallel()
 	testCases := []struct {
 		addrType lnrpc.AddressType
 		scope    waddrmgr.KeyScope
+		unused   bool
 	}{
 		{
 			addrType: lnrpc.AddressType_WITNESS_PUBKEY_HASH,
@@ -255,6 +256,7 @@ func TestNewAddressNative(t *testing.T) {
 		{
 			addrType: lnrpc.AddressType_UNUSED_WITNESS_PUBKEY_HASH,
 			scope:    waddrmgr.KeyScopeBIP0084,
+			unused:   true,
 		},
 		{
 			addrType: lnrpc.AddressType_NESTED_PUBKEY_HASH,
@@ -263,6 +265,7 @@ func TestNewAddressNative(t *testing.T) {
 		{
 			addrType: lnrpc.AddressType_UNUSED_NESTED_PUBKEY_HASH,
 			scope:    waddrmgr.KeyScopeBIP0049Plus,
+			unused:   true,
 		},
 		{
 			addrType: lnrpc.AddressType_TAPROOT_PUBKEY,
@@ -271,25 +274,37 @@ func TestNewAddressNative(t *testing.T) {
 		{
 			addrType: lnrpc.AddressType_UNUSED_TAPROOT_PUBKEY,
 			scope:    waddrmgr.KeyScopeBIP0086,
+			unused:   true,
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.addrType.String(), func(t *testing.T) {
-			// Arrange the exact scoped selector; Wallet owns unused
-			// child reuse.
+			// Arrange the native call for this wire mode.
+			// Fixture cleanup checks the single expected call.
 			w := &mock.WalletController{}
 			t.Cleanup(func() { w.AssertExpectations(t) })
 			addr, err := address.NewAddressWitnessPubKeyHash(
 				make([]byte, 20), &chaincfg.MainNetParams,
 			)
 			require.NoError(t, err)
-			w.On("NewAddress", t.Context(),
-				wallet.NewAccountSelectorByName(
-					tc.scope, "custom",
-				),
-				false).
-				Return(wallet.AddressInfo{Addr: addr}, nil).
-				Once()
+			selector := wallet.NewAccountSelectorByName(
+				tc.scope, "custom",
+			)
+			if tc.unused {
+				w.On("NewAddress",
+					t.Context(), selector, false,
+				).Return(wallet.AddressInfo{
+					Addr: addr,
+				}, nil).Once()
+			} else {
+				w.On("NewBulkAddresses", t.Context(), selector,
+					false, uint32(1),
+				).Return([]wallet.AddressInfo{
+					{
+						Addr: addr,
+					},
+				}, nil).Once()
+			}
 			lw := &lnwallet.LightningWallet{
 				Cfg: lnwallet.Config{
 					Wallet: w,
@@ -313,8 +328,8 @@ func TestNewAddressNative(t *testing.T) {
 				},
 			)
 
-			// Assert the native address passes through without a
-			// second allocator.
+			// Assert the chosen address reaches the caller with the
+			// requested fresh or reusable allocation mode.
 			require.NoError(t, err)
 			require.Equal(t, addr.String(), resp.Address)
 		})

@@ -1724,6 +1724,8 @@ func (r *rpcServer) SendMany(ctx context.Context,
 }
 
 // NewAddress creates a new address under control of the local wallet.
+// Ordinary types allocate a fresh child; UNUSED types let the Wallet choose a
+// receiving address according to its reuse policy.
 func (r *rpcServer) NewAddress(ctx context.Context,
 	in *lnrpc.NewAddressRequest) (*lnrpc.NewAddressResponse, error) {
 
@@ -1733,9 +1735,7 @@ func (r *rpcServer) NewAddress(ctx context.Context,
 		account = in.Account
 	}
 
-	// Both ordinary and UNUSED requests follow Task 396 receiving-address
-	// semantics; Wallet chooses whether an existing unused child is
-	// reusable.
+	// Preserve the requested payment scope for both allocation modes.
 	var scope waddrmgr.KeyScope
 	switch in.Type {
 	case lnrpc.AddressType_WITNESS_PUBKEY_HASH,
@@ -1750,8 +1750,26 @@ func (r *rpcServer) NewAddress(ctx context.Context,
 	default:
 		return nil, fmt.Errorf("unknown address type: %v", in.Type)
 	}
-	info, err := r.server.cc.Wallet.Cfg.Wallet.NewAddress(ctx,
-		base.NewAccountSelectorByName(scope, account), false)
+	selector := base.NewAccountSelectorByName(scope, account)
+	w := r.server.cc.Wallet.Cfg.Wallet
+	var info base.AddressInfo
+	var err error
+
+	// Skipping fresh children must create gaps for later seed recovery.
+	// The maintained bulk allocator promises exactly one child on success;
+	// UNUSED requests instead retain native receiving-address reuse.
+	if in.Type == lnrpc.AddressType_UNUSED_WITNESS_PUBKEY_HASH ||
+		in.Type == lnrpc.AddressType_UNUSED_NESTED_PUBKEY_HASH ||
+		in.Type == lnrpc.AddressType_UNUSED_TAPROOT_PUBKEY {
+
+		info, err = w.NewAddress(ctx, selector, false)
+	} else {
+		var allocated []base.AddressInfo
+		allocated, err = w.NewBulkAddresses(ctx, selector, false, 1)
+		if err == nil {
+			info = allocated[0]
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

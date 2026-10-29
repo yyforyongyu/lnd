@@ -2038,7 +2038,7 @@
           },
           {
             "name": "account",
-            "description": "The account name within the key scope selected by type. If empty, the\ndefault wallet account is used. The wallet selects a receiving address\naccording to its backend policy; the returned address may be reused.",
+            "description": "The account name within the key scope selected by type. If empty, the\ndefault wallet account is used. Ordinary address types allocate a fresh\naddress; UNUSED types may reuse an unused address under the wallet's policy.",
             "in": "query",
             "required": false,
             "type": "string"
@@ -3464,7 +3464,7 @@
         "UNUSED_TAPROOT_PUBKEY"
       ],
       "default": "WITNESS_PUBKEY_HASH",
-      "description": "- `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)\n- `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)\n- `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)\n\nUNUSED variants follow the same receiving-address policy as their corresponding\naddress type. SQL wallets reuse the oldest unused address in the selected\naccount and branch; kvdb wallets allocate the next address on each call.",
+      "description": "- `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)\n- `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)\n- `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)\n\nOrdinary variants allocate a fresh address. UNUSED variants use the wallet's\nreceiving-address policy: SQL reuses the oldest unused child in the selected\naccount, while kvdb allocates the next child on each call.",
       "title": "`AddressType` has to be one of:"
     },
     "lnrpcAliasMap": {

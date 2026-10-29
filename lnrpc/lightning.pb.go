@@ -150,9 +150,9 @@ func (CoinSelectionStrategy) EnumDescriptor() ([]byte, []int) {
 // - `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)
 // - `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)
 //
-// UNUSED variants follow the same receiving-address policy as their corresponding
-// address type. SQL wallets reuse the oldest unused address in the selected
-// account and branch; kvdb wallets allocate the next address on each call.
+// Ordinary variants allocate a fresh address. UNUSED variants use the wallet's
+// receiving-address policy: SQL reuses the oldest unused child in the selected
+// account, while kvdb allocates the next child on each call.
 type AddressType int32
 
 const (
@@ -3915,8 +3915,8 @@ type NewAddressRequest struct {
 	Type AddressType `protobuf:"varint,1,opt,name=type,proto3,enum=lnrpc.AddressType" json:"type,omitempty"`
 	//
 	//The account name within the key scope selected by type. If empty, the
-	//default wallet account is used. The wallet selects a receiving address
-	//according to its backend policy; the returned address may be reused.
+	//default wallet account is used. Ordinary address types allocate a fresh
+	//address; UNUSED types may reuse an unused address under the wallet's policy.
 	Account       string `protobuf:"bytes,2,opt,name=account,proto3" json:"account,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -35,6 +35,17 @@ type WalletController struct {
 var _ lnwallet.WalletAPI = (*WalletController)(nil)
 var _ lnwallet.WalletServices = (*WalletController)(nil)
 
+// NewBulkAddresses records deliberate fresh allocation for address RPCs using
+// the same mock expectation boundary as native receiving-address selection.
+func (w *WalletController) NewBulkAddresses(ctx context.Context,
+	selector base.AccountSelector, internal bool, count uint32) (
+	[]base.AddressInfo, error) {
+
+	args := w.Called(ctx, selector, internal, count)
+	addresses, _ := args.Get(0).([]base.AddressInfo)
+	return addresses, args.Error(1)
+}
+
 // IsWatchOnly returns the native mode used to distinguish remote signing.
 func (w *WalletController) IsWatchOnly() bool {
 	return w.Called().Bool(0)
