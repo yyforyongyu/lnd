@@ -68,7 +68,7 @@ const fetchPendingInvoices = `-- name: FetchPendingInvoices :many
 SELECT
     invoices.id, invoices.hash, invoices.preimage, invoices.settle_index, invoices.settled_at, invoices.memo, invoices.amount_msat, invoices.cltv_delta, invoices.expiry, invoices.payment_addr, invoices.payment_request, invoices.payment_request_hash, invoices.state, invoices.amount_paid_msat, invoices.is_amp, invoices.is_hodl, invoices.is_keysend, invoices.created_at
 FROM invoices
-WHERE state IN (0, 3) -- 0 = ContractOpen, 3 = ContractAccepted
+WHERE state IN (0, 3, 4) -- 0 = ContractOpen, 3 = ContractAccepted, 4 = ContractPendingSettle
   AND id > $1
 ORDER BY id ASC
 LIMIT $2
@@ -79,11 +79,12 @@ type FetchPendingInvoicesParams struct {
 	NumLimit int32
 }
 
-// FetchPendingInvoices returns all invoices in a pending state (open or
-// accepted). The invoices_state_idx index on the state column makes this a
-// fast index scan rather than a full table scan. id_cursor is an exclusive
-// lower bound on the primary key used for cursor-based pagination; the caller
-// must supply 0 when starting from the beginning.
+// FetchPendingInvoices returns all invoices in a pending state (open,
+// accepted or pending settle). The invoices_state_idx index on the state
+// column makes this a fast index scan rather than a full table scan.
+// id_cursor is an exclusive lower bound on the primary key used for
+// cursor-based pagination; the caller must supply 0 when starting from the
+// beginning.
 func (q *Queries) FetchPendingInvoices(ctx context.Context, arg FetchPendingInvoicesParams) ([]Invoice, error) {
 	rows, err := q.db.QueryContext(ctx, fetchPendingInvoices, arg.IDCursor, arg.NumLimit)
 	if err != nil {
@@ -256,7 +257,7 @@ SELECT
     invoices.id, invoices.hash, invoices.preimage, invoices.settle_index, invoices.settled_at, invoices.memo, invoices.amount_msat, invoices.cltv_delta, invoices.expiry, invoices.payment_addr, invoices.payment_request, invoices.payment_request_hash, invoices.state, invoices.amount_paid_msat, invoices.is_amp, invoices.is_hodl, invoices.is_keysend, invoices.created_at
 FROM invoices
 WHERE id >= $1
-  AND (NOT $2 OR state IN (0, 3)) -- 0 = ContractOpen, 3 = ContractAccepted
+  AND (NOT $2 OR state IN (0, 3, 4)) -- 0 = ContractOpen, 3 = ContractAccepted, 4 = ContractPendingSettle
   AND created_at >= $3
   AND created_at < $4
 ORDER BY id ASC
@@ -334,7 +335,7 @@ SELECT
     invoices.id, invoices.hash, invoices.preimage, invoices.settle_index, invoices.settled_at, invoices.memo, invoices.amount_msat, invoices.cltv_delta, invoices.expiry, invoices.payment_addr, invoices.payment_request, invoices.payment_request_hash, invoices.state, invoices.amount_paid_msat, invoices.is_amp, invoices.is_hodl, invoices.is_keysend, invoices.created_at
 FROM invoices
 WHERE id <= $1
-  AND (NOT $2 OR state IN (0, 3)) -- 0 = ContractOpen, 3 = ContractAccepted
+  AND (NOT $2 OR state IN (0, 3, 4)) -- 0 = ContractOpen, 3 = ContractAccepted, 4 = ContractPendingSettle
   AND created_at >= $3
   AND created_at < $4
 ORDER BY id DESC
