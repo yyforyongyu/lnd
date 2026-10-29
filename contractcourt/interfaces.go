@@ -22,7 +22,7 @@ type Registry interface {
 	// byte payment hash.
 	LookupInvoice(context.Context, lntypes.Hash) (invoices.Invoice, error)
 
-	// NotifyExitHopHtlc attempts to mark an invoice as settled. If the
+	// NotifyExitHopHtlc requests settlement of an invoice. If the
 	// invoice is a debug invoice, then this method is a noop as debug
 	// invoices are never fully settled. The return value describes how the
 	// htlc should be resolved. If the htlc cannot be resolved immediately,
@@ -32,6 +32,11 @@ type Registry interface {
 		circuitKey models.CircuitKey, hodlChan chan<- interface{},
 		wireCustomRecords lnwire.CustomRecords,
 		payload invoices.Payload) (invoices.HtlcResolution, error)
+
+	// NotifyExitHopHtlcFinalized marks a previously requested exit-hop HTLC
+	// settlement as final.
+	NotifyExitHopHtlcFinalized(ctx context.Context,
+		circuitKey models.CircuitKey, settled bool) error
 
 	// HodlUnsubscribeAll unsubscribes from all htlc resolutions.
 	HodlUnsubscribeAll(subscriber chan<- interface{})

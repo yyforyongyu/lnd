@@ -8,6 +8,7 @@ import (
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/stretchr/testify/mock"
 )
 
 type notifyExitHopData struct {
@@ -19,6 +20,8 @@ type notifyExitHopData struct {
 }
 
 type mockRegistry struct {
+	mock.Mock
+
 	notifyChan       chan notifyExitHopData
 	notifyErr        error
 	notifyResolution invoices.HtlcResolution
@@ -28,6 +31,9 @@ type mockRegistry struct {
 	// are not present report ErrInvoiceNotFound.
 	invoices map[lntypes.Hash]invoices.Invoice
 }
+
+// Check the finality callback alongside the existing registry methods.
+var _ Registry = (*mockRegistry)(nil)
 
 func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
 	paidAmount lnwire.MilliSatoshi, expiry uint32, currentHeight int32,
@@ -54,6 +60,15 @@ func (r *mockRegistry) NotifyExitHopHtlc(payHash lntypes.Hash,
 }
 
 func (r *mockRegistry) HodlUnsubscribeAll(subscriber chan<- interface{}) {}
+
+// NotifyExitHopHtlcFinalized checks the circuit and terminal outcome expected
+// by the resolver test, including absence of calls after a failed store.
+func (r *mockRegistry) NotifyExitHopHtlcFinalized(ctx context.Context,
+	circuitKey models.CircuitKey, settled bool) error {
+
+	args := r.Called(ctx, circuitKey, settled)
+	return args.Error(0)
+}
 
 func (r *mockRegistry) LookupInvoice(_ context.Context,
 	payHash lntypes.Hash) (invoices.Invoice, error) {

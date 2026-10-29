@@ -64,6 +64,13 @@ func (h *htlcIncomingContestResolver) processFinalHtlcFail() error {
 		return err
 	}
 
+	// The circuit failed finally. Notify the invoice while allowing its
+	// write failures to retry independently of channel resolution.
+	err = h.notifyInvoiceHtlcFinalized(false)
+	if err != nil {
+		h.log.Warnf("Unable to finalize invoice HTLC outcome: %v", err)
+	}
+
 	// Send notification.
 	h.ChainArbitratorConfig.HtlcNotifier.NotifyFinalHtlcEvent(
 		models.CircuitKey{
