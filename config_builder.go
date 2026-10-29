@@ -456,6 +456,8 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 	managerConfig := dbs.WalletDB
 	managerConfig.ChainParams = *d.cfg.ActiveNetParams.Params
 	managerConfig.ChainSource = partialChainControl.ChainSource
+	// Rewind before scanning so readiness covers the requested rescan.
+	managerConfig.RescanOnStart = d.cfg.ResetWalletTransactions
 	managerConfig.SignetChallengeDigest, err =
 		walletSignetChallengeDigest(d.cfg)
 	if err != nil {
@@ -1793,8 +1795,8 @@ func waitForWalletPassword(cfg *Config,
 		// remind the user to turn off the setting again after
 		// successful completion.
 		if cfg.ResetWalletTransactions {
-			ltndLog.Warnf("Dropped all transaction history from " +
-				"on-chain wallet. Remember to disable " +
+			ltndLog.Warnf("Rescanning on-chain wallet from its " +
+				"birthday. Remember to disable " +
 				"reset-wallet-transactions flag for next " +
 				"start of lnd")
 		}

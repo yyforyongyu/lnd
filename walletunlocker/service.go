@@ -288,6 +288,8 @@ func (u *UnlockerService) newManager(publicPass []byte,
 	cfg := *u.managerConfig
 	cfg.KVDBPubPassphrase = publicPass
 	cfg.RecoveryWindow = recoveryWindow
+	// The deferred kvdb Manager must rewind before its own scan starts.
+	cfg.RescanOnStart = u.resetWalletTransactions
 	manager, err := wallet.NewManager(context.Background(), cfg)
 	if err != nil {
 		return nil, nil, err
@@ -679,11 +681,8 @@ func (u *UnlockerService) LoadAndUnlock(password []byte,
 	recoveryWindow uint32) (*wallet.Wallet, *wallet.Manager, func() error,
 	error) {
 
-	if u.resetWalletTransactions {
-		return nil, nil, nil, fmt.Errorf("managed wallet " +
-			"does not support " +
-			"transaction-history reset")
-	}
+	// Birthday recovery belongs to Manager startup, before synchronization
+	// can report readiness. Unlock only authenticates that same Wallet.
 	exists, err := u.WalletExists()
 	if err != nil {
 		return nil, nil, nil, err
