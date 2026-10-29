@@ -231,7 +231,11 @@ func (b *BtcWallet) Start() error {
 	if err != nil {
 		return err
 	}
-	if info.Locked && !walletIsWatchOnly {
+	// SQL watch-only wallets still encrypt scripts with a passphrase key.
+	// Only the legacy kvdb watch-only vault has no unlockable material.
+	legacyWatchOnly := walletIsWatchOnly &&
+		b.cfg.ManagerConfig.Backend == base.DBBackendKVDB
+	if info.Locked && !legacyWatchOnly {
 		err = b.wallet.Unlock(ctx, base.UnlockRequest{
 			Passphrase: b.cfg.PrivatePass,
 			Timeout:    -1,
