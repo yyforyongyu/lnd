@@ -2492,10 +2492,12 @@ func testSpontaneousAmpPayment(t *testing.T,
 	t.Parallel()
 
 	tests := []struct {
-		name               string
-		ampEnabled         bool
-		failReconstruction bool
-		numShards          int
+		name                string
+		ampEnabled          bool
+		failReconstruction  bool
+		failFinalization    bool
+		replaceExpiredShard bool
+		numShards           int
 	}{
 		{
 			name:               "enabled valid one shard",
@@ -2508,6 +2510,18 @@ func testSpontaneousAmpPayment(t *testing.T,
 			ampEnabled:         true,
 			failReconstruction: false,
 			numShards:          3,
+		},
+		{
+			name:             "failed first finalized shard",
+			ampEnabled:       true,
+			failFinalization: true,
+			numShards:        3,
+		},
+		{
+			name:                "replaced unreleased shard",
+			ampEnabled:          true,
+			replaceExpiredShard: true,
+			numShards:           2,
 		},
 		{
 			name:               "enabled invalid one shard",
@@ -2533,6 +2547,7 @@ func testSpontaneousAmpPayment(t *testing.T,
 		t.Run(test.name, func(t *testing.T) {
 			testSpontaneousAmpPaymentImpl(
 				t, test.ampEnabled, test.failReconstruction,
+				test.failFinalization, test.replaceExpiredShard,
 				test.numShards, makeDB,
 			)
 		})
@@ -2541,7 +2556,8 @@ func testSpontaneousAmpPayment(t *testing.T,
 
 // testSpontaneousAmpPaymentImpl runs a specific spontaneous AMP test case.
 func testSpontaneousAmpPaymentImpl(
-	t *testing.T, ampEnabled, failReconstruction bool, numShards int,
+	t *testing.T, ampEnabled, failReconstruction, failFinalization,
+	replaceExpiredShard bool, numShards int,
 	makeDB func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock)) {
 
 	t.Parallel()
@@ -2563,9 +2579,11 @@ func testSpontaneousAmpPaymentImpl(
 	)
 
 	var (
-		shardAmt = totalAmt / lnwire.MilliSatoshi(numShards)
-		payAddr  [32]byte
-		setID    [32]byte
+		shardAmt   = totalAmt / lnwire.MilliSatoshi(numShards)
+		payAddr    [32]byte
+		setID      [32]byte
+		payHash    lntypes.Hash
+		firstChild *amp.Child
 	)
 	_, err = rand.Read(payAddr[:])
 	require.NoError(t, err)
@@ -2629,6 +2647,11 @@ func testSpontaneousAmpPaymentImpl(
 			child = sharer.Child(uint32(i))
 		}
 
+		if i == 0 {
+			payHash = child.Hash
+			firstChild = child
+		}
+
 		// Send a blank share when the set should fail reconstruction,
 		// otherwise send the derived share.
 		var share [32]byte
@@ -2641,9 +2664,16 @@ func testSpontaneousAmpPaymentImpl(
 			amp: record.NewAMP(share, setID, uint32(i)),
 		}
 
+		// Underpay the first share so its sibling can remain accepted
+		// while only the first circuit reaches its MPP timeout.
+		amount := shardAmt
+		if replaceExpiredShard && i == 0 {
+			amount /= 2
+		}
+
 		// Act by submitting the next share through the public registry.
 		resolution, err := ctx.registry.NotifyExitHopHtlc(
-			child.Hash, shardAmt, expiry, testCurrentHeight,
+			child.Hash, amount, expiry, testCurrentHeight,
 			getCircuitKey(uint64(i)), hodlChan, nil,
 			payload,
 		)
@@ -2658,6 +2688,40 @@ func testSpontaneousAmpPaymentImpl(
 				t, resolution, invpkg.ResultInvoiceNotFound,
 			)
 			continue
+		}
+
+		// Give the sibling a later deadline, then expire only the first
+		// circuit. Its canceled share has never received a preimage.
+		if replaceExpiredShard && i == 0 {
+			ctx.clock.SetTime(testTime.Add(time.Second))
+		}
+		if replaceExpiredShard && isFinalShard {
+			require.Nil(t, resolution)
+			ctx.clock.SetTime(testTime.Add(cfg.HtlcHoldDuration))
+			raw := <-hodlChans[firstChild.Preimage]
+			expired, ok := raw.(invpkg.HtlcResolution)
+			require.True(t, ok)
+			checkFailResolution(t, expired, invpkg.ResultMppTimeout)
+			delete(hodlChans, firstChild.Preimage)
+
+			// Retry that child on a new circuit at its full amount.
+			// Both shares now reconstruct after the old fail.
+			retryPayload := &mockPayload{
+				mpp: record.NewMPP(totalAmt, payAddr),
+				amp: record.NewAMP(firstChild.Share, setID, 0),
+			}
+			retryKey := getCircuitKey(uint64(numShards))
+			retried, err := ctx.registry.NotifyExitHopHtlc(
+				firstChild.Hash, shardAmt, expiry,
+				testCurrentHeight, retryKey,
+				nil, nil, retryPayload,
+			)
+			require.NoError(t, err)
+			checkSettleResolution(t, retried, firstChild.Preimage)
+			raw = <-hodlChan
+			resolved, ok := raw.(invpkg.HtlcResolution)
+			require.True(t, ok)
+			resolution = resolved
 		}
 
 		// Check that resolutions are properly formed.
@@ -2694,19 +2758,6 @@ func testSpontaneousAmpPaymentImpl(
 		return
 	}
 
-	// Assert that reconstruction failure cannot settle the set. Successful
-	// preimage release still waits for every circuit's final outcome.
-	if failReconstruction {
-		checkNoSettleSubscription()
-	} else {
-		for j := range numShards {
-			require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
-				ctxb, getCircuitKey(uint64(j)), true,
-			))
-		}
-		checkSettleSubscription()
-	}
-
 	// For the non-final hodl chans, assert that they receive the expected
 	// failure or preimage.
 	for preimage, hodlChan := range hodlChans {
@@ -2720,6 +2771,80 @@ func testSpontaneousAmpPaymentImpl(
 		} else {
 			checkSettleResolution(t, resolution, preimage)
 		}
+	}
+
+	// Assert that reconstruction failure cannot settle the set. Successful
+	// preimage release still waits for every circuit's final outcome.
+	if failReconstruction {
+		checkNoSettleSubscription()
+		return
+	}
+
+	checkNoSettleSubscription()
+	require.ErrorIs(t, ctx.registry.CancelInvoice(
+		ctxb, payHash,
+	), invpkg.ErrInvoiceAlreadySettled)
+
+	// Act on each final circuit outcome; reload through the public registry
+	// after each write to verify persisted membership and set accounting.
+	numCircuits := numShards
+	if replaceExpiredShard {
+		numCircuits++
+	}
+	for j := range numShards {
+		key := uint64(j)
+		if replaceExpiredShard && j == 0 {
+			key = uint64(numShards)
+		}
+		settled := !failFinalization || j != 0
+		require.NoError(t, ctx.registry.NotifyExitHopHtlcFinalized(
+			ctxb, getCircuitKey(key), settled,
+		))
+		inv, err := ctx.registry.LookupInvoice(ctxb, payHash)
+		require.NoError(t, err)
+		require.Len(t, inv.Htlcs, numCircuits)
+		if replaceExpiredShard {
+			old := inv.Htlcs[getCircuitKey(0)]
+			require.NotNil(t, old)
+			require.Equal(t, invpkg.HtlcStateCanceled, old.State)
+			require.Nil(t, old.AMP.Preimage)
+		}
+		for k := range numShards {
+			key := uint64(k)
+			if replaceExpiredShard && k == 0 {
+				key = uint64(numShards)
+			}
+			state := invpkg.HtlcStatePendingSettle
+			if k <= j {
+				state = invpkg.HtlcStateSettled
+			}
+			if k == 0 && failFinalization {
+				state = invpkg.HtlcStateCanceled
+			}
+			require.Equal(t, state,
+				inv.Htlcs[getCircuitKey(key)].State,
+			)
+		}
+		state := invpkg.HtlcStatePendingSettle
+		amount := totalAmt
+		if j == numShards-1 {
+			state = invpkg.HtlcStateSettled
+			if failFinalization {
+				state = invpkg.HtlcStateCanceled
+				amount = 0
+			}
+		}
+		require.Equal(t, state, inv.AMPState[setID].State)
+		require.Equal(t, amount, inv.AMPState[setID].AmtPaid)
+		require.Equal(t, amount, inv.AmtPaid)
+		if state != invpkg.HtlcStateSettled {
+			require.Zero(t, inv.AMPState[setID].SettleIndex)
+		}
+	}
+	if failFinalization {
+		checkNoSettleSubscription()
+	} else {
+		checkSettleSubscription()
 	}
 }
 
