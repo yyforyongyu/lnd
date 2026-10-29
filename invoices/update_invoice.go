@@ -91,6 +91,29 @@ func settleHtlcsAmp(invoice *Invoice, circuitKey models.CircuitKey,
 	return updater.UpdateAmpState(setID, newAmpState, circuitKey)
 }
 
+// pendingSettleHtlcsAmp marks an AMP HTLC set as pending settle without
+// changing the set's accepted amount.
+func pendingSettleHtlcsAmp(invoice *Invoice, circuitKey models.CircuitKey,
+	htlc *InvoiceHTLC, updater InvoiceUpdater) error {
+
+	setID := htlc.AMP.Record.SetID()
+
+	// Acceptance already counted these HTLCs, so the state transition
+	// contributes zero additional value.
+	newAmpState, err := getUpdatedInvoiceAmpState(
+		invoice, setID, circuitKey, HtlcStatePendingSettle, 0,
+	)
+	if err != nil {
+		return err
+	}
+
+	invoice.AMPState[setID] = newAmpState
+
+	// AMP HTLCs are stored separately; persist the pending set without
+	// assigning its final settlement metadata yet.
+	return updater.UpdateAmpState(setID, newAmpState, circuitKey)
+}
+
 // UpdateInvoice fetches the invoice, obtains the update descriptor from the
 // callback and applies the updates in a single db transaction.
 func UpdateInvoice(hash *lntypes.Hash, invoice *Invoice,
@@ -508,6 +531,66 @@ func settleHodlInvoice(invoice *Invoice, hash *lntypes.Hash,
 	}
 
 	return updateInvoiceAmtPaid(invoice, amtPaid, updater)
+}
+
+// finalizeAmpSetIfComplete updates an AMP sub-invoice after one HTLC finalizes.
+func finalizeAmpSetIfComplete(invoice *Invoice, setID SetID,
+	circuitKey models.CircuitKey, updater InvoiceUpdater) error {
+
+	ampState := invoice.AMPState[setID]
+	// The callback supplies a member of this set, so it cannot be empty.
+	// Inspect set membership directly without allocating another HTLC map.
+	allSettled := true
+	for _, htlc := range invoice.Htlcs {
+		if !htlc.IsInHTLCSet((*[32]byte)(&setID)) {
+			continue
+		}
+
+		// Unreleased canceled shares may be replaced on a new circuit.
+		// Only failures after preimage release can fail the entire set.
+		if htlc.State == HtlcStateCanceled && htlc.AMP.Preimage == nil {
+			continue
+		}
+
+		switch htlc.State {
+		case HtlcStatePendingSettle:
+			ampState.State = HtlcStatePendingSettle
+			invoice.AMPState[setID] = ampState
+
+			return updater.UpdateAmpState(
+				setID, ampState, circuitKey,
+			)
+
+		case HtlcStateSettled:
+
+		default:
+			allSettled = false
+		}
+	}
+
+	if allSettled {
+		ampState.State = HtlcStateSettled
+	} else {
+		// A released shard failed, so none of this set counts as paid.
+		// Remove its full contribution while preserving other AMP sets.
+		failedAmt := ampState.AmtPaid
+		amtPaid := lnwire.MilliSatoshi(0)
+		if invoice.AmtPaid > failedAmt {
+			amtPaid = invoice.AmtPaid - failedAmt
+		}
+
+		ampState.State = HtlcStateCanceled
+		ampState.AmtPaid = 0
+
+		err := updateInvoiceAmtPaid(invoice, amtPaid, updater)
+		if err != nil {
+			return err
+		}
+	}
+
+	invoice.AMPState[setID] = ampState
+
+	return updater.UpdateAmpState(setID, ampState, circuitKey)
 }
 
 // finalizeInvoiceIfComplete derives the terminal non-AMP invoice state once all
