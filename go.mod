@@ -222,3 +222,6 @@ replace github.com/lightningnetwork/lnd/kvdb => ./kvdb
 replace github.com/lightningnetwork/lnd/queue => ./queue
 
 replace github.com/lightningnetwork/lnd/ticker => ./ticker
+
+// Use the exact KVDB account-support revision from btcwallet PR #1454.
+replace github.com/btcsuite/btcwallet v0.18.1-0.20261028044647-ccd2c7c7487b => github.com/yyforyongyu/btcwallet v0.16.12-0.20261029063837-34c671af98c9

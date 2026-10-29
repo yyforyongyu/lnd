@@ -50,8 +50,6 @@ github.com/btcsuite/btclog v1.0.0 h1:sEkpKJMmfGiyZjADwEIgB1NSwMyfdD1FB8v6+w1T0Ns
 github.com/btcsuite/btclog v1.0.0/go.mod h1:w7xnGOhwT3lmrS4H3b/D1XAXxvh+tbhUm8xeHN2y3TQ=
 github.com/btcsuite/btclog/v2 v2.0.1-0.20250728225537-6090e87c6c5b h1:MQ+Q6sDy37V1wP1Yu79A5KqJutolqUGwA99UZWQDWZM=
 github.com/btcsuite/btclog/v2 v2.0.1-0.20250728225537-6090e87c6c5b/go.mod h1:XItGUfVOxotJL8kkuk2Hj3EVow5KCugXl3wWfQ6K0AE=
-github.com/btcsuite/btcwallet v0.18.1-0.20261028044647-ccd2c7c7487b h1:smUBpxyyiDxShwItN+pZOTJXSiFbBSX21FxwNuK4oW4=
-github.com/btcsuite/btcwallet v0.18.1-0.20261028044647-ccd2c7c7487b/go.mod h1:EvvPosLg7Hcrs9OLVfx6PtaldO/Syqy53C5sVrrBOik=
 github.com/btcsuite/btcwallet/wallet/txauthor v1.4.1-0.20261028044647-ccd2c7c7487b h1:UuYAA9TmLkmQwTpgQ4iHfl9KNjAxXaKnPiv7u4JvJzg=
 github.com/btcsuite/btcwallet/wallet/txauthor v1.4.1-0.20261028044647-ccd2c7c7487b/go.mod h1:tVoXyubc/5yVHLsRSPIdqXfr6Sm6cSd+sH9dhtjNSR8=
 github.com/btcsuite/btcwallet/wallet/txrules v1.3.0 h1:D5aGMwWIxdqek3xEJs4eOdMoh6iga2EI2xSlaXCdnNo=
@@ -391,6 +389,8 @@ github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2 h1:eY9dn8+vbi4tKz5
 github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2/go.mod h1:UETIi67q53MR2AWcXfiuqkDkRtnGDLqkBTpCHuJHxtU=
 github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
+github.com/yyforyongyu/btcwallet v0.16.12-0.20261029063837-34c671af98c9 h1:wBbLOo3DvbOpv1mjA4tS7MWwrAbfKuCNQLdLsY/IbDo=
+github.com/yyforyongyu/btcwallet v0.16.12-0.20261029063837-34c671af98c9/go.mod h1:EvvPosLg7Hcrs9OLVfx6PtaldO/Syqy53C5sVrrBOik=
 gitlab.com/yawning/bsaes.git v0.0.0-20190805113838-0a714cd429ec h1:FpfFs4EhNehiVfzQttTuxanPIT43FtkkCFypIod8LHo=
 gitlab.com/yawning/bsaes.git v0.0.0-20190805113838-0a714cd429ec/go.mod h1:BZ1RAoRPbCxum9Grlv5aeksu2H8BiKehBYooU2LFiOQ=
 go.etcd.io/bbolt v1.4.3 h1:dEadXpI6G79deX5prL3QRNP6JB8UxVkqo4UPnHaNXJo=
