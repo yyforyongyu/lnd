@@ -47,10 +47,8 @@ func testSingleHopInvoice(ht *lntest.HarnessTest) {
 	// to the above generated invoice.
 	ht.CompletePaymentRequests(alice, []string{invoiceResp.PaymentRequest})
 
-	// Bob's invoice should now be found and marked as settled.
-	dbInvoice := bob.RPC.LookupInvoice(invoiceResp.RHash)
-	require.Equal(ht, lnrpc.Invoice_SETTLED, dbInvoice.State,
-		"bob's invoice should be marked as settled")
+	// Invoice settlement follows the receiving circuit's final commitment.
+	ht.AssertInvoiceSettled(bob, invoiceResp.PaymentAddr)
 
 	// With the payment completed all balance related stats should be
 	// properly updated.
