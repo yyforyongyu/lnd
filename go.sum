@@ -389,8 +389,8 @@ github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2 h1:eY9dn8+vbi4tKz5
 github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2/go.mod h1:UETIi67q53MR2AWcXfiuqkDkRtnGDLqkBTpCHuJHxtU=
 github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
-github.com/yyforyongyu/btcwallet v0.16.12-0.20261029144719-828addd5fb33 h1:0WI1izJq1TsUeNE+XSSDYbuUJADLcpQB6as25IAasaU=
-github.com/yyforyongyu/btcwallet v0.16.12-0.20261029144719-828addd5fb33/go.mod h1:EvvPosLg7Hcrs9OLVfx6PtaldO/Syqy53C5sVrrBOik=
+github.com/yyforyongyu/btcwallet v0.16.12-0.20261029160932-746fe252a41d h1:SsbFMBcwlnTGGiF70SNovkiMYDDziRKqflyethpGN0Y=
+github.com/yyforyongyu/btcwallet v0.16.12-0.20261029160932-746fe252a41d/go.mod h1:EvvPosLg7Hcrs9OLVfx6PtaldO/Syqy53C5sVrrBOik=
 gitlab.com/yawning/bsaes.git v0.0.0-20190805113838-0a714cd429ec h1:FpfFs4EhNehiVfzQttTuxanPIT43FtkkCFypIod8LHo=
 gitlab.com/yawning/bsaes.git v0.0.0-20190805113838-0a714cd429ec/go.mod h1:BZ1RAoRPbCxum9Grlv5aeksu2H8BiKehBYooU2LFiOQ=
 go.etcd.io/bbolt v1.4.3 h1:dEadXpI6G79deX5prL3QRNP6JB8UxVkqo4UPnHaNXJo=

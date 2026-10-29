@@ -474,15 +474,6 @@ func (u *UnlockerService) InitWallet(ctx context.Context,
 		)
 	}
 
-	// Native SQL begins synchronization before this RPC, so historical
-	// recovery cannot promise discovery of accounts created afterward.
-	if u.managerConfig != nil &&
-		u.managerConfig.Backend != wallet.DBBackendKVDB &&
-		recoveryWindow != 0 {
-
-		return nil, fmt.Errorf("native wallet historical recovery " +
-			"requires accounts to exist before synchronization")
-	}
 	walletExists, err := u.WalletExists()
 	if err != nil {
 		return nil, err

@@ -37,6 +37,25 @@ var (
 	}
 )
 
+// InitialAccounts declares lnd's payment accounts before a native Wallet starts
+// scanning. Both RPC seed restoration and direct creation use the same scopes;
+// Lightning-only families retain their existing startup initialization.
+func InitialAccounts() []base.NewAccountParams {
+	accounts := make([]base.NewAccountParams, 0, len(LndDefaultKeyScopes))
+	for _, scope := range LndDefaultKeyScopes {
+		zero := base.AccountNumber(0)
+		schema := waddrmgr.ScopeAddrMap[scope]
+		accounts = append(accounts, base.NewAccountParams{
+			Scope:         scope,
+			Name:          lnwallet.DefaultAccountName,
+			AccountNumber: &zero,
+			AddrSchema:    &schema,
+		})
+	}
+
+	return accounts
+}
+
 // walletAPI composes the maintained wallet capabilities used by this adapter.
 // Embedding the existing interfaces keeps mock expectations at the same
 // boundary without a second runtime or a forwarding implementation.
@@ -74,16 +93,6 @@ var _ lnwallet.BlockChainIO = (*BtcWallet)(nil)
 // New returns a new fully initialized instance of BtcWallet given a valid
 // configuration struct.
 func New(cfg Config, blockCache *blockcache.BlockCache) (*BtcWallet, error) {
-	// SQL scanning starts before canonical account creation, so a nonzero
-	// recovery window cannot guarantee historical discovery on direct
-	// startup.
-	if cfg.ManagerConfig.Backend != base.DBBackendKVDB &&
-		cfg.RecoveryWindow != 0 {
-
-		return nil, fmt.Errorf("native wallet historical recovery " +
-			"requires accounts to exist before synchronization")
-	}
-
 	// Create the key scope for the coin type being managed by this wallet.
 	chainKeyScope := waddrmgr.KeyScope{
 		Purpose: keychain.BIP0043Purpose,
@@ -139,6 +148,12 @@ func New(cfg Config, blockCache *blockcache.BlockCache) (*BtcWallet, error) {
 			Birthday:          cfg.Birthday,
 			PubPassphrase:     cfg.PublicPass,
 			PrivatePassphrase: cfg.PrivatePass,
+		}
+		// Install native payment scopes before scanning for old funds.
+		// BtcWallet.Start would run after recovery has begun.
+		if cfg.ManagerConfig.Backend != base.DBBackendKVDB {
+			params.InitialDerivedAccounts = InitialAccounts()
+			params.RecoveryWindow = &cfg.RecoveryWindow
 		}
 		if cfg.PublicPass == nil {
 			params.PubPassphrase = defaultPubPassphrase

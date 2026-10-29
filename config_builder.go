@@ -1653,16 +1653,6 @@ func waitForWalletPassword(cfg *Config,
 				keychain.CurrentKeyDerivationVersion)
 		}
 
-		// The SQL Manager started before RPC admission with zero
-		// lookahead. It cannot recover accounts installed after
-		// scanning has begun.
-		if managerConfig.Backend != wallet.DBBackendKVDB &&
-			recoveryWindow != 0 {
-
-			return nil, fmt.Errorf("native wallet historical " +
-				"recovery requires accounts to exist before " +
-				"synchronization")
-		}
 		if watchOnlyAccounts != nil && !cfg.RemoteSigner.Enable {
 			return nil, fmt.Errorf("cannot initialize watch only " +
 				"wallet with remote signer config disabled")
@@ -1756,6 +1746,16 @@ func waitForWalletPassword(cfg *Config,
 			_ = manager.Stop()
 			return nil, fmt.Errorf("cannot create wallet " +
 				"without seed or root key")
+		}
+		// Supply the RPC lookahead and native payment scopes before
+		// scanning. Shell imports already name their initial accounts;
+		// kvdb initializes its native scopes itself.
+		if managerConfig.Backend != wallet.DBBackendKVDB {
+			params.RecoveryWindow = &recoveryWindow
+			if params.Mode != wallet.ModeShell {
+				params.InitialDerivedAccounts =
+					btcwallet.InitialAccounts()
+			}
 		}
 		newWallet, err := manager.Create(params)
 		if err != nil {
