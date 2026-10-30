@@ -185,9 +185,18 @@ func sendCoins(
 
 	t.Helper()
 
+	// Another fixture can mine after this wallet was funded. Wait for that
+	// new tip before native authoring, which requires a ready wallet.
+	require.NoError(t, waitForWalletSync(miner, sender))
+
 	tx, err := sender.SendOutputs(t.Context(), &wallet.TxIntent{
 		Outputs: []wire.TxOut{*output},
 		Inputs: &wallet.InputsPolicy{
+			// Select BIP84 to spend the fixture's credits.
+			Source: &wallet.ScopedAccount{
+				KeyScope:    waddrmgr.KeyScopeBIP0084,
+				AccountName: lnwallet.DefaultAccountName,
+			},
 			MinConfs: uint32(minConf),
 			Strategy: sender.Cfg.CoinSelectionStrategy,
 		},
@@ -245,6 +254,7 @@ func assertTxInWallet(t *testing.T, w *lnwallet.LightningWallet,
 	t.Fatalf("transaction %v not found", txHash)
 }
 
+// loadTestCredits funds BIP84 outputs and waits for native spending readiness.
 func loadTestCredits(miner *rpctest.Harness, w *lnwallet.LightningWallet,
 	numOutputs int, btcPerOutput float64) error {
 
@@ -334,7 +344,9 @@ func loadTestCredits(miner *rpctest.Harness, w *lnwallet.LightningWallet,
 	}
 	ticker.Stop()
 
-	return nil
+	// Credits can be visible before live watches finish registering. Reuse
+	// the readiness check before a caller starts transaction authoring.
+	return waitForWalletSync(miner, w)
 }
 
 // createTestWallet creates a test LightningWallet will a total of 20BTC
@@ -1079,6 +1091,7 @@ func testSingleFunderReservationWorkflow(miner *rpctest.Harness,
 	assertReservationDeleted(bobChanReservation, t)
 }
 
+// testListTransactionDetails checks incoming and outgoing native history views.
 func testListTransactionDetails(miner *rpctest.Harness,
 	alice, _ *lnwallet.LightningWallet, t *testing.T) {
 
@@ -1253,6 +1266,11 @@ func testListTransactionDetails(miner *rpctest.Harness,
 	burnTX, err := alice.SendOutputs(t.Context(), &wallet.TxIntent{
 		Outputs: []wire.TxOut{*burnOutput},
 		Inputs: &wallet.InputsPolicy{
+			// Select BIP84 to spend the fixture's credits.
+			Source: &wallet.ScopedAccount{
+				KeyScope:    waddrmgr.KeyScopeBIP0084,
+				AccountName: lnwallet.DefaultAccountName,
+			},
 			MinConfs: 1,
 			Strategy: alice.Cfg.CoinSelectionStrategy,
 		},
@@ -1475,6 +1493,8 @@ func testListTransactionDetailsOffset(miner *rpctest.Harness,
 	require.Len(t, page.Transactions, 0)
 }
 
+// testTransactionSubscriptions checks incoming and local publication
+// observations through the native event stream.
 func testTransactionSubscriptions(miner *rpctest.Harness,
 	alice, _ *lnwallet.LightningWallet, t *testing.T) {
 
@@ -1644,6 +1664,11 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 	tx, err := alice.SendOutputs(t.Context(), &wallet.TxIntent{
 		Outputs: []wire.TxOut{*burnOutput},
 		Inputs: &wallet.InputsPolicy{
+			// Select BIP84 to spend the fixture's credits.
+			Source: &wallet.ScopedAccount{
+				KeyScope:    waddrmgr.KeyScopeBIP0084,
+				AccountName: lnwallet.DefaultAccountName,
+			},
 			MinConfs: 1,
 			Strategy: alice.Cfg.CoinSelectionStrategy,
 		},
@@ -1828,6 +1853,10 @@ func newTx(t *testing.T, r *rpctest.Harness, pubKey *btcec.PublicKey,
 
 	t.Helper()
 
+	// Prior publication cases mine blocks before their next helper send.
+	// Reuse native readiness before authoring against that updated tip.
+	require.NoError(t, waitForWalletSync(r, alice))
+
 	keyScript, err := scriptFromKey(pubKey)
 	require.NoError(t, err, "unable to generate script")
 
@@ -1840,6 +1869,11 @@ func newTx(t *testing.T, r *rpctest.Harness, pubKey *btcec.PublicKey,
 	tx, err := alice.SendOutputs(t.Context(), &wallet.TxIntent{
 		Outputs: []wire.TxOut{*newOutput},
 		Inputs: &wallet.InputsPolicy{
+			// Select BIP84 to spend the fixture's credits.
+			Source: &wallet.ScopedAccount{
+				KeyScope:    waddrmgr.KeyScopeBIP0084,
+				AccountName: lnwallet.DefaultAccountName,
+			},
 			MinConfs: 1,
 			Strategy: alice.Cfg.CoinSelectionStrategy,
 		},
@@ -2091,8 +2125,15 @@ func testPublishTransaction(r *rpctest.Harness,
 	})
 }
 
+// testSignOutputUsingTweaks spends outputs whose keys use Lightning tweaks.
 func testSignOutputUsingTweaks(r *rpctest.Harness,
 	alice, _ *lnwallet.LightningWallet, t *testing.T) {
+
+	// Reuse the funded BIP84 account for native transaction authoring.
+	source := &wallet.ScopedAccount{
+		KeyScope:    waddrmgr.KeyScopeBIP0084,
+		AccountName: lnwallet.DefaultAccountName,
+	}
 
 	// We'd like to test the ability of the wallet's Signer implementation
 	// to be able to sign with a private key derived from tweaking the
@@ -2152,6 +2193,7 @@ func testSignOutputUsingTweaks(r *rpctest.Harness,
 		tx, err := alice.SendOutputs(t.Context(), &wallet.TxIntent{
 			Outputs: []wire.TxOut{*newOutput},
 			Inputs: &wallet.InputsPolicy{
+				Source:   source,
 				MinConfs: 1,
 				Strategy: alice.Cfg.CoinSelectionStrategy,
 			},
@@ -2244,6 +2286,7 @@ func testSignOutputUsingTweaks(r *rpctest.Harness,
 	}
 }
 
+// testReorgWalletBalance checks wallet funds across chain reorganizations.
 func testReorgWalletBalance(r *rpctest.Harness, w *lnwallet.LightningWallet,
 	_ *lnwallet.LightningWallet, t *testing.T) {
 
@@ -2276,6 +2319,11 @@ func testReorgWalletBalance(r *rpctest.Harness, w *lnwallet.LightningWallet,
 	tx, err := w.SendOutputs(t.Context(), &wallet.TxIntent{
 		Outputs: []wire.TxOut{*output},
 		Inputs: &wallet.InputsPolicy{
+			// Select BIP84 to spend the fixture's credits.
+			Source: &wallet.ScopedAccount{
+				KeyScope:    waddrmgr.KeyScopeBIP0084,
+				AccountName: lnwallet.DefaultAccountName,
+			},
 			MinConfs: 1,
 			Strategy: w.Cfg.CoinSelectionStrategy,
 		},
@@ -2509,6 +2557,11 @@ func testSpendUnconfirmed(miner *rpctest.Harness,
 	_, err = bob.SendOutputs(t.Context(), &wallet.TxIntent{
 		Outputs: []wire.TxOut{*output},
 		Inputs: &wallet.InputsPolicy{
+			// Select BIP84 to spend the fixture's credits.
+			Source: &wallet.ScopedAccount{
+				KeyScope:    waddrmgr.KeyScopeBIP0084,
+				AccountName: lnwallet.DefaultAccountName,
+			},
 			MinConfs: 0,
 			Strategy: bob.Cfg.CoinSelectionStrategy,
 		},
@@ -2547,6 +2600,11 @@ func testSpendUnconfirmed(miner *rpctest.Harness,
 	_, err = bob.SendOutputs(t.Context(), &wallet.TxIntent{
 		Outputs: []wire.TxOut{*output},
 		Inputs: &wallet.InputsPolicy{
+			// Select BIP84 to spend the fixture's credits.
+			Source: &wallet.ScopedAccount{
+				KeyScope:    waddrmgr.KeyScopeBIP0084,
+				AccountName: lnwallet.DefaultAccountName,
+			},
 			MinConfs: 1,
 			Strategy: bob.Cfg.CoinSelectionStrategy,
 		},
@@ -2673,6 +2731,12 @@ func testLastUnusedAddr(miner *rpctest.Harness,
 // one for testing only confirmed inputs.
 func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 	_ *lnwallet.LightningWallet, t *testing.T) {
+
+	// Reuse the funded BIP84 account for native transaction authoring.
+	source := &wallet.ScopedAccount{
+		KeyScope:    waddrmgr.KeyScopeBIP0084,
+		AccountName: lnwallet.DefaultAccountName,
+	}
 
 	// Send some money from the miner to the wallet
 	err := loadTestCredits(r, w, 20, 4)
@@ -2816,6 +2880,7 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 					},
 				),
 				Inputs: &wallet.InputsPolicy{
+					Source:   source,
 					MinConfs: uint32(minConfs),
 					Strategy: w.Cfg.CoinSelectionStrategy,
 				},
@@ -2845,6 +2910,7 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 				func(o *wire.TxOut) wire.TxOut { return *o },
 			),
 			Inputs: &wallet.InputsPolicy{
+				Source:   source,
 				MinConfs: uint32(minConfs),
 				Strategy: w.Cfg.CoinSelectionStrategy,
 			},
