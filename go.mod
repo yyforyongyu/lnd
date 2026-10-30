@@ -224,4 +224,4 @@ replace github.com/lightningnetwork/lnd/queue => ./queue
 replace github.com/lightningnetwork/lnd/ticker => ./ticker
 
 // Pin the published Wallet PoC used to verify the lnd integration.
-replace github.com/btcsuite/btcwallet v0.18.1-0.20261028044647-ccd2c7c7487b => github.com/yyforyongyu/btcwallet v0.16.12-0.20261030074149-fac8e6002b52
+replace github.com/btcsuite/btcwallet v0.18.1-0.20261028044647-ccd2c7c7487b => github.com/yyforyongyu/btcwallet v0.16.12-0.20261030105112-745f4e79cd69

@@ -1498,9 +1498,9 @@ func testListTransactionDetailsOffset(miner *rpctest.Harness,
 func testTransactionSubscriptions(miner *rpctest.Harness,
 	alice, _ *lnwallet.LightningWallet, t *testing.T) {
 
-	// Subscription delivery remains part of the wallet contract. Report
-	// unavailable event support at setup so the existing assertions remain
-	// a visible runtime gate for the maintained wallet pin.
+	// Arrange: Subscribe before creating transactions so the future-only
+	// stream observes our actions. Match identities and phases because the
+	// native API permits repeated and out-of-order observations.
 	events, cancel, err := alice.Cfg.Wallet.SubscribeTxns(t.Context())
 	require.NoError(t, err)
 	defer cancel()
@@ -1509,52 +1509,71 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 		outputAmt = btcutil.SatoshiPerBitcoin
 		numTxns   = 3
 	)
-	errCh1 := make(chan error, 1)
-	switch alice.Cfg.WalletServices.BackEnd() {
-	case "neutrino":
-		// Neutrino doesn't listen for unconfirmed transactions.
-	default:
-		go func() {
-			for i := 0; i < numTxns; i++ {
-				var event *wallet.TxEvent
-				select {
-				case event = <-events:
-				case <-t.Context().Done():
-					return
-				}
-				if event == nil {
-					errCh1 <- errors.New(
-						"wallet stream closed",
-					)
 
-					return
-				}
-				txDetail := event.Detail
-				if txDetail.Confirmations != 0 {
-					errCh1 <- fmt.Errorf("incorrect number of confs, "+
-						"expected %v got %v", 0,
-						txDetail.Confirmations)
-					return
-				}
-				if txDetail.Value != outputAmt {
-					errCh1 <- fmt.Errorf("incorrect output amt, "+
-						"expected %v got %v", outputAmt,
-						txDetail.Value)
-					return
-				}
-				if txDetail.Block != nil {
-					errCh1 <- fmt.Errorf("block hash should be nil, "+
-						"is instead %v",
-						txDetail.Block)
-					return
-				}
+	// Receive each expected identity once within the phase's original
+	// deadline. A repeated unconfirmed event may precede its mined event,
+	// but every consumed mined observation must report the actual block
+	// and count; a later successful query cannot hide a bad RPC payload.
+	receiveTxns := func(expected map[chainhash.Hash]struct{},
+		blockHash *chainhash.Hash,
+		timeout time.Duration) []*wallet.TxDetail {
+
+		seen := make(map[chainhash.Hash]struct{}, len(expected))
+		details := make([]*wallet.TxDetail, 0, len(expected))
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		for len(seen) < len(expected) {
+			var event *wallet.TxEvent
+			select {
+			case next, open := <-events:
+				require.True(t, open, "wallet stream closed")
+				event = next
+
+			case <-timer.C:
+				t.Fatalf("received %d of %d transaction events",
+					len(seen), len(expected))
+
+			case <-t.Context().Done():
+				t.Fatal("test ended before tx delivery")
 			}
-			errCh1 <- nil
-		}()
+
+			require.NotNil(t, event)
+			detail := event.Detail
+			require.NotNil(t, detail)
+
+			if _, wanted := expected[detail.Hash]; !wanted {
+				continue
+			}
+
+			if blockHash == nil {
+				require.Nil(t, detail.Block)
+				require.Zero(t, detail.Confirmations)
+			} else {
+				// Allow old mempool observations, but reject
+				// an inconsistent mined payload immediately.
+				if detail.Block == nil {
+					continue
+				}
+
+				require.Equal(t, *blockHash, detail.Block.Hash)
+				require.EqualValues(t, 1, detail.Confirmations)
+			}
+
+			if _, duplicate := seen[detail.Hash]; duplicate {
+				continue
+			}
+
+			seen[detail.Hash] = struct{}{}
+			details = append(details, detail)
+		}
+
+		return details
 	}
 
-	// Next, fetch a fresh address from the wallet, create 3 new outputs
-	// with the pkScript.
+	// Act: Create three incoming payments and retain their actual hashes;
+	// duplicate delivery of one payment cannot stand in for another.
+	expected := make(map[chainhash.Hash]struct{}, numTxns)
 	for i := 0; i < numTxns; i++ {
 		addr, err := alice.Cfg.Wallet.NewAddress(t.Context(),
 			wallet.NewAccountSelectorByName(
@@ -1578,77 +1597,36 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 		if err != nil {
 			t.Fatalf("unable to send coinbase: %v", err)
 		}
+		expected[*txid] = struct{}{}
 		err = waitForMempoolTx(miner, txid)
 		if err != nil {
 			t.Fatalf("tx not relayed to miner: %v", err)
 		}
 	}
 
-	switch alice.Cfg.WalletServices.BackEnd() {
-	case "neutrino":
-		// Neutrino doesn't listen for on unconfirmed transactions.
-	default:
-		// We should receive a notification for all three transactions
-		// generated above.
-		select {
-		case <-time.After(time.Second * 10):
-			t.Fatalf("transactions not received after 10 seconds")
-		case err := <-errCh1:
-			if err != nil {
-				t.Fatal(err)
-			}
+	// Assert: Full nodes report each incoming mempool transaction with its
+	// original value. Neutrino has no incoming mempool feed, as documented
+	// by the native subscription API and the existing test contract.
+	if alice.Cfg.WalletServices.BackEnd() != "neutrino" {
+		details := receiveTxns(expected, nil, 10*time.Second)
+		for _, detail := range details {
+			require.EqualValues(t, outputAmt, detail.Value)
 		}
 	}
 
-	errCh2 := make(chan error, 1)
-	go func() {
-		for i := 0; i < numTxns; i++ {
-			var event *wallet.TxEvent
-			select {
-			case event = <-events:
-			case <-t.Context().Done():
-				return
-			}
-			if event == nil {
-				errCh2 <- errors.New("wallet stream closed")
-				return
-			}
-			txDetail := event.Detail
-			if txDetail.Confirmations != 1 {
-				errCh2 <- fmt.Errorf("incorrect number of confs for %s, expected %v got %v",
-					txDetail.Hash, 1,
-					txDetail.Confirmations)
-				return
-			}
-			if txDetail.Value != outputAmt {
-				errCh2 <- fmt.Errorf("incorrect output amt, expected %v got %v in txid %s",
-					outputAmt, txDetail.Value, txDetail.Hash)
-				return
-			}
-		}
-		errCh2 <- nil
-	}()
+	// Act: Mine the payments together so their expected block is known.
+	blocks, err := miner.Client.Generate(1)
+	require.NoError(t, err, "unable to generate block")
 
-	// Next mine a single block, all the transactions generated above
-	// should be included.
-	if _, err := miner.Client.Generate(1); err != nil {
-		t.Fatalf("unable to generate block: %v", err)
+	// Assert: Every backend must deliver all three actual mined identities,
+	// their values and one confirmation in the block we just generated.
+	for _, detail := range receiveTxns(expected, blocks[0], 5*time.Second) {
+		require.EqualValues(t, outputAmt, detail.Value)
 	}
 
-	// We should receive a notification for all three transactions
-	// since they should be mined in the next block.
-	select {
-	case <-time.After(time.Second * 5):
-		t.Fatalf("transactions not received after 5 seconds")
-	case err := <-errCh2:
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// We'll also ensure that the client is able to send our new
-	// notifications when we _create_ transactions ourselves that spend our
-	// own outputs.
+	// Act: Wait for native authoring readiness, then publish our own spend.
+	// Local publication must notify even without an incoming mempool feed.
+	require.NoError(t, waitForWalletSync(miner, alice))
 	addr, err := alice.Cfg.Wallet.NewAddress(t.Context(),
 		wallet.NewAccountSelectorByName(
 			waddrmgr.KeyScopeBIP0084,
@@ -1680,25 +1658,11 @@ func testTransactionSubscriptions(miner *rpctest.Harness,
 	err = waitForMempoolTx(miner, &txid)
 	require.NoError(t, err, "tx not relayed to miner")
 
-	// Before we mine the next block, we'll ensure that the above
-	// transaction shows up in the set of unconfirmed transactions returned
-	// by ListTransactionDetails.
-	err = waitForWalletSync(miner, alice)
-	require.NoError(t, err, "Couldn't sync Alice's wallet")
-
-	// As we just sent the transaction and it was landed in the mempool, we
-	// should get a notification for a new unconfirmed transactions
-	select {
-	case <-time.After(time.Second * 10):
-		t.Fatalf("transactions not received after 10 seconds")
-	case event := <-events:
-		require.NotNil(t, event)
-		unConfTx := event.Detail
-		if unConfTx.Hash != txid {
-			t.Fatalf("wrong txn notified: expected %v got %v",
-				txid, unConfTx.Hash)
-		}
-	}
+	// Assert: Match our published hash despite older queued observations,
+	// and require its actual unconfirmed payload.
+	receiveTxns(map[chainhash.Hash]struct{}{
+		txid: {},
+	}, nil, 10*time.Second)
 }
 
 // scriptFromKey creates a P2WKH script from the given pubkey.
