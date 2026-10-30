@@ -2694,21 +2694,20 @@ func testNewAddress(miner *rpctest.Harness,
 	}
 }
 
-// testCreateSimpleTx checks that a call to CreateSimpleTx will return a
-// transaction that is equal to the one that is being created by SendOutputs in
-// a subsequent call.
-// All test cases are doubled-up: one for testing unconfirmed inputs,
-// one for testing only confirmed inputs.
+// testCreateSimpleTx verifies native unsigned authoring and signed publication
+// preserve the requested payments, selected inputs and fee with fresh change.
 func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 	_ *lnwallet.LightningWallet, t *testing.T) {
 
-	// Reuse the funded BIP84 account for native transaction authoring.
+	// Arrange: Fund BIP84 for native coin selection and its implicit change
+	// policy; the funding helper waits until the wallet can author spends.
+	const changeType = txscript.WitnessV0PubKeyHashTy
+
 	source := &wallet.ScopedAccount{
 		KeyScope:    waddrmgr.KeyScopeBIP0084,
 		AccountName: lnwallet.DefaultAccountName,
 	}
 
-	// Send some money from the miner to the wallet
 	err := loadTestCredits(r, w, 20, 4)
 	require.NoError(t, err, "unable to send money to lnwallet")
 
@@ -2840,7 +2839,8 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 			outputs[i] = output
 		}
 
-		// Now try creating a tx spending to these outputs.
+		// Act: Author payments without publishing; positive change
+		// commits a fresh child through the native API.
 		createTx, createErr := w.Cfg.Wallet.CreateTransaction(
 			t.Context(), &wallet.TxIntent{
 				Outputs: fn.Map(
@@ -2871,10 +2871,8 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 				"creation", i)
 		}
 
-		// Also send to these outputs. This should result in a tx
-		// _very_ similar to the one we just created being sent. The
-		// only difference is that the dry run tx is not signed, and
-		// that the change output position might be different.
+		// Publish the same intent through the configured signer. This
+		// authors again, allocating a different internal change child.
 		tx, sendErr := w.SendOutputs(t.Context(), &wallet.TxIntent{
 			Outputs: fn.Map(outputs,
 				func(o *wire.TxOut) wire.TxOut { return *o },
@@ -2917,7 +2915,8 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 			t.Fatalf("tx not relayed to miner: %v", err)
 		}
 
-		// Helper method to check that the two txs are similar.
+		// Assert: Preserve inputs and payments so both authorings pay
+		// the same fee while committing independent change children.
 		assertSimilarTx := func(a, b *wire.MsgTx) error {
 			if a.Version != b.Version {
 				return fmt.Errorf("different versions: "+
@@ -2949,14 +2948,27 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 				}
 			}
 
-			// They should have the same outputs. Since the change
-			// output position gets randomized, they are not
-			// guaranteed to be in the same order.
-			for _, outA := range a.TxOut {
+			// Match payments exactly. Change retains its amount
+			// and class while using a fresh internal script.
+			for index, outA := range a.TxOut {
 				found := false
 				for _, outB := range b.TxOut {
-					if reflect.DeepEqual(outA, outB) {
-						found = true
+					if index == createTx.ChangeIndex {
+						found = outA.Value ==
+							outB.Value &&
+							txscript.GetScriptClass(
+								outB.PkScript,
+							) == changeType &&
+							!bytes.Equal(
+								outA.PkScript,
+								outB.PkScript,
+							)
+					} else {
+						found = reflect.DeepEqual(
+							outA, outB,
+						)
+					}
+					if found {
 						break
 					}
 				}
@@ -2974,15 +2986,14 @@ func testCreateSimpleTx(r *rpctest.Harness, w *lnwallet.LightningWallet,
 			t.Fatalf("transactions not similar: %v", err)
 		}
 
-		// Now that we know both transactions were essentially
-		// identical, we'll make sure that a P2TR addr was used as the
-		// change output, which is the current default.
+		// With no explicit change source, native authoring uses the
+		// funded BIP84 account's schema for the template change too.
 		changeTxOut := createTx.Tx.TxOut[createTx.ChangeIndex]
 		changeScriptType, _, _, err := txscript.ExtractPkScriptAddrs(
 			changeTxOut.PkScript, &w.Cfg.NetParams,
 		)
 		require.NoError(t, err)
-		require.Equal(t, changeScriptType, txscript.WitnessV1TaprootTy)
+		require.Equal(t, changeType, changeScriptType)
 	}
 }
 
