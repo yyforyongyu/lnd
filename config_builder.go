@@ -570,6 +570,14 @@ func (d *DefaultWalletImpl) BuildWalletConfig(ctx context.Context,
 				PubPassphrase:     publicWalletPw,
 				PrivatePassphrase: privateWalletPw,
 			}
+			// Prepare SQL exports before publishing this wallet.
+			// KVDB still initializes accounts during startup.
+			if managerConfig.Backend != wallet.DBBackendKVDB {
+				params.InitialDerivedAccounts =
+					btcwallet.InitialAccounts(
+						d.cfg.ActiveNetParams.CoinType,
+					)
+			}
 			walletInitParams.Wallet, err = manager.Create(params)
 			if err != nil {
 				return nil, nil, nil, err
@@ -1749,14 +1757,16 @@ func waitForWalletPassword(cfg *Config,
 			return nil, fmt.Errorf("cannot create wallet " +
 				"without seed or root key")
 		}
-		// Supply the RPC lookahead and native payment scopes before
-		// scanning. Shell imports already name their initial accounts;
-		// kvdb initializes its native scopes itself.
+		// Supply RPC lookahead and native accounts before scanning to
+		// avoid live startup writes. Shell imports already name their
+		// accounts; KVDB initializes its native scopes itself.
 		if managerConfig.Backend != wallet.DBBackendKVDB {
 			params.RecoveryWindow = &recoveryWindow
 			if params.Mode != wallet.ModeShell {
 				params.InitialDerivedAccounts =
-					btcwallet.InitialAccounts()
+					btcwallet.InitialAccounts(
+						cfg.ActiveNetParams.CoinType,
+					)
 			}
 		}
 		newWallet, err := manager.Create(params)

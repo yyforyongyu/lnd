@@ -37,11 +37,13 @@ var (
 	}
 )
 
-// InitialAccounts declares lnd's payment accounts before a native Wallet starts
-// scanning. Both RPC seed restoration and direct creation use the same scopes;
-// Lightning-only families retain their existing startup initialization.
-func InitialAccounts() []base.NewAccountParams {
+// InitialAccounts declares payment and Lightning accounts before a native
+// Wallet starts scanning. Preparing the full Lightning family set makes signer
+// exports complete without account writes contending with the initial scan.
+func InitialAccounts(coinType uint32) []base.NewAccountParams {
 	accounts := make([]base.NewAccountParams, 0, len(LndDefaultKeyScopes))
+	// Payment scopes keep their existing account zero and address schemas
+	// so seed recovery scans the same on-chain derivation paths.
 	for _, scope := range LndDefaultKeyScopes {
 		zero := base.AccountNumber(0)
 		schema := waddrmgr.ScopeAddrMap[scope]
@@ -50,6 +52,26 @@ func InitialAccounts() []base.NewAccountParams {
 			Name:          lnwallet.DefaultAccountName,
 			AccountNumber: &zero,
 			AddrSchema:    &schema,
+		})
+	}
+
+	// Remote signers must export every hardened family because watch-only
+	// imports cannot derive missing account keys. These off-chain accounts
+	// use the existing names and never participate in payment-chain scans.
+	for family := base.AccountNumber(0); family <= 255; family++ {
+		name := fmt.Sprintf("act:%d", family)
+		if family == 0 {
+			name = lnwallet.DefaultAccountName
+		}
+		accounts = append(accounts, base.NewAccountParams{
+			Scope: waddrmgr.KeyScope{
+				Purpose: keychain.BIP0043Purpose,
+				Coin:    coinType,
+			},
+			Name:          name,
+			AccountNumber: &family,
+			AddrSchema:    &lightningAddrSchema,
+			NoChainSync:   true,
 		})
 	}
 
@@ -149,10 +171,11 @@ func New(cfg Config, blockCache *blockcache.BlockCache) (*BtcWallet, error) {
 			PubPassphrase:     cfg.PublicPass,
 			PrivatePassphrase: cfg.PrivatePass,
 		}
-		// Install native payment scopes before scanning for old funds.
-		// BtcWallet.Start would run after recovery has begun.
+		// Prepare native accounts before recovery starts, so exporting
+		// signer families does not compete with the initial chain scan.
 		if cfg.ManagerConfig.Backend != base.DBBackendKVDB {
-			params.InitialDerivedAccounts = InitialAccounts()
+			params.InitialDerivedAccounts =
+				InitialAccounts(cfg.CoinType)
 			params.RecoveryWindow = &cfg.RecoveryWindow
 		}
 		if cfg.PublicPass == nil {

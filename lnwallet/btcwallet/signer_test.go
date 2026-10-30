@@ -186,6 +186,58 @@ func TestScriptImport(t *testing.T) {
 	require.Equal(t, addr1, stored)
 }
 
+// TestInitialAccountExport verifies a fresh SQL wallet exposes every Lightning
+// account before lnd starts, so remote signers can export complete public keys.
+func TestInitialAccountExport(t *testing.T) {
+	// Arrange a fresh SQLite wallet through the ordinary constructor and
+	// real chain fixture, leaving BtcWallet.Start uncalled so its account
+	// completion loop cannot hide missing creation-time exports.
+	netParams := &chaincfg.RegressionNetParams
+	chainBackend, _ := getChainBackend(t, netParams)
+	config := Config{
+		PrivatePass: []byte("some-pass"),
+		HdSeed:      seedBytes,
+		NetParams:   netParams,
+		CoinType:    netParams.HDCoinType,
+		ChainSource: chainBackend,
+		ManagerConfig: wallet.ManagerConfig{
+			Backend:    wallet.DBBackendSQLite,
+			DataSource: filepath.Join(t.TempDir(), "wallet.sqlite"),
+		},
+	}
+	w, err := New(config, blockcache.NewBlockCache(10000))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, w.Stop()) })
+
+	// Act by listing the public account snapshots the remote-signer export
+	// consumes before startup can create accounts alongside scanning.
+	accounts, err := w.InternalWallet().ListAccountsByScope(
+		t.Context(), waddrmgr.KeyScope{
+			Purpose: keychain.BIP0043Purpose,
+			Coin:    netParams.HDCoinType,
+		},
+	)
+
+	// Assert the complete 0..255 family set is immediately exportable as
+	// public extended keys and remains excluded from payment-chain scans.
+	require.NoError(t, err)
+	require.Len(t, accounts, 256)
+	seen := make(map[wallet.AccountNumber]bool, len(accounts))
+	for _, account := range accounts {
+		require.NotNil(t, account.AccountNumber)
+		number := *account.AccountNumber
+		require.LessOrEqual(t, number, wallet.AccountNumber(255))
+		require.False(t, seen[number])
+		seen[number] = true
+		require.True(t, account.NoChainSync)
+		xpub, err := hdkeychain.NewKeyFromString(
+			string(account.PublicKey),
+		)
+		require.NoError(t, err)
+		require.False(t, xpub.IsPrivate())
+	}
+}
+
 // newTestWallet starts a fresh managed SQLite wallet for signing tests.
 func newTestWallet(t *testing.T, netParams *chaincfg.Params,
 	seedBytes []byte) (*BtcWallet, *rpctest.Harness) {
