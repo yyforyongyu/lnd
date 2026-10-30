@@ -5,6 +5,7 @@ package walletrpc
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -1891,6 +1892,90 @@ func TestListAddressesNativeKeys(t *testing.T) {
 					)
 				}
 			}
+		})
+	}
+}
+
+// TestListAccountsHybridEncoding verifies a generic native account key retains
+// its BIP49 scope when exported for a later numberless account import.
+func TestListAccountsHybridEncoding(t *testing.T) {
+	t.Parallel()
+
+	for _, params := range []*chaincfg.Params{
+		&chaincfg.MainNetParams,
+		&chaincfg.RegressionNetParams,
+	} {
+		t.Run(params.Name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange a BIP49 key with SQL's generic HD version.
+			// Export must preserve its known scope and key material
+			// without declaring a numbered import identity.
+			key, err := hdkeychain.NewMaster(
+				bytes.Repeat([]byte{1}, 32), params,
+			)
+			require.NoError(t, err)
+			for _, child := range []uint32{49, 0, 0} {
+				key, err = key.Derive(
+					child + hdkeychain.HardenedKeyStart,
+				)
+				require.NoError(t, err)
+			}
+			pub, err := key.Neuter()
+			require.NoError(t, err)
+
+			expectedKey, err := pub.ECPubKey()
+			require.NoError(t, err)
+
+			controller := &mock.WalletController{}
+			defer controller.AssertExpectations(t)
+
+			scope := waddrmgr.KeyScopeBIP0049Plus
+			schema := waddrmgr.ScopeAddrMap[scope]
+			encodedPub := []byte(pub.String())
+			controller.On("ListAccounts", t.Context()).Return(
+				[]wallet.AccountInfo{
+					{
+						AccountName: "default",
+						KeyScope:    scope,
+						AddrSchema:  schema,
+						PublicKey:   encodedPub,
+					},
+				}, nil,
+			).Once()
+			kit := &WalletKit{
+				cfg: &Config{
+					Wallet:      controller,
+					ChainParams: params,
+				},
+			}
+
+			// Act through the public account export used for
+			// imported funding and remote signing.
+			resp, err := kit.ListAccounts(t.Context(),
+				&ListAccountsRequest{},
+			)
+
+			// Assert encoding preserves BIP49 import selection
+			// while the actual public key retains its native value.
+			require.NoError(t, err)
+			require.Len(t, resp.Accounts, 1)
+			exported, err := hdkeychain.NewKeyFromString(
+				resp.Accounts[0].ExtendedPublicKey,
+			)
+			require.NoError(t, err)
+			version := waddrmgr.HDVersionMainNetBIP0049
+			if params.Net != wire.MainNet {
+				version = waddrmgr.HDVersionTestNetBIP0049
+			}
+			require.EqualValues(t, version,
+				binary.BigEndian.Uint32(exported.Version()),
+			)
+			actualKey, err := exported.ECPubKey()
+			require.NoError(t, err)
+			require.Equal(t, expectedKey.SerializeCompressed(),
+				actualKey.SerializeCompressed(),
+			)
 		})
 	}
 }

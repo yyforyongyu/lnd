@@ -2935,7 +2935,7 @@ func (w *WalletKit) validatePsbtAccount(ctx context.Context,
 
 // marshalWalletAccount converts the properties of an account into its RPC
 // representation.
-func marshalWalletAccount(internalScope waddrmgr.KeyScope,
+func (w *WalletKit) marshalWalletAccount(
 	account *base.AccountInfo) (*Account, error) {
 
 	var addrType AddressType
@@ -2967,7 +2967,7 @@ func marshalWalletAccount(internalScope waddrmgr.KeyScope,
 	case waddrmgr.KeyScopeBIP0086:
 		addrType = AddressType_TAPROOT_PUBKEY
 
-	case internalScope:
+	case w.internalScope():
 		addrType = AddressType_WITNESS_PUBKEY_HASH
 
 	default:
@@ -2987,6 +2987,32 @@ func marshalWalletAccount(internalScope waddrmgr.KeyScope,
 	// from a known zero; do not invent a wallet-root path for imported
 	// xpubs.
 	rpcAccount.ExtendedPublicKey = string(account.PublicKey)
+	// SQL stores derived keys with generic HD versions. Export the known
+	// BIP49 scope in SLIP132 form so native inferred imports preserve the
+	// hybrid schema instead of interpreting a generic xpub as BIP84.
+	if account.KeyScope == waddrmgr.KeyScopeBIP0049Plus &&
+		!account.IsImported {
+
+		key, err := hdkeychain.NewKeyFromString(
+			rpcAccount.ExtendedPublicKey,
+		)
+		if err != nil {
+			return nil, err
+		}
+		version := waddrmgr.HDVersionTestNetBIP0049
+		if w.cfg.ChainParams.Net == wire.MainNet ||
+			w.cfg.ChainParams.Net == wire.SimNet {
+
+			version = waddrmgr.HDVersionMainNetBIP0049
+		}
+		var encoded [4]byte
+		binary.BigEndian.PutUint32(encoded[:], uint32(version))
+		key, err = key.CloneWithVersion(encoded[:])
+		if err != nil {
+			return nil, err
+		}
+		rpcAccount.ExtendedPublicKey = key.String()
+	}
 	if account.MasterKeyFingerprint != nil {
 		var mkfp [4]byte
 		binary.BigEndian.PutUint32(
@@ -3011,9 +3037,7 @@ func marshalWalletAddressList(ctx context.Context, w *WalletKit,
 	addressList []base.AddressProperty) (*AccountWithAddresses, error) {
 
 	// Get the RPC representation of account.
-	rpcAccount, err := marshalWalletAccount(
-		w.internalScope(), account,
-	)
+	rpcAccount, err := w.marshalWalletAccount(account)
 	if err != nil {
 		return nil, err
 	}
@@ -3118,9 +3142,7 @@ func (w *WalletKit) ListAccounts(ctx context.Context,
 			continue
 		}
 
-		rpcAccount, err := marshalWalletAccount(
-			w.internalScope(), &account,
-		)
+		rpcAccount, err := w.marshalWalletAccount(&account)
 		if err != nil {
 			return nil, err
 		}
@@ -3213,7 +3235,7 @@ func (w *WalletKit) XCreateAccount(ctx context.Context,
 		return nil, err
 	}
 
-	rpcAccount, err := marshalWalletAccount(w.internalScope(), account)
+	rpcAccount, err := w.marshalWalletAccount(account)
 	if err != nil {
 		return nil, err
 	}
@@ -3323,7 +3345,7 @@ func (w *WalletKit) ListAddresses(ctx context.Context,
 func (w *WalletKit) marshalWalletKeyList(ctx context.Context,
 	account *base.AccountInfo) (*AccountWithAddresses, error) {
 
-	rpcAccount, err := marshalWalletAccount(w.internalScope(), account)
+	rpcAccount, err := w.marshalWalletAccount(account)
 	if err != nil {
 		return nil, err
 	}
@@ -3645,7 +3667,7 @@ func (w *WalletKit) ImportAccount(ctx context.Context,
 		return nil, err
 	}
 
-	rpcAccount, err := marshalWalletAccount(w.internalScope(), accountProps)
+	rpcAccount, err := w.marshalWalletAccount(accountProps)
 	if err != nil {
 		return nil, err
 	}
