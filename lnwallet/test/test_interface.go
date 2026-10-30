@@ -2048,7 +2048,8 @@ func testPublishTransaction(r *rpctest.Harness,
 		// and will accept it. Should look into if this is the behavior
 		// also for bitcoind, and update test accordingly.
 		if alice.Cfg.WalletServices.BackEnd() != "neutrino" {
-			// Create another tx spending tx3.
+			// Arrange: Sign a distinct spend of tx3's output after
+			// the prior spending transaction has been mined.
 			pubKey4, err := alice.DeriveNextKey(
 				keychain.KeyFamilyMultiSig,
 			)
@@ -2060,9 +2061,13 @@ func testPublishTransaction(r *rpctest.Harness,
 			)
 			require.NoError(t, err)
 
-			// Expect rejection.
+			// Act: Submit the already-consumed input through the
+			// native publisher's mempool acceptance check.
 			err = alice.PublishTransaction(tx7, labels.External)
-			require.ErrorIs(t, err, chain.ErrMempoolConflict)
+
+			// Assert: A confirmed spend removes its input from the
+			// UTXO set, so the backend reports a missing input.
+			require.ErrorIs(t, err, chain.ErrMissingInputs)
 		}
 	})
 
