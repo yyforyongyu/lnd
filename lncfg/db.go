@@ -487,10 +487,6 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 		if closeErr != nil {
 			return nil, closeErr
 		}
-		if !db.UseNativeSQL {
-			return nil, fmt.Errorf("managed wallet cannot open " +
-				"external postgres walletdb storage")
-		}
 		if lnrpc.FileExists(filepath.Join(walletDBPath, WalletDBName)) {
 			return nil, fmt.Errorf("existing bbolt wallet " +
 				"requires migration before native " +
@@ -530,9 +526,8 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 			DecayedLogDB:  postgresDecayedLogBackend,
 			TowerClientDB: postgresTowerClientBackend,
 			TowerServerDB: postgresTowerServerBackend,
-			// Native wallet storage has separate tables/files and
-			// is opened and closed exclusively by the wallet
-			// Manager.
+			// Manager owns native wallet storage independently of
+			// lnd's UseNativeSQL invoice/graph setting.
 			WalletDB: wallet.ManagerConfig{
 				Backend:        wallet.DBBackendPostgres,
 				DataSource:     db.Postgres.Dsn,
@@ -642,10 +637,6 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 		if closeErr != nil {
 			return nil, closeErr
 		}
-		if !db.UseNativeSQL {
-			return nil, fmt.Errorf("managed wallet cannot open " +
-				"external sqlite walletdb storage")
-		}
 		if lnrpc.FileExists(filepath.Join(walletDBPath, WalletDBName)) {
 			return nil, fmt.Errorf("existing bbolt wallet " +
 				"requires migration before native " +
@@ -686,9 +677,8 @@ func (db *DB) GetBackends(ctx context.Context, chanDBPath,
 			DecayedLogDB:  sqliteDecayedLogBackend,
 			TowerClientDB: sqliteTowerClientBackend,
 			TowerServerDB: sqliteTowerServerBackend,
-			// Native wallet storage has separate tables/files and
-			// is opened and closed exclusively by the wallet
-			// Manager.
+			// Manager owns native wallet storage independently of
+			// lnd's UseNativeSQL invoice/graph setting.
 			WalletDB: wallet.ManagerConfig{
 				Backend: wallet.DBBackendSQLite,
 				DataSource: filepath.Join(
