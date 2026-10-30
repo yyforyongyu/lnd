@@ -2098,6 +2098,10 @@ func testPublishTransaction(r *rpctest.Harness,
 func testSignOutputUsingTweaks(r *rpctest.Harness,
 	alice, _ *lnwallet.LightningWallet, t *testing.T) {
 
+	// Arrange: The prior publication case may still be syncing its final
+	// block; reuse the shared readiness wait before authoring outputs.
+	require.NoError(t, waitForWalletSync(r, alice))
+
 	// Reuse the funded BIP84 account for native transaction authoring.
 	source := &wallet.ScopedAccount{
 		KeyScope:    waddrmgr.KeyScopeBIP0084,
