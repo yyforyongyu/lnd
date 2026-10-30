@@ -3841,7 +3841,9 @@ func (r *rpcServer) WalletBalance(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	if in.Account != "" && len(accounts) == 0 && len(utxos) == 0 {
+	if in.Account != "" && in.Account != waddrmgr.ImportedAddrAccountName &&
+		len(accounts) == 0 && len(utxos) == 0 {
+
 		return nil, fmt.Errorf("%w: %s", base.ErrAccountNotFound,
 			in.Account)
 	}
@@ -3850,6 +3852,12 @@ func (r *rpcServer) WalletBalance(ctx context.Context,
 		unconfirmedBalance, lockedBalance btcutil.Amount
 	)
 	rpcAccountBalances := make(map[string]*lnrpc.WalletAccountBalance)
+	// Raw imports are accountless in SQL. Keep their RPC grouping visible
+	// after the last coin is spent, without creating a native account row.
+	if in.Account == "" || in.Account == waddrmgr.ImportedAddrAccountName {
+		rpcAccountBalances[waddrmgr.ImportedAddrAccountName] =
+			&lnrpc.WalletAccountBalance{}
+	}
 	for _, account := range accounts {
 		if !account.NoChainSync {
 			rpcAccountBalances[account.AccountName] =

@@ -358,7 +358,7 @@ func TestNewAddressNative(t *testing.T) {
 // rewards while counting tracked imported funds without local signing custody.
 func TestWalletBalanceNative(t *testing.T) {
 	t.Parallel()
-	for _, accountFilter := range []string{"", "missing"} {
+	for _, accountFilter := range []string{"", "missing", "imported"} {
 		t.Run("account "+accountFilter, func(t *testing.T) {
 			// Arrange native account/UTXO snapshots. Parent reads
 			// separate immature rewards from imported funds,
@@ -369,7 +369,7 @@ func TestWalletBalanceNative(t *testing.T) {
 			scope84 := waddrmgr.KeyScopeBIP0084
 			scope86 := waddrmgr.KeyScopeBIP0086
 			var utxos []*wallet.Utxo
-			if accountFilter == "missing" {
+			if accountFilter != "" {
 				w.On("ListAccountsByName",
 					t.Context(), accountFilter,
 				).Return([]wallet.AccountInfo{}, nil).Once()
@@ -481,7 +481,7 @@ func TestWalletBalanceNative(t *testing.T) {
 			// Assert unknown names fail, empty accounts survive,
 			// leases stay disjoint and imported value stays
 			// visible.
-			if accountFilter != "" {
+			if accountFilter == "missing" {
 				require.ErrorIs(t,
 					err, wallet.ErrAccountNotFound,
 				)
@@ -490,6 +490,19 @@ func TestWalletBalanceNative(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
+			if accountFilter == "imported" {
+				// Accountless imports retain a zero RPC bucket
+				// after spending their final coin, without a
+				// synthetic numbered account.
+				require.Zero(t, resp.TotalBalance)
+				require.Contains(t,
+					resp.AccountBalance, "imported",
+				)
+				require.Zero(t, resp.AccountBalance["imported"].
+					ConfirmedBalance)
+
+				return
+			}
 			require.EqualValues(t, 130, resp.TotalBalance)
 			require.EqualValues(t, 125, resp.ConfirmedBalance)
 			require.EqualValues(t, 5, resp.UnconfirmedBalance)
