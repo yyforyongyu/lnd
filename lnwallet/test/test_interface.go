@@ -2625,23 +2625,25 @@ func testSpendUnconfirmed(miner *rpctest.Harness,
 	assertTxInWallet(t, bob, txHash, true)
 }
 
-// testLastUnusedAddr tests that the LastUnusedAddress returns the address if
-// it isn't used, and also that once the address becomes used, then it's
-// properly rotated.
-func testLastUnusedAddr(miner *rpctest.Harness,
+// testNewAddress verifies the native KVDB fixtures allocate fresh receiving
+// children before and after a real payment to a previously issued address.
+func testNewAddress(miner *rpctest.Harness,
 	alice, bob *lnwallet.LightningWallet, t *testing.T) {
 
+	// Arrange: Advance the chain and exercise both configured receiving
+	// scopes with the shared fixtures, which explicitly use KVDB.
 	if _, err := miner.Client.Generate(1); err != nil {
 		t.Fatalf("unable to generate block: %v", err)
 	}
 
-	// We'll repeat this test for each address type to ensure they're all
-	// rotated properly.
 	addrTypes := []waddrmgr.KeyScope{
 		waddrmgr.KeyScopeBIP0084, waddrmgr.KeyScopeBIP0049Plus,
 	}
 	for _, addrType := range addrTypes {
-		addr1, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+		// Act: Request consecutive children without using either one;
+		// KVDB allocation advances while both addresses remain unused.
+		addr1, err := alice.Cfg.Wallet.NewAddress(
+			t.Context(),
 			wallet.NewAccountSelectorByName(
 				addrType, lnwallet.DefaultAccountName,
 			), false,
@@ -2649,7 +2651,8 @@ func testLastUnusedAddr(miner *rpctest.Harness,
 		if err != nil {
 			t.Fatalf("unable to get addr: %v", err)
 		}
-		addr2, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+		addr2, err := alice.Cfg.Wallet.NewAddress(
+			t.Context(),
 			wallet.NewAccountSelectorByName(
 				addrType, lnwallet.DefaultAccountName,
 			), false,
@@ -2658,18 +2661,12 @@ func testLastUnusedAddr(miner *rpctest.Harness,
 			t.Fatalf("unable to get addr: %v", err)
 		}
 
-		// If we generate two addresses back to back, then we should
-		// get the same addr, as none of them have been used yet.
-		if addr1.Addr.String() != addr2.Addr.String() {
-			t.Fatalf(
-				"addresses changed w/o use: %v vs %v",
-				addr1,
-				addr2,
-			)
-		}
+		// Assert: NewAddress returns a distinct child while earlier
+		// addresses remain unused, as the KVDB contract requires.
+		require.NotEqual(t, addr1.Addr.String(), addr2.Addr.String())
 
-		// Next, we'll have Bob pay to Alice's new address. This should
-		// trigger address rotation at the backend wallet.
+		// Act: Confirm a payment to the first child, then request a
+		// new child while the second address is still unused.
 		addrScript, err := txscript.PayToAddrScript(addr1.Addr)
 		if err != nil {
 			t.Fatalf("unable to convert addr to script: %v", err)
@@ -2681,9 +2678,8 @@ func testLastUnusedAddr(miner *rpctest.Harness,
 		}
 		sendCoins(t, miner, bob, alice, output, feeRate, true, 1)
 
-		// If we make a new address, then it should be brand new, as
-		// the prior address has been used.
-		addr3, err := alice.Cfg.Wallet.NewAddress(t.Context(),
+		addr3, err := alice.Cfg.Wallet.NewAddress(
+			t.Context(),
 			wallet.NewAccountSelectorByName(
 				addrType, lnwallet.DefaultAccountName,
 			), false,
@@ -2691,9 +2687,10 @@ func testLastUnusedAddr(miner *rpctest.Harness,
 		if err != nil {
 			t.Fatalf("unable to get addr: %v", err)
 		}
-		if addr1.Addr.String() == addr3.Addr.String() {
-			t.Fatalf("address should have changed but didn't")
-		}
+		// Assert: The next child differs from both the funded child
+		// and the earlier unused child after the payment is recorded.
+		require.NotEqual(t, addr1.Addr.String(), addr3.Addr.String())
+		require.NotEqual(t, addr2.Addr.String(), addr3.Addr.String())
 	}
 }
 
@@ -3139,8 +3136,8 @@ var walletTests = []walletTestCase{
 		test: testCancelNonExistentReservation,
 	},
 	{
-		name: "last unused addr",
-		test: testLastUnusedAddr,
+		name: "new address",
+		test: testNewAddress,
 	},
 	{
 		name: "reorg wallet balance",
