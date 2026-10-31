@@ -11,10 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channelnotifier"
@@ -34,6 +37,7 @@ import (
 	"github.com/lightningnetwork/lnd/pool"
 	"github.com/lightningnetwork/lnd/queue"
 	"github.com/lightningnetwork/lnd/shachain"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -635,12 +639,43 @@ func createTestPeer(t *testing.T) *peerTestCtx {
 	}
 
 	publishTx := make(chan *wire.MsgTx)
-	wallet := &lnwallet.LightningWallet{
-		WalletController: &mock.WalletController{
-			RootKey:               aliceKeyPriv,
-			PublishedTransactions: publishTx,
-		},
-	}
+	// Arrange the same mock through the borrowed native capability view.
+	walletMock := &mock.WalletController{}
+	t.Cleanup(func() { walletMock.AssertExpectations(t) })
+	// Shared close fixtures may request a delivery address or publish a
+	// close transaction. Arrange those optional native calls here;
+	// individual tests
+	// retain their existing transaction-channel assertions.
+	walletAddr, err := address.NewAddressPubKeyHash(
+		address.Hash160(
+			aliceKeyPub.SerializeCompressed(),
+		),
+		&chaincfg.MainNetParams,
+	)
+	require.NoError(t, err)
+	walletMock.On("NewAddress", testifymock.Anything,
+		testifymock.Anything, false).
+		Return(base.AddressInfo{Addr: walletAddr}, nil).Maybe()
+	walletMock.On(
+		"GetAddressInfo",
+		testifymock.Anything,
+		testifymock.Anything,
+	).
+		Return(base.AddressInfo{}, base.ErrAddressNotFound).
+		Maybe()
+	walletMock.On("Broadcast", testifymock.Anything,
+		testifymock.Anything, testifymock.Anything).
+		Return(nil).Run(func(args testifymock.Arguments) {
+		tx, _ := args.Get(1).(*wire.MsgTx)
+		select {
+		case publishTx <- tx:
+		case <-t.Context().Done():
+		}
+	}).Maybe()
+
+	wallet := &lnwallet.LightningWallet{Cfg: lnwallet.Config{
+		Wallet: walletMock, WalletServices: walletMock,
+	}}
 
 	const chanActiveTimeout = time.Minute
 

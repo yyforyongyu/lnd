@@ -10,14 +10,17 @@ import (
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -252,36 +255,158 @@ func serializeTxWitness(txWitness wire.TxWitness) ([]byte, error) {
 	return witnessBytes.Bytes(), nil
 }
 
+// TestSignPsbtDelegates checks the lnd-owned packet/tweak/result translation
+// without reproducing the maintained wallet's signing engine.
+func TestSignPsbtDelegates(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		walletErr error
+	}{
+		{
+			name: "returns wallet signed indices and tweak hooks",
+		},
+		{
+			name:      "returns wallet error",
+			walletErr: wallet.ErrNoAssocPrivateKey,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange both Lightning tweak fields and one unrelated
+			// proprietary field. Only the known fields need
+			// callbacks.
+			singleField := &psbt.Unknown{
+				Key:   PsbtKeyTypeInputSignatureTweakSingle,
+				Value: testTweakSingle,
+			}
+			doubleField := &psbt.Unknown{
+				Key:   PsbtKeyTypeInputSignatureTweakDouble,
+				Value: testCommitSecretBytes,
+			}
+			packet := &psbt.Packet{
+				Inputs: make([]psbt.PInput, 3),
+			}
+			packet.Inputs[0].Unknowns = []*psbt.Unknown{singleField}
+			packet.Inputs[1].Unknowns = []*psbt.Unknown{doubleField}
+			packet.Inputs[2].Unknowns = []*psbt.Unknown{
+				{
+					Key: []byte{0x99},
+				},
+			}
+			var captured *wallet.SignPsbtParams
+			backend := &walletControllerMock{}
+			backend.On(
+				"SignPsbt", mock.Anything, mock.Anything,
+			).Run(func(args mock.Arguments) {
+				arg := args.Get(1)
+				captured, _ = arg.(*wallet.SignPsbtParams)
+			}).Return(&wallet.SignPsbtResult{
+				Packet:       packet,
+				SignedInputs: []uint32{1},
+			}, test.walletErr).Once()
+			t.Cleanup(func() { backend.AssertExpectations(t) })
+			controller := &BtcWallet{wallet: backend}
+
+			// Act through the public PSBT method. Wallet decides
+			// which
+			// inputs are signed; lnd only supplies tweak callbacks.
+			signed, err := controller.SignPsbt(t.Context(), packet)
+
+			// Assert results/errors are actual wallet outcomes and
+			// the
+			// callbacks preserve lnd's existing Lightning tweak
+			// policy.
+			require.NotNil(t, captured)
+			require.Same(t, packet, captured.Packet)
+			require.Len(t, captured.InputTweakers, 2)
+			key, _ := btcec.PrivKeyFromBytes([]byte{1})
+			single, tweakErr := captured.InputTweakers[0](key)
+			require.NoError(t, tweakErr)
+			expected := input.TweakPrivKey(key, testTweakSingle)
+			require.Equal(t, expected, single)
+			double, tweakErr := captured.InputTweakers[1](key)
+			require.NoError(t, tweakErr)
+			expected = input.DeriveRevocationPrivKey(
+				key, testCommitSecret,
+			)
+			require.Equal(t, expected, double)
+			if test.walletErr != nil {
+				require.ErrorIs(t, err, test.walletErr)
+				require.Nil(t, signed)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, []uint32{1}, signed)
+			}
+		})
+	}
+}
+
 // TestSignPsbt tests the PSBT signing functionality.
 func TestSignPsbt(t *testing.T) {
 	w, _ := newTestWallet(t, netParams, seedBytes)
 
+	// Arrange the same first-address vector previously checked by the
+	// retired private path-parser test, through the public address API.
+	first, err := w.InternalWallet().NewAddress(t.Context(),
+		wallet.NewAccountSelectorByName(waddrmgr.KeyScopeBIP0084,
+			lnwallet.DefaultAccountName), false)
+	require.NoError(t, err)
+	require.Equal(t, firstAddress, first.Addr.String())
+
 	testCases := []struct {
 		name      string
 		inputType testInputType
-	}{{
-		name:      "plain P2WKH",
-		inputType: plainP2WKH,
-	}, {
-		name:      "tweaked P2WKH",
-		inputType: tweakedP2WKH,
-	}, {
-		name:      "nested P2WKH",
-		inputType: nestedP2WKH,
-	}, {
-		name:      "single key P2WSH",
-		inputType: singleKeyP2WSH,
-	}, {
-		name:      "single key double tweaked P2WSH",
-		inputType: singleKeyDoubleTweakedP2WSH,
-	}}
+	}{
+		{
+			name:      "plain P2WKH",
+			inputType: plainP2WKH,
+		},
+		{
+			name:      "tweaked P2WKH",
+			inputType: tweakedP2WKH,
+		},
+		{
+			name:      "nested P2WKH",
+			inputType: nestedP2WKH,
+		},
+		{
+			name:      "single key P2WSH",
+			inputType: singleKeyP2WSH,
+		},
+		{
+			name:      "single key double tweaked P2WSH",
+			inputType: singleKeyDoubleTweakedP2WSH,
+		},
+	}
 
 	for _, tc := range testCases {
 
-		// This is the private key we're going to sign with.
-		privKey, err := w.deriveKeyByBIP32Path(tc.inputType.keyPath())
+		// Arrange the reference output from the known test vector's
+		// explicit path. Production key parsing/signing belongs to
+		// Wallet; setup needs no lnd implementation of that parser.
+		path := tc.inputType.keyPath()
+		account := path[2] - hdkeychain.HardenedKeyStart
+		purpose := path[0] - hdkeychain.HardenedKeyStart
+		coin := path[1] - hdkeychain.HardenedKeyStart
+		privKey, err := w.InternalWallet().DerivePrivKey(
+			t.Context(), wallet.BIP32Path{
+				KeyScope: waddrmgr.KeyScope{
+					Purpose: purpose,
+					Coin:    coin,
+				},
+				DerivationPath: waddrmgr.DerivationPath{
+					InternalAccount: account,
+					Account:         account,
+					Branch:          path[3],
+					Index:           path[4],
+				},
+			},
+		)
 		require.NoError(t, err)
-
 		txOut, witnessScript := tc.inputType.output(t, privKey)
 
 		// Create the reference transaction that has the input that is
@@ -316,12 +441,14 @@ func TestSignPsbt(t *testing.T) {
 		}}
 		tc.inputType.decorateInput(t, privKey, &packet.Inputs[0])
 
-		// Let the wallet do its job. We expect to be the only signer
-		// for this PSBT, so we'll be able to finalize it later.
-		signedInputs, err := w.SignPsbt(packet)
+		// Act through the maintained signing path. Its actual signed
+		// indices must satisfy the original assertion, including when
+		// an upstream path limitation makes this test fail.
+		signedInputs, err := w.SignPsbt(t.Context(), packet)
 		require.NoError(t, err)
 
-		// We expect one signed input at index 0.
+		// Assert the original signed input, finalization and script
+		// execution results. No unsigned result is treated as success.
 		require.Len(t, signedInputs, 1)
 		require.EqualValues(t, 0, signedInputs[0])
 
@@ -570,9 +697,11 @@ func TestBip32DerivationFromKeyDesc(t *testing.T) {
 // TestBip32DerivationFromAddress tests that we can correctly extract a BIP32
 // derivation path from an address.
 func TestBip32DerivationFromAddress(t *testing.T) {
+	// Arrange the existing address types and paths on the managed wallet;
+	// each expected origin remains unchanged by the DTO conversion.
 	testCases := []struct {
 		name              string
-		addrType          lnwallet.AddressType
+		scope             waddrmgr.KeyScope
 		expectedAddr      string
 		expectedPath      string
 		expectedBip32Path []uint32
@@ -580,7 +709,7 @@ func TestBip32DerivationFromAddress(t *testing.T) {
 	}{
 		{
 			name:         "p2wkh",
-			addrType:     lnwallet.WitnessPubKey,
+			scope:        waddrmgr.KeyScopeBIP0084,
 			expectedAddr: firstAddress,
 			expectedPath: "m/84'/0'/0'/0/0",
 			expectedBip32Path: []uint32{
@@ -591,7 +720,7 @@ func TestBip32DerivationFromAddress(t *testing.T) {
 		},
 		{
 			name:         "p2tr",
-			addrType:     lnwallet.TaprootPubkey,
+			scope:        waddrmgr.KeyScopeBIP0086,
 			expectedAddr: firstAddressTaproot,
 			expectedPath: "m/86'/0'/0'/0/0",
 			expectedBip32Path: []uint32{
@@ -605,21 +734,26 @@ func TestBip32DerivationFromAddress(t *testing.T) {
 	w, _ := newTestWallet(t, netParams, seedBytes)
 	for _, tc := range testCases {
 
-		addr, err := w.NewAddress(
-			tc.addrType, false, lnwallet.DefaultAccountName,
+		addr, err := w.InternalWallet().NewAddress(t.Context(),
+			wallet.NewAccountSelectorByName(
+				tc.scope, lnwallet.DefaultAccountName,
+			), false,
 		)
 		require.NoError(t, err)
 
-		require.Equal(t, tc.expectedAddr, addr.String())
+		require.Equal(t, tc.expectedAddr, addr.Addr.String())
 
-		addrInfo, err := w.AddressInfo(addr)
-		require.NoError(t, err)
-		managedAddr, ok := addrInfo.(waddrmgr.ManagedPubKeyAddress)
-		require.True(t, ok)
-
-		d, trD, path, err := Bip32DerivationFromAddress(managedAddr)
+		addrInfo, err := w.InternalWallet().
+			GetAddressInfo(t.Context(), addr.Addr)
 		require.NoError(t, err)
 
+		// Act by extracting origins from the maintained address DTO,
+		// retaining both ordinary and Taproot PSBT derivations.
+		d, trD, path, err := Bip32DerivationFromAddress(&addrInfo)
+		require.NoError(t, err)
+
+		// Assert both origin forms and the display path retain the
+		// same keys as the existing derivation vectors.
 		require.Equal(t, tc.expectedPath, path)
 		require.Equal(t, tc.expectedBip32Path, d.Bip32Path)
 		require.Equal(t, tc.expectedBip32Path, trD.Bip32Path)

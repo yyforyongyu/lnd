@@ -19,6 +19,8 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/actor"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/chanacceptor"
@@ -1559,8 +1561,8 @@ func (f *Manager) fundeeProcessOpenChannel(peer lnpeer.Peer,
 	// We'll also reject any requests to create channels until we're fully
 	// synced to the network as we won't be able to properly validate the
 	// confirmation of the funding transaction.
-	isSynced, _, err := f.cfg.Wallet.IsSynced()
-	if err != nil || !isSynced {
+	info, err := f.cfg.Wallet.Cfg.Wallet.Info(context.Background())
+	if err != nil || !info.Synced {
 		if err != nil {
 			log.Errorf("unable to query wallet: %v", err)
 		}
@@ -5101,7 +5103,7 @@ func (f *Manager) handleInitFundingMsg(msg *InitFundingMsg) {
 		// Unconfirmed Utxos which are marked by the sweeper subsystem
 		// are excluded from the coin selection because they are not
 		// final and can be RBFed by the sweeper subsystem.
-		AllowUtxoForFunding: func(u lnwallet.Utxo) bool {
+		AllowUtxoForFunding: func(u base.Utxo) bool {
 			// Utxos with at least 1 confirmation are safe to use
 			// for channel openings because they don't bare the risk
 			// of being replaced (BIP 125 RBF).
@@ -5619,19 +5621,21 @@ func (f *Manager) deleteChannelOpeningState(chanPoint *wire.OutPoint) error {
 func (f *Manager) selectShutdownScript(taprootOK bool,
 ) (lnwire.DeliveryAddress, error) {
 
-	addrType := lnwallet.WitnessPubKey
+	scope := waddrmgr.KeyScopeBIP0084
 	if taprootOK {
-		addrType = lnwallet.TaprootPubkey
+		scope = waddrmgr.KeyScopeBIP0086
 	}
 
-	addr, err := f.cfg.Wallet.NewAddress(
-		addrType, false, lnwallet.DefaultAccountName,
+	addr, err := f.cfg.Wallet.Cfg.Wallet.NewAddress(
+		context.Background(), base.NewAccountSelectorByName(
+			scope, lnwallet.DefaultAccountName,
+		), false,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	return txscript.PayToAddrScript(addr)
+	return txscript.PayToAddrScript(addr.Addr)
 }
 
 // waitForPeerOnline blocks until the peer specified by peerPubkey comes online

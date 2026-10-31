@@ -10,286 +10,228 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/lntest/mock"
-	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-var (
-	errTestFetchLeaseOutput = errors.New("injected fetch failure")
-	errTestLeaseOutput      = errors.New("lease failed")
-	errTestReleaseOutput    = errors.New("release failed")
-)
-
-// leaseOptionsWallet records the optional lease settings passed by lockInputs.
-type leaseOptionsWallet struct {
-	*mock.WalletController
-
-	leaseCalls     []lnwallet.LeaseOutputOptions
-	legacyCalls    int
-	releasedIDs    []wtxmgr.LockID
-	releaseErr     error
-	failCall       int
-	legacyFailCall int
-	fetchCalls     int
-	failFetchCall  int
-}
-
-// legacyLeaseWallet records calls to the original lease method but does not
-// implement OutputLeaserWithOptions.
-type legacyLeaseWallet struct {
-	*mock.WalletController
-
-	leaseCalls int
-}
-
-// LeaseOutput records any fallback to the legacy lease path.
-func (w *legacyLeaseWallet) LeaseOutput(_ wtxmgr.LockID, _ wire.OutPoint,
-	_ time.Duration) (time.Time, error) {
-
-	w.leaseCalls++
-
-	return time.Unix(123, 0), nil
-}
-
-// LeaseOutputWithOptions records the requested behavior and optionally fails
-// one call so the partial-lock rollback path can be asserted.
-func (w *leaseOptionsWallet) LeaseOutputWithOptions(_ wtxmgr.LockID,
-	_ wire.OutPoint, _ time.Duration,
-	opts lnwallet.LeaseOutputOptions) (time.Time, error) {
-
-	w.leaseCalls = append(w.leaseCalls, opts)
-	if w.failCall > 0 && len(w.leaseCalls) == w.failCall {
-		return time.Time{}, errTestLeaseOutput
-	}
-
-	return time.Unix(123, 0), nil
-}
-
-// LeaseOutput records calls to the zero-option lease path.
-func (w *leaseOptionsWallet) LeaseOutput(_ wtxmgr.LockID, _ wire.OutPoint,
-	_ time.Duration) (time.Time, error) {
-
-	w.legacyCalls++
-	if w.legacyFailCall > 0 && w.legacyCalls == w.legacyFailCall {
-		return time.Time{}, errTestLeaseOutput
-	}
-
-	return time.Unix(123, 0), nil
-}
-
-// ReleaseOutput records the lock ID used to roll back an acquired lease.
-func (w *leaseOptionsWallet) ReleaseOutput(id wtxmgr.LockID,
-	_ wire.OutPoint) error {
-
-	w.releasedIDs = append(w.releasedIDs, id)
-
-	return w.releaseErr
-}
-
-// FetchOutpointInfo records metadata lookups and can fail one call to verify
-// that lockInputs rolls back leases acquired before the lookup failed.
-func (w *leaseOptionsWallet) FetchOutpointInfo(
-	outpoint *wire.OutPoint) (*lnwallet.Utxo, error) {
-
-	w.fetchCalls++
-	if w.failFetchCall > 0 && w.fetchCalls == w.failFetchCall {
-		return nil, errTestFetchLeaseOutput
-	}
-
-	return w.WalletController.FetchOutpointInfo(outpoint)
-}
-
-// TestLockInputsForwardsReleaseAfterSpend verifies that FundPsbt's lease helper
-// passes the requested confirmation depth to every selected input.
-func TestLockInputsForwardsReleaseAfterSpend(t *testing.T) {
+// TestLockInputsLifetime preserves explicit owner and native lifetime choices.
+func TestLockInputsLifetime(t *testing.T) {
 	t.Parallel()
-
-	wallet := &leaseOptionsWallet{
-		WalletController: &mock.WalletController{},
-	}
-	lockID := wtxmgr.LockID{1, 2, 3}
-	outpoints := []wire.OutPoint{
-		{Index: 1},
-		{Index: 2},
-	}
-
-	locks, err := lockInputs(
-		wallet, outpoints, &lockID, time.Hour, 6,
-	)
-	require.NoError(t, err)
-	require.Len(t, locks, 2)
-	require.Len(t, wallet.leaseCalls, 2)
-	for _, opts := range wallet.leaseCalls {
-		require.Equal(t, uint32(6), opts.ReleaseAfterSpendConfs)
-	}
-}
-
-// TestLockInputsUsesLegacyPathForZeroDepth verifies that the zero value keeps
-// the existing time-only lease path even when the wallet supports options.
-func TestLockInputsUsesLegacyPathForZeroDepth(t *testing.T) {
-	t.Parallel()
-
-	wallet := &leaseOptionsWallet{
-		WalletController: &mock.WalletController{},
-	}
-
-	locks, err := lockInputs(
-		wallet, []wire.OutPoint{{Index: 1}}, nil, time.Hour, 0,
-	)
-	require.NoError(t, err)
-	require.Len(t, locks, 1)
-	require.Equal(t, 1, wallet.legacyCalls)
-	require.Empty(t, wallet.leaseCalls)
-}
-
-// TestLockInputsRejectsUnsupportedLeaseOptions verifies an option-bearing
-// FundPsbt lease fails before falling back to a time-only wallet lease.
-func TestLockInputsRejectsUnsupportedLeaseOptions(t *testing.T) {
-	t.Parallel()
-
-	controller := &legacyLeaseWallet{
-		WalletController: &mock.WalletController{},
-	}
-	wallet := &lnwallet.LightningWallet{
-		WalletController: controller,
-	}
-
-	_, err := lockInputs(
-		wallet, []wire.OutPoint{{Index: 1}}, nil, time.Hour, 6,
-	)
-	require.ErrorIs(t, err, errOutputLeaseOptionsUnsupported)
-	require.Zero(t, controller.leaseCalls,
-		"unsupported options must not create a shorter legacy lease")
-}
-
-// TestLockInputsRejectsUnsupportedOptionsWithoutInputs verifies capability is
-// checked even when FundPsbt does not need to acquire a new input lease.
-func TestLockInputsRejectsUnsupportedOptionsWithoutInputs(t *testing.T) {
-	t.Parallel()
-
-	controller := &legacyLeaseWallet{
-		WalletController: &mock.WalletController{},
-	}
-	wallet := &lnwallet.LightningWallet{
-		WalletController: controller,
-	}
-
-	_, err := lockInputs(wallet, nil, nil, time.Hour, 6)
-	require.ErrorIs(t, err, errOutputLeaseOptionsUnsupported)
-	require.Zero(t, controller.leaseCalls)
-}
-
-// TestLockInputsRollbackUsesActualLockID verifies that a later lease failure
-// releases earlier inputs with the ID that acquired them.
-func TestLockInputsRollbackUsesActualLockID(t *testing.T) {
-	t.Parallel()
-
-	wallet := &leaseOptionsWallet{
-		WalletController: &mock.WalletController{},
-		failCall:         2,
-	}
-	lockID := wtxmgr.LockID{9, 8, 7}
-	outpoints := []wire.OutPoint{
-		{Index: 1},
-		{Index: 2},
-	}
-
-	_, err := lockInputs(wallet, outpoints, &lockID, time.Hour, 6)
-	require.ErrorIs(t, err, errTestLeaseOutput)
-	require.Equal(t, []wtxmgr.LockID{lockID}, wallet.releasedIDs)
-}
-
-// TestLockInputsLegacyRollbackUsesActualLockID verifies the zero-depth path
-// releases earlier inputs with the custom ID that acquired them.
-func TestLockInputsLegacyRollbackUsesActualLockID(t *testing.T) {
-	t.Parallel()
-
-	wallet := &leaseOptionsWallet{
-		WalletController: &mock.WalletController{},
-		legacyFailCall:   2,
-	}
-	lockID := wtxmgr.LockID{9, 8, 7}
-	outpoints := []wire.OutPoint{
-		{Index: 1},
-		{Index: 2},
-	}
-
-	_, err := lockInputs(wallet, outpoints, &lockID, time.Hour, 0)
-	require.ErrorIs(t, err, errTestLeaseOutput)
-	require.Equal(t, []wtxmgr.LockID{lockID}, wallet.releasedIDs)
-}
-
-// TestLockInputsReportsRollbackFailure verifies that a lease which survives a
-// failed rollback remains attributable by outpoint and owner ID to the caller.
-func TestLockInputsReportsRollbackFailure(t *testing.T) {
-	t.Parallel()
-
-	wallet := &leaseOptionsWallet{
-		WalletController: &mock.WalletController{},
-		failCall:         2,
-		releaseErr:       errTestReleaseOutput,
-	}
-	lockID := wtxmgr.LockID{9, 8, 7}
-	outpoint := wire.OutPoint{Index: 1}
-
-	_, err := lockInputs(
-		wallet, []wire.OutPoint{outpoint, {Index: 2}}, &lockID,
-		time.Hour, 6,
-	)
-	require.ErrorIs(t, err, errTestLeaseOutput)
-	require.ErrorIs(t, err, errTestReleaseOutput)
-	require.ErrorContains(t, err, outpoint.String())
-	require.ErrorContains(t, err, hex.EncodeToString(lockID[:]))
-}
-
-// TestLockInputsRollbackOnFetchFailure verifies that a metadata failure after
-// one successful lease releases that lease with the ID that acquired it.
-func TestLockInputsRollbackOnFetchFailure(t *testing.T) {
-	t.Parallel()
-
-	customLockID := wtxmgr.LockID{9, 8, 7}
 	testCases := []struct {
-		name       string
-		lockID     *wtxmgr.LockID
-		expectedID wtxmgr.LockID
+		name     string
+		noExpiry bool
 	}{
 		{
-			name:       "internal lock ID",
-			expectedID: chanfunding.LndInternalLockID,
+			name: "timed",
 		},
 		{
-			name:       "custom lock ID",
-			lockID:     &customLockID,
-			expectedID: customLockID,
+			name:     "no expiry",
+			noExpiry: true,
 		},
 	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-
-			wallet := &leaseOptionsWallet{
-				WalletController: &mock.WalletController{},
-				failFetchCall:    2,
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange one known output with exact native
+			// acquisition calls. The backend result, rather than
+			// lnd state, describes lifetime.
+			w := &mock.WalletController{}
+			t.Cleanup(func() { w.AssertExpectations(t) })
+			owner := wtxmgr.LockID{9}
+			op := wire.OutPoint{Index: 1}
+			w.On("GetUtxo", testifymock.Anything, op).
+				Return(&wallet.Utxo{OutPoint: op}, nil).Once()
+			duration := chanfunding.DefaultLockDuration
+			expiry := time.Unix(123, 0)
+			var depth uint32
+			if tc.noExpiry {
+				duration, expiry, depth = 0, time.Time{}, 1
 			}
-			outpoints := []wire.OutPoint{
-				{Index: 1},
-				{Index: 2},
-			}
+			opts := testifymock.MatchedBy(
+				func(opts []wallet.LeaseOption) bool {
+					return len(opts) == int(depth)
+				},
+			)
+			w.On(
+				"LeaseOutput",
+				testifymock.Anything,
+				owner,
+				op,
+				duration,
+				opts,
+			).
+				Return(expiry, nil).
+				Once()
 
-			_, err := lockInputs(
-				wallet, outpoints, testCase.lockID,
-				time.Hour, 6,
+			// Act through the funding reservation helper with the
+			// caller owner.
+			leases, err := lockInputs(
+				t.Context(),
+				w,
+				[]wire.OutPoint{op},
+				&owner,
+				0,
+				depth,
 			)
-			require.ErrorIs(t, err, errTestFetchLeaseOutput)
-			require.Len(t, wallet.leaseCalls, 1)
-			require.Equal(
-				t, []wtxmgr.LockID{testCase.expectedID},
-				wallet.releasedIDs,
+
+			// Assert native identity/lifetime survives without a
+			// wrapper DTO.
+			require.NoError(t, err)
+			require.Len(t, leases, 1)
+			require.Equal(t, owner, leases[0].LockID)
+			require.Equal(t, op, leases[0].OutPoint)
+			require.Equal(t, expiry, leases[0].Expiration)
+			require.Equal(t, tc.noExpiry, leases[0].NoExpiry)
+		})
+	}
+}
+
+// TestLockInputsRollback preserves acquired-owner cleanup and visible failures.
+func TestLockInputsRollback(t *testing.T) {
+	t.Parallel()
+	leaseErr := errors.New("lease failed")
+	lookupErr := errors.New("output lookup failed")
+	releaseErr := errors.New("release failed")
+	customOwner := wtxmgr.LockID{9, 8, 7}
+	testCases := []struct {
+		name       string
+		owner      *wtxmgr.LockID
+		noExpiry   bool
+		lookupErr  error
+		leaseErr   error
+		releaseErr error
+	}{
+		{
+			name:     "timed acquisition failure",
+			owner:    &customOwner,
+			leaseErr: leaseErr,
+		},
+		{
+			name:     "no expiry acquisition failure",
+			owner:    &customOwner,
+			noExpiry: true,
+			leaseErr: leaseErr,
+		},
+		{
+			name:       "cleanup failure remains attributable",
+			owner:      &customOwner,
+			noExpiry:   true,
+			leaseErr:   leaseErr,
+			releaseErr: releaseErr,
+		},
+		{
+			name:      "metadata failure with custom owner",
+			owner:     &customOwner,
+			noExpiry:  true,
+			lookupErr: lookupErr,
+		},
+		{
+			name:      "metadata failure with internal owner",
+			lookupErr: lookupErr,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange one acquired lease followed by the existing
+			// lookup or acquisition failure. Cleanup must use the
+			// owner that acquired it.
+			w := &mock.WalletController{}
+			t.Cleanup(func() { w.AssertExpectations(t) })
+			first, second := wire.OutPoint{
+				Index: 1,
+			}, wire.OutPoint{
+				Index: 2,
+			}
+			owner := chanfunding.LndInternalLockID
+			if tc.owner != nil {
+				owner = *tc.owner
+			}
+			duration := chanfunding.DefaultLockDuration
+			expiry := time.Unix(123, 0)
+			var depth uint32
+			if tc.noExpiry {
+				duration, expiry, depth = 0, time.Time{}, 1
+			}
+			opts := testifymock.MatchedBy(
+				func(opts []wallet.LeaseOption) bool {
+					return len(opts) == int(depth)
+				},
 			)
+			w.On("GetUtxo", testifymock.Anything, first).
+				Return(&wallet.Utxo{OutPoint: first}, nil).
+				Once()
+			w.On(
+				"LeaseOutput",
+				testifymock.Anything,
+				owner,
+				first,
+				duration,
+				opts,
+			).
+				Return(expiry, nil).
+				Once()
+			w.On("GetUtxo", testifymock.Anything, second).
+				Return(
+					&wallet.Utxo{OutPoint: second},
+					tc.lookupErr,
+				).
+				Once()
+			if tc.lookupErr == nil {
+				w.On(
+					"LeaseOutput",
+					testifymock.Anything,
+					owner,
+					second,
+					duration,
+					opts,
+				).
+					Return(time.Time{}, tc.leaseErr).
+					Once()
+			}
+			w.On(
+				"ReleaseOutput",
+				testifymock.Anything,
+				owner,
+				first,
+			).
+				Return(tc.releaseErr).
+				Once()
+
+			// Act through the same partial-acquisition cleanup used
+			// by FundPsbt.
+			leases, err := lockInputs(
+				t.Context(),
+				w,
+				[]wire.OutPoint{
+					first,
+					second,
+				},
+				tc.owner,
+				0,
+				depth,
+			)
+
+			// Assert failure cannot publish a successful result or
+			// hide a lease whose cleanup failed; its owner and
+			// outpoint remain recoverable.
+			require.Nil(t, leases)
+			if tc.lookupErr != nil {
+				require.ErrorIs(t, err, tc.lookupErr)
+			} else {
+				require.ErrorIs(t, err, tc.leaseErr)
+			}
+			if tc.releaseErr != nil {
+				require.ErrorIs(t, err, tc.releaseErr)
+				require.ErrorContains(t, err, first.String())
+				require.ErrorContains(
+					t,
+					err,
+					hex.EncodeToString(owner[:]),
+				)
+			}
 		})
 	}
 }

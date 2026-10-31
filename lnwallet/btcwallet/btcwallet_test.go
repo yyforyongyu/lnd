@@ -1,337 +1,57 @@
 package btcwallet
 
 import (
-	"math"
-	"testing"
-	"time"
+	"context"
 
-	"github.com/btcsuite/btcd/btcjson"
-	"github.com/btcsuite/btcd/rpcclient"
-	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcwallet/wallet"
-	"github.com/btcsuite/btcwallet/wtxmgr"
-	"github.com/lightningnetwork/lnd/lnmock"
-	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/stretchr/testify/mock"
-	"github.com/stretchr/testify/require"
 )
 
-// lockedOutpointWallet simulates an output held by btcwallet's memory locker.
-type lockedOutpointWallet struct {
-	wallet.Interface
-	leaseCalled bool
+// walletControllerMock records calls at the maintained adapter boundary;
+// unused embedded operations have no implementation and fail if invoked.
+type walletControllerMock struct {
+	walletAPI
+	mock.Mock
 }
 
-// LockedOutpoint reports that the test output is already locked in memory.
-func (w *lockedOutpointWallet) LockedOutpoint(wire.OutPoint) bool {
-	return true
+// SignPsbt captures the packet and Lightning callback translation.
+func (w *walletControllerMock) SignPsbt(ctx context.Context,
+	params *wallet.SignPsbtParams) (*wallet.SignPsbtResult, error) {
+
+	args := w.Called(ctx, params)
+	result, _ := args.Get(0).(*wallet.SignPsbtResult)
+
+	return result, args.Error(1)
 }
 
-// LeaseOutput records an unexpected attempt to lease the locked output.
-func (w *lockedOutpointWallet) LeaseOutput(wtxmgr.LockID, wire.OutPoint,
-	time.Duration) (time.Time, error) {
+// ComputeRawSig supplies the maintained signature encoding for conversion.
+func (w *walletControllerMock) ComputeRawSig(ctx context.Context,
+	params *wallet.RawSigParams) (wallet.RawSignature, error) {
 
-	w.leaseCalled = true
-	return time.Time{}, nil
+	args := w.Called(ctx, params)
+	sig, _ := args.Get(0).(wallet.RawSignature)
+
+	return sig, args.Error(1)
 }
 
-// TestLeaseOutputRejectsInMemoryLock verifies that the legacy lease path
-// preserves the in-memory double-lock guard.
-func TestLeaseOutputRejectsInMemoryLock(t *testing.T) {
-	t.Parallel()
+// SignDigest supplies the concrete signature selected by the request.
+func (w *walletControllerMock) SignDigest(ctx context.Context,
+	path wallet.BIP32Path, intent *wallet.SignDigestIntent) (
+	wallet.Signature, error) {
 
-	backend := &lockedOutpointWallet{}
-	wallet := &BtcWallet{wallet: backend}
+	args := w.Called(ctx, path, intent)
+	sig, _ := args.Get(0).(wallet.Signature)
 
-	_, err := wallet.LeaseOutput(
-		wtxmgr.LockID{}, wire.OutPoint{}, time.Minute,
-	)
-	require.ErrorIs(t, err, wtxmgr.ErrOutputAlreadyLocked)
-	require.False(t, backend.leaseCalled)
+	return sig, args.Error(1)
 }
 
-type previousOutpointsTest struct {
-	name     string
-	tx       *wire.MsgTx
-	myInputs []wallet.TransactionSummaryInput
-	expRes   []lnwallet.PreviousOutPoint
-}
+// GetAddressInfo resolves only public path metadata for signing.
+func (w *walletControllerMock) GetAddressInfo(ctx context.Context,
+	addr address.Address) (wallet.AddressInfo, error) {
 
-var previousOutpointsTests = []previousOutpointsTest{{
-	name: "both outpoints are wallet controlled",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{{
-			PreviousOutPoint: wire.OutPoint{Index: 0},
-		}, {
-			PreviousOutPoint: wire.OutPoint{Index: 1},
-		}},
-	},
-	myInputs: []wallet.TransactionSummaryInput{{
-		Index: 0,
-	}, {
-		Index: 1,
-	}},
-	expRes: []lnwallet.PreviousOutPoint{{
-		OutPoint:    wire.OutPoint{Index: 0}.String(),
-		IsOurOutput: true,
-	}, {
-		OutPoint:    wire.OutPoint{Index: 1}.String(),
-		IsOurOutput: true,
-	}},
-}, {
-	name: "only one outpoint is wallet controlled",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{{
-			PreviousOutPoint: wire.OutPoint{Index: 0},
-		}, {
-			PreviousOutPoint: wire.OutPoint{Index: 1},
-		}},
-	},
-	myInputs: []wallet.TransactionSummaryInput{{
-		Index: 0,
-	}, {
-		Index: 2,
-	}},
-	expRes: []lnwallet.PreviousOutPoint{{
-		OutPoint:    wire.OutPoint{Index: 0}.String(),
-		IsOurOutput: true,
-	}, {
-		OutPoint:    wire.OutPoint{Index: 1}.String(),
-		IsOurOutput: false,
-	}},
-}, {
-	name: "no outpoint is wallet controlled",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{{
-			PreviousOutPoint: wire.OutPoint{Index: 0},
-		}, {
-			PreviousOutPoint: wire.OutPoint{Index: 1},
-		}},
-	},
-	myInputs: []wallet.TransactionSummaryInput{{
-		Index: 2,
-	}, {
-		Index: 3,
-	}},
-	expRes: []lnwallet.PreviousOutPoint{{
-		OutPoint:    wire.OutPoint{Index: 0}.String(),
-		IsOurOutput: false,
-	}, {
-		OutPoint:    wire.OutPoint{Index: 1}.String(),
-		IsOurOutput: false,
-	}},
-}, {
-	name: "tx is empty",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{},
-	},
-	myInputs: []wallet.TransactionSummaryInput{{
-		Index: 2,
-	}, {
-		Index: 3,
-	}},
-	expRes: []lnwallet.PreviousOutPoint{},
-}, {
-	name: "wallet controlled input set is empty",
-	tx: &wire.MsgTx{
-		TxIn: []*wire.TxIn{{
-			PreviousOutPoint: wire.OutPoint{Index: 0},
-		}, {
-			PreviousOutPoint: wire.OutPoint{Index: 1},
-		}},
-	},
-	myInputs: []wallet.TransactionSummaryInput{},
-	expRes: []lnwallet.PreviousOutPoint{{
-		OutPoint:    wire.OutPoint{Index: 0}.String(),
-		IsOurOutput: false,
-	}, {
-		OutPoint:    wire.OutPoint{Index: 1}.String(),
-		IsOurOutput: false,
-	}},
-}}
+	args := w.Called(ctx, addr)
+	info, _ := args.Get(0).(wallet.AddressInfo)
 
-// TestPreviousOutpoints tests if we are able to get the previous
-// outpoints correctly.
-func TestPreviousOutpoints(t *testing.T) {
-	for _, test := range previousOutpointsTests {
-		t.Run(test.name, func(t *testing.T) {
-			respOutpoints := getPreviousOutpoints(
-				test.tx, test.myInputs,
-			)
-
-			for idx, respOutpoint := range respOutpoints {
-				expRes := test.expRes[idx]
-				require.Equal(
-					t, expRes.OutPoint,
-					respOutpoint.OutPoint,
-				)
-				require.Equal(
-					t, expRes.IsOurOutput,
-					respOutpoint.IsOurOutput,
-				)
-			}
-		})
-	}
-}
-
-// TestTransactionDetailsPage verifies the bounds returned for transaction
-// pagination, including requests that would overflow with uint32 addition.
-func TestTransactionDetailsPage(t *testing.T) {
-	t.Parallel()
-
-	txDetails := []*lnwallet.TransactionDetail{{}, {}, {}, {}}
-
-	testCases := []struct {
-		name          string
-		offset        uint32
-		limit         uint32
-		expectedPage  []*lnwallet.TransactionDetail
-		expectedFirst uint64
-		expectedLast  uint64
-	}{
-		{
-			name:          "zero limit returns remainder",
-			offset:        1,
-			expectedPage:  txDetails[1:],
-			expectedFirst: 1,
-			expectedLast:  3,
-		},
-		{
-			name:          "limit selects page",
-			offset:        1,
-			limit:         2,
-			expectedPage:  txDetails[1:3],
-			expectedFirst: 1,
-			expectedLast:  2,
-		},
-		{
-			name:          "limit exceeds remainder",
-			offset:        2,
-			limit:         10,
-			expectedPage:  txDetails[2:],
-			expectedFirst: 2,
-			expectedLast:  3,
-		},
-		{
-			name:          "offset plus limit exceeds uint32",
-			offset:        1,
-			limit:         math.MaxUint32,
-			expectedPage:  txDetails[1:],
-			expectedFirst: 1,
-			expectedLast:  3,
-		},
-		{
-			name:         "offset equals transaction count",
-			offset:       uint32(len(txDetails)),
-			limit:        1,
-			expectedPage: []*lnwallet.TransactionDetail{},
-		},
-		{
-			name:         "maximum offset",
-			offset:       math.MaxUint32,
-			limit:        1,
-			expectedPage: []*lnwallet.TransactionDetail{},
-		},
-	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			page, first, last := transactionDetailsPage(
-				txDetails, testCase.offset, testCase.limit,
-			)
-
-			require.Equal(t, testCase.expectedPage, page)
-			require.Equal(t, testCase.expectedFirst, first)
-			require.Equal(t, testCase.expectedLast, last)
-		})
-	}
-}
-
-// TestCheckMempoolAcceptance asserts the CheckMempoolAcceptance behaves as
-// expected.
-func TestCheckMempoolAcceptance(t *testing.T) {
-	t.Parallel()
-
-	rt := require.New(t)
-
-	// Create a mock chain.Interface.
-	mockChain := &lnmock.MockChain{}
-	defer mockChain.AssertExpectations(t)
-
-	// Create a test tx and a test max feerate.
-	tx := wire.NewMsgTx(2)
-	maxFeeRate := float64(0)
-
-	// Create a test wallet.
-	wallet := &BtcWallet{
-		chain: mockChain,
-	}
-
-	// Assert that when the chain backend doesn't support
-	// `TestMempoolAccept`, an error is returned.
-	//
-	// Mock the chain backend to not support `TestMempoolAccept`.
-	mockChain.On("TestMempoolAccept", []*wire.MsgTx{tx}, maxFeeRate).Return(
-		nil, rpcclient.ErrBackendVersion).Once()
-
-	err := wallet.CheckMempoolAcceptance(tx)
-	rt.ErrorIs(err, rpcclient.ErrBackendVersion)
-
-	// Assert that when the chain backend doesn't implement
-	// `TestMempoolAccept`, an error is returned.
-	//
-	// Mock the chain backend to not support `TestMempoolAccept`.
-	mockChain.On("TestMempoolAccept", []*wire.MsgTx{tx}, maxFeeRate).Return(
-		nil, chain.ErrUnimplemented).Once()
-
-	// Now call the method under test.
-	err = wallet.CheckMempoolAcceptance(tx)
-	rt.ErrorIs(err, chain.ErrUnimplemented)
-
-	// Assert that when the returned results are not as expected, an error
-	// is returned.
-	//
-	// Mock the chain backend to return more than one result.
-	results := []*btcjson.TestMempoolAcceptResult{
-		{Txid: "txid1", Allowed: true},
-		{Txid: "txid2", Allowed: false},
-	}
-	mockChain.On("TestMempoolAccept", []*wire.MsgTx{tx}, maxFeeRate).Return(
-		results, nil).Once()
-
-	// Now call the method under test.
-	err = wallet.CheckMempoolAcceptance(tx)
-	rt.ErrorContains(err, "expected 1 result from TestMempoolAccept")
-
-	// Assert that when the tx is rejected, the reason is converted to an
-	// RPC error and returned.
-	//
-	// Mock the chain backend to return one result.
-	results = []*btcjson.TestMempoolAcceptResult{{
-		Txid:         tx.TxHash().String(),
-		Allowed:      false,
-		RejectReason: "insufficient fee",
-	}}
-	mockChain.On("TestMempoolAccept", []*wire.MsgTx{tx}, maxFeeRate).Return(
-		results, nil).Once()
-	mockChain.On("MapRPCErr", mock.Anything).Return(
-		chain.ErrInsufficientFee).Once()
-
-	// Now call the method under test.
-	err = wallet.CheckMempoolAcceptance(tx)
-	rt.ErrorIs(err, chain.ErrInsufficientFee)
-
-	// Assert that when the tx is accepted, no error is returned.
-	//
-	// Mock the chain backend to return one result.
-	results = []*btcjson.TestMempoolAcceptResult{
-		{Txid: tx.TxHash().String(), Allowed: true},
-	}
-	mockChain.On("TestMempoolAccept", []*wire.MsgTx{tx}, maxFeeRate).Return(
-		results, nil).Once()
-
-	// Now call the method under test.
-	err = wallet.CheckMempoolAcceptance(tx)
-	rt.NoError(err)
+	return info, args.Error(1)
 }

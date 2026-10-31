@@ -3,330 +3,281 @@ package mock
 import (
 	"context"
 	"encoding/hex"
-	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcjson"
-	"github.com/btcsuite/btcd/btcutil/v2"
-	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
-	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	base "github.com/btcsuite/btcwallet/wallet"
-	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wtxmgr"
-	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet"
-	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/stretchr/testify/mock"
 )
 
-var (
-	CoinPkScript, _ = hex.DecodeString("001431df1bde03c074d0cf21ea2529427e1499b8f1de")
+// CoinPkScript is the existing witness output used by funding fixtures.
+var CoinPkScript, _ = hex.DecodeString(
+	"001431df1bde03c074d0cf21ea2529427e1499b8f1de",
 )
 
-// WalletController is a mock implementation of the WalletController
-// interface. It let's us mock the interaction with the bitcoin network.
+// WalletController records maintained-wallet calls in lnd consumer fixtures.
+// Embedded unused capabilities fail if a test unexpectedly invokes them.
 type WalletController struct {
-	RootKey               *btcec.PrivateKey
-	PublishedTransactions chan *wire.MsgTx
-	index                 uint32
-	Utxos                 []*lnwallet.Utxo
+	lnwallet.WalletAPI
+	lnwallet.WalletServices
+	mock.Mock
+
+	Utxos []*base.Utxo
 }
 
-// A compile time check to ensure this mocked WalletController implements the
-// WalletController.
-var _ lnwallet.WalletController = (*WalletController)(nil)
+var _ lnwallet.WalletAPI = (*WalletController)(nil)
+var _ lnwallet.WalletServices = (*WalletController)(nil)
 
-// BackEnd returns "mock" to signify a mock wallet controller.
-func (w *WalletController) BackEnd() string {
-	return "mock"
+// ImportAccount records declared origin metadata at the maintained Wallet
+// boundary, so RPC tests can distinguish omitted values from supplied zeroes.
+func (w *WalletController) ImportAccount(ctx context.Context,
+	params base.ImportAccountParams, dryRun bool) (
+	*base.AccountInfo, error) {
+
+	args := w.Called(ctx, params, dryRun)
+	account, _ := args.Get(0).(*base.AccountInfo)
+	return account, args.Error(1)
 }
 
-// FetchOutpointInfo will be called to get info about the inputs to the funding
-// transaction.
-func (w *WalletController) FetchOutpointInfo(
-	prevOut *wire.OutPoint) (*lnwallet.Utxo, error) {
+// NewBulkAddresses records deliberate fresh allocation for address RPCs using
+// the same mock expectation boundary as native receiving-address selection.
+func (w *WalletController) NewBulkAddresses(ctx context.Context,
+	selector base.AccountSelector, internal bool, count uint32) (
+	[]base.AddressInfo, error) {
 
-	utxo := &lnwallet.Utxo{
-		AddressType:   lnwallet.WitnessPubKey,
-		Value:         10 * btcutil.SatoshiPerBitcoin,
-		PkScript:      []byte("dummy"),
-		Confirmations: 1,
-		OutPoint:      *prevOut,
-	}
-	return utxo, nil
+	args := w.Called(ctx, selector, internal, count)
+	addresses, _ := args.Get(0).([]base.AddressInfo)
+	return addresses, args.Error(1)
 }
 
-// ScriptForOutput returns the address, witness program and redeem script for a
-// given UTXO. An error is returned if the UTXO does not belong to our wallet or
-// it is not a managed pubKey address.
-func (w *WalletController) ScriptForOutput(*wire.TxOut) (
-	waddrmgr.ManagedPubKeyAddress, []byte, []byte, error) {
-
-	return nil, nil, nil, nil
+// IsWatchOnly returns the native mode used to distinguish remote signing.
+func (w *WalletController) IsWatchOnly() bool {
+	return w.Called().Bool(0)
 }
 
-// ConfirmedBalance currently returns dummy values.
-func (w *WalletController) ConfirmedBalance(int32, string) (btcutil.Amount,
+// DerivePubKey records read-only public derivation without allocating children.
+func (w *WalletController) DerivePubKey(ctx context.Context,
+	params base.DerivePubKeyParams) (*btcec.PublicKey, error) {
+
+	args := w.Called(ctx, params)
+	key, _ := args.Get(0).(*btcec.PublicKey)
+	return key, args.Error(1)
+}
+
+// ListAccounts supplies the native catalog, including empty accounts.
+func (w *WalletController) ListAccounts(ctx context.Context) (
+	[]base.AccountInfo, error) {
+
+	args := w.Called(ctx)
+	accounts, _ := args.Get(0).([]base.AccountInfo)
+	return accounts, args.Error(1)
+}
+
+// GetAccount records scope-aware lookup for account constraints and fee quotes.
+func (w *WalletController) GetAccount(ctx context.Context,
+	scope waddrmgr.KeyScope, name string) (*base.AccountInfo, error) {
+
+	args := w.Called(ctx, scope, name)
+	info, _ := args.Get(0).(*base.AccountInfo)
+	return info, args.Error(1)
+}
+
+// ScriptForOutput supplies native ownership metadata for offline inputs too.
+func (w *WalletController) ScriptForOutput(ctx context.Context,
+	output wire.TxOut) (base.OutputScriptInfo, error) {
+
+	args := w.Called(ctx, output)
+	info, _ := args.Get(0).(base.OutputScriptInfo)
+	return info, args.Error(1)
+}
+
+// ListAddresses returns the native payment-account address projection.
+func (w *WalletController) ListAddresses(ctx context.Context, name string,
+	addrType waddrmgr.AddressType) ([]base.AddressProperty, error) {
+
+	args := w.Called(ctx, name, addrType)
+	addresses, _ := args.Get(0).([]base.AddressProperty)
+	return addresses, args.Error(1)
+}
+
+// ListTxns returns maintained history for public RPC filtering tests.
+func (w *WalletController) ListTxns(ctx context.Context,
+	startHeight, endHeight int32) ([]*base.TxDetail, error) {
+
+	args := w.Called(ctx, startHeight, endHeight)
+	txns, _ := args.Get(0).([]*base.TxDetail)
+	return txns, args.Error(1)
+}
+
+// Info returns the arranged native synchronization snapshot.
+func (w *WalletController) Info(ctx context.Context) (*base.Info, error) {
+	args := w.Called(ctx)
+	info, _ := args.Get(0).(*base.Info)
+	return info, args.Error(1)
+}
+
+// NewAddress records native selector and branch use.
+func (w *WalletController) NewAddress(ctx context.Context,
+	selector base.AccountSelector, internal bool) (base.AddressInfo,
 	error) {
 
-	return 0, nil
+	args := w.Called(ctx, selector, internal)
+	info, _ := args.Get(0).(base.AddressInfo)
+	return info, args.Error(1)
 }
 
-// NewAddress is called to get new addresses for delivery, change etc.
-func (w *WalletController) NewAddress(lnwallet.AddressType, bool,
-	string) (address.Address, error) {
+// GetAddressInfo returns arranged wallet-owned address metadata.
+func (w *WalletController) GetAddressInfo(ctx context.Context,
+	addr address.Address) (base.AddressInfo, error) {
 
-	pkh := address.Hash160(w.RootKey.PubKey().SerializeCompressed())
-	addr, _ := address.NewAddressPubKeyHash(pkh, &chaincfg.MainNetParams)
-	return addr, nil
+	args := w.Called(ctx, addr)
+	info, _ := args.Get(0).(base.AddressInfo)
+	return info, args.Error(1)
 }
 
-// LastUnusedAddress currently returns dummy values.
-func (w *WalletController) LastUnusedAddress(lnwallet.AddressType,
-	string) (address.Address, error) {
+// ListUnspent returns the fixture's arranged native UTXO snapshot.
+func (w *WalletController) ListUnspent(ctx context.Context,
+	query base.UtxoQuery) ([]*base.Utxo, error) {
 
-	return nil, nil
-}
-
-// IsOurAddress currently returns a dummy value.
-func (w *WalletController) IsOurAddress(address.Address) bool {
-	return false
-}
-
-// AddressInfo currently returns a dummy value.
-func (w *WalletController) AddressInfo(
-	address.Address) (waddrmgr.ManagedAddress, error) {
-
-	return nil, nil
-}
-
-// ListAccounts currently returns a dummy value.
-func (w *WalletController) ListAccounts(string,
-	*waddrmgr.KeyScope) ([]*waddrmgr.AccountProperties, error) {
-
-	return nil, nil
-}
-
-// RequiredReserve currently returns a dummy value.
-func (w *WalletController) RequiredReserve(uint32) btcutil.Amount {
-	return 0
-}
-
-// ListAddresses currently returns a dummy value.
-func (w *WalletController) ListAddresses(string,
-	bool) (lnwallet.AccountAddressMap, error) {
-
-	return nil, nil
-}
-
-// CreateAccount currently returns a dummy value.
-func (w *WalletController) CreateAccount(waddrmgr.KeyScope,
-	string) (*waddrmgr.AccountProperties, error) {
-
-	return nil, nil
-}
-
-// ImportAccount currently returns a dummy value.
-func (w *WalletController) ImportAccount(string, *hdkeychain.ExtendedKey,
-	uint32, *waddrmgr.AddressType, bool) (*waddrmgr.AccountProperties,
-	[]address.Address, []address.Address, error) {
-
-	return nil, nil, nil, nil
-}
-
-// ImportPublicKey currently returns a dummy value.
-func (w *WalletController) ImportPublicKey(*btcec.PublicKey,
-	waddrmgr.AddressType) error {
-
-	return nil
-}
-
-// ImportTaprootScript currently returns a dummy value.
-func (w *WalletController) ImportTaprootScript(waddrmgr.KeyScope,
-	*waddrmgr.Tapscript) (waddrmgr.ManagedAddress, error) {
-
-	return nil, nil
-}
-
-// SendOutputs currently returns dummy values.
-func (w *WalletController) SendOutputs(fn.Set[wire.OutPoint], []*wire.TxOut,
-	chainfee.SatPerKWeight, int32, string, base.CoinSelectionStrategy) (
-	*wire.MsgTx, error) {
-
-	return nil, nil
-}
-
-// CreateSimpleTx currently returns dummy values.
-func (w *WalletController) CreateSimpleTx(fn.Set[wire.OutPoint], []*wire.TxOut,
-	chainfee.SatPerKWeight, int32, base.CoinSelectionStrategy,
-	bool) (*txauthor.AuthoredTx, error) {
-
-	return nil, nil
-}
-
-// ListUnspentWitness is called by the wallet when doing coin selection. We just
-// need one unspent for the funding transaction.
-func (w *WalletController) ListUnspentWitness(int32, int32,
-	string) ([]*lnwallet.Utxo, error) {
-
-	// If the mock already has a list of utxos, return it.
-	if w.Utxos != nil {
-		return w.Utxos, nil
+	args := w.Called(ctx, query)
+	if result, ok := args.Get(0).(func() []*base.Utxo); ok {
+		return result(), args.Error(1)
 	}
+	utxos, _ := args.Get(0).([]*base.Utxo)
 
-	// Otherwise create one to return.
-	utxo := &lnwallet.Utxo{
-		AddressType: lnwallet.WitnessPubKey,
-		Value:       btcutil.Amount(10 * btcutil.SatoshiPerBitcoin),
-		PkScript:    CoinPkScript,
-		OutPoint: wire.OutPoint{
-			Hash:  chainhash.Hash{},
-			Index: w.index,
-		},
+	return utxos, args.Error(1)
+}
+
+// GetUtxo returns arranged owned-output metadata.
+func (w *WalletController) GetUtxo(ctx context.Context,
+	op wire.OutPoint) (*base.Utxo, error) {
+
+	args := w.Called(ctx, op)
+	// Shared funding fixtures arrange metadata from the requested outpoint
+	// without a mock wallet store or losing manual-input identity.
+	if result, ok := args.Get(0).(func(wire.OutPoint) *base.Utxo); ok {
+		return result(op), args.Error(1)
 	}
-	atomic.AddUint32(&w.index, 1)
-	var ret []*lnwallet.Utxo
-	ret = append(ret, utxo)
-	return ret, nil
+	utxo, _ := args.Get(0).(*base.Utxo)
+
+	return utxo, args.Error(1)
 }
 
-// ListTransactionDetails currently returns dummy values.
-func (w *WalletController) ListTransactionDetails(int32, int32,
-	string, uint32, uint32) ([]*lnwallet.TransactionDetail,
-	uint64, uint64, error) {
+// GetTx returns arranged native transaction metadata.
+func (w *WalletController) GetTx(ctx context.Context,
+	hash chainhash.Hash) (*base.TxDetail, error) {
 
-	return nil, 0, 0, nil
+	args := w.Called(ctx, hash)
+	detail, _ := args.Get(0).(*base.TxDetail)
+	return detail, args.Error(1)
 }
 
-// LeaseOutput returns the current time and a nil error.
-func (w *WalletController) LeaseOutput(wtxmgr.LockID, wire.OutPoint,
-	time.Duration) (time.Time, error) {
+// LeaseOutput records the owner, duration and native options.
+func (w *WalletController) LeaseOutput(ctx context.Context,
+	id wtxmgr.LockID, op wire.OutPoint, duration time.Duration,
+	opts ...base.LeaseOption) (time.Time, error) {
 
-	return time.Now(), nil
+	args := w.Called(ctx, id, op, duration, opts)
+	return args.Get(0).(time.Time), args.Error(1)
 }
 
-// ReleaseOutput currently does nothing.
-func (w *WalletController) ReleaseOutput(wtxmgr.LockID, wire.OutPoint) error {
-	return nil
+// ReleaseOutput records lease ownership when returning a coin.
+func (w *WalletController) ReleaseOutput(ctx context.Context,
+	id wtxmgr.LockID, op wire.OutPoint) error {
+
+	return w.Called(ctx, id, op).Error(0)
 }
 
-func (w *WalletController) ListLeasedOutputs() ([]*base.ListLeasedOutputResult,
-	error) {
+// ListLeasedOutputs returns the arranged native lease snapshot.
+func (w *WalletController) ListLeasedOutputs(ctx context.Context) (
+	[]*base.LeasedOutput, error) {
 
-	return nil, nil
+	args := w.Called(ctx)
+	leases, _ := args.Get(0).([]*base.LeasedOutput)
+	return leases, args.Error(1)
 }
 
-// FundPsbt currently does nothing.
-func (w *WalletController) FundPsbt(*psbt.Packet, int32, chainfee.SatPerKWeight,
-	string, *waddrmgr.KeyScope, base.CoinSelectionStrategy,
-	func(utxo wtxmgr.Credit) bool) (int32, error) {
+// Broadcast records publication without creating a separate mock wallet store.
+func (w *WalletController) Broadcast(ctx context.Context,
+	tx *wire.MsgTx, label string) error {
 
-	return 0, nil
+	return w.Called(ctx, tx, label).Error(0)
 }
 
-// SignPsbt currently does nothing.
-func (w *WalletController) SignPsbt(*psbt.Packet) ([]uint32, error) {
-	return nil, nil
-}
-
-// FinalizePsbt currently does nothing.
-func (w *WalletController) FinalizePsbt(_ *psbt.Packet, _ string) error {
-	return nil
-}
-
-// DecorateInputs currently does nothing.
-func (w *WalletController) DecorateInputs(*psbt.Packet, bool) error {
-	return nil
-}
-
-// PublishTransaction sends a transaction to the PublishedTransactions chan.
-func (w *WalletController) PublishTransaction(tx *wire.MsgTx, _ string) error {
-	w.PublishedTransactions <- tx
-	return nil
-}
-
-// SubmitPackage publishes each transaction in the package individually,
-// mirroring PublishTransaction.
-func (w *WalletController) SubmitPackage(txns []*wire.MsgTx,
-	_ *chainfee.SatPerVByte) (*btcjson.SubmitPackageResult, error) {
-
-	for _, tx := range txns {
-		w.PublishedTransactions <- tx
-	}
-
-	return &btcjson.SubmitPackageResult{}, nil
-}
-
-// GetTransactionDetails currently does nothing.
-func (w *WalletController) GetTransactionDetails(
-	txHash *chainhash.Hash) (*lnwallet.TransactionDetail, error) {
-
-	return nil, nil
-}
-
-// LabelTransaction currently does nothing.
-func (w *WalletController) LabelTransaction(chainhash.Hash, string,
-	bool) error {
-
-	return nil
-}
-
-// SubscribeTransactions currently does nothing.
-func (w *WalletController) SubscribeTransactions() (lnwallet.TransactionSubscription,
-	error) {
-
-	return nil, nil
-}
-
-// IsSynced currently returns dummy values.
-func (w *WalletController) IsSynced() (bool, int64, error) {
-	return true, int64(0), nil
-}
-
-// GetRecoveryInfo currently returns dummy values.
-func (w *WalletController) GetRecoveryInfo() (bool, float64, error) {
-	return true, float64(1), nil
-}
-
-// Start currently does nothing.
+// Start records application wallet startup.
 func (w *WalletController) Start() error {
-	return nil
+	return w.Called().Error(0)
 }
 
-// Stop currently does nothing.
+// Stop records joined application wallet shutdown.
 func (w *WalletController) Stop() error {
-	return nil
+	return w.Called().Error(0)
 }
 
-// ReadySignal currently signals that the wallet is ready instantly.
-func (w *WalletController) ReadySignal(_ context.Context) chan error {
-	readyChan := make(chan error, 1)
-	readyChan <- nil
+// DecorateInputs returns the arranged packet without a mock wallet algorithm.
+func (w *WalletController) DecorateInputs(ctx context.Context,
+	packet *psbt.Packet, skipUnknown bool) (*psbt.Packet, error) {
 
-	return readyChan
+	args := w.Called(ctx, packet, skipUnknown)
+	result, _ := args.Get(0).(*psbt.Packet)
+	return result, args.Error(1)
 }
 
-func (w *WalletController) FetchTx(chainhash.Hash) (*wire.MsgTx, error) {
-	return nil, nil
+// DeleteUnconfirmedTx records root deletion at the maintained boundary.
+func (w *WalletController) DeleteUnconfirmedTx(ctx context.Context,
+	hash chainhash.Hash) error {
+
+	return w.Called(ctx, hash).Error(0)
 }
 
-func (w *WalletController) RemoveDescendants(*wire.MsgTx) error {
-	return nil
+// FinalizePsbt records native local finalization without requiring origins.
+func (w *WalletController) FinalizePsbt(ctx context.Context,
+	packet *psbt.Packet) error {
+
+	return w.Called(ctx, packet).Error(0)
 }
 
-func (w *WalletController) CheckMempoolAcceptance(tx *wire.MsgTx) error {
-	return nil
+// FundPsbt returns the arranged packet and native reservation owner.
+func (w *WalletController) FundPsbt(ctx context.Context,
+	intent *base.FundIntent) (*base.FundResult, error) {
+
+	args := w.Called(ctx, intent)
+	result, _ := args.Get(0).(*base.FundResult)
+	return result, args.Error(1)
 }
 
-// FetchDerivationInfo queries for the wallet's knowledge of the passed
-// pkScript and constructs the derivation info and returns it.
-func (w *WalletController) FetchDerivationInfo(
-	pkScript []byte) (*psbt.Bip32Derivation, error) {
+// NewAccount records scoped native creation without a mock account registry.
+func (w *WalletController) NewAccount(ctx context.Context,
+	params base.NewAccountParams) (*base.AccountInfo, error) {
 
-	return nil, nil
+	args := w.Called(ctx, params)
+	info, _ := args.Get(0).(*base.AccountInfo)
+	return info, args.Error(1)
+}
+
+// SubscribeTxns borrows the arranged event stream and cancellation function.
+func (w *WalletController) SubscribeTxns(ctx context.Context) (
+	<-chan *base.TxEvent, func(), error) {
+
+	args := w.Called(ctx)
+	events, _ := args.Get(0).(<-chan *base.TxEvent)
+	cancel, _ := args.Get(1).(func())
+
+	return events, cancel, args.Error(2)
+}
+
+// ListAccountsByName returns native scoped matches for name-only requests.
+func (w *WalletController) ListAccountsByName(ctx context.Context,
+	name string) ([]base.AccountInfo, error) {
+
+	args := w.Called(ctx, name)
+	accounts, _ := args.Get(0).([]base.AccountInfo)
+	return accounts, args.Error(1)
 }

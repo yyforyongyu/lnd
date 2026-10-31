@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -24,6 +25,7 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/actor"
 	"github.com/lightningnetwork/lnd/aliasmgr"
@@ -51,6 +53,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/msgmux"
+	testifymock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -435,7 +438,7 @@ func (n *testNode) RemovePendingChannel(_ lnwire.ChannelID) error {
 }
 
 func createTestWallet(cdb *channeldb.ChannelStateDB, netParams *chaincfg.Params,
-	notifier chainntnfs.ChainNotifier, wc lnwallet.WalletController,
+	notifier chainntnfs.ChainNotifier, wc *mock.WalletController,
 	signer input.Signer, keyRing keychain.SecretKeyRing,
 	bio lnwallet.BlockChainIO,
 	estimator chainfee.Estimator) (*lnwallet.LightningWallet, error) {
@@ -444,7 +447,8 @@ func createTestWallet(cdb *channeldb.ChannelStateDB, netParams *chaincfg.Params,
 		Database:              cdb,
 		Notifier:              notifier,
 		SecretKeyRing:         keyRing,
-		WalletController:      wc,
+		Wallet:                wc,
+		WalletServices:        wc,
 		Signer:                signer,
 		ChainIO:               bio,
 		FeeEstimator:          estimator,
@@ -491,9 +495,77 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 	shutdownChan := make(chan struct{})
 	reportScidChan := make(chan struct{})
 
-	wc := &mock.WalletController{
-		RootKey: alicePrivKey,
-	}
+	wc := &mock.WalletController{}
+	// Arrange native capabilities for the shared funding fixture. Tests
+	// vary
+	// the number of negotiations, so only startup is universally required;
+	// optional calls retain their existing fixture behavior through
+	// mock.Mock.
+	t.Cleanup(func() { wc.AssertExpectations(t) })
+	wc.On("Start").Return(nil).Once()
+	wc.On("Info", testifymock.Anything).
+		Return(&wallet.Info{Synced: true}, nil).Maybe()
+	var utxoIndex atomic.Uint32
+	wc.On("ListUnspent", testifymock.Anything, testifymock.Anything).
+		Return(func() []*wallet.Utxo {
+			if wc.Utxos != nil {
+				return wc.Utxos
+			}
+
+			return []*wallet.Utxo{
+				{
+					OutPoint: wire.OutPoint{
+						Index: utxoIndex.Add(1) - 1,
+					},
+					Amount: 10 *
+						btcutil.SatoshiPerBitcoin,
+					PkScript:    mock.CoinPkScript,
+					AddressType: waddrmgr.WitnessPubKey,
+					Spendable:   true,
+				},
+			}
+		}, nil).Maybe()
+	walletAddr, err := address.NewAddressPubKeyHash(
+		address.Hash160(
+			alicePrivKey.PubKey().SerializeCompressed(),
+		),
+		netParams,
+	)
+	require.NoError(t, err)
+	wc.On("NewAddress", testifymock.Anything,
+		testifymock.Anything, testifymock.Anything).
+		Return(wallet.AddressInfo{Addr: walletAddr}, nil).Maybe()
+	wc.On("GetAddressInfo", testifymock.Anything, testifymock.Anything).
+		Return(wallet.AddressInfo{}, wallet.ErrAddressNotFound).Maybe()
+	wc.On(
+		"LeaseOutput",
+		testifymock.Anything,
+		chanfunding.LndInternalLockID,
+		testifymock.Anything,
+		chanfunding.DefaultLockDuration,
+		[]wallet.LeaseOption(nil),
+	).
+		Return(time.Unix(123, 0), nil).
+		Maybe()
+	wc.On(
+		"ReleaseOutput",
+		testifymock.Anything,
+		chanfunding.LndInternalLockID,
+		testifymock.Anything,
+	).
+		Return(nil).
+		Maybe()
+	wc.On("ListLeasedOutputs", testifymock.Anything).
+		Return([]*wallet.LeasedOutput(nil), nil).Maybe()
+	wc.On("GetUtxo", testifymock.Anything, testifymock.Anything).
+		Return(func(op wire.OutPoint) *wallet.Utxo {
+			return &wallet.Utxo{
+				OutPoint: op,
+				Amount:   10 * btcutil.SatoshiPerBitcoin,
+				PkScript: mock.CoinPkScript,
+			}
+		}, nil).Maybe()
+
 	signer := mock.NewSingleSigner(alicePrivKey)
 	bio := &mock.ChainIO{
 		BestHeight: fundingBroadcastHeight,
@@ -4417,10 +4489,11 @@ func TestFundingManagerFundAll(t *testing.T) {
 
 	// We set up our mock wallet to control a list of UTXOs that sum to
 	// less than the max channel size.
-	allCoins := []*lnwallet.Utxo{
+	allCoins := []*wallet.Utxo{
 		{
-			AddressType: lnwallet.WitnessPubKey,
-			Value: btcutil.Amount(
+			AddressType: waddrmgr.WitnessPubKey,
+			Spendable:   true,
+			Amount: btcutil.Amount(
 				0.05 * btcutil.SatoshiPerBitcoin,
 			),
 			PkScript: mock.CoinPkScript,
@@ -4430,8 +4503,9 @@ func TestFundingManagerFundAll(t *testing.T) {
 			},
 		},
 		{
-			AddressType: lnwallet.WitnessPubKey,
-			Value: btcutil.Amount(
+			AddressType: waddrmgr.WitnessPubKey,
+			Spendable:   true,
+			Amount: btcutil.Amount(
 				0.06 * btcutil.SatoshiPerBitcoin,
 			),
 			PkScript: mock.CoinPkScript,
@@ -4470,7 +4544,10 @@ func TestFundingManagerFundAll(t *testing.T) {
 			tearDownFundingManagers(t, alice, bob)
 		})
 
-		alice.fundingMgr.cfg.Wallet.WalletController.(*mock.WalletController).Utxos = allCoins
+		nativeWallet := alice.fundingMgr.cfg.Wallet.Cfg.Wallet
+		wc, ok := nativeWallet.(*mock.WalletController)
+		require.True(t, ok)
+		wc.Utxos = allCoins
 
 		// We will consume the channel updates as we go, so no
 		// buffering is needed.
@@ -4516,12 +4593,13 @@ func TestFundingManagerFundMax(t *testing.T) {
 	t.Parallel()
 
 	// Helper function to create a test utxos
-	constructTestUtxos := func(values ...btcutil.Amount) []*lnwallet.Utxo {
-		var utxos []*lnwallet.Utxo
+	constructTestUtxos := func(values ...btcutil.Amount) []*wallet.Utxo {
+		var utxos []*wallet.Utxo
 		for _, value := range values {
-			utxos = append(utxos, &lnwallet.Utxo{
-				AddressType: lnwallet.WitnessPubKey,
-				Value:       value,
+			utxos = append(utxos, &wallet.Utxo{
+				AddressType: waddrmgr.WitnessPubKey,
+				Spendable:   true,
+				Amount:      value,
 				PkScript:    mock.CoinPkScript,
 				OutPoint: wire.OutPoint{
 					Hash:  chainhash.Hash{},
@@ -4535,7 +4613,7 @@ func TestFundingManagerFundMax(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		coins          []*lnwallet.Utxo
+		coins          []*wallet.Utxo
 		fundUpToMaxAmt btcutil.Amount
 		minFundAmt     btcutil.Amount
 		pushAmt        btcutil.Amount
@@ -4617,7 +4695,7 @@ func TestFundingManagerFundMax(t *testing.T) {
 			// We set up our mock wallet to control a list of UTXOs
 			// that sum to more than the max channel size.
 			addFunds := func(fundingCfg *Config) {
-				wc := fundingCfg.Wallet.WalletController
+				wc := fundingCfg.Wallet.Cfg.Wallet
 				mockWc, ok := wc.(*mock.WalletController)
 				if ok {
 					mockWc.Utxos = test.coins

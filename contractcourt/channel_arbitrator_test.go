@@ -13,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
@@ -1410,7 +1411,8 @@ func TestChannelArbitratorLocalForceDoubleSpend(t *testing.T) {
 		case <-chanArb.quit:
 			return fmt.Errorf("exiting")
 		}
-		return lnwallet.ErrDoubleSpend
+
+		return chain.ErrMempoolConflict
 	}
 
 	errChan := make(chan error, 1)
@@ -3597,7 +3599,7 @@ func TestChannelArbitratorStartForceCloseFail(t *testing.T) {
 		{
 			name: "Commitment is rejected because of low mempool " +
 				"fees",
-			broadcastErr:    lnwallet.ErrMempoolFee,
+			broadcastErr:    chain.ErrMempoolMinFeeNotMet,
 			expectedState:   StateCommitmentBroadcasted,
 			expectedStartup: true,
 		},
@@ -3606,7 +3608,7 @@ func TestChannelArbitratorStartForceCloseFail(t *testing.T) {
 			// in lnd.
 			name: "Commitment is rejected because of a " +
 				"rbf transaction not succeeding",
-			broadcastErr:    lnwallet.ErrDoubleSpend,
+			broadcastErr:    chain.ErrMempoolConflict,
 			expectedState:   StateCommitmentBroadcasted,
 			expectedStartup: true,
 		},

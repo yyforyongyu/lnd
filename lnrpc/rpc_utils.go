@@ -7,7 +7,7 @@ import (
 	"sort"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
-	"github.com/lightningnetwork/lnd/lnwallet"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/sweep"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -58,11 +58,11 @@ var (
 )
 
 // RPCTransaction returns a rpc transaction.
-func RPCTransaction(tx *lnwallet.TransactionDetail) *Transaction {
+func RPCTransaction(tx *base.TxDetail) *Transaction {
 	var destAddresses []string
 	// Re-package destination output information.
 	var outputDetails []*OutputDetail
-	for _, o := range tx.OutputDetails {
+	for _, o := range tx.Outputs {
 		// Note: DestAddresses is deprecated but we keep
 		// populating it with addresses for backwards
 		// compatibility.
@@ -77,37 +77,41 @@ func RPCTransaction(tx *lnwallet.TransactionDetail) *Transaction {
 		}
 
 		outputDetails = append(outputDetails, &OutputDetail{
-			OutputType:   MarshallOutputType(o.OutputType),
+			OutputType:   MarshallOutputType(o.Type),
 			Address:      address,
 			PkScript:     hex.EncodeToString(o.PkScript),
-			OutputIndex:  int64(o.OutputIndex),
-			Amount:       int64(o.Value),
-			IsOurAddress: o.IsOurAddress,
+			OutputIndex:  int64(o.Index),
+			Amount:       int64(o.Amount),
+			IsOurAddress: o.IsOurs,
 		})
 	}
 
-	previousOutpoints := make([]*PreviousOutPoint, len(tx.PreviousOutpoints))
-	for idx, previousOutPoint := range tx.PreviousOutpoints {
+	previousOutpoints := make([]*PreviousOutPoint, len(tx.PrevOuts))
+	for idx, previousOutPoint := range tx.PrevOuts {
 		previousOutpoints[idx] = &PreviousOutPoint{
-			Outpoint:    previousOutPoint.OutPoint,
-			IsOurOutput: previousOutPoint.IsOurOutput,
+			Outpoint:    previousOutPoint.OutPoint.String(),
+			IsOurOutput: previousOutPoint.IsOurs,
 		}
 	}
 
 	// We also get unconfirmed transactions, so BlockHash can be nil.
 	blockHash := ""
-	if tx.BlockHash != nil {
-		blockHash = tx.BlockHash.String()
+	var blockHeight int32
+	timestamp := tx.ReceivedTime.Unix()
+	if tx.Block != nil {
+		blockHash = tx.Block.Hash.String()
+		blockHeight = tx.Block.Height
+		timestamp = tx.Block.Timestamp
 	}
 
 	return &Transaction{
 		TxHash:            tx.Hash.String(),
 		Amount:            int64(tx.Value),
-		NumConfirmations:  tx.NumConfirmations,
+		NumConfirmations:  tx.Confirmations,
 		BlockHash:         blockHash,
-		BlockHeight:       tx.BlockHeight,
-		TimeStamp:         tx.Timestamp,
-		TotalFees:         tx.TotalFees,
+		BlockHeight:       blockHeight,
+		TimeStamp:         timestamp,
+		TotalFees:         int64(tx.Fee),
 		DestAddresses:     destAddresses,
 		OutputDetails:     outputDetails,
 		RawTxHex:          hex.EncodeToString(tx.RawTx),
@@ -117,8 +121,26 @@ func RPCTransaction(tx *lnwallet.TransactionDetail) *Transaction {
 }
 
 // RPCTransactionDetails returns a set of rpc transaction details.
-func RPCTransactionDetails(txns []*lnwallet.TransactionDetail, firstIdx,
-	lastIdx uint64) *TransactionDetails {
+func RPCTransactionDetails(txns []*base.TxDetail, indexOffset,
+	maxTransactions uint32) *TransactionDetails {
+
+	// Pagination is an RPC query projection over native history, not a
+	// second wallet history API. Clamp against the remaining count before
+	// addition so offsets/limits are safe on 32-bit builds too.
+	firstIdx := uint64(indexOffset)
+	end := uint64(len(txns))
+	if firstIdx >= end {
+		return &TransactionDetails{Transactions: []*Transaction{}}
+	}
+	if limit := uint64(
+		maxTransactions,
+	); limit != 0 &&
+		limit < end-firstIdx {
+
+		end = firstIdx + limit
+	}
+	txns = txns[int(firstIdx):int(end)]
+	lastIdx := end - 1
 
 	txDetails := &TransactionDetails{
 		Transactions: make([]*Transaction, len(txns)),

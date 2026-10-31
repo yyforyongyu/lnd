@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,8 +32,9 @@ import (
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/pkg/btcunit"
 	"github.com/btcsuite/btcwallet/waddrmgr"
-	"github.com/btcsuite/btcwallet/wallet"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/lightningnetwork/lnd/autopilot"
@@ -66,7 +68,6 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"github.com/lightningnetwork/lnd/lnwallet"
-	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chancloser"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
@@ -1134,18 +1135,22 @@ func allowCORS(handler http.Handler, origins []string) http.Handler {
 // address to a specified output value to be sent to that address.
 func (r *rpcServer) sendCoinsOnChain(paymentMap map[string]int64,
 	feeRate chainfee.SatPerKWeight, minConfs int32, label string,
-	strategy wallet.CoinSelectionStrategy,
+	strategy base.CoinSelectionStrategy,
 	selectedUtxos fn.Set[wire.OutPoint]) (*chainhash.Hash, error) {
 
-	outputs, err := addrPairsToOutputs(paymentMap, r.cfg.ActiveNetParams.Params)
+	outputs, err := addrPairsToOutputs(
+		paymentMap,
+		r.cfg.ActiveNetParams.Params,
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	// We first do a dry run, to sanity check we won't spend our wallet
 	// balance below the reserved amount.
-	authoredTx, err := r.server.cc.Wallet.CreateSimpleTx(
-		selectedUtxos, outputs, feeRate, minConfs, strategy, true,
+	authoredTx, err := r.estimateTransaction(
+		context.Background(), selectedUtxos, outputs,
+		btcutil.Amount(feeRate.FeePerKVByte()), minConfs, strategy,
 	)
 	if err != nil {
 		return nil, err
@@ -1165,9 +1170,41 @@ func (r *rpcServer) sendCoinsOnChain(paymentMap map[string]int64,
 
 	// If that checks out, we're fairly confident that creating sending to
 	// these outputs will keep the wallet balance above the reserve.
-	tx, err := r.server.cc.Wallet.SendOutputs(
-		selectedUtxos, outputs, feeRate, minConfs, label, strategy,
-	)
+	intent := &base.TxIntent{
+		FeeRate: btcunit.NewSatPerKVByte(
+			btcutil.Amount(feeRate.FeePerKVByte()),
+		),
+		Label: label,
+	}
+	for _, output := range outputs {
+		intent.Outputs = append(intent.Outputs, *output)
+	}
+	if len(selectedUtxos) != 0 {
+		intent.Inputs = &base.InputsManual{
+			UTXOs: selectedUtxos.ToSlice(),
+		}
+	} else {
+		utxos, err := r.server.cc.Wallet.Cfg.Wallet.ListUnspent(
+			context.Background(), base.UtxoQuery{
+				Account:  lnwallet.DefaultAccountName,
+				MinConfs: minConfs, MaxConfs: math.MaxInt32,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		var candidates []wire.OutPoint
+		for _, utxo := range utxos {
+			if !utxo.Locked {
+				candidates = append(candidates, utxo.OutPoint)
+			}
+		}
+		intent.Inputs = &base.InputsPolicy{
+			Strategy: strategy, MinConfs: uint32(minConfs),
+			Source: &base.CoinSourceUTXOs{UTXOs: candidates},
+		}
+	}
+	tx, err := r.server.cc.Wallet.SendOutputs(context.Background(), intent)
 	if err != nil {
 		return nil, err
 	}
@@ -1198,10 +1235,13 @@ func (r *rpcServer) ListUnspent(ctx context.Context,
 	// We'll acquire the global coin selection lock to ensure there aren't
 	// any other concurrent processes attempting to lock any UTXOs which may
 	// be shown available to us.
-	var utxos []*lnwallet.Utxo
+	var utxos []*base.Utxo
 	err = r.server.cc.Wallet.WithCoinSelectLock(func() error {
-		utxos, err = r.server.cc.Wallet.ListUnspentWitness(
-			minConfs, maxConfs, in.Account,
+		utxos, err = r.server.cc.Wallet.Cfg.Wallet.ListUnspent(
+			ctx, base.UtxoQuery{
+				Account: in.Account, MinConfs: minConfs,
+				MaxConfs: maxConfs,
+			},
 		)
 		return err
 	})
@@ -1209,7 +1249,10 @@ func (r *rpcServer) ListUnspent(ctx context.Context,
 		return nil, err
 	}
 
-	rpcUtxos, err := lnrpc.MarshalUtxos(utxos, r.cfg.ActiveNetParams.Params)
+	rpcUtxos, err := lnrpc.MarshalUtxos(
+		ctx, r.server.cc.Wallet.Cfg.Wallet, utxos,
+		r.cfg.ActiveNetParams.Params,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1289,9 +1332,10 @@ func (r *rpcServer) EstimateFee(ctx context.Context,
 	var tx *txauthor.AuthoredTx
 	wallet := r.server.cc.Wallet
 	err = wallet.WithCoinSelectLock(func() error {
-		tx, err = wallet.CreateSimpleTx(
-			selectOutpoints, outputs, feePerKw, minConfs,
-			coinSelectionStrategy, true,
+		tx, err = r.estimateTransaction(
+			ctx, selectOutpoints, outputs,
+			btcutil.Amount(feePerKw.FeePerKVByte()), minConfs,
+			coinSelectionStrategy,
 		)
 		return err
 	})
@@ -1475,7 +1519,7 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 		// reserve any value, the rest will go to targetAddr.
 		sweepTxPkg, err := sweep.CraftSweepAllTx(
 			feePerKw, maxFeeRate, uint32(bestHeight), nil,
-			targetAddr, wallet, wallet, wallet.WalletController,
+			targetAddr, wallet, wallet, wallet.Cfg.Wallet,
 			r.server.cc.Signer, minConfs, selectOutpoints,
 		)
 		if err != nil {
@@ -1509,9 +1553,14 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 			// where we'll send this reserved value back to. This
 			// ensures this is an address the wallet knows about,
 			// allowing us to pass the reserved value check.
-			changeAddr, err := r.server.cc.Wallet.NewAddress(
-				lnwallet.TaprootPubkey, true,
-				lnwallet.DefaultAccountName,
+			wc := r.server.cc.Wallet.Cfg.Wallet
+			changeAddrInfo, err := wc.NewAddress(
+				ctx,
+				base.NewAccountSelectorByName(
+					waddrmgr.KeyScopeBIP0086,
+					lnwallet.DefaultAccountName,
+				),
+				true,
 			)
 			if err != nil {
 				return nil, err
@@ -1521,7 +1570,7 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 			// remaining funds will go to the targetAddr.
 			outputs := []sweep.DeliveryAddr{
 				{
-					Addr: changeAddr,
+					Addr: changeAddrInfo.Addr,
 					Amt:  reservedVal,
 				},
 			}
@@ -1529,7 +1578,7 @@ func (r *rpcServer) SendCoins(ctx context.Context,
 			sweepTxPkg, err = sweep.CraftSweepAllTx(
 				feePerKw, maxFeeRate, uint32(bestHeight),
 				outputs, targetAddr, wallet, wallet,
-				wallet.WalletController,
+				wallet.Cfg.Wallet,
 				r.server.cc.Signer, minConfs, selectOutpoints,
 			)
 			if err != nil {
@@ -1675,6 +1724,8 @@ func (r *rpcServer) SendMany(ctx context.Context,
 }
 
 // NewAddress creates a new address under control of the local wallet.
+// Ordinary types allocate a fresh child; UNUSED types let the Wallet choose a
+// receiving address according to its reuse policy.
 func (r *rpcServer) NewAddress(ctx context.Context,
 	in *lnrpc.NewAddressRequest) (*lnrpc.NewAddressResponse, error) {
 
@@ -1684,67 +1735,50 @@ func (r *rpcServer) NewAddress(ctx context.Context,
 		account = in.Account
 	}
 
-	// Translate the gRPC proto address type to the wallet controller's
-	// available address types.
-	var (
-		addr address.Address
-		err  error
-	)
+	// Preserve the requested payment scope for both allocation modes.
+	var scope waddrmgr.KeyScope
 	switch in.Type {
-	case lnrpc.AddressType_WITNESS_PUBKEY_HASH:
-		addr, err = r.server.cc.Wallet.NewAddress(
-			lnwallet.WitnessPubKey, false, account,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-	case lnrpc.AddressType_NESTED_PUBKEY_HASH:
-		addr, err = r.server.cc.Wallet.NewAddress(
-			lnwallet.NestedWitnessPubKey, false, account,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-	case lnrpc.AddressType_TAPROOT_PUBKEY:
-		addr, err = r.server.cc.Wallet.NewAddress(
-			lnwallet.TaprootPubkey, false, account,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-	case lnrpc.AddressType_UNUSED_WITNESS_PUBKEY_HASH:
-		addr, err = r.server.cc.Wallet.LastUnusedAddress(
-			lnwallet.WitnessPubKey, account,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-	case lnrpc.AddressType_UNUSED_NESTED_PUBKEY_HASH:
-		addr, err = r.server.cc.Wallet.LastUnusedAddress(
-			lnwallet.NestedWitnessPubKey, account,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-	case lnrpc.AddressType_UNUSED_TAPROOT_PUBKEY:
-		addr, err = r.server.cc.Wallet.LastUnusedAddress(
-			lnwallet.TaprootPubkey, account,
-		)
-		if err != nil {
-			return nil, err
-		}
-
+	case lnrpc.AddressType_WITNESS_PUBKEY_HASH,
+		lnrpc.AddressType_UNUSED_WITNESS_PUBKEY_HASH:
+		scope = waddrmgr.KeyScopeBIP0084
+	case lnrpc.AddressType_NESTED_PUBKEY_HASH,
+		lnrpc.AddressType_UNUSED_NESTED_PUBKEY_HASH:
+		scope = waddrmgr.KeyScopeBIP0049Plus
+	case lnrpc.AddressType_TAPROOT_PUBKEY,
+		lnrpc.AddressType_UNUSED_TAPROOT_PUBKEY:
+		scope = waddrmgr.KeyScopeBIP0086
 	default:
 		return nil, fmt.Errorf("unknown address type: %v", in.Type)
 	}
+	selector := base.NewAccountSelectorByName(scope, account)
+	w := r.server.cc.Wallet.Cfg.Wallet
+	var info base.AddressInfo
+	var err error
 
-	rpcsLog.Debugf("[newaddress] account=%v type=%v addr=%v", account,
-		in.Type, addr.String())
+	// Skipping fresh children must create gaps for later seed recovery.
+	// SQL's bulk allocator promises exactly one child on success; kvdb's
+	// receiving API allocates fresh and does not support bulk calls.
+	// UNUSED requests retain their backend's receiving-address policy.
+	sqlWallet := r.cfg.DB.Backend == lncfg.SqliteBackend ||
+		r.cfg.DB.Backend == lncfg.PostgresBackend
+	if !sqlWallet ||
+		in.Type == lnrpc.AddressType_UNUSED_WITNESS_PUBKEY_HASH ||
+		in.Type == lnrpc.AddressType_UNUSED_NESTED_PUBKEY_HASH ||
+		in.Type == lnrpc.AddressType_UNUSED_TAPROOT_PUBKEY {
+
+		info, err = w.NewAddress(ctx, selector, false)
+	} else {
+		var allocated []base.AddressInfo
+		allocated, err = w.NewBulkAddresses(ctx, selector, false, 1)
+		if err == nil {
+			info = allocated[0]
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	addr := info.Addr
+
 	return &lnrpc.NewAddressResponse{Address: addr.String()}, nil
 }
 
@@ -2093,11 +2127,13 @@ func (r *rpcServer) canOpenChannel() error {
 
 	// Creation of channels before the wallet syncs up is currently
 	// disallowed.
-	isSynced, _, err := r.server.cc.Wallet.IsSynced()
+	walletInfo, err := r.server.cc.Wallet.Cfg.Wallet.Info(
+		context.Background(),
+	)
 	if err != nil {
 		return err
 	}
-	if !isSynced {
+	if !walletInfo.Synced {
 		return errors.New("channels cannot be created before the " +
 			"wallet is fully synced")
 	}
@@ -3559,10 +3595,13 @@ func (r *rpcServer) GetDebugInfo(_ context.Context,
 // GetRecoveryInfo returns a boolean indicating whether the wallet is started
 // in recovery mode, whether the recovery is finished, and the progress made
 // so far.
-func (r *rpcServer) GetRecoveryInfo(ctx context.Context,
-	in *lnrpc.GetRecoveryInfoRequest) (*lnrpc.GetRecoveryInfoResponse, error) {
+func (r *rpcServer) GetRecoveryInfo(
+	ctx context.Context,
+	in *lnrpc.GetRecoveryInfoRequest,
+) (*lnrpc.GetRecoveryInfoResponse, error) {
 
-	isRecoveryMode, progress, err := r.server.cc.Wallet.GetRecoveryInfo()
+	isRecoveryMode, progress, err := r.server.cc.Wallet.Cfg.
+		WalletServices.GetRecoveryInfo()
 	if err != nil {
 		return nil, fmt.Errorf("unable to get wallet recovery info: %w",
 			err)
@@ -3778,93 +3817,89 @@ func (r *rpcServer) SubscribePeerEvents(req *lnrpc.PeerEventSubscription,
 func (r *rpcServer) WalletBalance(ctx context.Context,
 	in *lnrpc.WalletBalanceRequest) (*lnrpc.WalletBalanceResponse, error) {
 
-	// Retrieve all existing wallet accounts. We'll compute the confirmed
-	// and unconfirmed balance for each and tally them up.
-	accounts, err := r.server.cc.Wallet.ListAccounts(in.Account, nil)
+	// Native account metadata retains empty accounts in the name-keyed RPC
+	// map. Read filters group matching names across their native scopes.
+	w := r.server.cc.Wallet.Cfg.Wallet
+	var accounts []base.AccountInfo
+	var err error
+	if in.Account == "" {
+		accounts, err = w.ListAccounts(ctx)
+	} else {
+		accounts, err = w.ListAccountsByName(ctx, in.Account)
+	}
 	if err != nil {
 		return nil, err
 	}
-
-	var totalBalance, confirmedBalance, unconfirmedBalance btcutil.Amount
-	rpcAccountBalances := make(
-		map[string]*lnrpc.WalletAccountBalance, len(accounts),
+	utxos, err := w.ListUnspent(
+		ctx,
+		base.UtxoQuery{
+			Account:  in.Account,
+			MinConfs: 0,
+			MaxConfs: math.MaxInt32,
+		},
 	)
+	if err != nil {
+		return nil, err
+	}
+	if in.Account != "" && in.Account != waddrmgr.ImportedAddrAccountName &&
+		len(accounts) == 0 && len(utxos) == 0 {
+
+		return nil, fmt.Errorf("%w: %s", base.ErrAccountNotFound,
+			in.Account)
+	}
+	var (
+		totalBalance, confirmedBalance    btcutil.Amount
+		unconfirmedBalance, lockedBalance btcutil.Amount
+	)
+	rpcAccountBalances := make(map[string]*lnrpc.WalletAccountBalance)
+	// Raw imports are accountless in SQL. Keep their RPC grouping visible
+	// after the last coin is spent, without creating a native account row.
+	if in.Account == "" || in.Account == waddrmgr.ImportedAddrAccountName {
+		rpcAccountBalances[waddrmgr.ImportedAddrAccountName] =
+			&lnrpc.WalletAccountBalance{}
+	}
 	for _, account := range accounts {
-		// There are two default accounts, one for NP2WKH outputs and
-		// another for P2WKH outputs. The balance will be computed for
-		// both given one call to ConfirmedBalance with the default
-		// wallet and imported account, so we'll skip the second
-		// instance to avoid inflating the balance.
-		switch account.AccountName {
-		case waddrmgr.ImportedAddrAccountName:
-			// Omit the imported account from the response unless we
-			// actually have any keys imported.
-			if account.ImportedKeyCount == 0 {
-				continue
-			}
+		// KVDB has no NoChainSync policy; keep lnd's off-chain key
+		// families out of the RPC view using their native scope.
+		if !account.NoChainSync &&
+			account.KeyScope.Purpose != keychain.BIP0043Purpose {
 
-			fallthrough
-
-		case lnwallet.DefaultAccountName:
-			if _, ok := rpcAccountBalances[account.AccountName]; ok {
-				continue
-			}
-
-		default:
+			rpcAccountBalances[account.AccountName] =
+				&lnrpc.WalletAccountBalance{}
 		}
-
-		// There now also are the accounts for the internal channel
-		// related keys. We skip those as they'll never have any direct
-		// balance.
-		if account.KeyScope.Purpose == keychain.BIP0043Purpose {
+	}
+	minConfs := max(in.MinConfs, 1)
+	for _, utxo := range utxos {
+		// Leases are reported separately from available funds. Imported
+		// outputs need not have local keys, but must still be mature.
+		if utxo.Locked {
+			lockedBalance += utxo.Amount
+			continue
+		}
+		mature, err := lnwallet.UtxoMature(
+			ctx, w, utxo,
+			r.cfg.ActiveNetParams.Params.CoinbaseMaturity,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !mature {
 			continue
 		}
 
-		// Get total balance, from txs that have >= 0 confirmations.
-		totalBal, err := r.server.cc.Wallet.ConfirmedBalance(
-			0, account.AccountName,
-		)
-		if err != nil {
-			return nil, err
+		balance := rpcAccountBalances[utxo.Account]
+		if balance == nil {
+			balance = &lnrpc.WalletAccountBalance{}
+			rpcAccountBalances[utxo.Account] = balance
 		}
-		totalBalance += totalBal
-
-		// Get confirmed balance, from txs that have >= 1 confirmations.
-		// TODO(halseth): get both unconfirmed and confirmed balance in
-		// one call, as this is racy.
-		if in.MinConfs <= 0 {
-			in.MinConfs = 1
+		totalBalance += utxo.Amount
+		if utxo.Confirmations >= minConfs {
+			confirmedBalance += utxo.Amount
+			balance.ConfirmedBalance += int64(utxo.Amount)
+		} else {
+			unconfirmedBalance += utxo.Amount
+			balance.UnconfirmedBalance += int64(utxo.Amount)
 		}
-		confirmedBal, err := r.server.cc.Wallet.ConfirmedBalance(
-			in.MinConfs, account.AccountName,
-		)
-		if err != nil {
-			return nil, err
-		}
-		confirmedBalance += confirmedBal
-
-		// Get unconfirmed balance, from txs with 0 confirmations.
-		unconfirmedBal := totalBal - confirmedBal
-		unconfirmedBalance += unconfirmedBal
-
-		rpcAccountBalances[account.AccountName] = &lnrpc.WalletAccountBalance{
-			ConfirmedBalance:   int64(confirmedBal),
-			UnconfirmedBalance: int64(unconfirmedBal),
-		}
-	}
-
-	// Now that we have the base balance accounted for with each account,
-	// we'll look at the set of locked UTXOs to tally that as well. If we
-	// don't display this, then anytime we attempt a funding reservation,
-	// the outputs will chose as being "gone" until they're confirmed on
-	// chain.
-	var lockedBalance btcutil.Amount
-	leases, err := r.server.cc.Wallet.ListLeasedOutputs()
-	if err != nil {
-		return nil, err
-	}
-	for _, leasedOutput := range leases {
-		lockedBalance += btcutil.Amount(leasedOutput.Value)
 	}
 
 	// Get the current number of non-private anchor channels.
@@ -6151,24 +6186,28 @@ func (r *rpcServer) SubscribeInvoices(req *lnrpc.InvoiceSubscription,
 func (r *rpcServer) SubscribeTransactions(req *lnrpc.GetTransactionsRequest,
 	updateStream lnrpc.Lightning_SubscribeTransactionsServer) error {
 
-	txClient, err := r.server.cc.Wallet.SubscribeTransactions()
+	txClient, cancel, err := r.server.cc.Wallet.Cfg.Wallet.SubscribeTxns(
+		updateStream.Context(),
+	)
 	if err != nil {
 		return err
 	}
-	defer txClient.Cancel()
+	defer cancel()
 	rpcsLog.Infof("New transaction subscription")
 
 	for {
 		select {
-		case tx := <-txClient.ConfirmedTransactions():
-			detail := lnrpc.RPCTransaction(tx)
-			if err := updateStream.Send(detail); err != nil {
-				return err
+		case event, ok := <-txClient:
+			// The native stream owns both observation kinds and
+			// closure;
+			// no intermediate queue or wallet DTO is needed at RPC.
+			if !ok {
+				return nil
 			}
-
-		case tx := <-txClient.UnconfirmedTransactions():
-			detail := lnrpc.RPCTransaction(tx)
-			if err := updateStream.Send(detail); err != nil {
+			err := updateStream.Send(
+				lnrpc.RPCTransaction(event.Detail),
+			)
+			if err != nil {
 				return err
 			}
 
@@ -6193,26 +6232,74 @@ func (r *rpcServer) SubscribeTransactions(req *lnrpc.GetTransactionsRequest,
 func (r *rpcServer) GetTransactions(ctx context.Context,
 	req *lnrpc.GetTransactionsRequest) (*lnrpc.TransactionDetails, error) {
 
-	// To remain backwards compatible with the old api, default to the
-	// special case end height which will return transactions from the start
-	// height until the chain tip, including unconfirmed transactions.
-	var endHeight = btcwallet.UnconfirmedHeight
-
-	// If the user has provided an end height, we overwrite our default.
+	endHeight := int32(-1)
 	if req.EndHeight != 0 {
 		endHeight = req.EndHeight
 	}
-
-	txns, firstIdx, lastIdx, err :=
-		r.server.cc.Wallet.ListTransactionDetails(
-			req.StartHeight, endHeight, req.Account,
-			req.IndexOffset, req.MaxTransactions,
-		)
+	w := r.server.cc.Wallet.Cfg.Wallet
+	txns, err := w.ListTxns(ctx, req.StartHeight, endHeight)
 	if err != nil {
 		return nil, err
 	}
+	if req.Account != "" {
+		// Account selectors on this RPC are read filters across
+		// matching scopes, so duplicate names do not silently select
+		// one account.
+		accounts, err := w.ListAccountsByName(ctx, req.Account)
+		if err != nil {
+			return nil, err
+		}
+		addresses := fn.NewSet[string]()
+		for _, account := range accounts {
+			if account.NoChainSync {
+				continue
+			}
+			owned, err := w.ListAddresses(ctx, req.Account,
+				account.AddrSchema.ExternalAddrType)
+			if err != nil {
+				return nil, err
+			}
+			for _, addr := range owned {
+				addresses.Add(addr.Address.String())
+			}
+		}
+		matches := func(output base.Output) bool {
+			return slices.ContainsFunc(output.Addresses,
+				func(addr address.Address) bool {
+					return addresses.Contains(addr.String())
+				},
+			)
+		}
+		filtered := make([]*base.TxDetail, 0, len(txns))
+		for _, tx := range txns {
+			matched := slices.ContainsFunc(tx.Outputs, matches)
+			for _, prev := range tx.PrevOuts {
+				if matched || !prev.IsOurs {
+					continue
+				}
+				parent, err := w.GetTx(ctx, prev.OutPoint.Hash)
+				if err != nil {
+					return nil, err
+				}
+				for _, output := range parent.Outputs {
+					if output.Index == int(
+						prev.OutPoint.Index,
+					) {
 
-	return lnrpc.RPCTransactionDetails(txns, firstIdx, lastIdx), nil
+						matched = matches(output)
+					}
+				}
+			}
+			if matched {
+				filtered = append(filtered, tx)
+			}
+		}
+		txns = filtered
+	}
+
+	return lnrpc.RPCTransactionDetails(
+		txns, req.IndexOffset, req.MaxTransactions,
+	), nil
 }
 
 // DescribeGraph returns a description of the latest graph state from the PoV
@@ -6814,8 +6901,8 @@ func (r *rpcServer) StopDaemon(_ context.Context,
 		// manually continue the rescan process next time by using
 		// `lncli unlock --recovery_window X` otherwise some funds
 		// wouldn't be picked up.
-		isRecoveryMode, progress, err := r.server.cc.Wallet.
-			GetRecoveryInfo()
+		services := r.server.cc.Wallet.Cfg.WalletServices
+		isRecoveryMode, progress, err := services.GetRecoveryInfo()
 		if err != nil {
 			return nil, fmt.Errorf("unable to get wallet recovery "+
 				"info: %w", err)
@@ -8934,8 +9021,9 @@ func (r *rpcServer) getChainSyncInfo() (*chainSyncInfo, error) {
 		return nil, fmt.Errorf("unable to get best block info: %w", err)
 	}
 
-	isWalletSynced, bestHeaderTimestamp, err :=
-		r.server.cc.Wallet.IsSynced()
+	walletInfo, err := r.server.cc.Wallet.Cfg.Wallet.Info(
+		context.Background(),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to sync PoV of the wallet "+
 			"with current best block in the main chain: %v", err)
@@ -8943,14 +9031,14 @@ func (r *rpcServer) getChainSyncInfo() (*chainSyncInfo, error) {
 
 	// Create info to be returned.
 	info := &chainSyncInfo{
-		isWalletSynced: isWalletSynced,
+		isWalletSynced: walletInfo.Synced,
 		bestHeight:     bestHeight,
 		blockHash:      *bestHash,
-		timestamp:      bestHeaderTimestamp,
+		timestamp:      walletInfo.SyncedTo.Timestamp.Unix(),
 	}
 
 	// Exit early if the wallet is not synced.
-	if !isWalletSynced {
+	if !walletInfo.Synced {
 		rpcsLog.Debugf("Wallet is not synced to height %v yet",
 			bestHeight)
 
@@ -8965,7 +9053,7 @@ func (r *rpcServer) getChainSyncInfo() (*chainSyncInfo, error) {
 	// by many wallets (and also our itests) to make sure everything's up to
 	// date, we add the router's state to it. So the flag will only toggle
 	// to true once the router was also able to catch up.
-	isSynced := isWalletSynced
+	isSynced := walletInfo.Synced
 	if !r.cfg.Routing.AssumeChannelValid {
 		routerHeight := r.server.graphBuilder.SyncedHeight()
 		isSynced = uint32(bestHeight) == routerHeight
@@ -8992,4 +9080,134 @@ func (r *rpcServer) getChainSyncInfo() (*chainSyncInfo, error) {
 	}
 
 	return info, nil
+}
+
+// estimateTransaction quotes fees from read-only native sources. EstimateFee
+// has onchain:read permission, so the quote must not allocate change.
+func (r *rpcServer) estimateTransaction(ctx context.Context,
+	selected fn.Set[wire.OutPoint],
+	outputs []*wire.TxOut, fee btcutil.Amount, minConfs int32,
+	strategy base.CoinSelectionStrategy) (*txauthor.AuthoredTx, error) {
+
+	// Explicit inputs may belong to any account; automatic selection stays
+	// within the default account, matching CreateSimpleTx's normal path.
+	accountName := lnwallet.DefaultAccountName
+	if len(selected) != 0 {
+		accountName = ""
+	}
+	utxos, err := r.server.cc.Wallet.Cfg.Wallet.ListUnspent(
+		ctx,
+		base.UtxoQuery{
+			Account:  accountName,
+			MinConfs: minConfs,
+			MaxConfs: math.MaxInt32,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	var coins []base.Coin
+	for _, utxo := range utxos {
+		unselected := utxo.Locked || len(selected) != 0 &&
+			!selected.Contains(utxo.OutPoint)
+		if unselected || (!utxo.Spendable &&
+			!r.server.cc.Wallet.Cfg.Wallet.IsWatchOnly()) {
+
+			continue
+		}
+		// A quote must use the same immediately usable funds as the
+		// send path, including mature coins with remote signatures.
+		mature, err := lnwallet.UtxoMature(
+			ctx, r.server.cc.Wallet.Cfg.Wallet, utxo,
+			r.cfg.ActiveNetParams.Params.CoinbaseMaturity,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !mature {
+			continue
+		}
+		coins = append(coins, base.Coin{
+			OutPoint: utxo.OutPoint,
+			TxOut: wire.TxOut{
+				Value:    int64(utxo.Amount),
+				PkScript: utxo.PkScript,
+			},
+		})
+	}
+	if len(selected) != 0 && len(coins) != len(selected) {
+		return nil, fmt.Errorf("selected inputs are not all available")
+	}
+	if strategy == nil {
+		strategy = base.CoinSelectionLargest
+	}
+	coins, err = strategy.ArrangeCoins(coins, fee)
+	if err != nil {
+		return nil, err
+	}
+
+	// The author may raise its target after estimating witness fees. Keep
+	// accumulated inputs between calls, requiring every explicitly selected
+	// coin even when an earlier prefix already covers the payment.
+	var total btcutil.Amount
+	var txInputs []*wire.TxIn
+	var values []btcutil.Amount
+	var scripts [][]byte
+	inputSource := func(target btcutil.Amount) (btcutil.Amount,
+		[]*wire.TxIn, []btcutil.Amount, [][]byte, error) {
+
+		for len(coins) != 0 && (total < target || len(selected) != 0) {
+			coin := coins[0]
+			coins = coins[1:]
+			txIn := wire.NewTxIn(&coin.OutPoint, nil, nil)
+			txInputs = append(txInputs, txIn)
+			total += btcutil.Amount(coin.Value)
+			values = append(values, btcutil.Amount(coin.Value))
+			scripts = append(scripts, coin.PkScript)
+		}
+
+		return total, txInputs, values, scripts, nil
+	}
+
+	// Actual default-account authoring chooses BIP86 change. Resolve the
+	// persisted schema and next cursor so script size and fees match the
+	// send.
+	account, err := r.server.cc.Wallet.Cfg.Wallet.GetAccount(
+		ctx, waddrmgr.KeyScopeBIP0086,
+		lnwallet.DefaultAccountName,
+	)
+	if err != nil {
+		return nil, err
+	}
+	pubKey, err := r.server.cc.Wallet.Cfg.Wallet.DerivePubKey(
+		ctx, base.DerivePubKeyParams{
+			Account: base.NewAccountSelectorByName(
+				account.KeyScope, account.AccountName,
+			),
+			Branch: 1,
+			Index:  account.InternalKeyCount,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	addr, err := account.AddrSchema.InternalAddrType.AddrFromPubKeyBytes(
+		pubKey.SerializeCompressed(), r.cfg.ActiveNetParams.Params,
+	)
+	if err != nil {
+		return nil, err
+	}
+	changeScript, err := txscript.PayToAddrScript(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	return txauthor.NewUnsignedTransaction(
+		outputs, fee, inputSource, &txauthor.ChangeSource{
+			ScriptSize: len(changeScript),
+			NewScript: func() ([]byte, error) {
+				return changeScript, nil
+			},
+		},
+	)
 }

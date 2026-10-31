@@ -20,6 +20,7 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/chanstate"
@@ -1565,7 +1566,7 @@ func testBreachSpends(t *testing.T, test breachTest) {
 	)
 
 	// Make PublishTransaction always return ErrDoubleSpend to begin with.
-	publErr = lnwallet.ErrDoubleSpend
+	publErr = chain.ErrMempoolConflict
 	brar.cfg.PublishTransaction = func(tx *wire.MsgTx, _ string) error {
 		publMtx.Lock()
 		err := publErr

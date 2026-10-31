@@ -5,6 +5,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lntest"
@@ -626,7 +627,8 @@ func testBumpFeeExternalInput(ht *lntest.HarnessTest) {
 		Immediate: true,
 	}
 	err := alice.RPC.BumpFeeAssertErr(bumpFeeReq)
-	require.ErrorContains(ht, err, "does not belong to the wallet")
+	// The maintained Wallet rejects foreign outputs at its native lookup.
+	require.ErrorContains(ht, err, wallet.ErrUnknownOutput.Error())
 
 	// Clean up the mempool.
 	ht.MineBlocksAndAssertNumTxes(1, 1)

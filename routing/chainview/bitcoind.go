@@ -67,9 +67,18 @@ var _ FilteredChainView = (*BitcoindFilteredChainView)(nil)
 // from RPC credentials and a ZMQ socket address for a bitcoind instance.
 func NewBitcoindFilteredChainView(
 	chainConn *chain.BitcoindConn,
-	blockCache *blockcache.BlockCache) *BitcoindFilteredChainView {
+	blockCache *blockcache.BlockCache) (*BitcoindFilteredChainView, error) {
+
+	// Client registration may fail after connection shutdown. Propagate
+	// that failure before returning a view that depends on its
+	// notifications.
+	client, err := chainConn.NewBitcoindClient()
+	if err != nil {
+		return nil, err
+	}
 
 	chainView := &BitcoindFilteredChainView{
+		chainClient:     client,
 		chainFilter:     make(map[wire.OutPoint]struct{}),
 		filterUpdates:   make(chan filterUpdate),
 		filterBlockReqs: make(chan *filterBlockReq),
@@ -77,10 +86,9 @@ func NewBitcoindFilteredChainView(
 		quit:            make(chan struct{}),
 	}
 
-	chainView.chainClient = chainConn.NewBitcoindClient()
 	chainView.blockQueue = newBlockEventQueue()
 
-	return chainView
+	return chainView, nil
 }
 
 // Start starts all goroutines necessary for normal operation.
