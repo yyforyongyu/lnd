@@ -18,6 +18,7 @@ import (
 	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest/mock"
@@ -368,6 +369,12 @@ func TestWalletBalanceNative(t *testing.T) {
 			t.Cleanup(func() { w.AssertExpectations(t) })
 			scope84 := waddrmgr.KeyScopeBIP0084
 			scope86 := waddrmgr.KeyScopeBIP0086
+			// KVDB reports false for key-family sync exclusion;
+			// its native scope still identifies the signing family.
+			keyScope := waddrmgr.KeyScope{
+				Purpose: keychain.BIP0043Purpose,
+				Coin:    0,
+			}
 			var utxos []*wallet.Utxo
 			if accountFilter != "" {
 				w.On("ListAccountsByName",
@@ -386,6 +393,11 @@ func TestWalletBalanceNative(t *testing.T) {
 						},
 						{
 							AccountName: "empty",
+						},
+						{
+							AccountName: "act:1",
+							KeyScope:    keyScope,
+							NoChainSync: false,
 						},
 					}, nil,
 				).Once()
@@ -507,6 +519,10 @@ func TestWalletBalanceNative(t *testing.T) {
 			require.EqualValues(t, 125, resp.ConfirmedBalance)
 			require.EqualValues(t, 5, resp.UnconfirmedBalance)
 			require.EqualValues(t, 50, resp.LockedBalance)
+			// Empty signing accounts stay out of the RPC view.
+			require.NotContains(
+				t, resp.AccountBalance, "act:1",
+			)
 			require.Contains(t, resp.AccountBalance, "empty")
 			require.Zero(t,
 				resp.AccountBalance["empty"].ConfirmedBalance)

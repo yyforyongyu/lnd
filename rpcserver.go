@@ -3859,7 +3859,11 @@ func (r *rpcServer) WalletBalance(ctx context.Context,
 			&lnrpc.WalletAccountBalance{}
 	}
 	for _, account := range accounts {
-		if !account.NoChainSync {
+		// KVDB has no NoChainSync policy; keep lnd's off-chain key
+		// families out of the RPC view using their native scope.
+		if !account.NoChainSync &&
+			account.KeyScope.Purpose != keychain.BIP0043Purpose {
+
 			rpcAccountBalances[account.AccountName] =
 				&lnrpc.WalletAccountBalance{}
 		}
