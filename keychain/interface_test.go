@@ -99,6 +99,9 @@ func createTestBtcWallet(t testing.TB, coinType uint32) (*wallet.Wallet, error) 
 	// Keep background synchronization waiting on its owned cancellation,
 	// while allowing the real Manager's birthday setup to read genesis.
 	chainMock := &bwmock.Chain{}
+	// Manager reads the stream even while wallet synchronization waits.
+	// A nil stream parks the reader until Stop cancels and joins it.
+	chainMock.On("Notifications").Return((<-chan any)(nil)).Once()
 	chainMock.On("IsCurrent").Return(false).Maybe()
 	chainMock.On("GetBestBlock").
 		Return(params.GenesisHash, int32(0), nil).Maybe()

@@ -51,9 +51,17 @@ var (
 // testManagerConfig supplies a real local walletdb and an existing strict chain
 // mock. Background synchronization waits until Manager.Stop joins it; genesis
 // reads allow wallet unlock and password operations to run normally.
-func testManagerConfig(t *testing.T, testDir string) *wallet.ManagerConfig {
+func testManagerConfig(t *testing.T, testDir string,
+	managerStarts int) *wallet.ManagerConfig {
+
 	t.Helper()
 	chainMock := &bwmock.Chain{}
+	// Each successful Manager.Start owns one reader, including retries.
+	// Nil streams park those readers until the existing unload paths join
+	// them; tests that never start Manager require no stream acquisition.
+	for range managerStarts {
+		chainMock.On("Notifications").Return((<-chan any)(nil)).Once()
+	}
 	chainMock.On("IsCurrent").Return(false).Maybe()
 	chainMock.On("GetBestBlock").
 		Return(testNetParams.GenesisHash, int32(0), nil).Maybe()
@@ -174,7 +182,7 @@ func TestGenSeed(t *testing.T) {
 	testDir := t.TempDir()
 
 	service := walletunlocker.New(
-		testNetParams, nil, false, testManagerConfig(t, testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
 	// Act through GenSeed with the existing entropy/passphrase request for
@@ -209,7 +217,7 @@ func TestGenSeedGenerateEntropy(t *testing.T) {
 	// Manager configuration, preserving the existing seed scenario.
 	testDir := t.TempDir()
 	service := walletunlocker.New(
-		testNetParams, nil, false, testManagerConfig(t, testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
 	// Act through GenSeed with the existing entropy/passphrase request for
@@ -243,7 +251,7 @@ func TestGenSeedInvalidEntropy(t *testing.T) {
 	// Manager configuration, preserving the existing seed scenario.
 	testDir := t.TempDir()
 	service := walletunlocker.New(
-		testNetParams, nil, false, testManagerConfig(t, testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
 	// Act through GenSeed with the existing entropy/passphrase request for
@@ -275,7 +283,7 @@ func TestInitWallet(t *testing.T) {
 
 	// Create new UnlockerService.
 	service := walletunlocker.New(
-		testNetParams, nil, false, testManagerConfig(t, testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
 	// Once we have the unlocker service created, we'll now instantiate a
@@ -360,7 +368,7 @@ func TestCreateWalletInvalidEntropy(t *testing.T) {
 
 	// Create new UnlockerService.
 	service := walletunlocker.New(
-		testNetParams, nil, false, testManagerConfig(t, testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
 	// We'll attempt to init the wallet with an invalid cipher seed and
@@ -390,7 +398,7 @@ func TestUnlockWallet(t *testing.T) {
 	// Create new UnlockerService that'll also drop the wallet's history on
 	// unlock.
 	service := walletunlocker.New(
-		testNetParams, nil, true, testManagerConfig(t, testDir),
+		testNetParams, nil, true, testManagerConfig(t, testDir, 1),
 	)
 
 	ctx := t.Context()
@@ -481,7 +489,8 @@ func TestChangeWalletPasswordNewRootKey(t *testing.T) {
 
 	// Create a new UnlockerService with our temp files.
 	service := walletunlocker.New(
-		testNetParams, tempFiles, false, testManagerConfig(t, testDir),
+		testNetParams, tempFiles, false,
+		testManagerConfig(t, testDir, 1),
 	)
 	service.SetMacaroonDB(store.Backend)
 
@@ -611,7 +620,7 @@ func TestChangeWalletPasswordStateless(t *testing.T) {
 	service := walletunlocker.New(
 		testNetParams, []string{
 			tempMacFile, nonExistingFile,
-		}, false, testManagerConfig(t, testDir),
+		}, false, testManagerConfig(t, testDir, 2),
 	)
 	service.SetMacaroonDB(store.Backend)
 
