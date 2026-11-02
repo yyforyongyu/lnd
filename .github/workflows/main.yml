@@ -635,7 +635,8 @@ jobs:
     # only run the fast subset (see the unit-test and basic itest jobs).
     needs: ci-gate
     if: ${{ !cancelled() && needs.ci-gate.outputs.docs-only != 'true' && github.event.pull_request.draft != true }}
-    runs-on: macos-14
+    # macOS 14 retirement brownouts prevent this job from starting.
+    runs-on: macos-15
     steps:
       - name: Git checkout
         uses: actions/checkout@v5
