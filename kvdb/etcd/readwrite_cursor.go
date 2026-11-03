@@ -110,6 +110,10 @@ func (c *readWriteCursor) Seek(seek []byte) (key, value []byte) {
 		return getKeyVal(kv)
 	}
 
+	// Keep a missed seek as a position, so the reverse block iterator can
+	// step back from above the largest height to the final record.
+	c.currKey = c.prefix + string(seek)
+
 	return nil, nil
 }
 
