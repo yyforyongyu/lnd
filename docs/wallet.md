@@ -1,9 +1,17 @@
 # Wallet management
 
-The wallet in the context of `lnd` is a database file (located in the data
-directory, for example `~/.lnd/data/chain/bitcoin/mainnet/wallet.db` on Linux)
-that contains all addresses and private keys for the on-chain **and** off-chain
-(LN) funds.
+The wallet in the context of `lnd` is a database that contains all addresses
+and private keys for the on-chain **and** off-chain (LN) funds. With the default
+bolt database backend, new wallets use native SQLite storage, for example
+`~/.lnd/data/chain/bitcoin/mainnet/wallet.sqlite` on Linux. An existing
+`wallet.db` continues to use its bbolt storage unchanged; this default does not
+migrate an existing wallet.
+
+With the SQLite or PostgreSQL database backend, new wallets also use native
+SQL storage. Existing SQL-backed wallets continue to use their current
+walletdb namespace through the maintained Wallet APIs. This preserves startup
+while storage conversion is handled separately; upgrading does not copy or
+convert wallet data.
 
 The wallet is independent of the chain backend that is used (`bitcoind`, `btcd`
 or `neutrino`) and must therefore be created as the first step after starting

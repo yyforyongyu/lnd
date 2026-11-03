@@ -69,8 +69,9 @@ Important to know:
 The wallet password is one of the first things that has to be entered if a new
 wallet is created using `lnd`. It is completely independent from the `aezeed`
 cipher seed passphrase (which is optional). The wallet password is used to
-encrypt the sensitive parts of `lnd`'s databases, currently some parts of
-`wallet.db` and `macaroons.db`. Loss of this password does not necessarily
+encrypt the sensitive parts of `lnd`'s wallet database and `macaroons.db`.
+See [wallet management](wallet.md) for the wallet storage filenames.
+Loss of this password does not necessarily
 mean loss of funds, as long as the `aezeed` passphrase is still available.
 But the node will need to be restored using the
 [SCB restore procedure](recovery.md).
@@ -208,7 +209,7 @@ It is absolutely important to write both the seed and, if set, the password down
 and store it in a safe place as **there is no way of exporting the seed from an
 lnd wallet**. When creating the wallet, after printing the seed to the command
 line, it is hashed and only the hash (or to be more exact, the BIP32 extended
-root key) is stored in the `wallet.db` file.   
+root key) is stored in the [wallet database](wallet.md).
 There is
 [a tool being worked on](https://github.com/lightningnetwork/lnd/pull/2373)
 that can extract the BIP32 extended root key, but currently you cannot restore
