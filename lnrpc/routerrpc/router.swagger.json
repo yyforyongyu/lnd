@@ -726,6 +726,16 @@
       ],
       "default": "IN_FLIGHT"
     },
+    "HtlcEventEventType": {
+      "type": "string",
+      "enum": [
+        "UNKNOWN",
+        "SEND",
+        "RECEIVE",
+        "FORWARD"
+      ],
+      "default": "UNKNOWN"
+    },
     "MissionControlConfigProbabilityModel": {
       "type": "string",
       "enum": [
@@ -1702,7 +1712,7 @@
           "description": "The time in unix nanoseconds that the event occurred."
         },
         "event_type": {
-          "$ref": "#/definitions/routerrpcHtlcEventEventType",
+          "$ref": "#/definitions/HtlcEventEventType",
           "description": "The event type indicates whether the htlc was part of a send, receive or\nforward."
         },
         "forward_event": {
@@ -1725,16 +1735,6 @@
         }
       },
       "title": "HtlcEvent contains the htlc event that was processed. These are served on a\nbest-effort basis; events are not persisted, delivery is not guaranteed\n(in the event of a crash in the switch, forward events may be lost) and\nsome events may be replayed upon restart. Events consumed from this package\nshould be de-duplicated by the htlc's unique combination of incoming and\noutgoing channel id and htlc id. [EXPERIMENTAL]"
-    },
-    "routerrpcHtlcEventEventType": {
-      "type": "string",
-      "enum": [
-        "UNKNOWN",
-        "SEND",
-        "RECEIVE",
-        "FORWARD"
-      ],
-      "default": "UNKNOWN"
     },
     "routerrpcHtlcInfo": {
       "type": "object",
