@@ -630,6 +630,7 @@ func runPsbtChanFundingSingleStep(ht *lntest.HarnessTest, private bool,
 }
 
 // testSignPsbt tests that the SignPsbt RPC works correctly.
+// Its funded-wallet case also checks transaction and change across a restart.
 func testSignPsbt(ht *lntest.HarnessTest) {
 	psbtTestRunners := []struct {
 		name   string
@@ -660,8 +661,41 @@ func testSignPsbt(ht *lntest.HarnessTest) {
 			// that aren't in the wallet. But we also want to make
 			// sure we can fund and then sign PSBTs from our
 			// wallet.
-			name:   "fund and sign psbt",
-			runner: runFundAndSignPsbt,
+			name: "fund and sign psbt",
+			runner: func(st *lntest.HarnessTest,
+				alice *node.HarnessNode) {
+
+				// Arrange: reuse the funded matrix, which
+				// checks metadata and mines its final
+				// payment/change. Wait for that exact tip
+				// before saving the public records.
+				runFundAndSignPsbt(st, alice)
+				tip, _ := st.GetBestBlock()
+				st.WaitForBlockchainSyncTo(alice, *tip)
+				utxos := st.AssertNumUTXOsConfirmed(alice, 2)
+				request := &walletrpc.GetTransactionRequest{
+					Txid: utxos[0].Outpoint.TxidStr,
+				}
+				tx := alice.RPC.GetTransaction(request)
+
+				// Act: restart lnd and its Manager once.
+				// Keep the chain tip fixed so a difference
+				// cannot come from new confirmations.
+				st.RestartNode(alice)
+				st.WaitForBlockchainSyncTo(alice, *tip)
+
+				// Assert: the same confirmed outputs and
+				// transaction survive, including values,
+				// scripts and identities, ignoring order.
+				require.ElementsMatch(
+					st, utxos,
+					st.AssertNumUTXOsConfirmed(alice, 2),
+				)
+				require.Equal(
+					st, tx,
+					alice.RPC.GetTransaction(request),
+				)
+			},
 		},
 	}
 
