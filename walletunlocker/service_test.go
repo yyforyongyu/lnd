@@ -3,6 +3,7 @@ package walletunlocker_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
 	"github.com/btcsuite/btcwallet/snacl"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
@@ -47,10 +49,40 @@ var (
 	)
 )
 
-func testLoaderOpts(testDir string) []btcwallet.LoaderOption {
-	dbDir := btcwallet.NetworkDir(testDir, testNetParams)
-	return []btcwallet.LoaderOption{
-		btcwallet.LoaderWithLocalWalletDB(dbDir, true, time.Minute),
+// testManagerConfig supplies a real local walletdb and an existing strict chain
+// mock. Background synchronization waits until Manager.Stop joins it; genesis
+// reads allow wallet unlock and password operations to run normally.
+func testManagerConfig(t *testing.T, testDir string,
+	managerStarts int) *wallet.ManagerConfig {
+
+	t.Helper()
+	chainMock := &bwmock.Chain{}
+	// Each successful Manager.Start owns one reader, including retries.
+	// Nil streams park those readers until the existing unload paths join
+	// them; tests that never start Manager require no stream acquisition.
+	for range managerStarts {
+		chainMock.On("Notifications").Return((<-chan any)(nil)).Once()
+	}
+	chainMock.On("IsCurrent").Return(false).Maybe()
+	chainMock.On("GetBestBlock").
+		Return(testNetParams.GenesisHash, int32(0), nil).Maybe()
+	chainMock.On("GetBlockHash", int64(0)).
+		Return(testNetParams.GenesisHash, nil).Maybe()
+	chainMock.On("GetBlockHeader", testNetParams.GenesisHash).
+		Return(&testNetParams.GenesisBlock.Header, nil).Maybe()
+	chainMock.On("BackEnd").Return("mock").Maybe()
+	t.Cleanup(func() { chainMock.AssertExpectations(t) })
+
+	return &wallet.ManagerConfig{
+		Backend: wallet.DBBackendKVDB,
+		DataSource: path.Join(
+			btcwallet.NetworkDir(testDir, testNetParams),
+			"wallet.db",
+		),
+		ChainParams:    *testNetParams,
+		ChainSource:    chainMock,
+		NoFreelistSync: true,
+		Timeout:        time.Minute,
 	}
 }
 
@@ -145,15 +177,17 @@ func openOrCreateTestMacStore(tempDir string, pw *[]byte,
 func TestGenSeed(t *testing.T) {
 	t.Parallel()
 
-	// First, we'll create a new test directory and unlocker service for
-	// that directory.
+	// Arrange an empty wallet directory and an unlocker using the
+	// maintained
+	// Manager configuration, preserving the existing seed scenario.
 	testDir := t.TempDir()
 
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
-	// Now that the service has been created, we'll ask it to generate a
+	// Act through GenSeed with the existing entropy/passphrase request for
+	// a
 	// new seed for us given a test passphrase.
 	aezeedPass := []byte("kek")
 	genSeedReq := &lnrpc.GenSeedRequest{
@@ -165,8 +199,8 @@ func TestGenSeed(t *testing.T) {
 	seedResp, err := service.GenSeed(ctx, genSeedReq)
 	require.NoError(t, err)
 
-	// We should then be able to take the generated mnemonic, and properly
-	// decipher both it.
+	// Assert the generated mnemonic decrypts with the supplied passphrase,
+	// preserving the existing seed-generation success contract.
 	var mnemonic aezeed.Mnemonic
 	copy(mnemonic[:], seedResp.CipherSeedMnemonic[:])
 	_, err = mnemonic.ToCipherSeed(aezeedPass)
@@ -179,14 +213,16 @@ func TestGenSeed(t *testing.T) {
 func TestGenSeedGenerateEntropy(t *testing.T) {
 	t.Parallel()
 
-	// First, we'll create a new test directory and unlocker service for
-	// that directory.
+	// Arrange an empty wallet directory and an unlocker using the
+	// maintained
+	// Manager configuration, preserving the existing seed scenario.
 	testDir := t.TempDir()
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
-	// Now that the service has been created, we'll ask it to generate a
+	// Act through GenSeed with the existing entropy/passphrase request for
+	// a
 	// new seed for us given a test passphrase. Note that we don't actually
 	aezeedPass := []byte("kek")
 	genSeedReq := &lnrpc.GenSeedRequest{
@@ -197,8 +233,8 @@ func TestGenSeedGenerateEntropy(t *testing.T) {
 	seedResp, err := service.GenSeed(ctx, genSeedReq)
 	require.NoError(t, err)
 
-	// We should then be able to take the generated mnemonic, and properly
-	// decipher both it.
+	// Assert the generated mnemonic decrypts with the supplied passphrase,
+	// preserving the existing seed-generation success contract.
 	var mnemonic aezeed.Mnemonic
 	copy(mnemonic[:], seedResp.CipherSeedMnemonic[:])
 	_, err = mnemonic.ToCipherSeed(aezeedPass)
@@ -211,14 +247,16 @@ func TestGenSeedGenerateEntropy(t *testing.T) {
 func TestGenSeedInvalidEntropy(t *testing.T) {
 	t.Parallel()
 
-	// First, we'll create a new test directory and unlocker service for
-	// that directory.
+	// Arrange an empty wallet directory and an unlocker using the
+	// maintained
+	// Manager configuration, preserving the existing seed scenario.
 	testDir := t.TempDir()
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
-	// Now that the service has been created, we'll ask it to generate a
+	// Act through GenSeed with the existing entropy/passphrase request for
+	// a
 	// new seed for us given a test passphrase. However, we'll be using an
 	// invalid set of entropy that's 55 bytes, instead of 15 bytes.
 	aezeedPass := []byte("kek")
@@ -227,10 +265,11 @@ func TestGenSeedInvalidEntropy(t *testing.T) {
 		SeedEntropy:      bytes.Repeat([]byte("a"), 55),
 	}
 
-	// We should get an error now since the entropy source was invalid.
+	// Act through GenSeed with the oversized entropy to reach validation.
 	ctx := t.Context()
 	_, err := service.GenSeed(ctx, genSeedReq)
 	require.Error(t, err)
+	// Assert the caller still receives the specific entropy-length failure.
 	require.Contains(t, err.Error(), "incorrect entropy length")
 }
 
@@ -239,12 +278,13 @@ func TestGenSeedInvalidEntropy(t *testing.T) {
 func TestInitWallet(t *testing.T) {
 	t.Parallel()
 
-	// testDir is empty, meaning wallet was not created from before.
+	// Arrange an empty wallet directory so the existing RPC scenario starts
+	// without persisted keys and owns its Manager configuration.
 	testDir := t.TempDir()
 
 	// Create new UnlockerService.
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
 	// Once we have the unlocker service created, we'll now instantiate a
@@ -252,10 +292,8 @@ func TestInitWallet(t *testing.T) {
 	pass := []byte("test")
 	cipherSeed, mnemonic := createSeedAndMnemonic(t, pass)
 
-	// Now that we have all the necessary items, we'll now issue the Init
-	// command to the wallet. This should check the validity of the cipher
-	// seed, then send over the initialization information over the init
-	// channel.
+	// Act by issuing InitWallet asynchronously: the RPC validates the seed
+	// and waits for the daemon's existing initialization-channel handshake.
 	ctx := t.Context()
 	req := &lnrpc.InitWalletRequest{
 		WalletPassword:     testPassword,
@@ -279,8 +317,8 @@ func TestInitWallet(t *testing.T) {
 		}
 	}()
 
-	// The same user passphrase, and also the plaintext cipher seed
-	// should be sent over and match exactly.
+	// Assert the handoff contains the original password, seed and startup
+	// preferences before replying with the fixture macaroon.
 	select {
 	case err := <-errChan:
 		t.Fatalf("InitWallet call failed: %v", err)
@@ -296,8 +334,8 @@ func TestInitWallet(t *testing.T) {
 		require.Equal(t, testRecoveryWindow, msg.RecoveryWindow)
 		require.Equal(t, true, msg.StatelessInit)
 
-		// Send a fake macaroon that should be returned in the response
-		// in the async code above.
+		// Send the fixture macaroon back to the waiting RPC, preserving
+		// the existing response handshake.
 		service.MacResponseChan <- testMac
 
 	case <-time.After(defaultTestTimeout):
@@ -309,7 +347,9 @@ func TestInitWallet(t *testing.T) {
 
 	// Now calling InitWallet should fail, since a wallet already exists in
 	// the directory.
+	// Act through InitWallet with the existing invalid/duplicate request.
 	_, err := service.InitWallet(ctx, req)
+	// Assert it remains rejected instead of creating a replacement wallet.
 	require.Error(t, err)
 
 	// Similarly, if we try to do GenSeed again, we should get an error as
@@ -323,12 +363,13 @@ func TestInitWallet(t *testing.T) {
 func TestCreateWalletInvalidEntropy(t *testing.T) {
 	t.Parallel()
 
-	// testDir is empty, meaning wallet was not created from before.
+	// Arrange an empty wallet directory so the existing RPC scenario starts
+	// without persisted keys and owns its Manager configuration.
 	testDir := t.TempDir()
 
 	// Create new UnlockerService.
 	service := walletunlocker.New(
-		testNetParams, nil, false, testLoaderOpts(testDir),
+		testNetParams, nil, false, testManagerConfig(t, testDir, 0),
 	)
 
 	// We'll attempt to init the wallet with an invalid cipher seed and
@@ -340,23 +381,25 @@ func TestCreateWalletInvalidEntropy(t *testing.T) {
 	}
 
 	ctx := t.Context()
+	// Act through InitWallet with the existing invalid/duplicate request.
 	_, err := service.InitWallet(ctx, req)
+	// Assert it remains rejected instead of creating a replacement wallet.
 	require.Error(t, err)
 }
 
-// TestUnlockWallet checks that trying to unlock non-existing wallet fails, that
-// unlocking existing wallet with wrong passphrase fails, and that unlocking
-// existing wallet with correct passphrase succeeds.
+// TestUnlockWallet verifies that unlocking an existing wallet with the
+// correct passphrase succeeds.
 func TestUnlockWallet(t *testing.T) {
 	t.Parallel()
 
-	// testDir is empty, meaning wallet was not created from before.
+	// Arrange an empty wallet directory so the existing RPC scenario starts
+	// without persisted keys and owns its Manager configuration.
 	testDir := t.TempDir()
 
 	// Create new UnlockerService that'll also drop the wallet's history on
 	// unlock.
 	service := walletunlocker.New(
-		testNetParams, nil, true, testLoaderOpts(testDir),
+		testNetParams, nil, true, testManagerConfig(t, testDir, 1),
 	)
 
 	ctx := t.Context()
@@ -366,7 +409,8 @@ func TestUnlockWallet(t *testing.T) {
 		StatelessInit:  true,
 	}
 
-	// Should fail to unlock non-existing wallet.
+	// Act through UnlockWallet before creating a wallet; assert absence is
+	// still reported rather than constructing an empty replacement.
 	_, err := service.UnlockWallet(ctx, req)
 	require.Error(t, err)
 
@@ -391,7 +435,8 @@ func TestUnlockWallet(t *testing.T) {
 		}
 	}()
 
-	// Password and recovery window should be sent over the channel.
+	// Assert the accepted request hands off the same password, recovery
+	// window and stateless preference through the existing unlock channel.
 	select {
 	case err := <-errChan:
 		t.Fatalf("UnlockWallet call failed: %v", err)
@@ -401,13 +446,136 @@ func TestUnlockWallet(t *testing.T) {
 		require.Equal(t, testRecoveryWindow, unlockMsg.RecoveryWindow)
 		require.Equal(t, true, unlockMsg.StatelessInit)
 
-		// Send a fake macaroon that should be returned in the response
-		// in the async code above.
+		// Send the fixture macaroon back to the waiting RPC, preserving
+		// the existing response handshake.
 		service.MacResponseChan <- testMac
 		require.NoError(t, unlockMsg.UnloadWallet())
 
 	case <-time.After(defaultTestTimeout):
 		t.Fatalf("password not received")
+	}
+}
+
+// TestWalletExistsRemoteKVDB verifies existence comes from the supplied
+// database before startup has a public password or a local wallet filename.
+func TestWalletExistsRemoteKVDB(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty database", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange: Connect to an empty database without a runtime.
+		// Wallet namespaces, rather than a connection, identify keys.
+		cfg := testManagerConfig(t, t.TempDir(), 0)
+		remotePath := cfg.DataSource
+		cfg.DataSource = ""
+		cfg.KVDBOpen = func(context.Context) (kvdb.Backend, error) {
+			return kvdb.GetBoltBackend(&kvdb.BoltBackendConfig{
+				DBPath:         path.Dir(remotePath),
+				DBFileName:     path.Base(remotePath),
+				NoFreelistSync: true,
+				DBTimeout:      time.Second,
+			})
+		}
+		service := walletunlocker.New(testNetParams, nil, false, cfg)
+
+		// Act: Query existence before credentials are supplied, without
+		// asking Manager to initialize a Wallet.
+		exists, err := service.WalletExists()
+
+		// Assert: Empty remote storage permits wallet creation.
+		require.NoError(t, err)
+		require.False(t, exists)
+	})
+
+	t.Run("initialized database", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange: Persist keys, then expose only their opener.
+		// A missing local filename must not hide remote wallet state.
+		testDir := t.TempDir()
+		createTestWallet(t, testDir, testNetParams)
+		cfg := testManagerConfig(t, testDir, 0)
+		remotePath := cfg.DataSource
+		cfg.DataSource = ""
+		cfg.KVDBOpen = func(context.Context) (kvdb.Backend, error) {
+			return kvdb.Open(
+				"bdb", remotePath, true, time.Second, false,
+			)
+		}
+		service := walletunlocker.New(testNetParams, nil, false, cfg)
+
+		// Act: Probe storage before receiving the public password.
+		exists, err := service.WalletExists()
+
+		// Assert: Existing keys remain visible without a local path.
+		require.NoError(t, err)
+		require.True(t, exists)
+	})
+}
+
+// TestWalletExistsRemoteKVDBOpenFailure verifies a failed remote connection is
+// reported to the caller instead of being mistaken for an absent Wallet.
+func TestWalletExistsRemoteKVDBOpenFailure(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: A connection failure must not enable seed creation over keys
+	// whose database cannot currently be inspected.
+	openErr := errors.New("remote wallet database unavailable")
+	cfg := testManagerConfig(t, t.TempDir(), 0)
+	cfg.DataSource = ""
+	cfg.KVDBOpen = func(context.Context) (kvdb.Backend, error) {
+		return nil, openErr
+	}
+	service := walletunlocker.New(testNetParams, nil, false, cfg)
+
+	// Act: Ask the same public existence method used by create and unlock.
+	exists, err := service.WalletExists()
+
+	// Assert: Preserve the connection error instead of allowing creation.
+	require.False(t, exists)
+	require.ErrorIs(t, err, openErr)
+}
+
+// TestUnlockWalletRemoteKVDB verifies an incorrect credential does not prevent
+// later unlocks from reopening and authenticating the configured remote Wallet.
+func TestUnlockWalletRemoteKVDB(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Persist a wallet and expect exactly two successful startups.
+	// Failed public authentication acquires no chain reader.
+	testDir := t.TempDir()
+	createTestWallet(t, testDir, testNetParams)
+	cfg := testManagerConfig(t, testDir, 2)
+	remotePath := cfg.DataSource
+	cfg.DataSource = ""
+	cfg.KVDBOpen = func(context.Context) (kvdb.Backend, error) {
+		return kvdb.Open("bdb", remotePath, true, time.Second, false)
+	}
+	service := walletunlocker.New(testNetParams, nil, false, cfg)
+
+	// Act: Refuse a wrong password, then use the RPC's unlock method.
+	// Close each successful attempt before reopening the same storage.
+	w, manager, cleanup, err := service.LoadAndUnlock([]byte("wrong"), 0)
+	require.Error(t, err)
+	require.Nil(t, w)
+	require.Nil(t, manager)
+	require.Nil(t, cleanup)
+
+	for range 2 {
+		w, manager, cleanup, err := service.LoadAndUnlock(
+			testPassword, 0,
+		)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = manager.Stop() })
+		info, err := w.Info(t.Context())
+
+		// Assert: Each attempt authenticates and releases its database
+		// before reopening. The fixture checks its strict expectations
+		// once after Manager shutdown joins the chain reader.
+		require.NoError(t, err)
+		require.False(t, info.Locked)
+		require.NoError(t, cleanup())
 	}
 }
 
@@ -417,7 +585,8 @@ func TestUnlockWallet(t *testing.T) {
 func TestChangeWalletPasswordNewRootKey(t *testing.T) {
 	t.Parallel()
 
-	// testDir is empty, meaning wallet was not created from before.
+	// Arrange an empty wallet directory so the existing RPC scenario starts
+	// without persisted keys and owns its Manager configuration.
 	testDir := t.TempDir()
 
 	// Changing the password of the wallet will also try to change the
@@ -444,7 +613,8 @@ func TestChangeWalletPasswordNewRootKey(t *testing.T) {
 
 	// Create a new UnlockerService with our temp files.
 	service := walletunlocker.New(
-		testNetParams, tempFiles, false, testLoaderOpts(testDir),
+		testNetParams, tempFiles, false,
+		testManagerConfig(t, testDir, 1),
 	)
 	service.SetMacaroonDB(store.Backend)
 
@@ -457,7 +627,8 @@ func TestChangeWalletPasswordNewRootKey(t *testing.T) {
 		NewMacaroonRootKey: true,
 	}
 
-	// Changing the password to a non-existing wallet should fail.
+	// Act through ChangePassword before wallet creation, preserving the
+	// existing rejection of an absent wallet.
 	_, err = service.ChangePassword(ctx, req)
 	require.Error(t, err)
 
@@ -493,7 +664,8 @@ func TestChangeWalletPasswordNewRootKey(t *testing.T) {
 	errChan := make(chan error, 1)
 	go doChangePassword(service, req, errChan)
 
-	// The new password should be sent over the channel.
+	// Assert the accepted password reaches the existing unlock handoff;
+	// complete its macaroon response before checking the persisted store.
 	select {
 	case err := <-errChan:
 		t.Fatalf("ChangePassword call failed: %v", err)
@@ -501,8 +673,8 @@ func TestChangeWalletPasswordNewRootKey(t *testing.T) {
 	case unlockMsg := <-service.UnlockMsgs:
 		require.Equal(t, newPassword, unlockMsg.Passphrase)
 
-		// Send a fake macaroon that should be returned in the response
-		// in the async code above.
+		// Send the fixture macaroon back to the waiting RPC, preserving
+		// the existing response handshake.
 		service.MacResponseChan <- testMac
 		require.NoError(t, unlockMsg.UnloadWallet())
 
@@ -542,7 +714,8 @@ func TestChangeWalletPasswordNewRootKey(t *testing.T) {
 func TestChangeWalletPasswordStateless(t *testing.T) {
 	t.Parallel()
 
-	// testDir is empty, meaning wallet was not created from before.
+	// Arrange an empty wallet directory so the existing RPC scenario starts
+	// without persisted keys and owns its Manager configuration.
 	testDir := t.TempDir()
 
 	// Changing the password of the wallet will also try to change the
@@ -571,7 +744,7 @@ func TestChangeWalletPasswordStateless(t *testing.T) {
 	service := walletunlocker.New(
 		testNetParams, []string{
 			tempMacFile, nonExistingFile,
-		}, false, testLoaderOpts(testDir),
+		}, false, testManagerConfig(t, testDir, 2),
 	)
 	service.SetMacaroonDB(store.Backend)
 
@@ -603,15 +776,13 @@ func TestChangeWalletPasswordStateless(t *testing.T) {
 		NewMacaroonRootKey: true,
 	}
 
-	// Since we indicated the wallet was initialized stateless, the service
-	// will block until it receives the macaroon through the channel
-	// provided in the message in UnlockMsgs. So we need to call the service
-	// async and then wait for the unlock message to arrive so we can send
-	// back a fake macaroon.
+	// Act asynchronously through ChangePassword because stateless startup
+	// waits for the existing unlock-channel macaroon response.
 	errChan := make(chan error, 1)
 	go doChangePassword(service, req, errChan)
 
-	// Password and recovery window should be sent over the channel.
+	// Assert the new password reaches the unlock handoff, then retain the
+	// existing checks for removed macaroon files and persisted credentials.
 	select {
 	case err := <-errChan:
 		t.Fatalf("ChangePassword call failed: %v", err)
@@ -619,8 +790,8 @@ func TestChangeWalletPasswordStateless(t *testing.T) {
 	case unlockMsg := <-service.UnlockMsgs:
 		require.Equal(t, testPassword, unlockMsg.Passphrase)
 
-		// Send a fake macaroon that should be returned in the response
-		// in the async code above.
+		// Send the fixture macaroon back to the waiting RPC, preserving
+		// the existing response handshake.
 		service.MacResponseChan <- testMac
 		require.NoError(t, unlockMsg.UnloadWallet())
 
@@ -644,6 +815,8 @@ func TestChangeWalletPasswordStateless(t *testing.T) {
 	assertPasswordChanged(t, testDir, req.NewPassword)
 }
 
+// doChangePassword completes the RPC response and returns its error to the
+// owning test goroutine, which performs all assertions.
 func doChangePassword(service *walletunlocker.UnlockerService,
 	req *lnrpc.ChangePasswordRequest, errChan chan error) {
 

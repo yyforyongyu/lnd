@@ -168,4 +168,4 @@ func (b *BtcWallet) GetBlockHash(blockHeight int64) (*chainhash.Hash, error) {
 
 // A compile time check to ensure that BtcWallet implements the BlockChainIO
 // interface.
-var _ lnwallet.WalletController = (*BtcWallet)(nil)
+var _ lnwallet.BlockChainIO = (*BtcWallet)(nil)

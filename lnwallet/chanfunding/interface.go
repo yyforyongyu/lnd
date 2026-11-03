@@ -1,14 +1,11 @@
 package chanfunding
 
 import (
-	"time"
-
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/wallet"
-	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
@@ -38,20 +35,6 @@ type CoinSelectionLocker interface {
 	// ability to execute a function closure under an exclusive coin
 	// selection lock.
 	WithCoinSelectLock(func() error) error
-}
-
-// OutputLeaser allows a caller to lease/release an output. When leased, the
-// outputs shouldn't be used for any sort of channel funding or coin selection.
-// Leased outputs are expected to be persisted between restarts.
-type OutputLeaser interface {
-	// LeaseOutput leases a target output, rendering it unusable for coin
-	// selection.
-	LeaseOutput(i wtxmgr.LockID, o wire.OutPoint, d time.Duration) (
-		time.Time, error)
-
-	// ReleaseOutput releases a target output, allowing it to be used for
-	// coin selection once again.
-	ReleaseOutput(i wtxmgr.LockID, o wire.OutPoint) error
 }
 
 // Request is a new request for funding a channel. The items in the struct

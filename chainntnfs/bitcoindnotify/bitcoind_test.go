@@ -58,10 +58,13 @@ func setUpNotifier(t *testing.T, bitcoindConn *chain.BitcoindConn,
 
 	t.Helper()
 
-	notifier := New(
+	// Check client construction before starting the notifier so connection
+	// setup errors fail this fixture at their source.
+	notifier, err := New(
 		bitcoindConn, unittest.NetParams, spendHintCache,
 		confirmHintCache, blockCache,
 	)
+	require.NoError(t, err)
 	if err := notifier.Start(); err != nil {
 		t.Fatalf("unable to start notifier: %v", err)
 	}

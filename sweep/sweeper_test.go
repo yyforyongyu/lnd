@@ -1,6 +1,7 @@
 package sweep
 
 import (
+	"bytes"
 	"crypto/rand"
 	"errors"
 	"testing"
@@ -10,6 +11,8 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	base "github.com/btcsuite/btcwallet/wallet"
+	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
@@ -68,6 +71,156 @@ func createMockInput(t *testing.T, s *UtxoSweeper,
 	}
 
 	return inp
+}
+
+// TestRemoveConflictSweepDescendants checks that excluded sweeps stop being
+// rebroadcast without releasing fee coins still used by monitored sweeps.
+func TestRemoveConflictSweepDescendants(t *testing.T) {
+	t.Parallel()
+
+	// Arrange the four ownership/lifecycle boundaries of destructive
+	// cleanup. A retained replaced row can still represent a live sweep
+	// when Neutrino cannot report which conflicting broadcast was accepted.
+	tests := []struct {
+		name         string
+		sharedFee    bool
+		walletFee    bool
+		siblingState SweepState
+		deleteTx     bool
+	}{
+		{
+			name:         "LiveSweepRetainsSharedWalletFee",
+			sharedFee:    true,
+			walletFee:    true,
+			siblingState: Published,
+			deleteTx:     false,
+		},
+		{
+			name:         "SeparateWalletFeesAllowDeletion",
+			sharedFee:    false,
+			walletFee:    true,
+			siblingState: Published,
+			deleteTx:     true,
+		},
+		{
+			name:         "TerminatedSweepAllowsDeletion",
+			sharedFee:    true,
+			walletFee:    true,
+			siblingState: Excluded,
+			deleteTx:     true,
+		},
+		{
+			name:         "ExternalInputAllowsDeletion",
+			sharedFee:    true,
+			walletFee:    false,
+			siblingState: Published,
+			deleteTx:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange an excluded anchor and a separately monitored
+			// sweep. The existing input fixture verifies its own
+			// expectations; these direct mocks each need one check.
+			wallet := &MockWallet{}
+			defer wallet.AssertExpectations(t)
+
+			store := &MockSweeperStore{}
+			defer store.AssertExpectations(t)
+
+			s := New(&UtxoSweeperConfig{
+				Wallet: wallet,
+				Store:  store,
+			})
+
+			excluded := createMockInput(t, s, Excluded)
+			sibling := createMockInput(t, s, tc.siblingState)
+
+			// Isolate fee sharing from input lifecycle so each
+			// case changes only the deletion boundary it exercises.
+			fee := wire.OutPoint{
+				Hash: chainhash.Hash{1},
+			}
+
+			siblingFee := fee
+			if !tc.sharedFee {
+				siblingFee.Index++
+			}
+
+			// Serialize real native snapshots rather than replacing
+			// transaction decoding. Only the sibling's wallet-owned
+			// prevout may protect the shared fee claim.
+			excludedPoint := excluded.OutPoint()
+			siblingPoint := sibling.OutPoint()
+
+			excludedTx := wire.NewMsgTx(2)
+			excludedTx.AddTxIn(wire.NewTxIn(
+				&excludedPoint, nil, nil,
+			))
+			excludedTx.AddTxIn(wire.NewTxIn(&fee, nil, nil))
+
+			siblingTx := wire.NewMsgTx(2)
+			siblingTx.AddTxIn(wire.NewTxIn(
+				&siblingPoint, nil, nil,
+			))
+			siblingTx.AddTxIn(wire.NewTxIn(&siblingFee, nil, nil))
+
+			var excludedRaw, siblingRaw bytes.Buffer
+			require.NoError(t, excludedTx.Serialize(&excludedRaw))
+			require.NoError(t, siblingTx.Serialize(&siblingRaw))
+
+			// Return the excluded record first so retention cannot
+			// depend on reading the protected sibling before it.
+			excludedHash := excludedTx.TxHash()
+			siblingHash := siblingTx.TxHash()
+			store.On("ListSweeps").Return([]chainhash.Hash{
+				excludedHash, siblingHash,
+			}, nil).Once()
+
+			wallet.On("GetTx", mock.Anything, excludedHash).
+				Return(&base.TxDetail{
+					RawTx: excludedRaw.Bytes(),
+				}, nil).Once()
+
+			wallet.On("GetTx", mock.Anything, siblingHash).
+				Return(&base.TxDetail{
+					RawTx:  siblingRaw.Bytes(),
+					Status: base.TxStatusReplaced,
+					PrevOuts: []base.PrevOut{
+						{
+							OutPoint: siblingFee,
+							IsOurs:   tc.walletFee,
+						},
+					},
+				}, nil).Once()
+
+			// Deferred deletion must still stop rebroadcasting
+			// the excluded transaction and retain its fee claim.
+			if tc.deleteTx {
+				wallet.On("DeleteUnconfirmedTx",
+					mock.Anything, excludedHash,
+				).Return(nil).Once()
+			}
+
+			wallet.On("CancelRebroadcast", excludedHash).Once()
+
+			// Act by cleaning up the excluded anchor's branch,
+			// matching exclusive-group confirmation.
+			err := s.removeConflictSweepDescendants(
+				map[wire.OutPoint]struct{}{
+					excluded.OutPoint(): {},
+				},
+			)
+
+			// Assert successful cleanup. Deferred mock checks
+			// require cancellation in every case and allow deletion
+			// only without a live wallet fee claim to protect.
+			require.NoError(t, err)
+		})
+	}
 }
 
 // TestMarkInputsPendingPublish checks that given a list of inputs with
@@ -611,7 +764,8 @@ func TestMarkInputFailed(t *testing.T) {
 func TestSweepPendingInputs(t *testing.T) {
 	t.Parallel()
 
-	// Create a mock wallet and aggregator.
+	// Arrange wallet, aggregation and publication expectations for ordinary
+	// selection, including one set that must acquire a wallet fee input.
 	wallet := &MockWallet{}
 	defer wallet.AssertExpectations(t)
 
@@ -679,11 +833,183 @@ func TestSweepPendingInputs(t *testing.T) {
 		setNeedWallet, normalSet,
 	})
 
-	// Mock `Broadcast` to return a result.
-	publisher.On("Broadcast", mock.Anything).Return(nil).Twice()
+	// Ordinary selection leaves initial publication to the publisher's
+	// blockbeat instead of forcing the wallet-notification retry behavior.
+	publisher.On("Broadcast", mock.MatchedBy(func(req *BumpRequest) bool {
+		return !req.Immediate
+	})).Return(nil).Twice()
 
-	// Call the method under test.
-	s.sweepPendingInputs(pis)
+	// Act by selecting the two normal sets without an immediate override.
+	s.sweepPendingInputs(pis, false)
+
+	// Assert deferred expectations verify both sets are submitted,
+	// and that only the fee-input set acquires the wallet selection lock.
+}
+
+// TestSweeperWalletConfirmation retries a pending sweep when the wallet commits
+// its fee coin after the blockbeat, without requiring another mined block.
+func TestSweeperWalletConfirmation(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a mature pending input and a wallet whose confirmed fee coin
+	// is absent on the blockbeat but available on the next selection. Real
+	// input, beat and estimator types isolate the collector behavior.
+	wallet := &MockWallet{}
+	defer wallet.AssertExpectations(t)
+	aggregator := &mockUtxoAggregator{}
+	defer aggregator.AssertExpectations(t)
+	publisher := &MockBumper{}
+	defer publisher.AssertExpectations(t)
+	set := &MockInputSet{}
+	defer set.AssertExpectations(t)
+
+	events := make(chan *base.TxEvent)
+	canceled := make(chan struct{})
+	cancel := func() {
+		// Closing this receipt also detects a duplicate cancellation.
+		close(canceled)
+	}
+	wallet.On("SubscribeTxns", mock.Anything).Return(
+		(<-chan *base.TxEvent)(events), cancel, nil,
+	).Once()
+	wallet.On("WithCoinSelectLock", mock.Anything).Return(nil).Twice()
+	set.On("NeedWalletInput").Return(true).Twice()
+	set.On("AddWalletInputs", wallet).Return(ErrNotEnoughInputs).Once()
+	set.On("AddWalletInputs", wallet).Return(nil).Once()
+
+	op := wire.OutPoint{Index: 1}
+	inp := input.NewBaseInput(
+		&op, input.CommitmentTimeLock,
+		&input.SignDescriptor{Output: &wire.TxOut{Value: 1000}}, 0,
+	)
+	set.On("Inputs").Return([]input.Input{inp}).Twice()
+	set.On("DeadlineHeight").Return(testHeight).Once()
+	set.On("Budget").Return(btcutil.Amount(1)).Once()
+	set.On("StartingFeeRate").Return(
+		fn.None[chainfee.SatPerKWeight](),
+	).Once()
+	set.On("Immediate").Return(false).Once()
+	published := make(chan *BumpRequest, 1)
+	publisher.On("Broadcast", mock.Anything).Return(nil).Run(
+		func(args mock.Arguments) {
+			// The owning test goroutine inspects the typed request.
+			req, ok := args.Get(0).(*BumpRequest)
+			if ok {
+				published <- req
+			}
+		},
+	).Once()
+
+	addr := lnwallet.AddrWithKey{
+		DeliveryAddress: testPubKey.SerializeCompressed(),
+	}
+	s := New(&UtxoSweeperConfig{
+		Wallet:       wallet,
+		Aggregator:   aggregator,
+		Publisher:    publisher,
+		FeeEstimator: chainfee.NewStaticEstimator(1000, 253),
+		GenSweepScript: func() fn.Result[lnwallet.AddrWithKey] {
+			// Give the retried sweep an ordinary destination.
+			return fn.Ok(addr)
+		},
+	})
+	s.inputs[op] = &SweeperInput{Input: inp, state: Init}
+	aggregator.On("ClusterInputs", s.inputs).Return([]InputSet{set}).Twice()
+	beat := chainio.NewBeat(chainntnfs.BlockEpoch{Height: testHeight})
+	require.NoError(t, s.Start(beat))
+	defer func() {
+		// Join the collector before deferred mock verification.
+		require.NoError(t, s.Stop())
+	}()
+
+	// Act on a blockbeat before credit, then deliver an unconfirmed
+	// observation. PendingInputs fences the collector after that delivery,
+	// so an empty channel proves no premature retry without sleeps.
+	require.NoError(t, s.ProcessBlock(beat))
+	events <- &base.TxEvent{Detail: &base.TxDetail{}}
+	pending, err := s.PendingInputs()
+	require.NoError(t, err)
+	require.Contains(t, pending, op)
+	require.Empty(t, published)
+
+	// Act on the committed confirmation without sending another blockbeat.
+	// Its height differs deliberately: only blockbeats own sweeper height.
+	events <- &base.TxEvent{Detail: &base.TxDetail{
+		Block: &base.BlockDetails{Height: testHeight + 1},
+	}}
+	_, err = s.PendingInputs()
+	require.NoError(t, err)
+
+	// Assert the public event loop publishes the same pending input at its
+	// original deadline. Immediate triggers initial publication even if
+	// the publisher already consumed this block; Stop joins cancellation.
+	select {
+	case req := <-published:
+		require.Equal(t, []input.Input{inp}, req.Inputs)
+		require.Equal(t, testHeight, req.DeadlineHeight)
+		require.True(t, req.Immediate)
+	default:
+		t.Fatal("confirmed wallet credit did not retry the sweep")
+	}
+	require.NoError(t, s.Stop())
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("Stop did not join wallet subscription cancellation")
+	}
+}
+
+// TestSweeperWalletSubscription preserves registration errors and permits a
+// subsequent start, block processing after stream closure, and joined shutdown.
+func TestSweeperWalletSubscription(t *testing.T) {
+	t.Parallel()
+
+	// Arrange one failed registration followed by a live subscription. The
+	// closed receipt detects duplicate cancellation, while an empty cluster
+	// permits a normal blockbeat after the wallet stream closes.
+	wallet := &MockWallet{}
+	defer wallet.AssertExpectations(t)
+	aggregator := &mockUtxoAggregator{}
+	defer aggregator.AssertExpectations(t)
+	events := make(chan *base.TxEvent)
+	canceled := make(chan struct{})
+	cancel := func() {
+		// Stop must join cancellation before acknowledging shutdown.
+		close(canceled)
+	}
+	wallet.On("SubscribeTxns", mock.Anything).Return(
+		(<-chan *base.TxEvent)(nil), (func())(nil), errDummy,
+	).Once()
+	wallet.On("SubscribeTxns", mock.Anything).Return(
+		(<-chan *base.TxEvent)(events), cancel, nil,
+	).Once()
+	aggregator.On("ClusterInputs", InputsMap{}).Return([]InputSet{}).Once()
+	s := New(&UtxoSweeperConfig{
+		Wallet:       wallet,
+		Aggregator:   aggregator,
+		FeeEstimator: chainfee.NewStaticEstimator(1000, 253),
+	})
+	defer func() {
+		// Join the collector even if an assertion aborts the test.
+		require.NoError(t, s.Stop())
+	}()
+	beat := chainio.NewBeat(chainntnfs.BlockEpoch{Height: testHeight})
+
+	// Act by retrying Start, closing its stream, and processing a
+	// block through the public consumer before stopping the collector.
+	require.ErrorIs(t, s.Start(beat), errDummy)
+	require.NoError(t, s.Start(beat))
+	close(events)
+	require.NoError(t, s.ProcessBlock(beat))
+	require.NoError(t, s.Stop())
+
+	// Assert shutdown includes cancellation even after channel closure.
+	// Deferred expectations also verify both required registrations.
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("Stop did not cancel the closed wallet stream")
+	}
 }
 
 // TestHandleBumpEventTxFailed checks that the sweeper correctly handles the

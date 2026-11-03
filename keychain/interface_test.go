@@ -3,12 +3,16 @@ package keychain
 import (
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/txscript/v2"
+	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
 	"github.com/btcsuite/btcwallet/snacl"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
@@ -30,67 +34,116 @@ var (
 	testDBTimeout = time.Second * 10
 )
 
+// createTestBtcWallet reopens an initialized legacy wallet through Manager.
+// Legacy fixture creation is limited to arranging persisted purpose-1017
+// accounts; every key operation under test uses the maintained runtime.
 func createTestBtcWallet(t testing.TB, coinType uint32) (*wallet.Wallet, error) {
-	// Instruct waddrmgr to use the cranked down scrypt parameters when
-	// creating new wallet encryption keys.
+	t.Helper()
+
+	// Arrange a durable wallet with all lnd families already present. This
+	// exercises supported kvdb reopen without claiming fresh exact-account
+	// creation is available on that backend.
 	fastScrypt := waddrmgr.FastScryptOptions
-	keyGen := func(passphrase *[]byte, config *waddrmgr.ScryptOptions) (
-		*snacl.SecretKey, error) {
+	waddrmgr.SetSecretKeyGen(func(passphrase *[]byte,
+		_ *waddrmgr.ScryptOptions) (*snacl.SecretKey, error) {
 
 		return snacl.NewSecretKey(
 			passphrase, fastScrypt.N, fastScrypt.R, fastScrypt.P,
 		)
-	}
-	waddrmgr.SetSecretKeyGen(keyGen)
-
-	// Create a new test wallet that uses fast scrypt as KDF.
-	loader := wallet.NewLoader(
-		&chaincfg.SimNetParams, t.TempDir(), true, testDBTimeout, 0,
-	)
-
+	})
+	dir := t.TempDir()
+	params := &chaincfg.SimNetParams
+	loader := wallet.NewLoader(params, dir, true, testDBTimeout, 0)
 	pass := []byte("test")
-
-	baseWallet, err := loader.CreateNewWallet(
-		pass, pass, testHDSeed[:], time.Time{},
+	legacy, err := loader.CreateNewWallet(
+		pass,
+		pass,
+		testHDSeed[:],
+		time.Time{},
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	if err := baseWallet.Unlock(pass, nil); err != nil {
+	// The fixture needs only the persisted account keys, not the deprecated
+	// wallet locker. Unlock its address manager within the legacy
+	// namespace.
+	err = walletdb.View(legacy.Database(), func(tx walletdb.ReadTx) error {
+		return legacy.AddrManager().Unlock(
+			tx.ReadBucket([]byte("waddrmgr")), pass,
+		)
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	// Construct the key scope required to derive keys for the chose
-	// coinType.
-	chainKeyScope := waddrmgr.KeyScope{
+	scope, err := legacy.AddScopeManager(waddrmgr.KeyScope{
 		Purpose: BIP0043Purpose,
 		Coin:    coinType,
-	}
-
-	// We'll now ensure that the KeyScope: (1017, coinType) exists within
-	// the internal waddrmgr. We'll need this in order to properly generate
-	// the keys required for signing various contracts.
-	_, err = baseWallet.Manager.FetchScopedKeyManager(chainKeyScope)
-	if err != nil {
-		err := walletdb.Update(baseWallet.Database(), func(tx walletdb.ReadWriteTx) error {
-			addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-			_, err := baseWallet.Manager.NewScopedKeyManager(
-				addrmgrNs, chainKeyScope, lightningAddrSchema,
-			)
-			return err
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	t.Cleanup(func() {
-		baseWallet.Lock()
+	}, waddrmgr.ScopeAddrSchema{
+		ExternalAddrType: waddrmgr.WitnessPubKey,
+		InternalAddrType: waddrmgr.WitnessPubKey,
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Only this legacy setup needs the concrete scoped manager. The managed
+	// keyring never accesses it after the database is reopened.
+	legacyScope, ok := scope.(*waddrmgr.ScopedKeyManager)
+	require.True(t, ok)
+	if err := legacy.InitAccounts(legacyScope, false, 255); err != nil {
+		return nil, err
+	}
+	if err := loader.UnloadWallet(); err != nil {
+		return nil, err
+	}
 
-	return baseWallet, nil
+	// Keep background synchronization waiting on its owned cancellation,
+	// while allowing the real Manager's birthday setup to read genesis.
+	chainMock := &bwmock.Chain{}
+	// Manager reads the stream even while wallet synchronization waits.
+	// A nil stream parks the reader until Stop cancels and joins it.
+	chainMock.On("Notifications").Return((<-chan any)(nil)).Once()
+	chainMock.On("IsCurrent").Return(false).Maybe()
+	chainMock.On("GetBestBlock").
+		Return(params.GenesisHash, int32(0), nil).Maybe()
+	chainMock.On("GetBlockHash", int64(0)).
+		Return(params.GenesisHash, nil).Maybe()
+	chainMock.On("GetBlockHeader", params.GenesisHash).
+		Return(&params.GenesisBlock.Header, nil).Maybe()
+	chainMock.On("BackEnd").Return("mock").Maybe()
+	t.Cleanup(func() { chainMock.AssertExpectations(t) })
+	managerConfig := wallet.ManagerConfig{
+		Backend:           wallet.DBBackendKVDB,
+		DataSource:        filepath.Join(dir, "wallet.db"),
+		ChainParams:       *params,
+		ChainSource:       chainMock,
+		KVDBPubPassphrase: pass,
+		Timeout:           testDBTimeout,
+	}
+	manager, err := wallet.NewManager(t.Context(), managerConfig)
+	if err != nil {
+		return nil, err
+	}
+	t.Cleanup(func() { require.NoError(t, manager.Stop()) })
+
+	// Act by starting only Manager and unlocking its returned wallet. The
+	// existing derivation tests then operate on this maintained boundary.
+	wallets, err := manager.Start(t.Context())
+	if err != nil {
+		return nil, err
+	}
+
+	// Assert the single-wallet handoff before any test accesses its keys.
+	require.Len(t, wallets, 1)
+	w := wallets[0]
+	err = w.Unlock(t.Context(), wallet.UnlockRequest{
+		Passphrase: pass,
+		Timeout:    -1,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return w, nil
 }
 
 func assertEqualKeyLocator(t *testing.T, a, b KeyLocator) {
@@ -217,6 +270,55 @@ func TestKeyRingDerivation(t *testing.T) {
 		if !success {
 			break
 		}
+	}
+}
+
+// TestKeyRingSparseFamily checks that explicitly requested families beyond
+// startup's range are provisioned without changing their key locators.
+func TestKeyRingSparseFamily(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		family   KeyFamily
+		allocate bool
+	}{
+		{
+			name:   "derive exact key",
+			family: 9999,
+		},
+		{
+			name:     "allocate next key",
+			family:   10000,
+			allocate: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange: Reuse the real managed Wallet fixture, whose
+			// existing 0..255 families omit the requested family.
+			w, err := createTestBtcWallet(t, CoinTypeTestnet)
+			require.NoError(t, err)
+			ring := NewBtcWalletKeyRing(w, CoinTypeTestnet)
+			locator := KeyLocator{Family: tc.family}
+
+			// Act: Request the family through each public entry
+			// point, then resolve the returned locator directly.
+			var key KeyDescriptor
+			if tc.allocate {
+				key, err = ring.DeriveNextKey(tc.family)
+			} else {
+				key, err = ring.DeriveKey(locator)
+			}
+			require.NoError(t, err)
+			again, err := ring.DeriveKey(locator)
+
+			// Assert: Provisioning preserves the family and index;
+			// the stored account resolves the identical key.
+			require.NoError(t, err)
+			require.Equal(t, locator, key.KeyLocator)
+			require.True(t, key.PubKey.IsEqual(again.PubKey))
+		})
 	}
 }
 
@@ -366,4 +468,107 @@ func init() {
 	// We'll clamp the max range scan to constrain the run time of the
 	// private key scan test.
 	MaxKeyRangeScan = 3
+}
+
+// TestKeyRingMessageSigning verifies each public message format against keys
+// from the existing managed-wallet fixture, including a locked-wallet failure.
+func TestKeyRingMessageSigning(t *testing.T) {
+	// Arrange one real unlocked managed wallet and its public signing key.
+	// Existing cleanup owns wallet shutdown and mock chain expectations.
+	w, err := createTestBtcWallet(t, CoinTypeBitcoin)
+	require.NoError(t, err)
+	ring := NewBtcWalletKeyRing(w, CoinTypeBitcoin)
+	locator := KeyLocator{
+		Family: KeyFamilyNodeKey,
+		Index:  0,
+	}
+	key, err := ring.DeriveKey(locator)
+	require.NoError(t, err)
+	msg := []byte("managed wallet message")
+	tests := []struct {
+		name    string
+		compact bool
+		schnorr bool
+		tag     []byte
+		tweak   []byte
+	}{
+		{
+			name: "ecdsa",
+		},
+		{
+			name:    "compact double hash",
+			compact: true,
+		},
+		{
+			name:    "schnorr tagged and tweaked",
+			schnorr: true,
+			tag:     []byte("lnd"),
+			tweak:   chainhash.HashB([]byte("taproot root")),
+		},
+		{
+			name:    "schnorr empty tweak stays absent",
+			schnorr: true,
+			tweak:   []byte{},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Arrange the public verification digest and key. Empty
+			// tweaks retain lnd's no-tweak semantics rather than
+			// BIP86.
+			digest := chainhash.HashB(msg)
+			pubKey := key.PubKey
+			if test.compact {
+				digest = chainhash.DoubleHashB(msg)
+			}
+			if len(test.tag) > 0 {
+				hash := chainhash.TaggedHash(test.tag, msg)
+				digest = hash[:]
+			}
+			if len(test.tweak) > 0 {
+				pubKey = txscript.ComputeTaprootOutputKey(
+					pubKey, test.tweak,
+				)
+			}
+
+			// Act through each public keyring signing method, then
+			// Assert the returned format verifies or recovers the
+			// key.
+			switch {
+			case test.compact:
+				sig, err := ring.SignMessageCompact(
+					locator, msg, true,
+				)
+				require.NoError(t, err)
+				pub, compressed, err := ecdsa.RecoverCompact(
+					sig, digest,
+				)
+				require.NoError(t, err)
+				require.True(t, compressed)
+				require.True(t, pubKey.IsEqual(pub))
+			case test.schnorr:
+				sig, err := ring.SignMessageSchnorr(
+					locator, msg, false,
+					test.tweak, test.tag,
+				)
+				require.NoError(t, err)
+				require.True(t, sig.Verify(digest, pubKey))
+			default:
+				sig, err := ring.SignMessage(
+					locator, msg, false,
+				)
+				require.NoError(t, err)
+				require.True(t, sig.Verify(digest, pubKey))
+			}
+		})
+	}
+
+	// Arrange an actually locked wallet, then Act through the same public
+	// method. Assert that native admission failure exposes no signature.
+	require.NoError(t, w.Lock(t.Context()))
+	sig, err := ring.SignMessage(
+		locator, msg, false,
+	)
+	require.Error(t, err)
+	require.Nil(t, sig)
 }

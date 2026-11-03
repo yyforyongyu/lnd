@@ -8,9 +8,10 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
-	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/stretchr/testify/require"
 )
 
@@ -147,8 +148,8 @@ func TestAddWalletInput(t *testing.T) {
 	}
 
 	// Create an utxo with unknown address type to trigger an error.
-	utxo := &lnwallet.Utxo{
-		AddressType: lnwallet.UnknownAddressType,
+	utxo := &base.Utxo{
+		AddressType: waddrmgr.AddressType(255),
 	}
 
 	// Check that the error is returned from addWalletInput.
@@ -156,9 +157,9 @@ func TestAddWalletInput(t *testing.T) {
 	require.Error(t, err)
 
 	// Create a wallet utxo.
-	utxo = &lnwallet.Utxo{
-		AddressType: lnwallet.WitnessPubKey,
-		Value:       1000,
+	utxo = &base.Utxo{
+		AddressType: waddrmgr.WitnessPubKey,
+		Amount:      1000,
 	}
 
 	// Check that no error is returned from addWalletInput.
@@ -415,13 +416,13 @@ func TestAddWalletInputsReturnErr(t *testing.T) {
 	require.ErrorIs(t, err, dummyErr)
 
 	// Create an utxo with unknown address type to trigger an error.
-	utxo := &lnwallet.Utxo{
-		AddressType: lnwallet.UnknownAddressType,
+	utxo := &base.Utxo{
+		AddressType: waddrmgr.AddressType(255),
 	}
 
 	// Mock the wallet to return the above utxo.
 	wallet.On("ListUnspentWitnessFromDefaultAccount",
-		min, max).Return([]*lnwallet.Utxo{utxo}, nil).Once()
+		min, max).Return([]*base.Utxo{utxo}, nil).Once()
 
 	// Check that the error is returned from createWalletTxInput.
 	err = set.AddWalletInputs(wallet)
@@ -429,7 +430,7 @@ func TestAddWalletInputsReturnErr(t *testing.T) {
 
 	// Mock the wallet to return empty utxos.
 	wallet.On("ListUnspentWitnessFromDefaultAccount",
-		min, max).Return([]*lnwallet.Utxo{}, nil).Once()
+		min, max).Return([]*base.Utxo{}, nil).Once()
 
 	// Check that the error is returned from not having wallet inputs.
 	err = set.AddWalletInputs(wallet)
@@ -470,14 +471,14 @@ func TestAddWalletInputsNotEnoughInputs(t *testing.T) {
 	}
 
 	// Create a wallet utxo that cannot cover the budget.
-	utxo := &lnwallet.Utxo{
-		AddressType: lnwallet.WitnessPubKey,
-		Value:       budget - 1,
+	utxo := &base.Utxo{
+		AddressType: waddrmgr.WitnessPubKey,
+		Amount:      budget - 1,
 	}
 
 	// Mock the wallet to return the above utxo.
 	wallet.On("ListUnspentWitnessFromDefaultAccount",
-		min, max).Return([]*lnwallet.Utxo{utxo}, nil).Once()
+		min, max).Return([]*base.Utxo{utxo}, nil).Once()
 
 	// Initialize an input set with the pending input.
 	set := BudgetInputSet{inputs: []*SweeperInput{pi}}
@@ -545,7 +546,7 @@ func TestAddWalletInputsEmptyWalletSuccess(t *testing.T) {
 
 	// Mock the wallet to return empty utxos.
 	wallet.On("ListUnspentWitnessFromDefaultAccount",
-		minConf, maxConf).Return([]*lnwallet.Utxo{}, nil).Once()
+		minConf, maxConf).Return([]*base.Utxo{}, nil).Once()
 
 	// Initialize an input set with the pending inputs.
 	set := BudgetInputSet{inputs: []*SweeperInput{pi1, pi2}}
@@ -594,14 +595,14 @@ func TestAddWalletInputsSuccess(t *testing.T) {
 	mockInput.On("WitnessType").Return(input.CommitmentAnchor)
 
 	// Create a wallet utxo that cannot cover the budget.
-	utxo := &lnwallet.Utxo{
-		AddressType: lnwallet.WitnessPubKey,
-		Value:       budget - 1,
+	utxo := &base.Utxo{
+		AddressType: waddrmgr.WitnessPubKey,
+		Amount:      budget - 1,
 	}
 
 	// Mock the wallet to return the two utxos which can cover the budget.
 	wallet.On("ListUnspentWitnessFromDefaultAccount",
-		min, max).Return([]*lnwallet.Utxo{utxo, utxo}, nil).Once()
+		min, max).Return([]*base.Utxo{utxo, utxo}, nil).Once()
 
 	// Initialize an input set with the pending input.
 	set, err := NewBudgetInputSet(

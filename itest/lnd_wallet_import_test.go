@@ -2,7 +2,6 @@ package itest
 
 import (
 	"bytes"
-	"fmt"
 	"testing"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/funding"
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -526,36 +526,15 @@ func runWalletImportAccountScenario(ht *lntest.HarnessTest,
 		Name:              importedAccount,
 		ExtendedPublicKey: carolAccount.ExtendedPublicKey,
 		AddressType:       addrType,
+		// Preserve the signer's actual root metadata when it is known.
+		MasterKeyFingerprint: carolAccount.MasterKeyFingerprint,
 	}
 	dave.RPC.ImportAccount(importReq)
 
-	// Try to import an account with the same name but with a different
-	// key scope. It should return an error.
-	otherAddrType := walletrpc.AddressType_TAPROOT_PUBKEY
-	if addrType == walletrpc.AddressType_TAPROOT_PUBKEY {
-		otherAddrType--
-	}
-
-	listReq = &walletrpc.ListAccountsRequest{
-		Name:        "default",
-		AddressType: otherAddrType,
-	}
-	listResp = carol.RPC.ListAccounts(listReq)
-	require.Len(ht, listResp.Accounts, 1)
-
-	carolAccountOtherAddrType := listResp.Accounts[0]
-
-	errAccountExists := fmt.Sprintf(
-		"account '%s' already exists", importedAccount,
-	)
-
-	importReq = &walletrpc.ImportAccountRequest{
-		Name:              importedAccount,
-		ExtendedPublicKey: carolAccountOtherAddrType.ExtendedPublicKey,
-		AddressType:       otherAddrType,
-	}
+	// Native names are scoped. Repeating this same-scope request must
+	// still reject its occupied name, without imposing global uniqueness.
 	err := dave.RPC.ImportAccountAssertErr(importReq)
-	require.ErrorContains(ht, err, errAccountExists)
+	require.ErrorContains(ht, err, wallet.ErrAccountAlreadyExists.Error())
 
 	// We'll generate an address for Carol from Dave's node to receive some
 	// funds.

@@ -2,10 +2,10 @@ package itest
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lntest"
@@ -491,16 +491,11 @@ func runUtxoSelectionTestCase(ht *lntest.HarnessTest, alice,
 	chanPoint := ht.OpenChannel(alice, bob, chanParams)
 	defer ht.CloseChannel(alice, chanPoint)
 
-	// When re-selecting a spent output for funding another channel we
-	// expect the respective error message.
+	// A spent output is absent from the maintained Wallet's UTXO lookup.
+	// Keep the second channel request and check its native rejection.
 	if tc.reuseUtxo {
-		expectedErrStr := fmt.Sprintf("outpoint already spent or "+
-			"locked by another subsystem: %s:%d",
-			selectedOutpoints[0].TxidStr,
-			selectedOutpoints[0].OutputIndex)
-		expectedErr := errors.New(expectedErrStr)
 		ht.OpenChannelAssertErr(
-			alice, bob, chanParams, expectedErr,
+			alice, bob, chanParams, wallet.ErrUnknownOutput,
 		)
 
 		return

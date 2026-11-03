@@ -3,8 +3,8 @@ package btcwallet
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"math"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,15 +15,19 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/integration/rpctest"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/blockcache"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntest/unittest"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,155 +78,28 @@ var (
 		[]byte{txscript.OP_1, txscript.OP_DATA_32},
 		schnorr.SerializePubKey(testTaprootKey)...,
 	)
-
-	testCases = []struct {
-		name string
-		path []uint32
-		err  string
-		wif  string
-	}{{
-		name: "m/84'/0'/0'/0/0",
-		path: []uint32{
-			hardenedKey(84), hardenedKey(0), hardenedKey(0), 0, 0,
-		},
-		wif: "cPp3XUewCBQVg3pgwVWbtpzDwhWTQpHhu8saN3SdGRTkiLpu1R6h",
-	}, {
-		name: "m/84'/0'/0'/1/0",
-		path: []uint32{
-			hardenedKey(84), hardenedKey(0), hardenedKey(0), 1, 0,
-		},
-		wif: "cPUR1nFAeYAtSWSkKoWB6WbzRTbDSGdrGRmv1kVLRPyo7QXph2gt",
-	}, {
-		name: "m/84'/0'/0'/0/12345",
-		path: []uint32{
-			hardenedKey(84), hardenedKey(0), hardenedKey(0), 0,
-			12345,
-		},
-		wif: "cQCdGxqKeGZKiC2uRYMAGenJHkDvajiPieT4Yg7k1BKawjKkywvz",
-	}, {
-		name: "m/49'/0'/0'/0/0",
-		path: []uint32{
-			hardenedKey(49), hardenedKey(0), hardenedKey(0), 0, 0,
-		},
-		wif: "cMwVK2bcTzivPZfcCH585rBGghqsJAP9MdVy8inRti1wZvLn5DvY",
-	}, {
-		name: "m/49'/0'/0'/1/0",
-		path: []uint32{
-			hardenedKey(49), hardenedKey(0), hardenedKey(0), 1, 0,
-		},
-		wif: "cNPW9bMtdc2YGBzWzSCXFN4excjrT34nZzGYtfkzkazUrt3dXuv7",
-	}, {
-		name: "m/49'/0'/0'/1/12345",
-		path: []uint32{
-			hardenedKey(49), hardenedKey(0), hardenedKey(0), 1,
-			12345,
-		},
-		wif: "cNdJt2fSNUJYVSb8JFjhosPcQgNvJ92SjNeNpsf1gUwDVDv2KVRa",
-	}, {
-		name: "m/1017'/1'/0'/0/0",
-		path: []uint32{
-			hardenedKey(1017), hardenedKey(1), hardenedKey(0), 0, 0,
-		},
-		wif: "cPsCmbWQENgptj3eTiyd85QSAD1xqYKPM9jUkfvm7vgN3SoVPWSP",
-	}, {
-		name: "m/1017'/1'/6'/0/0",
-		path: []uint32{
-			hardenedKey(1017), hardenedKey(1), hardenedKey(6), 0, 0,
-		},
-		wif: "cPeQdpcGJmLqpdmvokh3DK9ZtjYAXxiw4p4ELNUWkWt6bMRqArEV",
-	}, {
-		name: "m/1017'/1'/7'/0/123",
-		path: []uint32{
-			hardenedKey(1017), hardenedKey(1), hardenedKey(7), 0,
-			123,
-		},
-		wif: "cPcWZMqY4YErkcwjtFJaYoXkzd7bKxrfxAVzhDgy3n5BGH8CU8sn",
-	}, {
-		name: "m/84'/1'/0'/0/0",
-		path: []uint32{
-			hardenedKey(84), hardenedKey(1), hardenedKey(0), 0, 0,
-		},
-		err: "coin type must be 0 for BIP49/84 btcwallet keys",
-	}, {
-		name: "m/1017'/0'/0'/0/0",
-		path: []uint32{
-			hardenedKey(1017), hardenedKey(0), hardenedKey(0), 0, 0,
-		},
-		err: "expected coin type 1, instead was 0",
-	}, {
-		name: "m/84'/0'/1'/0/0",
-		path: []uint32{
-			hardenedKey(84), hardenedKey(0), hardenedKey(1), 0, 0,
-		},
-		err: "account 1 not found",
-	}, {
-		name: "m/49'/0'/1'/0/0",
-		path: []uint32{
-			hardenedKey(49), hardenedKey(0), hardenedKey(1), 0, 0,
-		},
-		err: "account 1 not found",
-	}, {
-		name: "non-hardened purpose m/84/0/0/0/0",
-		path: []uint32{84, 0, 0, 0, 0},
-		err:  "element at index 0 is not hardened",
-	}, {
-		name: "non-hardened account m/84'/0'/0/0/0",
-		path: []uint32{hardenedKey(84), hardenedKey(0), 0, 0, 0},
-		err:  "element at index 2 is not hardened",
-	}}
 )
 
-// TestBip32KeyDerivation makes sure that private keys can be derived from a
-// BIP32 key path correctly.
-func TestBip32KeyDerivation(t *testing.T) {
-	netParams := &chaincfg.RegressionNetParams
-	w, _ := newTestWallet(t, netParams, seedBytes)
-
-	// This is just a sanity check that the wallet was initialized
-	// correctly. We make sure the first derived address is the expected
-	// one.
-	firstDerivedAddr, err := w.NewAddress(
-		lnwallet.WitnessPubKey, false, lnwallet.DefaultAccountName,
-	)
-	require.NoError(t, err)
-	require.Equal(t, firstAddress, firstDerivedAddr.String())
-
-	// Let's go through the test cases now that we know our wallet is ready.
-	for _, tc := range testCases {
-
-		t.Run(tc.name, func(t *testing.T) {
-			privKey, err := w.deriveKeyByBIP32Path(tc.path)
-
-			if tc.err == "" {
-				require.NoError(t, err)
-				wif, err := btcutil.NewWIF(
-					privKey, netParams, true,
-				)
-				require.NoError(t, err)
-				require.Equal(t, tc.wif, wif.String())
-			} else {
-				require.Error(t, err)
-				require.Contains(t, err.Error(), tc.err)
-			}
-		})
-	}
-}
-
-// TestScriptImport tests the btcwallet's tapscript import capabilities by
-// importing both a full taproot script tree and a partially revealed branch
-// with a proof to make sure the resulting addresses match up.
+// TestScriptImport tests tapscript import with a full script tree and a
+// partially revealed branch whose proof must yield the same address.
 func TestScriptImport(t *testing.T) {
+	// Arrange the existing funded wallet and tapscript tree, retaining the
+	// expected addresses while switching metadata to wallet-owned DTOs.
 	netParams := &chaincfg.RegressionNetParams
 	w, miner := newTestWallet(t, netParams, seedBytes)
 
-	firstDerivedAddr, err := w.NewAddress(
-		lnwallet.TaprootPubkey, false, lnwallet.DefaultAccountName,
+	firstDerivedAddr, err := w.InternalWallet().NewAddress(
+		t.Context(), wallet.NewAccountSelectorByName(
+			waddrmgr.KeyScopeBIP0086, lnwallet.DefaultAccountName,
+		), false,
 	)
 	require.NoError(t, err)
-	require.Equal(t, firstAddressTaproot, firstDerivedAddr.String())
+	require.Equal(t, firstAddressTaproot, firstDerivedAddr.Addr.String())
 
 	scope := waddrmgr.KeyScopeBIP0086
-	_, err = w.InternalWallet().AddrManager().FetchScopedKeyManager(scope)
+	_, err = w.InternalWallet().GetAccount(
+		t.Context(), scope, lnwallet.DefaultAccountName,
+	)
 	require.NoError(t, err)
 
 	// Let's create a taproot script output now. This is a hash lock with a
@@ -254,11 +131,14 @@ func TestScriptImport(t *testing.T) {
 		taprootKey1.SerializeCompressed(),
 	)
 
-	addr1, err := w.ImportTaprootScript(scope, tapscript1)
+	// Act by importing the complete tapscript through WalletController.
+	addr1, err := w.InternalWallet().
+		ImportTaprootScript(t.Context(), *tapscript1)
 	require.NoError(t, err)
 
-	require.Equal(t, testTapscriptAddr, addr1.Address().String())
-	pkScript, err := txscript.PayToAddrScript(addr1.Address())
+	// Assert the maintained address and script match the original vectors.
+	require.Equal(t, testTapscriptAddr, addr1.Addr.String())
+	pkScript, err := txscript.PayToAddrScript(addr1.Addr)
 	require.NoError(t, err)
 	require.Equal(t, testTapscriptPkScript, pkScript)
 
@@ -270,56 +150,128 @@ func TestScriptImport(t *testing.T) {
 	}}, 1)
 	require.NoError(t, err)
 
-	var utxos []*lnwallet.Utxo
+	var utxos []*wallet.Utxo
 	require.Eventually(t, func() bool {
-		utxos, err = w.ListUnspentWitness(0, math.MaxInt32, "")
+		utxos, err = w.InternalWallet().ListUnspent(
+			t.Context(), wallet.UtxoQuery{
+				MinConfs: 0,
+				MaxConfs: math.MaxInt32,
+			},
+		)
 		require.NoError(t, err)
 
 		return len(utxos) == 1
 	}, time.Minute, 50*time.Millisecond)
 	require.Equal(t, testTapscriptPkScript, utxos[0].PkScript)
 
-	// Now, as a last test, make sure that when we try adding an address
-	// with partial script reveal, we get an error that the address already
-	// exists.
+	// Arrange a partial reveal of the same output. The maintained import
+	// API retains the first representation and returns its stored metadata
+	// for repeats, so the caller need not emulate a legacy duplicate error.
 	inclusionProof := leaf2.TapHash()
 	tapscript2 := input.TapscriptPartialReveal(
 		testPubKey, leaf1, inclusionProof[:],
 	)
-	_, err = w.ImportTaprootScript(scope, tapscript2)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), fmt.Sprintf(
-		"address for script hash/key %x already exists",
-		schnorr.SerializePubKey(testTaprootKey),
-	))
+	// Act by importing the equivalent output with less script information.
+	addr2, err := w.InternalWallet().
+		ImportTaprootScript(t.Context(), *tapscript2)
+
+	// Assert that the duplicate returns the canonical existing metadata,
+	// rather than replacing it with the partial reveal's representation.
+	require.NoError(t, err)
+	require.Equal(t, addr1, addr2)
+	stored, err := w.InternalWallet().GetAddressInfo(
+		t.Context(), addr1.Addr,
+	)
+	require.NoError(t, err)
+	require.Equal(t, addr1, stored)
 }
 
-func newTestWallet(t *testing.T, netParams *chaincfg.Params,
-	seedBytes []byte) (*BtcWallet, *rpctest.Harness) {
-
-	chainBackend, miner := getChainBackend(t, netParams)
-
-	loaderOpt := LoaderWithLocalWalletDB(t.TempDir(), false, time.Minute)
+// TestInitialAccountExport verifies a fresh SQL wallet exposes every Lightning
+// account before lnd starts, so remote signers can export complete public keys.
+func TestInitialAccountExport(t *testing.T) {
+	// Arrange a fresh SQLite wallet through the ordinary constructor and
+	// real chain fixture, leaving BtcWallet.Start uncalled so its account
+	// completion loop cannot hide missing creation-time exports.
+	netParams := &chaincfg.RegressionNetParams
+	chainBackend, _ := getChainBackend(t, netParams)
 	config := Config{
 		PrivatePass: []byte("some-pass"),
 		HdSeed:      seedBytes,
 		NetParams:   netParams,
 		CoinType:    netParams.HDCoinType,
 		ChainSource: chainBackend,
-		// wallet starts in recovery mode
-		RecoveryWindow: 2,
-		LoaderOptions:  []LoaderOption{loaderOpt},
+		ManagerConfig: wallet.ManagerConfig{
+			Backend:    wallet.DBBackendSQLite,
+			DataSource: filepath.Join(t.TempDir(), "wallet.sqlite"),
+		},
+	}
+	w, err := New(config, blockcache.NewBlockCache(10000))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, w.Stop()) })
+
+	// Act by listing the public account snapshots the remote-signer export
+	// consumes before startup can create accounts alongside scanning.
+	accounts, err := w.InternalWallet().ListAccountsByScope(
+		t.Context(), waddrmgr.KeyScope{
+			Purpose: keychain.BIP0043Purpose,
+			Coin:    netParams.HDCoinType,
+		},
+	)
+
+	// Assert the complete 0..255 family set is immediately exportable as
+	// public extended keys and remains excluded from payment-chain scans.
+	require.NoError(t, err)
+	require.Len(t, accounts, 256)
+	seen := make(map[wallet.AccountNumber]bool, len(accounts))
+	for _, account := range accounts {
+		require.NotNil(t, account.AccountNumber)
+		number := *account.AccountNumber
+		require.LessOrEqual(t, number, wallet.AccountNumber(255))
+		require.False(t, seen[number])
+		seen[number] = true
+		require.True(t, account.NoChainSync)
+		xpub, err := hdkeychain.NewKeyFromString(
+			string(account.PublicKey),
+		)
+		require.NoError(t, err)
+		require.False(t, xpub.IsPrivate())
+	}
+}
+
+// newTestWallet starts a fresh managed SQLite wallet for signing tests.
+func newTestWallet(t *testing.T, netParams *chaincfg.Params,
+	seedBytes []byte) (*BtcWallet, *rpctest.Harness) {
+
+	t.Helper()
+
+	// Arrange a real chain source and fresh native storage so lnd creates
+	// its exact key families through the same account API as normal
+	// startup.
+	chainBackend, miner := getChainBackend(t, netParams)
+
+	config := Config{
+		PrivatePass: []byte("some-pass"),
+		HdSeed:      seedBytes,
+		NetParams:   netParams,
+		CoinType:    netParams.HDCoinType,
+		ChainSource: chainBackend,
+		ManagerConfig: wallet.ManagerConfig{
+			Backend:    wallet.DBBackendSQLite,
+			DataSource: filepath.Join(t.TempDir(), "wallet.sqlite"),
+		},
 	}
 	blockCache := blockcache.NewBlockCache(10000)
+
+	// Act through the ordinary constructor and account initialization. No
+	// legacy loader or private database setup participates in this fixture.
 	w, err := New(config, blockCache)
-	if err != nil {
-		t.Fatalf("creating wallet failed: %v", err)
-	}
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, w.Stop()) })
 
 	err = w.Start()
-	if err != nil {
-		t.Fatalf("starting wallet failed: %v", err)
-	}
+
+	// Assert startup success before exposing keys or addresses to a test.
+	require.NoError(t, err)
 
 	return w, miner
 }
@@ -527,6 +479,273 @@ func TestMaybeTweakPrivKey(t *testing.T) {
 
 			// Validate the result.
 			tc.validate(t, result, pubKey)
+		})
+	}
+}
+
+// TestSignOutputRawDelegates checks descriptor translation at the maintained
+// signing boundary; the wallet owns signature generation and key admission.
+func TestSignOutputRawDelegates(t *testing.T) {
+	t.Parallel()
+
+	// Arrange stable wallet encodings to check adapter conversion,
+	// without reproducing private-key derivation or transaction signing.
+	key, _ := btcec.PrivKeyFromBytes([]byte{1})
+	hash := address.Hash160(key.PubKey().SerializeCompressed())
+	addr, err := address.NewAddressWitnessPubKeyHash(hash, netParams)
+	require.NoError(t, err)
+	digest := chainhash.HashB([]byte("raw signing"))
+	ecdsaSig := ecdsa.Sign(key, digest)
+	schnorrSig, err := schnorr.Sign(key, digest)
+	require.NoError(t, err)
+	tests := []struct {
+		name      string
+		method    input.SignMethod
+		byAddress bool
+		walletErr error
+	}{
+		{
+			name:   "segwit locator",
+			method: input.WitnessV0SignMethod,
+		},
+		{
+			name:      "taproot key metadata",
+			method:    input.TaprootKeySpendSignMethod,
+			byAddress: true,
+		},
+		{
+			name:   "taproot script locator",
+			method: input.TaprootScriptSpendSignMethod,
+		},
+		{
+			name:      "wallet admission failure",
+			walletErr: wallet.ErrNoAssocPrivateKey,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange an explicit locator, or public address
+			// metadata,
+			// and an encoded wallet signature. No private-key
+			// lookup is
+			// configured, so the adapter must use the native
+			// signer.
+			scope := waddrmgr.KeyScope{
+				Purpose: keychain.BIP0043Purpose,
+				Coin:    1,
+			}
+			path := wallet.BIP32Path{
+				KeyScope: scope,
+				DerivationPath: waddrmgr.DerivationPath{
+					InternalAccount: 2,
+					Account:         2,
+					Index:           3,
+				},
+			}
+			output := wire.NewTxOut(1000, []byte{0x51})
+			desc := &input.SignDescriptor{
+				KeyDesc: keychain.KeyDescriptor{
+					KeyLocator: keychain.KeyLocator{
+						Family: 2,
+						Index:  3,
+					},
+				},
+				Output:        output,
+				WitnessScript: []byte{0x51},
+				HashType:      txscript.SigHashAll,
+				SignMethod:    test.method,
+				SingleTweak:   testTweakSingle,
+				TapTweak:      digest,
+			}
+			backend := &walletControllerMock{}
+			if test.byAddress {
+				desc.KeyDesc = keychain.KeyDescriptor{
+					PubKey: key.PubKey(),
+				}
+				path.KeyScope = waddrmgr.KeyScopeBIP0086
+				path.DerivationPath.Branch = 1
+
+				origin := &wallet.AddressDerivation{
+					KeyScope: path.KeyScope,
+					Account:  2,
+					Branch:   1,
+					Index:    3,
+				}
+				backend.On(
+					"GetAddressInfo", mock.Anything, addr,
+				).
+					Return(wallet.AddressInfo{
+						Derivation: origin,
+					}, nil).Once()
+			}
+			tx := wire.NewMsgTx(2)
+			tx.AddTxIn(&wire.TxIn{})
+			tx.AddTxIn(&wire.TxIn{})
+			desc.InputIndex = 1
+			expectedSig := ecdsaSig.Serialize()
+			raw := wallet.RawSignature(expectedSig)
+			var details wallet.SpendDetails
+			details = wallet.SegwitV0SpendDetails{
+				WitnessScript: desc.WitnessScript,
+			}
+			if test.method != input.WitnessV0SignMethod {
+				desc.Output.PkScript = testTapscriptPkScript
+				fetcher := txscript.NewCannedPrevOutputFetcher(
+					desc.Output.PkScript, desc.Output.Value,
+				)
+				desc.PrevOutputFetcher = fetcher
+				expectedSig = schnorrSig.Serialize()
+				raw = wallet.RawSignature(expectedSig)
+				raw = append(raw, byte(desc.HashType))
+				details = wallet.TaprootSpendDetails{
+					SpendPath: wallet.KeyPathSpend,
+					Tweak:     desc.TapTweak,
+				}
+				if test.method ==
+					input.TaprootScriptSpendSignMethod {
+
+					spend := wallet.ScriptPathSpend
+					script := desc.WitnessScript
+					details = wallet.TaprootSpendDetails{
+						SpendPath:     spend,
+						WitnessScript: script,
+					}
+				}
+			}
+			var captured *wallet.RawSigParams
+			backend.On(
+				"ComputeRawSig", mock.Anything, mock.Anything,
+			).
+				Run(func(args mock.Arguments) {
+					arg := args.Get(1)
+					captured, _ = arg.(*wallet.RawSigParams)
+				}).Return(raw, test.walletErr).Once()
+			t.Cleanup(func() { backend.AssertExpectations(t) })
+			controller := &BtcWallet{
+				wallet:        backend,
+				chainKeyScope: scope,
+				netParams:     netParams,
+			}
+
+			// Act through SignOutputRaw so path, spend details and
+			// the
+			// returned encoding are checked at the public boundary.
+			sig, err := controller.SignOutputRaw(tx, desc)
+
+			// Assert lnd supplies its exact descriptor and tweak
+			// policy,
+			// while wallet errors and actual signature bytes
+			// survive.
+			require.NotNil(t, captured)
+			require.Same(t, tx, captured.Tx)
+			require.Same(t, desc.Output, captured.Output)
+			require.Equal(t, path, captured.Path)
+			require.Equal(t, details, captured.Details)
+			require.Equal(t, desc.HashType, captured.HashType)
+			require.Equal(t, desc.InputIndex, captured.InputIndex)
+			if desc.PrevOutputFetcher != nil {
+				require.Equal(t, txscript.NewTxSigHashes(
+					tx, desc.PrevOutputFetcher,
+				), captured.SigHashes)
+			} else {
+				hashes := captured.SigHashes
+				require.Same(t, desc.SigHashes, hashes)
+			}
+			tweaked, tweakErr := captured.Tweaker(key)
+			require.NoError(t, tweakErr)
+			expected := input.TweakPrivKey(key, testTweakSingle)
+			require.Equal(t, expected, tweaked)
+			if test.walletErr != nil {
+				require.ErrorIs(t, err, test.walletErr)
+				require.Nil(t, sig)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, expectedSig, sig.Serialize())
+		})
+	}
+}
+
+// TestSignMessageDelegates checks lnd hashing and the maintained signer result
+// without deriving or exposing a private key through the adapter.
+func TestSignMessageDelegates(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		doubleHash bool
+		walletErr  error
+	}{
+		{
+			name: "single digest",
+		},
+		{
+			name:       "double digest",
+			doubleHash: true,
+		},
+		{
+			name:      "wallet error",
+			walletErr: wallet.ErrNoAssocPrivateKey,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange the exact purpose-1017 path and digest
+			// expected
+			// by Wallet, including the caller's double-hash choice.
+			msg := []byte("lightning message")
+			digest := chainhash.HashB(msg)
+			if test.doubleHash {
+				digest = chainhash.DoubleHashB(msg)
+			}
+			key, _ := btcec.PrivKeyFromBytes([]byte{1})
+			sig := ecdsa.Sign(key, digest)
+			path := wallet.BIP32Path{
+				KeyScope: waddrmgr.KeyScope{
+					Purpose: keychain.BIP0043Purpose,
+					Coin:    1,
+				},
+				DerivationPath: waddrmgr.DerivationPath{
+					InternalAccount: 2,
+					Account:         2,
+					Index:           3,
+				},
+			}
+			backend := &walletControllerMock{}
+			backend.On("SignDigest", mock.Anything, path,
+				&wallet.SignDigestIntent{
+					Digest:  digest,
+					SigType: wallet.SigTypeECDSA,
+				}).Return(wallet.ECDSASignature{
+				Signature: sig,
+			}, test.walletErr).Once()
+			t.Cleanup(func() { backend.AssertExpectations(t) })
+			controller := &BtcWallet{
+				wallet:        backend,
+				chainKeyScope: path.KeyScope,
+			}
+
+			// Act through the public message signer; no private-key
+			// method is configured on the mock.
+			got, err := controller.SignMessage(keychain.KeyLocator{
+				Family: 2,
+				Index:  3,
+			}, msg, test.doubleHash)
+
+			// Assert the concrete ECDSA result is returned
+			// unchanged,
+			// or the original wallet error prevents a signature.
+			if test.walletErr != nil {
+				require.ErrorIs(t, err, test.walletErr)
+				require.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			require.Same(t, sig, got)
 		})
 	}
 }

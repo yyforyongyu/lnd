@@ -3,7 +3,6 @@ package rpcwallet
 import (
 	"bytes"
 	"crypto/sha256"
-	"errors"
 	"testing"
 	"time"
 
@@ -13,54 +12,12 @@ import (
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/watchonlyrpc"
-	"github.com/lightningnetwork/lnd/lntest/mock"
-	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/stretchr/testify/require"
 )
-
-// errNotMine mirrors lnwallet.ErrNotMine for the parts of these tests that
-// just need *some* "wallet doesn't know this outpoint" sentinel.
-var errNotMine = errors.New("not mine")
-
-// leaseOptionsController exposes the optional output lease capability through
-// a mock wallet controller.
-type leaseOptionsController struct {
-	*mock.WalletController
-}
-
-// LeaseOutputWithOptions satisfies lnwallet.OutputLeaserWithOptions.
-func (l *leaseOptionsController) LeaseOutputWithOptions(_ wtxmgr.LockID,
-	_ wire.OutPoint, _ time.Duration, _ lnwallet.LeaseOutputOptions) (
-	time.Time, error) {
-
-	return time.Time{}, nil
-}
-
-// TestResolveOutputLeaserRPCKeyRing verifies that optional wallet capabilities
-// remain available through the production LightningWallet and RPCKeyRing
-// adapter stack used by remote-signer nodes.
-func TestResolveOutputLeaserRPCKeyRing(t *testing.T) {
-	t.Parallel()
-
-	controller := &leaseOptionsController{
-		WalletController: &mock.WalletController{},
-	}
-	remoteWallet := &RPCKeyRing{
-		WalletController: controller,
-	}
-	wallet := &lnwallet.LightningWallet{
-		WalletController: remoteWallet,
-	}
-
-	leaser, ok := lnwallet.ResolveOutputLeaser(wallet)
-	require.True(t, ok)
-	require.Same(t, controller, leaser)
-}
 
 // makeOutPoint returns a wire.OutPoint with a unique, deterministic hash so
 // each test case can build inputs without colliding.
@@ -105,16 +62,14 @@ func TestPopulateNonSignedInputWitnessUtxosFromWallet(t *testing.T) {
 	)
 
 	walletPkScript := []byte{0x51, 0x20, 0xaa, 0xbb}
-	fetchInfo := func(op *wire.OutPoint) (*lnwallet.Utxo, error) {
-		if *op == walletOp {
-			return &lnwallet.Utxo{
-				Value:    12345,
-				PkScript: walletPkScript,
-			}, nil
-		}
-
-		return nil, errNotMine
-	}
+	// Arrange a real native prevout view for the wallet-owned input.
+	fetchInfo := txscript.NewMultiPrevOutFetcher(
+		map[wire.OutPoint]*wire.TxOut{
+			walletOp: {
+				Value: 12345, PkScript: walletPkScript,
+			},
+		},
+	)
 
 	signDesc := &input.SignDescriptor{InputIndex: 1}
 	populateNonSignedInputWitnessUtxos(packet, tx, signDesc, fetchInfo)
@@ -148,9 +103,7 @@ func TestPopulateNonSignedInputWitnessUtxosFromFetcher(t *testing.T) {
 		map[wire.OutPoint]*wire.TxOut{externalOp: externalUtxo},
 	)
 
-	fetchInfo := func(*wire.OutPoint) (*lnwallet.Utxo, error) {
-		return nil, errNotMine
-	}
+	fetchInfo := txscript.NewMultiPrevOutFetcher(nil)
 
 	signDesc := &input.SignDescriptor{
 		InputIndex:        1,
@@ -195,9 +148,7 @@ func TestPopulateNonSignedInputWitnessUtxosZeroValueFromFetcher(t *testing.T) {
 		map[wire.OutPoint]*wire.TxOut{bip322ToSpendOp: zeroValueUtxo},
 	)
 
-	fetchInfo := func(*wire.OutPoint) (*lnwallet.Utxo, error) {
-		return nil, errNotMine
-	}
+	fetchInfo := txscript.NewMultiPrevOutFetcher(nil)
 
 	signDesc := &input.SignDescriptor{
 		InputIndex:        1,
@@ -229,9 +180,7 @@ func TestPopulateNonSignedInputWitnessUtxosNoFallback(t *testing.T) {
 		t, []wire.OutPoint{unknownOp, signingOp},
 	)
 
-	fetchInfo := func(*wire.OutPoint) (*lnwallet.Utxo, error) {
-		return nil, errNotMine
-	}
+	fetchInfo := txscript.NewMultiPrevOutFetcher(nil)
 	// No PrevOutputFetcher on the sign descriptor.
 	signDesc := &input.SignDescriptor{InputIndex: 1}
 
@@ -261,9 +210,7 @@ func TestPopulateNonSignedInputWitnessUtxosEmptyPkScript(t *testing.T) {
 		},
 	)
 
-	fetchInfo := func(*wire.OutPoint) (*lnwallet.Utxo, error) {
-		return nil, errNotMine
-	}
+	fetchInfo := txscript.NewMultiPrevOutFetcher(nil)
 	signDesc := &input.SignDescriptor{
 		InputIndex:        1,
 		PrevOutputFetcher: prevFetcher,
@@ -288,7 +235,7 @@ func TestRPCKeyRingUsesRequestTimeoutForInboundSigner(t *testing.T) {
 	conn := NewInboundConnection(requestTimeout, 0)
 	stream, runErrChan := setupNewStream(t, conn.SignCoordinator)
 
-	keyRing, err := NewRPCKeyRing(nil, nil, conn, nil)
+	keyRing, err := NewRPCKeyRing(nil, nil, nil, conn, nil)
 	require.NoError(t, err)
 
 	// Prove the constructor copied the request timeout, not the startup

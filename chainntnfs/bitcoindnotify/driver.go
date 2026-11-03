@@ -49,7 +49,7 @@ func createNewNotifier(args ...interface{}) (chainntnfs.ChainNotifier, error) {
 	}
 
 	return New(chainConn, chainParams, spendHintCache,
-		confirmHintCache, blockCache), nil
+		confirmHintCache, blockCache)
 }
 
 // init registers a driver for the BtcdNotifier concrete implementation of the

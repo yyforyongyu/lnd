@@ -18,6 +18,8 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btclog/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/actor"
 	"github.com/lightningnetwork/lnd/aliasmgr"
 	"github.com/lightningnetwork/lnd/brontide"
@@ -1191,7 +1193,9 @@ func (p *Brontide) addrWithInternalKey(
 	// the internal key for taproot addresses to be able to provide a non
 	// inclusion proof of any scripts.
 	internalKeyDesc, err := lnwallet.InternalKeyForAddr(
-		p.cfg.Wallet, &p.cfg.Wallet.Cfg.NetParams, deliveryScript,
+		p.cfg.Wallet.Cfg.Wallet,
+		&p.cfg.Wallet.Cfg.NetParams,
+		deliveryScript,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch internal key: %w", err)
@@ -3630,13 +3634,15 @@ func (p *Brontide) ChannelSnapshots() []*channeldb.ChannelSnapshot {
 func (p *Brontide) genDeliveryScript() ([]byte, error) {
 	// We'll send a normal p2wkh address unless we've negotiated the
 	// shutdown-any-segwit feature.
-	addrType := lnwallet.WitnessPubKey
+	scope := waddrmgr.KeyScopeBIP0084
 	if p.taprootShutdownAllowed() {
-		addrType = lnwallet.TaprootPubkey
+		scope = waddrmgr.KeyScopeBIP0086
 	}
 
-	deliveryAddr, err := p.cfg.Wallet.NewAddress(
-		addrType, false, lnwallet.DefaultAccountName,
+	deliveryAddr, err := p.cfg.Wallet.Cfg.Wallet.NewAddress(
+		context.Background(), base.NewAccountSelectorByName(
+			scope, lnwallet.DefaultAccountName,
+		), false,
 	)
 	if err != nil {
 		return nil, err
@@ -3644,7 +3650,7 @@ func (p *Brontide) genDeliveryScript() ([]byte, error) {
 	p.log.Infof("Delivery addr for channel close: %v",
 		deliveryAddr)
 
-	return txscript.PayToAddrScript(deliveryAddr)
+	return txscript.PayToAddrScript(deliveryAddr.Addr)
 }
 
 // channelManager is goroutine dedicated to handling all requests/signals

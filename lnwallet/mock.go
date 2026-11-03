@@ -3,27 +3,14 @@ package lnwallet
 import (
 	"context"
 	"encoding/hex"
-	"sync/atomic"
-	"time"
 
-	"github.com/btcsuite/btcd/address/v2"
-	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcjson"
-	"github.com/btcsuite/btcd/btcutil/v2"
-	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
-	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
-	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/btcsuite/btcwallet/waddrmgr"
-	base "github.com/btcsuite/btcwallet/wallet"
-	"github.com/btcsuite/btcwallet/wallet/txauthor"
-	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lntypes"
-	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/mock"
 )
@@ -34,317 +21,57 @@ var (
 	)
 )
 
-// mockWalletController is a mock implementation of the WalletController
-// interface. It let's us mock the interaction with the bitcoin network.
+// mockWalletController records the native operations exercised by wallet tests.
+// Unused capabilities panic through the embedded interfaces if called.
 type mockWalletController struct {
-	RootKey               *btcec.PrivateKey
+	WalletAPI
+	WalletServices
+	mock.Mock
+
 	PublishedTransactions chan *wire.MsgTx
-	index                 uint32
-	Utxos                 []*Utxo
 }
 
-// A compile time check to ensure that mockWalletController implements the
-// WalletController.
-var _ WalletController = (*mockWalletController)(nil)
+var _ WalletAPI = (*mockWalletController)(nil)
+var _ WalletServices = (*mockWalletController)(nil)
 
-// BackEnd returns "mock" to signify a mock wallet controller.
-func (w *mockWalletController) BackEnd() string {
-	return "mock"
+// IsWatchOnly returns the arranged native custody mode for coin consumers.
+func (w *mockWalletController) IsWatchOnly() bool {
+	return w.Called().Bool(0)
 }
 
-// FetchOutpointInfo will be called to get info about the inputs to the funding
-// transaction.
-func (w *mockWalletController) FetchOutpointInfo(
-	prevOut *wire.OutPoint) (*Utxo, error) {
+// ListUnspent returns the arranged native coins without implementing selection.
+func (w *mockWalletController) ListUnspent(ctx context.Context,
+	query wallet.UtxoQuery) ([]*wallet.Utxo, error) {
 
-	utxo := &Utxo{
-		AddressType:   WitnessPubKey,
-		Value:         10 * btcutil.SatoshiPerBitcoin,
-		PkScript:      []byte("dummy"),
-		Confirmations: 1,
-		OutPoint:      *prevOut,
-	}
-
-	return utxo, nil
+	args := w.Called(ctx, query)
+	utxos, _ := args.Get(0).([]*wallet.Utxo)
+	return utxos, args.Error(1)
 }
 
-// ScriptForOutput returns the address, witness program and redeem script for a
-// given UTXO. An error is returned if the UTXO does not belong to our wallet or
-// it is not a managed pubKey address.
-func (w *mockWalletController) ScriptForOutput(*wire.TxOut) (
-	waddrmgr.ManagedPubKeyAddress, []byte, []byte, error) {
+// GetTx supplies parent metadata when remote coinbase maturity needs checking.
+func (w *mockWalletController) GetTx(ctx context.Context,
+	hash chainhash.Hash) (*wallet.TxDetail, error) {
 
-	return nil, nil, nil, nil
+	args := w.Called(ctx, hash)
+	detail, _ := args.Get(0).(*wallet.TxDetail)
+	return detail, args.Error(1)
 }
 
-// ConfirmedBalance currently returns dummy values.
-func (w *mockWalletController) ConfirmedBalance(int32, string) (btcutil.Amount,
-	error) {
+// Broadcast records native publication and returns its arranged outcome.
+func (w *mockWalletController) Broadcast(ctx context.Context,
+	tx *wire.MsgTx, label string) error {
 
-	return 0, nil
+	return w.Called(ctx, tx, label).Error(0)
 }
 
-// NewAddress is called to get new addresses for delivery, change etc.
-func (w *mockWalletController) NewAddress(AddressType, bool,
-	string) (address.Address, error) {
-
-	addr, _ := address.NewAddressPubKey(
-		w.RootKey.PubKey().SerializeCompressed(),
-		&chaincfg.MainNetParams,
-	)
-
-	return addr, nil
-}
-
-// LastUnusedAddress currently returns dummy values.
-func (w *mockWalletController) LastUnusedAddress(AddressType,
-	string) (address.Address, error) {
-
-	return nil, nil
-}
-
-// IsOurAddress currently returns a dummy value.
-func (w *mockWalletController) IsOurAddress(address.Address) bool {
-	return false
-}
-
-// AddressInfo currently returns a dummy value.
-func (w *mockWalletController) AddressInfo(
-	address.Address) (waddrmgr.ManagedAddress, error) {
-
-	return nil, nil
-}
-
-// ListAccounts currently returns a dummy value.
-func (w *mockWalletController) ListAccounts(string,
-	*waddrmgr.KeyScope) ([]*waddrmgr.AccountProperties, error) {
-
-	return nil, nil
-}
-
-// RequiredReserve currently returns a dummy value.
-func (w *mockWalletController) RequiredReserve(uint32) btcutil.Amount {
-	return 0
-}
-
-// ListAddresses currently returns a dummy value.
-func (w *mockWalletController) ListAddresses(string,
-	bool) (AccountAddressMap, error) {
-
-	return nil, nil
-}
-
-// CreateAccount currently returns a dummy value.
-func (w *mockWalletController) CreateAccount(waddrmgr.KeyScope,
-	string) (*waddrmgr.AccountProperties, error) {
-
-	return nil, nil
-}
-
-// ImportAccount currently returns a dummy value.
-func (w *mockWalletController) ImportAccount(string, *hdkeychain.ExtendedKey,
-	uint32, *waddrmgr.AddressType, bool) (*waddrmgr.AccountProperties,
-	[]address.Address, []address.Address, error) {
-
-	return nil, nil, nil, nil
-}
-
-// ImportPublicKey currently returns a dummy value.
-func (w *mockWalletController) ImportPublicKey(*btcec.PublicKey,
-	waddrmgr.AddressType) error {
-
-	return nil
-}
-
-// ImportTaprootScript currently returns a dummy value.
-func (w *mockWalletController) ImportTaprootScript(waddrmgr.KeyScope,
-	*waddrmgr.Tapscript) (waddrmgr.ManagedAddress, error) {
-
-	return nil, nil
-}
-
-// SendOutputs currently returns dummy values.
-func (w *mockWalletController) SendOutputs(fn.Set[wire.OutPoint], []*wire.TxOut,
-	chainfee.SatPerKWeight, int32, string,
-	base.CoinSelectionStrategy) (*wire.MsgTx, error) {
-
-	return nil, nil
-}
-
-// CreateSimpleTx currently returns dummy values.
-func (w *mockWalletController) CreateSimpleTx(fn.Set[wire.OutPoint],
-	[]*wire.TxOut, chainfee.SatPerKWeight, int32,
-	base.CoinSelectionStrategy, bool) (*txauthor.AuthoredTx, error) {
-
-	return nil, nil
-}
-
-// ListUnspentWitness is called by the wallet when doing coin selection. We just
-// need one unspent for the funding transaction.
-func (w *mockWalletController) ListUnspentWitness(int32, int32,
-	string) ([]*Utxo, error) {
-
-	// If the mock already has a list of utxos, return it.
-	if w.Utxos != nil {
-		return w.Utxos, nil
-	}
-
-	// Otherwise create one to return.
-	utxo := &Utxo{
-		AddressType: WitnessPubKey,
-		Value:       btcutil.Amount(10 * btcutil.SatoshiPerBitcoin),
-		PkScript:    CoinPkScript,
-		OutPoint: wire.OutPoint{
-			Hash:  chainhash.Hash{},
-			Index: w.index,
-		},
-	}
-	atomic.AddUint32(&w.index, 1)
-	var ret []*Utxo
-	ret = append(ret, utxo)
-
-	return ret, nil
-}
-
-// ListTransactionDetails currently returns dummy values.
-func (w *mockWalletController) ListTransactionDetails(int32, int32,
-	string, uint32, uint32) ([]*TransactionDetail, uint64, uint64, error) {
-
-	return nil, 0, 0, nil
-}
-
-// LeaseOutput returns the current time and a nil error.
-func (w *mockWalletController) LeaseOutput(wtxmgr.LockID, wire.OutPoint,
-	time.Duration) (time.Time, error) {
-
-	return time.Now(), nil
-}
-
-// ReleaseOutput currently does nothing.
-func (w *mockWalletController) ReleaseOutput(wtxmgr.LockID,
-	wire.OutPoint) error {
-
-	return nil
-}
-
-func (w *mockWalletController) ListLeasedOutputs() (
-	[]*base.ListLeasedOutputResult, error) {
-
-	return nil, nil
-}
-
-// FundPsbt currently does nothing.
-func (w *mockWalletController) FundPsbt(*psbt.Packet, int32,
-	chainfee.SatPerKWeight, string, *waddrmgr.KeyScope,
-	base.CoinSelectionStrategy, func(utxo wtxmgr.Credit) bool) (int32,
-	error) {
-
-	return 0, nil
-}
-
-// SignPsbt currently does nothing.
-func (w *mockWalletController) SignPsbt(*psbt.Packet) ([]uint32, error) {
-	return nil, nil
-}
-
-// FinalizePsbt currently does nothing.
-func (w *mockWalletController) FinalizePsbt(_ *psbt.Packet, _ string) error {
-	return nil
-}
-
-// DecorateInputs currently does nothing.
-func (w *mockWalletController) DecorateInputs(*psbt.Packet, bool) error {
-	return nil
-}
-
-// PublishTransaction sends a transaction to the PublishedTransactions chan.
-func (w *mockWalletController) PublishTransaction(tx *wire.MsgTx,
-	_ string) error {
-
-	w.PublishedTransactions <- tx
-	return nil
-}
-
-// SubmitPackage publishes each transaction in the package individually,
-// mirroring PublishTransaction. The mock has no real chain backend so it
-// returns an empty result.
-func (w *mockWalletController) SubmitPackage(txns []*wire.MsgTx,
-	_ *chainfee.SatPerVByte) (*btcjson.SubmitPackageResult, error) {
-
-	for _, tx := range txns {
-		w.PublishedTransactions <- tx
-	}
-
-	return &btcjson.SubmitPackageResult{}, nil
-}
-
-// GetTransactionDetails currently does nothing.
-func (w *mockWalletController) GetTransactionDetails(*chainhash.Hash) (
-	*TransactionDetail, error) {
-
-	return nil, nil
-}
-
-// LabelTransaction currently does nothing.
-func (w *mockWalletController) LabelTransaction(chainhash.Hash, string,
-	bool) error {
-
-	return nil
-}
-
-// SubscribeTransactions currently does nothing.
-func (w *mockWalletController) SubscribeTransactions() (TransactionSubscription,
-	error) {
-
-	return nil, nil
-}
-
-// IsSynced currently returns dummy values.
-func (w *mockWalletController) IsSynced() (bool, int64, error) {
-	return true, int64(0), nil
-}
-
-// GetRecoveryInfo currently returns dummy values.
-func (w *mockWalletController) GetRecoveryInfo() (bool, float64, error) {
-	return true, float64(1), nil
-}
-
-// Start currently does nothing.
+// Start records application initialization for lifecycle tests.
 func (w *mockWalletController) Start() error {
-	return nil
+	return w.Called().Error(0)
 }
 
-// Stop currently does nothing.
+// Stop records joined application shutdown for lifecycle tests.
 func (w *mockWalletController) Stop() error {
-	return nil
-}
-
-// ReadySignal currently signals that the wallet is ready instantly.
-func (w *mockWalletController) ReadySignal(_ context.Context) chan error {
-	readyChan := make(chan error, 1)
-	readyChan <- nil
-
-	return readyChan
-}
-
-func (w *mockWalletController) FetchTx(chainhash.Hash) (*wire.MsgTx, error) {
-	return nil, nil
-}
-
-func (w *mockWalletController) RemoveDescendants(*wire.MsgTx) error {
-	return nil
-}
-
-// FetchDerivationInfo queries for the wallet's knowledge of the passed
-// pkScript and constructs the derivation info and returns it.
-func (w *mockWalletController) FetchDerivationInfo(
-	pkScript []byte) (*psbt.Bip32Derivation, error) {
-
-	return nil, nil
-}
-
-func (w *mockWalletController) CheckMempoolAcceptance(tx *wire.MsgTx) error {
-	return nil
+	return w.Called().Error(0)
 }
 
 // mockChainNotifier is a mock implementation of the ChainNotifier interface.

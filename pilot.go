@@ -299,7 +299,7 @@ func initAutoPilot(svr *server, cfg *lncfg.AutoPilot,
 				Node:    autopilot.NewNodeID(channel.IdentityPub),
 			}, nil
 		},
-		SubscribeTransactions: svr.cc.Wallet.SubscribeTransactions,
+		SubscribeTransactions: svr.cc.Wallet.Cfg.Wallet.SubscribeTxns,
 		SubscribeTopology:     svr.graphDB.SubscribeTopology,
 	}, nil
 }

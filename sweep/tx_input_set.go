@@ -8,9 +8,10 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
-	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
 
@@ -75,22 +76,22 @@ type InputSet interface {
 
 // createWalletTxInput converts a wallet utxo into an object that can be added
 // to the other inputs to sweep.
-func createWalletTxInput(utxo *lnwallet.Utxo) (input.Input, error) {
+func createWalletTxInput(utxo *base.Utxo) (input.Input, error) {
 	signDesc := &input.SignDescriptor{
 		Output: &wire.TxOut{
 			PkScript: utxo.PkScript,
-			Value:    int64(utxo.Value),
+			Value:    int64(utxo.Amount),
 		},
 		HashType: txscript.SigHashAll,
 	}
 
 	var witnessType input.WitnessType
 	switch utxo.AddressType {
-	case lnwallet.WitnessPubKey:
+	case waddrmgr.WitnessPubKey:
 		witnessType = input.WitnessKeyHash
-	case lnwallet.NestedWitnessPubKey:
+	case waddrmgr.NestedWitnessPubKey:
 		witnessType = input.NestedWitnessKeyHash
-	case lnwallet.TaprootPubkey:
+	case waddrmgr.TaprootPubKey:
 		witnessType = input.TaprootPubKeySpend
 		signDesc.HashType = txscript.SigHashDefault
 	default:
@@ -246,7 +247,7 @@ func (b *BudgetInputSet) addInput(input SweeperInput) {
 
 // addWalletInput takes a wallet UTXO and adds it as an input to be used as
 // budget for the input set.
-func (b *BudgetInputSet) addWalletInput(utxo *lnwallet.Utxo) error {
+func (b *BudgetInputSet) addWalletInput(utxo *base.Utxo) error {
 	input, err := createWalletTxInput(utxo)
 	if err != nil {
 		return err
@@ -261,7 +262,7 @@ func (b *BudgetInputSet) addWalletInput(utxo *lnwallet.Utxo) error {
 	b.addInput(pi)
 
 	log.Debugf("Added wallet input to input set: op=%v, amt=%v",
-		pi.OutPoint(), utxo.Value)
+		pi.OutPoint(), utxo.Amount)
 
 	return nil
 }
@@ -364,7 +365,7 @@ func (b *BudgetInputSet) AddWalletInputs(wallet Wallet) error {
 	// TODO(yy): add more choices to CoinSelectionStrategy and use the
 	// configured value here.
 	sort.Slice(utxos, func(i, j int) bool {
-		return utxos[i].Value < utxos[j].Value
+		return utxos[i].Amount < utxos[j].Amount
 	})
 
 	// Add wallet inputs to the set until the specified budget is covered.
