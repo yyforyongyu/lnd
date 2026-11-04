@@ -1,12 +1,15 @@
 package btcwallet
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr/musig2"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chainhash/v2"
@@ -16,6 +19,7 @@ import (
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lnwallet"
 )
 
@@ -438,3 +442,35 @@ func (b *BtcWallet) SignMessage(keyLoc keychain.KeyLocator,
 // A compile time check to ensure that BtcWallet implements the MessageSigner
 // interface.
 var _ lnwallet.MessageSigner = (*BtcWallet)(nil)
+
+// bindMuSig2Nonce records the transcript before releasing a partial signature.
+// An identical reconstructed session may sign again after a crash, but changing
+// the transcript for recorded nonce material would expose the signing key.
+func (b *BtcWallet) bindMuSig2Nonce(nonce [musig2.PubNonceSize]byte,
+	transcript [sha256.Size]byte) error {
+
+	// Only public fingerprints are retained. The transaction serializes
+	// competing sessions, even when they have different session IDs.
+	key := sha256.Sum256(append([]byte("lnd-musig2-nonce-v1"), nonce[:]...))
+
+	return kvdb.Update(b.db, func(tx kvdb.RwTx) error {
+		bucket, err := tx.CreateTopLevelBucket([]byte("musig2-nonces"))
+		if err != nil {
+			return fmt.Errorf("open MuSig2 nonce history: %w", err)
+		}
+		if previous := bucket.Get(key[:]); previous != nil {
+			if !bytes.Equal(previous, transcript[:]) {
+				return fmt.Errorf("MuSig2 nonce already " +
+					"bound to a different signing " +
+					"transcript")
+			}
+
+			return nil
+		}
+
+		// A failed commit returns an error, so signing cannot proceed
+		// with an uncertain durable history. Cleanup never deletes this
+		// record.
+		return bucket.Put(key[:], transcript[:])
+	}, func() {})
+}
