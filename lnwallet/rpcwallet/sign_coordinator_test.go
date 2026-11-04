@@ -9,7 +9,7 @@ import (
 
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/watchonlyrpc"
-	"github.com/lightningnetwork/lnd/lntest/wait"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -19,13 +19,11 @@ import (
 // mockSCStream is a mock implementation of the
 // watchonlyrpc.WatchOnly_SignCoordinatorStreamsServer stream interface.
 type mockSCStream struct {
+	mock.Mock
+
 	// sendChan is used to simulate requests sent over the stream from the
 	// sign coordinator to the remote signer.
 	sendChan chan *watchonlyrpc.SignCoordinatorRequest
-
-	// sendErrorChan is used to simulate requests sent over the stream from
-	// the sign coordinator to the remote signer.
-	sendErrorChan chan error
 
 	// recvChan is used to simulate responses sent over the stream from the
 	// remote signer to the sign coordinator.
@@ -33,67 +31,186 @@ type mockSCStream struct {
 
 	// cancelChan is used to simulate a canceled stream.
 	cancelChan chan struct{}
+	cancel     sync.Once
+
+	// Stream actions expose the send boundary without coordinator
+	// internals.
+	sendStarted chan *watchonlyrpc.SignCoordinatorRequest
+	sendGate    <-chan struct{}
 
 	ctx context.Context //nolint:containedctx
 }
 
-// newMockSCStream creates a new mock stream.
-func newMockSCStream() *mockSCStream {
-	return &mockSCStream{
-		sendChan:      make(chan *watchonlyrpc.SignCoordinatorRequest),
-		sendErrorChan: make(chan error, 1),
-		recvChan: make(
-			chan *watchonlyrpc.SignCoordinatorResponse, 1,
-		),
-		cancelChan: make(chan struct{}),
-		ctx:        context.Background(),
+// newMockSCStream arranges one serialized reader and writer with the exact
+// signing traffic required by the test. The final waiting Recv is optional
+// because shutdown can win before the reader re-enters the transport.
+func newMockSCStream(t *testing.T, sends, responses int) *mockSCStream {
+	t.Helper()
+	serverCtx, _ := remoteSignerTLSContexts(t)
+	stream := &mockSCStream{
+		sendChan:    make(chan *watchonlyrpc.SignCoordinatorRequest),
+		recvChan:    make(chan *watchonlyrpc.SignCoordinatorResponse),
+		cancelChan:  make(chan struct{}),
+		sendStarted: make(chan *watchonlyrpc.SignCoordinatorRequest, 1),
+		ctx:         serverCtx,
 	}
+	t.Cleanup(func() {
+		stream.AssertExpectations(t)
+	})
+
+	// Context is an immutable transport accessor, read throughout Run and
+	// by the test. Its call count is not a signing/lifecycle contract.
+	stream.On("Context").Return(serverCtx)
+	if sends > 0 {
+		call := stream.On("Send", mock.Anything).Return(nil)
+		if sends == 1 {
+			call.Once()
+		} else {
+			call.Times(sends)
+		}
+		call.Run(func(args mock.Arguments) {
+			req, _ := args.Get(0).(*watchonlyrpc.
+				SignCoordinatorRequest)
+			// Expose the old writer's entry while retaining
+			// cancellation after the test releases a deliberately
+			// stalled send.
+			if req.GetRequestId() > handshakeRequestID {
+				select {
+				case stream.sendStarted <- req:
+				default:
+				}
+				if stream.sendGate != nil {
+					<-stream.sendGate
+				}
+			}
+			var err error
+			select {
+			case <-stream.cancelChan:
+				err = status.Error(codes.Unavailable,
+					"stream closed before send")
+			case <-serverCtx.Done():
+				err = serverCtx.Err()
+			case stream.sendChan <- req:
+			}
+			// This stream has one writer. Publish the selected
+			// transport result through the expectation before
+			// Called returns it.
+			call.Return(err)
+		})
+		// A failed Send can reach the owner before the reader reports
+		// disconnect, allowing a safe retry on this cancelled stream.
+		// Only observed traffic has an exact count; these writes fail
+		// immediately without reaching the simulated wire.
+		cancelled := mock.MatchedBy(func(
+			_ *watchonlyrpc.SignCoordinatorRequest) bool {
+
+			select {
+			case <-stream.cancelChan:
+				return true
+			default:
+				return false
+			}
+		})
+		stream.On("Send", cancelled).Return(status.Error(
+			codes.Unavailable, "stream closed before send",
+		)).Maybe()
+	}
+	if responses > 0 {
+		for index, count := range []int{responses, 1} {
+			call := stream.On("Recv").Return(nil, nil)
+			switch {
+			case index == 1:
+				call.Maybe()
+			case count == 1:
+				call.Once()
+			default:
+				call.Times(count)
+			}
+			call.Run(func(mock.Arguments) {
+				var response *RSResponse
+				var err error
+				select {
+				case response = <-stream.recvChan:
+				case <-serverCtx.Done():
+					err = serverCtx.Err()
+				case <-stream.cancelChan:
+					err = ErrStreamCanceled
+				}
+				// Handshake and response reads are serialized,
+				// so each invocation returns its own observed
+				// channel result.
+				call.Return(response, err)
+			})
+		}
+	}
+
+	return stream
 }
 
-// Send simulates a sent request from the sign coordinator to the remote signer
-// over the mock stream.
+// Send returns the transport result selected by the arranged wire behavior.
 func (ms *mockSCStream) Send(req *watchonlyrpc.SignCoordinatorRequest) error {
-	select {
-	case ms.sendChan <- req:
-		return nil
+	args := ms.Called(req)
 
-	case err := <-ms.sendErrorChan:
-		return err
-	}
+	return args.Error(0)
 }
 
-// Recv simulates a received response from the remote signer to the sign
-// coordinator over the mock stream.
+// Recv returns the next arranged signer message or transport failure.
 func (ms *mockSCStream) Recv() (*watchonlyrpc.SignCoordinatorResponse,
 	error) {
 
-	select {
-	case resp := <-ms.recvChan:
-		return resp, nil
+	args := ms.Called()
+	response, _ := args.Get(0).(*watchonlyrpc.SignCoordinatorResponse)
 
-	case <-ms.cancelChan:
-		// To simulate a canceled stream, we return an error when the
-		// cancelChan is closed.
-		return nil, ErrStreamCanceled
-	}
+	return response, args.Error(1)
 }
 
-// Mock implementations of various WatchOnly_SignCoordinatorStreamsServer
-// methods.
-func (ms *mockSCStream) RecvMsg(msg any) error        { return nil }
-func (ms *mockSCStream) SendHeader(metadata.MD) error { return nil }
-func (ms *mockSCStream) SendMsg(m any) error          { return nil }
-func (ms *mockSCStream) SetHeader(metadata.MD) error  { return nil }
-func (ms *mockSCStream) SetTrailer(metadata.MD)       {}
+// RecvMsg rejects unexpected use of the generic gRPC receive path.
+func (ms *mockSCStream) RecvMsg(msg any) error {
+	args := ms.Called(msg)
 
-// Context returns the context of the mock stream.
+	return args.Error(0)
+}
+
+// SendHeader requires an explicit expectation if a test uses gRPC headers.
+func (ms *mockSCStream) SendHeader(header metadata.MD) error {
+	args := ms.Called(header)
+
+	return args.Error(0)
+}
+
+// SendMsg rejects unexpected use of the generic gRPC send path.
+func (ms *mockSCStream) SendMsg(msg any) error {
+	args := ms.Called(msg)
+
+	return args.Error(0)
+}
+
+// SetHeader requires an explicit expectation if a test configures headers.
+func (ms *mockSCStream) SetHeader(header metadata.MD) error {
+	args := ms.Called(header)
+
+	return args.Error(0)
+}
+
+// SetTrailer records trailer changes instead of silently accepting them.
+func (ms *mockSCStream) SetTrailer(trailer metadata.MD) {
+	ms.Called(trailer)
+}
+
+// Context returns the immutable TLS transport context from Arrange.
 func (ms *mockSCStream) Context() context.Context {
-	return ms.ctx
+	args := ms.Called()
+	ctx, _ := args.Get(0).(context.Context)
+
+	return ctx
 }
+
+// Compile-time checking keeps the fixture on the public stream interface.
+var _ StreamServer = (*mockSCStream)(nil)
 
 // Cancel closes the cancelChan to simulate a canceled stream.
 func (ms *mockSCStream) Cancel() {
-	close(ms.cancelChan)
+	ms.cancel.Do(func() { close(ms.cancelChan) })
 }
 
 // Helper function to simulate responses sent over the mock stream.
@@ -106,11 +223,14 @@ func (ms *mockSCStream) sendResponse(
 // setupSignCoordinator sets up a new SignCoordinator instance with a mock
 // stream to simulate communication with a remote signer. It also simulates the
 // handshake between the sign coordinator and the remote signer.
-func setupSignCoordinator(t *testing.T) (*SignCoordinator, *mockSCStream,
-	chan error) {
+func setupSignCoordinator(t *testing.T, sends, responses int) (*SignCoordinator,
+	*mockSCStream, chan error) {
 
 	coordinator := NewSignCoordinator(2*time.Second, 3*time.Second)
-	stream, errChan := setupNewStream(t, coordinator)
+	// One owner joins the coordinator after test-owned gates are released.
+	// Replacement streams must never register another shutdown callback.
+	t.Cleanup(coordinator.Stop)
+	stream, errChan := setupNewStream(t, coordinator, sends, responses)
 
 	return coordinator, stream, errChan
 }
@@ -119,21 +239,26 @@ func setupSignCoordinator(t *testing.T) (*SignCoordinator, *mockSCStream,
 // remote signer. It also simulates the handshake between the passed sign
 // coordinator and the remote signer.
 func setupNewStream(t *testing.T,
-	coordinator *SignCoordinator) (*mockSCStream, chan error) {
+	coordinator *SignCoordinator, sends, responses int) (*mockSCStream,
+	chan error) {
 
-	stream := newMockSCStream()
+	stream := newMockSCStream(t, sends, responses)
 
-	errChan := make(chan error)
+	errChan := make(chan error, 1)
 	go func() {
 		err := coordinator.Run(stream)
+		// Returning from the real gRPC handler cancels its stream;
+		// model that lifecycle so Stop can join reader/writer IO.
+		stream.Cancel()
 		if err != nil {
 			errChan <- err
 		}
 	}()
 
+	version := watchonlyrpc.RegistrationVersion
 	signReg := &watchonlyrpc.SignerRegistration{
-		RegistrationChallenge: []byte("registrationChallenge"),
-		RegistrationInfo:      "outboundSigner",
+		RegistrationChallenge: make([]byte, 32),
+		RegistrationInfo:      version,
 	}
 
 	regType := &watchonlyrpc.SignCoordinatorResponse_SignerRegistration{
@@ -161,6 +286,8 @@ func setupNewStream(t *testing.T,
 			t, "registration complete message not received",
 		)
 	}
+
+	require.NoError(t, coordinator.WaitUntilConnected(t.Context()))
 
 	return stream, errChan
 }
@@ -209,651 +336,159 @@ func (ms *mockSCStream) pong(id uint64) {
 	})
 }
 
-// TestPingRequests tests that the sign coordinator correctly sends a Ping
-// request to the remote signer and handles the received Pong response
-// correctly.
+// TestPingRequests verifies an observed request completes through its response.
 func TestPingRequests(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, _ := setupSignCoordinator(t)
-
-	var wg sync.WaitGroup
-
-	// Send a Ping request in a goroutine so that we can pick up the request
-	// sent over the mock stream, and respond accordingly.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		// The Ping method will return true if the response is a Pong
-		// response.
-		success, err := coordinator.Ping(t.Context(), 2*time.Second)
-		require.NoError(t, err)
-		require.True(t, success)
-	}()
-
-	// Get the request sent over the mock stream.
-	req, err := getRequest(stream)
+	// Arrange an authenticated stream and one waiting public RPC.
+	coordinator, stream, _ := setupSignCoordinator(t, 2, 2)
+	result := coordinatorPing(t, coordinator, time.Second)
+	request, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(2), req.GetRequestId())
-	require.True(t, req.GetPing())
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// Now we simulate the response from the remote signer by sending a Pong
-	// response over the mock stream.
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 2,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-
-	// Wait for the goroutines to finish, which should only happen after the
-	// requests have had their expected responses processed.
-	wg.Wait()
-
-	// Verify the responses map is empty after all responses are received
-	// to ensure that no memory leaks occur.
-	require.Equal(t, coordinator.responses.Len(), 0)
+	// Act by returning a pong for the observed request ID.
+	stream.pong(request.GetRequestId())
+	// Assert the public result and the reserved handshake ID boundary.
+	require.Equal(t, uint64(2), request.GetRequestId())
+	require.True(t, request.GetPing())
+	require.NoError(t, <-result)
 }
 
-// TestConcurrentPingRequests tests that the sign coordinator correctly handles
-// concurrent Ping requests and responses, and that the order in which responses
-// are sent back over the stream doesn't matter.
+// TestConcurrentPingRequests verifies independent response correlation when the
+// signer replies in a different order from request submission.
 func TestConcurrentPingRequests(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, _ := setupSignCoordinator(t)
-
-	var wg sync.WaitGroup
-
-	// Let's first start by sending two concurrent Ping requests and sending
-	// the respective responses back in order.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-		success, err := coordinator.Ping(t.Context(), 2*time.Second)
-
-		require.NoError(t, err)
-		require.True(t, success)
-	}()
-
-	// Get the first request sent over the mock stream.
-	req1, err := getRequest(stream)
+	// Arrange two requests with distinct observed IDs on one stream.
+	coordinator, stream, _ := setupSignCoordinator(t, 3, 3)
+	first := coordinatorPing(t, coordinator, time.Second)
+	request1, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(2), req1.GetRequestId())
-	require.True(t, req1.GetPing())
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// Now we send the second Ping request.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-		success, err := coordinator.Ping(t.Context(), 2*time.Second)
-
-		require.NoError(t, err)
-		require.True(t, success)
-	}()
-
-	// Get the second request sent over the mock stream.
-	req2, err := getRequest(stream)
+	second := coordinatorPing(t, coordinator, time.Second)
+	request2, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(3), req2.GetRequestId())
-	require.True(t, req2.GetPing())
-
-	// Verify that the coordinator has correctly set up two response
-	// channels for the Ping requests with their specific request IDs.
-	require.Equal(t, coordinator.responses.Len(), 2)
-	_, ok = coordinator.responses.Load(uint64(3))
-	require.True(t, ok)
-
-	// Send responses for both Ping requests in order.
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 2,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 3,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-
-	// Wait for the goroutines to finish, which should only happen after the
-	// requests have had their expected responses processed.
-	wg.Wait()
-
-	// Verify the responses map is empty after all responses are received.
-	require.Equal(t, coordinator.responses.Len(), 0)
-
-	// Now let's verify that the sign coordinator can correctly process
-	// responses that are sent back in a different order than the requests
-	// were sent.
-
-	// Send a new set of concurrent Ping requests.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		success, err := coordinator.Ping(t.Context(), 2*time.Second)
-		require.NoError(t, err)
-		require.True(t, success)
-	}()
-
-	req3, err := getRequest(stream)
-	require.NoError(t, err)
-
-	require.Equal(t, uint64(4), req3.GetRequestId())
-	require.True(t, req3.GetPing())
-
-	// Verify that the coordinator has removed the response channels for the
-	// previous Ping requests and set up a new one for the new request.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok = coordinator.responses.Load(uint64(4))
-	require.True(t, ok)
-
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		success, err := coordinator.Ping(t.Context(), 2*time.Second)
-		require.NoError(t, err)
-		require.True(t, success)
-	}()
-
-	req4, err := getRequest(stream)
-	require.NoError(t, err)
-
-	require.Equal(t, uint64(5), req4.GetRequestId())
-	require.True(t, req4.GetPing())
-
-	require.Equal(t, coordinator.responses.Len(), 2)
-	_, ok = coordinator.responses.Load(uint64(5))
-	require.True(t, ok)
-
-	// Send the responses back in reverse order.
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 5,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 4,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-
-	// Wait for the goroutines to finish, which should only happen after the
-	// requests have had their expected responses processed.
-	wg.Wait()
-
-	// Verify the responses map is empty after all responses are received
-	// to ensure that no memory leaks occur.
-	require.Equal(t, coordinator.responses.Len(), 0)
+	// Act by answering the second request before the first.
+	stream.pong(request2.GetRequestId())
+	// Assert only its caller completes, then finish the remaining request.
+	require.NoError(t, <-second)
+	select {
+	case err := <-first:
+		t.Fatalf("unanswered request completed: %v", err)
+	default:
+	}
+	stream.pong(request1.GetRequestId())
+	require.NoError(t, <-first)
 }
 
-// TestPingTimeout tests that the sign coordinator correctly handles a Ping
-// request that times out.
+// TestPingTimeout preserves the caller deadline while late responses are
+// ignored.
 func TestPingTimeout(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, _ := setupSignCoordinator(t)
-
-	var wg sync.WaitGroup
-
-	// Simulate a Ping request that is expected to time out.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		// Note that the timeout is set to 1 second.
-		success, err := coordinator.Ping(t.Context(), 1*time.Second)
-		require.Equal(t, context.DeadlineExceeded, err)
-		require.False(t, success)
-	}()
-
-	// Get the request sent over the mock stream.
-	req1, err := getRequest(stream)
+	// Arrange a caller deadline shorter than the configured request
+	// timeout.
+	coordinator, stream, _ := setupSignCoordinator(t, 2, 2)
+	result := coordinatorPing(t, coordinator, 50*time.Millisecond)
+	request, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(2), req1.GetRequestId())
-	require.True(t, req1.GetPing())
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// Now wait for the request to time out.
-	wg.Wait()
-
-	// Verify that the responses map is empty after the timeout.
-	require.Equal(t, coordinator.responses.Len(), 0)
-
-	// Now let's simulate that the response is sent back after the request
-	// has timed out.
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 2,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-
-	// Verify that the responses map still remains empty, as responses for
-	// timed out requests are ignored.
-	require.Equal(t, coordinator.responses.Len(), 0)
+	// Act by withholding the response until the caller's deadline expires.
+	err = <-result
+	stream.pong(request.GetRequestId())
+	// Assert the caller deadline remains distinguishable from RPC timeout.
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-// TestConcurrentPingTimeout tests that the sign coordinator correctly handles a
-// Ping request that times out, while another Ping request is still pending
-// and then receives a response.
+// TestConcurrentPingTimeout verifies one expired caller does not cancel
+// another.
 func TestConcurrentPingTimeout(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, _ := setupSignCoordinator(t)
-
-	var wg sync.WaitGroup
-
-	timeoutChan := make(chan struct{})
-
-	// Send a Ping request that is expected to time out.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		// Note that the timeout is set to 1 second.
-		success, err := coordinator.Ping(t.Context(), 1*time.Second)
-		require.Equal(t, context.DeadlineExceeded, err)
-		require.False(t, success)
-
-		// Signal that the request has timed out.
-		close(timeoutChan)
-	}()
-
-	// Get the request sent over the mock stream.
-	req1, err := getRequest(stream)
+	// Arrange one short caller and an independent outstanding request.
+	coordinator, stream, _ := setupSignCoordinator(t, 3, 2)
+	first := coordinatorPing(t, coordinator, 50*time.Millisecond)
+	_, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(2), req1.GetRequestId())
-	require.True(t, req1.GetPing())
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// Now let's send another Ping request that will receive a response.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		// Note that the timeout is set to 2 seconds and will therefore
-		// time out later than the first request.
-		success, err := coordinator.Ping(t.Context(), 2*time.Second)
-		require.NoError(t, err)
-		require.True(t, success)
-	}()
-
-	// Get the second request sent over the mock stream.
-	req2, err := getRequest(stream)
+	second := coordinatorPing(t, coordinator, time.Second)
+	request, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(3), req2.GetRequestId())
-	require.True(t, req2.GetPing())
-
-	// Verify that the coordinator has correctly set up two response
-	// channels for the Ping requests with their specific request IDs.
-	require.Equal(t, coordinator.responses.Len(), 2)
-	_, ok = coordinator.responses.Load(uint64(3))
-	require.True(t, ok)
-
-	// Now let's wait for the first request to time out.
-	<-timeoutChan
-
-	// Ensure that this leads to the sign coordinator removing the response
-	// channel for the timed-out request.
-	require.Equal(t, coordinator.responses.Len(), 1)
-
-	// The second request should still be pending, so the responses map
-	// should contain the response channel for the second request.
-	_, ok = coordinator.responses.Load(uint64(3))
-	require.True(t, ok)
-
-	// Send responses for the second Ping request.
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 3,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-
-	// Wait for the goroutines to finish, which should only happen after the
-	// second request has had its expected response processed.
-	wg.Wait()
-
-	// Verify the responses map is empty after all responses have been
-	// handled, to ensure that no memory leaks occur.
-	require.Equal(t, coordinator.responses.Len(), 0)
+	// Act by letting the first expire before answering the second.
+	firstErr := <-first
+	stream.pong(request.GetRequestId())
+	// Assert only the intended caller expired and the other still succeeds.
+	require.ErrorIs(t, firstErr, context.DeadlineExceeded)
+	require.NoError(t, <-second)
 }
 
-// TestIncorrectResponseRequestId tests that the sign coordinator correctly
-// ignores responses with an unknown request ID.
+// TestIncorrectResponseRequestId verifies unknown responses cannot settle an
+// RPC.
 func TestIncorrectResponseRequestId(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, _ := setupSignCoordinator(t)
-
-	var wg sync.WaitGroup
-
-	// Save the start time of the test.
-	startTime := time.Now()
-
-	// The coordinator uses a 2s request timeout (see setupSignCoordinator).
-	// Make the ping timeout longer to avoid racing context cancellation
-	// against the request timeout.
-	pingTimeout := coordinator.requestTimeout + time.Second
-
-	wg.Add(1)
-
-	// Send a Ping request that times out in 3 seconds. As the request
-	// timeout is lower than the ping timeout, the request should error
-	// after 2 seconds with a ErrRequestTimeout.
-	go func() {
-		defer wg.Done()
-
-		success, err := coordinator.Ping(t.Context(), pingTimeout)
-		require.Equal(t, ErrRequestTimeout, err)
-		require.False(t, success)
-	}()
-
-	// Get the request sent over the mock stream.
-	req, err := getRequest(stream)
+	// Arrange a caller that outlives the configured round-trip timeout.
+	coordinator, stream, _ := setupSignCoordinator(t, 2, 2)
+	result := coordinatorPing(t, coordinator, 3*time.Second)
+	_, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(2), req.GetRequestId())
-	require.True(t, req.GetPing())
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// Now let's send a response with another request ID than the Ping
-	// request.
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 3, // Incorrect request ID
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-
-	// Ensure that the response is ignored and that the responses map still
-	// contains the response channel for the Ping request until the request
-	// times out. We allow a small margin of error to account for the time
-	// it takes to execute the Invariant function.
-	invariantWaitTime := coordinator.requestTimeout -
-		time.Since(startTime) - 100*time.Millisecond
-
-	err = wait.Invariant(func() bool {
-		correctLen := coordinator.responses.Len() == 1
-		_, ok = coordinator.responses.Load(uint64(2))
-
-		return correctLen && ok
-	}, invariantWaitTime)
-	require.NoError(t, err)
-
-	// Wait for the goroutines to finish, which should only happen after the
-	// request has timed out and verified the error.
-	wg.Wait()
-
-	// Verify the responses map is empty after all responses are received
-	require.Equal(t, coordinator.responses.Len(), 0)
+	// Act by supplying a response for a request that was never submitted.
+	stream.pong(999)
+	// Assert the real request times out rather than accepting that
+	// response.
+	require.ErrorIs(t, <-result, ErrRequestTimeout)
 }
 
-// TestSignerErrorResponse tests that the sign coordinator correctly handles a
-// SignerError response from the remote signer.
+// TestSignerErrorResponse preserves signer-side application errors.
 func TestSignerErrorResponse(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, _ := setupSignCoordinator(t)
-
-	var wg sync.WaitGroup
-
-	// Send a Ping request that will receive a SignerError response.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		success, err := coordinator.Ping(t.Context(), 1*time.Second)
-		// Ensure that the result from the Ping method is an error,
-		// which is the expected result when a SignerError response is
-		// received.
-		require.Equal(t, "mock error", err.Error())
-		require.False(t, success)
-	}()
-
-	// Get the request sent over the mock stream.
-	req, err := getRequest(stream)
+	// Arrange an observed request whose backend will reject it.
+	coordinator, stream, _ := setupSignCoordinator(t, 2, 2)
+	result := coordinatorPing(t, coordinator, time.Second)
+	request, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(2), req.GetRequestId())
-	require.True(t, req.GetPing())
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// Now let's send a SignerError response instead of a Pong back over the
-	// mock stream.
-	rType := &watchonlyrpc.SignCoordinatorResponse_SignerError{
-		SignerError: &watchonlyrpc.SignerError{
-			Error: "mock error",
-		},
-	}
-
+	// Act through the wire error variant instead of invoking internal
+	// handlers.
 	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId:     2,
-		SignResponseType: rType,
+		RefRequestId: request.GetRequestId(),
+		SignResponseType: &watchonlyrpc.
+			SignCoordinatorResponse_SignerError{
+			SignerError: &watchonlyrpc.SignerError{
+				Error: "mock error",
+			},
+		},
 	})
-
-	// Wait for the goroutines to finish, which should only happen after the
-	// request has had its expected response processed.
-	wg.Wait()
-
-	// Verify the responses map is empty after all responses have been
-	// processed, to ensure that no memory leaks occur.
-	require.Equal(t, coordinator.responses.Len(), 0)
+	// Assert the caller sees the application error unchanged.
+	require.EqualError(t, <-result, "mock error")
 }
 
-// TestStopCoordinator tests that the sign coordinator correctly stops
-// processing responses for any pending requests when the sign coordinator is
-// stopped.
+// TestStopCoordinator settles all outstanding requests and closes admission.
 func TestStopCoordinator(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, runErrChan := setupSignCoordinator(t)
-
-	pingTimeout := 3 * time.Second
-	startTime := time.Now()
-
-	var wg sync.WaitGroup
-
-	// Send a Ping request with a long timeout to ensure that the request
-	// will not time out before the coordinator is stopped.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		success, err := coordinator.Ping(t.Context(), pingTimeout)
-		require.Equal(t, ErrShuttingDown, err)
-		require.False(t, success)
-	}()
-
-	// Get the request sent over the mock stream.
-	req, err := getRequest(stream)
+	// Arrange two observed requests with no responses and a running stream.
+	coordinator, stream, runErr := setupSignCoordinator(t, 3, 1)
+	first := coordinatorPing(t, coordinator, 3*time.Second)
+	_, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(2), req.GetRequestId())
-	require.True(t, req.GetPing())
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// Now let's stop the sign coordinator.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		coordinator.Stop()
-	}()
-
-	// When the coordinator is stopped, the Run function will return an
-	// error that gets sent over the runErrChan.
-	err = <-runErrChan
-
-	// Ensure that the Run function returned the expected error that lnd is
-	// shutting down.
-	require.Equal(t, ErrShuttingDown, err)
-
-	// As the coordinator Run function returned the ErrShuttingDown error,
-	// lnd would normally cancel the stream. We simulate this by calling the
-	// Cancel method on the mock stream.
-	stream.Cancel()
-
-	// Ensure that both the Ping request goroutine and the sign coordinator
-	// Stop goroutine have finished.
-	wg.Wait()
-
-	// Ensure that the Ping request goroutine returned before the timeout
-	// was reached, which indicates that the request was canceled because
-	// the sign coordinator was stopped.
-	require.Less(t, time.Since(startTime), pingTimeout)
-
-	// Verify the responses map is empty after all responses are received
-	require.Equal(t, coordinator.responses.Len(), 0)
+	second := coordinatorPing(t, coordinator, 3*time.Second)
+	_, err = getRequest(stream)
+	require.NoError(t, err)
+	// Act by shutting down while both callers are waiting on signer
+	// responses.
+	coordinator.Stop()
+	// Assert Run and both callers settle, and a later request is rejected.
+	require.ErrorIs(t, <-runErr, ErrShuttingDown)
+	require.ErrorIs(t, <-first, ErrShuttingDown)
+	require.ErrorIs(t, <-second, ErrShuttingDown)
+	_, err = coordinator.Ping(t.Context(), time.Second)
+	require.ErrorIs(t, err, ErrShuttingDown)
 }
 
-// TestRemoteSignerDisconnects tests that the sign coordinator correctly handles
-// the remote signer disconnecting, which closes the stream.
+// TestRemoteSignerDisconnects preserves the configured reconnect wait timeout.
 func TestRemoteSignerDisconnects(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, runErrChan := setupSignCoordinator(t)
-
-	// Use a timeout longer than the connection timeout so the coordinator
-	// returns ErrConnectTimeout because of a disconnect, instead of the
-	// context deadline error for the ping request.
-	pingTimeout := coordinator.startupTimeout + (1 * time.Second)
-	startTime := time.Now()
-
-	var wg sync.WaitGroup
-
-	// Send a Ping request with a long timeout to ensure that the request
-	// will not time out before the remote signer disconnects.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		success, err := coordinator.Ping(t.Context(), pingTimeout)
-		require.Equal(t, ErrConnectTimeout, err)
-		require.False(t, success)
-	}()
-
-	// Get the request sent over the mock stream.
-	req, err := getRequest(stream)
+	// Arrange an in-flight safe RPC with a caller timeout beyond reconnect
+	// waiting.
+	coordinator, stream, runErr := setupSignCoordinator(t, 2, 1)
+	result := coordinatorPing(t, coordinator, 5*time.Second)
+	_, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	require.Equal(t, uint64(2), req.GetRequestId())
-	require.True(t, req.GetPing())
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// We simulate the remote signer disconnecting by canceling the
-	// stream.
+	// Act by disconnecting without providing a replacement signer.
 	stream.Cancel()
-
-	// This should cause the Run function to return the error that the
-	// stream was canceled.
-	err = <-runErrChan
-	require.Equal(t, ErrStreamCanceled, err)
-
-	// Ensure that the Ping request goroutine has finished.
-	wg.Wait()
-
-	// Verify that the coordinator signals that it's done receiving
-	// responses after the stream is canceled, i.e. the StartReceiving
-	// function is no longer running.
-	<-coordinator.disconnected
-
-	// Ensure that the Ping request goroutine returned after the connection
-	// timeout, but before the ping timeout was reached, which indicates
-	// that the request was canceled because the remote signer disconnected.
-	require.Greater(t, time.Since(startTime), coordinator.startupTimeout)
-	require.Less(t, time.Since(startTime), pingTimeout)
-
-	// Verify the responses map is empty after all responses are received
-	require.Equal(t, coordinator.responses.Len(), 0)
+	// Assert the stream closes and the caller reports connection timeout.
+	require.ErrorIs(t, <-runErr, ErrStreamCanceled)
+	require.ErrorIs(t, <-result, ErrConnectTimeout)
 }
 
 // TestWaitUntilConnectedNoTimeout preserves indefinite startup waiting at zero.
@@ -880,338 +515,143 @@ func TestWaitUntilConnectedNoTimeout(t *testing.T) {
 	require.ErrorIs(t, <-result, context.Canceled)
 }
 
-// TestRemoteSignerReconnectsDuringResponseWait verifies that the sign
-// coordinator correctly handles the scenario where the remote signer
-// disconnects while a request is being processed and then reconnects. In this
-// case, the sign coordinator should establish a new stream, reprocess the
-// request, and ultimately receive a response.
+// TestRemoteSignerReconnectsDuringResponseWait retries a safe outstanding RPC.
 func TestRemoteSignerReconnectsDuringResponseWait(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, runErrChan := setupSignCoordinator(t)
-
-	pingTimeout := 3 * time.Second
-	startTime := time.Now()
-
-	var wg sync.WaitGroup
-
-	// Send a Ping request with a long timeout to ensure that the request
-	// will not time out before the remote signer disconnects.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		success, err := coordinator.Ping(t.Context(), pingTimeout)
-		require.NoError(t, err)
-		require.True(t, success)
-	}()
-
-	// Get the request sent over the mock stream.
-	req, err := getRequest(stream)
+	// Arrange a request already sent but not yet answered by the signer.
+	coordinator, stream, runErr := setupSignCoordinator(t, 2, 1)
+	result := coordinatorPing(t, coordinator, 3*time.Second)
+	original, err := getRequest(stream)
 	require.NoError(t, err)
-
-	// Verify that the request has the expected request ID and that it's a
-	// Ping request.
-	originalReqID := req.GetRequestId()
-	require.Equal(t, uint64(2), originalReqID)
-	require.True(t, req.GetPing())
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// Now, lets simulate that the remote signer disconnects by canceling
-	// the stream, while the sign coordinator is still waiting for the Pong
-	// response for the request it sent.
+	// Act by closing that generation and completing the retry on its
+	// replacement.
 	stream.Cancel()
-
-	// This should cause the Run function to return the error that the
-	// stream was canceled.
-	err = <-runErrChan
-	require.Equal(t, ErrStreamCanceled, err)
-
-	// Verify that the coordinator signals that it's done receiving
-	// responses after the stream is canceled, i.e. the StartReceiving
-	// function is no longer running.
-	<-coordinator.disconnected
-
-	// Now let's simulate that the remote signer reconnects with a new
-	// stream.
-	stream, _ = setupNewStream(t, coordinator)
-
-	// This should lead to that the sign coordinator resends the Ping
-	// request it still needs a response for over the new stream.
-	req, err = getRequest(stream)
+	require.ErrorIs(t, <-runErr, ErrStreamCanceled)
+	replacement, _ := setupNewStream(t, coordinator, 2, 2)
+	resent, err := getRequest(replacement)
 	require.NoError(t, err)
-
-	// Verify that the resent request is explicitly another Ping from the
-	// watch-only node, not some unrelated follow-up request. The request
-	// ID must also be new, as the coordinator no longer waits for the
-	// response to the disconnected request.
-	require.NotEqual(t, originalReqID, req.GetRequestId())
-	require.Equal(t, uint64(3), req.GetRequestId())
-	require.True(t, req.GetPing())
-
-	// Verify that the coordinator cleaned up the response channel for the
-	// disconnected request before retrying and now only tracks the resent
-	// request.
-	require.Equal(t, coordinator.responses.Len(), 1)
-
-	_, ok = coordinator.responses.Load(uint64(2))
-	require.False(t, ok)
-	_, ok = coordinator.responses.Load(uint64(3))
-	require.True(t, ok)
-
-	// Now let's send the Pong response for the resent Ping request.
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 3,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-
-	// Ensure that the Ping request goroutine has finished.
-	wg.Wait()
-
-	// Ensure that the Ping request goroutine returned before the timeout
-	// was reached, which indicates that the request didn't time out as
-	// the remote signer reconnected in time and sent a response.
-	require.Less(t, time.Since(startTime), pingTimeout)
-
-	// Verify the responses map is empty after all responses are received
-	require.Equal(t, coordinator.responses.Len(), 0)
+	replacement.pong(resent.GetRequestId())
+	// Assert retry gets a new ID and the original caller receives its
+	// response.
+	require.Equal(t, original.GetRequestId()+1, resent.GetRequestId())
+	require.True(t, resent.GetPing())
+	require.NoError(t, <-result)
 }
 
-// TestMuSig2RequestDoesNotRetryOnReconnect verifies that stateful MuSig2
-// requests are not replayed after the remote signer disconnects and later
-// reconnects.
+// TestMuSig2RequestDoesNotRetryOnReconnect preserves stateful single-attempt
+// calls.
 func TestMuSig2RequestDoesNotRetryOnReconnect(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, runErrChan := setupSignCoordinator(t)
-
-	var (
-		wg     sync.WaitGroup
-		reqErr error
-	)
-
-	wg.Add(1)
+	// Arrange a stateful MuSig2 call whose signer response will be lost.
+	coordinator, stream, runErr := setupSignCoordinator(t, 2, 1)
+	result := make(chan error, 1)
 	go func() {
-		defer wg.Done()
-
-		_, reqErr = coordinator.MuSig2CreateSession(
+		_, err := coordinator.MuSig2CreateSession(
 			t.Context(), &signrpc.MuSig2SessionRequest{},
 		)
+		result <- err
 	}()
-
-	req, err := getRequest(stream)
+	request, err := getRequest(stream)
 	require.NoError(t, err)
-	require.Equal(t, uint64(2), req.GetRequestId())
-	require.NotNil(t, req.GetMuSig2SessionRequest())
-
-	// Verify that the coordinator tracks the outstanding MuSig2 request
-	// while it is waiting for the signer response.
-	require.Equal(t, coordinator.responses.Len(), 1)
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.True(t, ok)
-
-	// Simulate that the signer disconnects before it responds.
+	require.NotNil(t, request.GetMuSig2SessionRequest())
+	// Act by disconnecting, then bringing a new signer stream online.
 	stream.Cancel()
-
-	err = <-runErrChan
-	require.Equal(t, ErrStreamCanceled, err)
-
-	<-coordinator.disconnected
-
-	// Reconnect the signer. Since MuSig2 requests are stateful, the
-	// coordinator must not replay the request on the new stream.
-	stream, _ = setupNewStream(t, coordinator)
-
-	wg.Wait()
-	require.Equal(t, ErrNotConnected, reqErr)
-
-	select {
-	case req := <-stream.sendChan:
-		t.Fatalf("unexpected replayed request after reconnect: %T",
-			req.GetSignRequestType())
-
-	case <-time.After(1 * time.Second):
-		// No new request was sent.
-	}
-
-	require.Equal(t, coordinator.responses.Len(), 0)
+	require.ErrorIs(t, <-runErr, ErrStreamCanceled)
+	replacement, _ := setupNewStream(t, coordinator, 2, 2)
+	// Assert the original call failed without replay; a control Ping must
+	// be the next request the new signer observes.
+	require.ErrorIs(t, <-result, ErrNotConnected)
+	control := coordinatorPing(t, coordinator, time.Second)
+	request, err = getRequest(replacement)
+	require.NoError(t, err)
+	require.True(t, request.GetPing())
+	replacement.pong(request.GetRequestId())
+	require.NoError(t, <-control)
 }
 
-// TestRemoteSignerDisconnectsMidSend verifies that the sign coordinator
-// correctly handles the scenario in which the remote signer disconnects while
-// the sign coordinator is sending data over the stream (i.e., during the
-// execution of the `Send` function) and then reconnects. In such a case, the
-// sign coordinator should establish a new stream, reprocess the request, and
-// eventually receive a response.
+// TestRemoteSignerDisconnectsMidSend covers cancellation while Send is blocked.
 func TestRemoteSignerDisconnectsMidSend(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream, runErrChan := setupSignCoordinator(t)
-
-	pingTimeout := 3 * time.Second
-	startTime := time.Now()
-
-	var wg sync.WaitGroup
-
-	// Send a Ping request with a long timeout to ensure that the request
-	// will not time out before the remote signer disconnects.
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		success, err := coordinator.Ping(t.Context(), pingTimeout)
-		require.NoError(t, err)
-		require.True(t, success)
-	}()
-
-	// Just wait slightly, to ensure that the Ping requests starts getting
-	// processed before we simulate the remote signer disconnecting.
-	<-time.After(10 * time.Millisecond)
-
-	// We simulate the remote signer disconnecting by canceling the
-	// stream.
+	// Arrange a stream whose transport Send has started but cannot yet
+	// write.
+	coordinator, stream, runErr := setupSignCoordinator(t, 2, 1)
+	result := coordinatorPing(t, coordinator, 3*time.Second)
+	original := <-stream.sendStarted
+	// Act by interrupting that Send and reconnecting before answering the
+	// RPC.
 	stream.Cancel()
-
-	// This should cause the Run function to return the error that the
-	// stream was canceled with.
-	err := <-runErrChan
-	require.Equal(t, ErrStreamCanceled, err)
-
-	// Verify that the coordinator signals that it's done receiving
-	// responses after the stream is canceled, i.e. the StartReceiving
-	// function is no longer running.
-	<-coordinator.disconnected
-
-	// Now since the sign coordinator is still processing the requests, and
-	// we never extracted the request sent over the stream, the sign
-	// coordinator is stuck at the steam.Send function. We simulate this
-	// function now errors with the codes.Unavailable error, which is what
-	// the function would error with if the signer was disconnected during
-	// the send operation in a real scenario.
-	stream.sendErrorChan <- status.Errorf(
-		codes.Unavailable, "simulated unavailable error",
-	)
-
-	// Verify that the coordinator has correctly set up a single response
-	// channel for the Ping request with the specific request ID.
-	require.Equal(t, 1, coordinator.responses.Len())
-
-	// Now let's simulate that the remote signer reconnects with a new
-	// stream.
-	stream, _ = setupNewStream(t, coordinator)
-
-	// This should lead to that the sign coordinator resends the Ping
-	// request it's needs a response for over the new stream.
-	req, err := getRequest(stream)
+	require.ErrorIs(t, <-runErr, ErrStreamCanceled)
+	replacement, _ := setupNewStream(t, coordinator, 2, 2)
+	resent, err := getRequest(replacement)
 	require.NoError(t, err)
-
-	// Note that the request ID will be 3 for the resent request, as the
-	// coordinator will no longer wait for the response for the request with
-	// request ID 2.
-	require.Equal(t, uint64(3), req.GetRequestId())
-	require.True(t, req.GetPing())
-
-	// Verify that the coordinator cleaned up the response channel for the
-	// disconnected request before retrying and now only tracks the resent
-	// request.
-	require.Equal(t, coordinator.responses.Len(), 1)
-
-	_, ok := coordinator.responses.Load(uint64(2))
-	require.False(t, ok)
-	_, ok = coordinator.responses.Load(uint64(3))
-	require.True(t, ok)
-
-	// Now let's send the Pong response for the resent Ping request.
-	stream.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 3,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
-		},
-	})
-
-	// Ensure that the Ping request goroutine has finished.
-	wg.Wait()
-
-	// Ensure that the Ping request goroutine returned before the timeout
-	// was reached, which indicates that the request didn't time out as
-	// the remote signer reconnected in time and sent a response.
-	require.Less(t, time.Since(startTime), pingTimeout)
-
-	// Verify the responses map is empty after all responses are received
-	require.Equal(t, coordinator.responses.Len(), 0)
+	replacement.pong(resent.GetRequestId())
+	// Assert the safe request is retried on a fresh generation and ID.
+	require.Greater(t, resent.GetRequestId(), original.GetRequestId())
+	require.NoError(t, <-result)
 }
 
-// TestRemoteSignerReconnectsBeforeSend verifies that a request that has already
-// observed readiness still succeeds if the signer disconnects and reconnects
-// before the request can send on the snapshotted stream.
+// TestRemoteSignerReconnectsBeforeSend ignores late sends from an old
+// generation.
 func TestRemoteSignerReconnectsBeforeSend(t *testing.T) {
 	t.Parallel()
-
-	coordinator, stream1, runErrChan := setupSignCoordinator(t)
-
-	// Hold the send mutex so the request can pass readiness, snapshot the
-	// current stream, and register its response channel before it reaches
-	// the actual Send call.
-	coordinator.sendMu.Lock()
-
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		success, err := coordinator.Ping(t.Context(), 2*time.Second)
-		require.NoError(t, err)
-		require.True(t, success)
-	}()
-
-	require.Eventually(t, func() bool {
-		_, ok := coordinator.responses.Load(uint64(2))
-		return ok
-	}, time.Second, 10*time.Millisecond)
-
-	// Disconnect the current signer after the request has observed
-	// readiness and snapshotted the old stream, but before it can actually
-	// send.
-	stream1.Cancel()
-
-	err := <-runErrChan
-	require.Equal(t, ErrStreamCanceled, err)
-
-	<-coordinator.disconnected
-
-	// Reconnect the signer before letting the blocked request proceed.
-	stream2, _ := setupNewStream(t, coordinator)
-
-	// Once the blocked send continues, the old stream should return an
-	// unavailable error so the request retries on the new connection.
-	stream1.sendErrorChan <- status.Errorf(
-		codes.Unavailable, "simulated unavailable error",
-	)
-
-	coordinator.sendMu.Unlock()
-
-	req, err := getRequest(stream2)
+	// Arrange a gate before bytes leave the old stream. Cleanup releases it
+	// before joining the coordinator if any assertion aborts the test.
+	coordinator, stream, runErr := setupSignCoordinator(t, 2, 1)
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	stream.sendGate = gate
+	result := coordinatorPing(t, coordinator, 3*time.Second)
+	original := <-stream.sendStarted
+	// Act by replacing the generation while its old Send remains blocked.
+	stream.Cancel()
+	require.ErrorIs(t, <-runErr, ErrStreamCanceled)
+	replacement, _ := setupNewStream(t, coordinator, 3, 3)
+	resent, err := getRequest(replacement)
 	require.NoError(t, err)
-	require.Equal(t, uint64(3), req.GetRequestId())
-	require.True(t, req.GetPing())
+	replacement.pong(resent.GetRequestId())
+	release()
+	// Assert the old completion cannot corrupt the replacement's request
+	// state.
+	require.Greater(t, resent.GetRequestId(), original.GetRequestId())
+	require.NoError(t, <-result)
+	control := coordinatorPing(t, coordinator, time.Second)
+	request, err := getRequest(replacement)
+	require.NoError(t, err)
+	replacement.pong(request.GetRequestId())
+	require.NoError(t, <-control)
+}
 
-	stream2.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId: 3,
-		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
-			Pong: true,
+// TestRemoteSignerSecondRun rejects a competing stream during handshake.
+func TestRemoteSignerSecondRun(t *testing.T) {
+	t.Parallel()
+	// Arrange an admitted stream whose registration-complete Send is
+	// blocked.
+	coordinator := NewSignCoordinator(time.Second, time.Second)
+	t.Cleanup(coordinator.Stop)
+	stream := newMockSCStream(t, 1, 1)
+	first := make(chan error, 1)
+	go func() {
+		first <- coordinator.Run(stream)
+		stream.Cancel()
+	}()
+	version := watchonlyrpc.RegistrationVersion
+	stream.recvChan <- &watchonlyrpc.SignCoordinatorResponse{
+		RefRequestId: handshakeRequestID,
+		SignResponseType: &RSRegistration{
+			SignerRegistration: &watchonlyrpc.SignerRegistration{
+				RegistrationChallenge: make([]byte, 32),
+				RegistrationInfo:      version,
+			},
 		},
-	})
-
-	wg.Wait()
-	require.Equal(t, coordinator.responses.Len(), 0)
+	}
+	// Act with another stream while the first handshake is still active.
+	err := coordinator.Run(newMockSCStream(t, 0, 0))
+	// Assert exclusive admission and then complete/close the original
+	// stream.
+	require.ErrorIs(t, err, ErrMultipleConnections)
+	_, err = getRequest(stream)
+	require.NoError(t, err)
+	stream.Cancel()
+	require.ErrorIs(t, <-first, ErrStreamCanceled)
 }
