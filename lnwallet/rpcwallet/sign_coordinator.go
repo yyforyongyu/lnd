@@ -1005,12 +1005,7 @@ func (s *SignCoordinator) Ping(ctx context.Context,
 
 	return processRequest(
 		ctxt, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) bool {
 			return resp.GetPong()
 		},
@@ -1032,12 +1027,7 @@ func (s *SignCoordinator) DeriveSharedKey(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) *signrpc.SharedKeyResponse {
 			return resp.GetSharedKeyResponse()
 		},
@@ -1059,12 +1049,7 @@ func (s *SignCoordinator) MuSig2Cleanup(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) *signrpc.MuSig2CleanupResponse {
 			return resp.GetMuSig2CleanupResponse()
 		},
@@ -1086,12 +1071,7 @@ func (s *SignCoordinator) MuSig2CombineSig(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) *signrpc.MuSig2CombineSigResponse {
 			return resp.GetMuSig2CombineSigResponse()
 		},
@@ -1113,12 +1093,7 @@ func (s *SignCoordinator) MuSig2CreateSession(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) *signrpc.MuSig2SessionResponse {
 			return resp.GetMuSig2SessionResponse()
 		},
@@ -1143,12 +1118,7 @@ func (s *SignCoordinator) MuSig2RegisterNonces(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) muSig2RegisterNoncesResp {
 			return resp.GetMuSig2RegisterNoncesResponse()
 		},
@@ -1171,12 +1141,7 @@ func (s *SignCoordinator) MuSig2RegisterCombinedNonce(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) muSig2RegCombNResp {
 			return resp.GetMuSig2CombNoncesResp()
 		},
@@ -1198,12 +1163,7 @@ func (s *SignCoordinator) MuSig2GetCombinedNonce(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) muSig2GetCombNonceResp {
 			return resp.GetMuSig2GetCombNoncesResp()
 		},
@@ -1225,12 +1185,7 @@ func (s *SignCoordinator) MuSig2Sign(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) *signrpc.MuSig2SignResponse {
 			return resp.GetMuSig2SignResponse()
 		},
@@ -1252,12 +1207,7 @@ func (s *SignCoordinator) SignMessage(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) *signrpc.SignMessageResp {
 			return resp.GetSignMessageResp()
 		},
@@ -1279,12 +1229,7 @@ func (s *SignCoordinator) SignPsbt(ctx context.Context,
 
 	return processRequest(
 		ctx, s,
-		func(reqId uint64) watchonlyrpc.SignCoordinatorRequest {
-			return watchonlyrpc.SignCoordinatorRequest{
-				RequestId:       reqId,
-				SignRequestType: req,
-			}
-		},
+		&watchonlyrpc.SignCoordinatorRequest{SignRequestType: req},
 		func(resp *RSResponse) *walletrpc.SignPsbtResponse {
 			return resp.GetSignPsbtResponse()
 		},
@@ -1304,7 +1249,7 @@ func (s *SignCoordinator) SignPsbt(ctx context.Context,
 //     caller should stop retrying and return the error.
 func processRequestAttempt[R comparable](ctx context.Context,
 	s *SignCoordinator,
-	generateRequest func(uint64) watchonlyrpc.SignCoordinatorRequest,
+	request *watchonlyrpc.SignCoordinatorRequest,
 	extractResponse func(*RSResponse) R, retryPolicy requestRetryPolicy) (
 	bool, R, error) {
 
@@ -1327,7 +1272,8 @@ func processRequestAttempt[R comparable](ctx context.Context,
 	}
 
 	reqID := s.nextRequestID.Add(1)
-	req := generateRequest(reqID)
+	req := *request
+	req.RequestId = reqID
 
 	reqCtx, cancelReq := context.WithCancel(ctx)
 	cleanUpChannel := s.createResponseChannel(reqID, reqCtx.Done())
@@ -1386,18 +1332,14 @@ func processRequestAttempt[R comparable](ctx context.Context,
 	return false, rpcResp, nil
 }
 
-// processRequest is a generic function that sends a request to the remote
-// signer and waits for the corresponding response. If a timeout is set, the
-// function will limit the execution time of the entire function to the
-// specified timeout. If it is not set, configured timeouts will be used for
-// the individual operations within the function.
+// processRequest retains the existing safe-retry policy and keeps stateful
+// MuSig2 calls single-attempt even if a replacement stream becomes ready.
 func processRequest[R comparable](ctx context.Context, s *SignCoordinator,
-	generateRequest func(uint64) watchonlyrpc.SignCoordinatorRequest,
+	request *watchonlyrpc.SignCoordinatorRequest,
 	extractResponse func(*RSResponse) R,
 	retryPolicy requestRetryPolicy) (R, error) {
 
 	var zero R
-
 	done, err := s.registerRequest()
 	if err != nil {
 		return zero, err
@@ -1405,16 +1347,13 @@ func processRequest[R comparable](ctx context.Context, s *SignCoordinator,
 	defer done()
 
 	for {
-		shouldRetry, rpcResp, err := processRequestAttempt(
-			ctx, s, generateRequest, extractResponse, retryPolicy,
+		retry, response, err := processRequestAttempt(
+			ctx, s, request, extractResponse, retryPolicy,
 		)
-		if err != nil {
-			return zero, err
-		}
-		if shouldRetry {
+		if retry {
 			continue
 		}
 
-		return rpcResp, nil
+		return response, err
 	}
 }

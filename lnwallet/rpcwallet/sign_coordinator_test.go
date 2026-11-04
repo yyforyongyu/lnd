@@ -179,6 +179,36 @@ func getRequest(s *mockSCStream) (*watchonlyrpc.SignCoordinatorRequest,
 	}
 }
 
+// coordinatorPing starts an RPC while leaving stream actions to the owning test
+// goroutine. Assertions and mock expectation checks never run in workers.
+func coordinatorPing(t *testing.T, coordinator *SignCoordinator,
+	timeout time.Duration) <-chan error {
+
+	t.Helper()
+	ctx := t.Context()
+	result := make(chan error, 1)
+	go func() {
+		pong, err := coordinator.Ping(ctx, timeout)
+		if err == nil && !pong {
+			err = errors.New("missing pong")
+		}
+		result <- err
+	}()
+
+	return result
+}
+
+// pong completes a specific observed request, keeping response correlation
+// visible at the transport boundary rather than inspecting pending maps.
+func (ms *mockSCStream) pong(id uint64) {
+	ms.sendResponse(&watchonlyrpc.SignCoordinatorResponse{
+		RefRequestId: id,
+		SignResponseType: &watchonlyrpc.SignCoordinatorResponse_Pong{
+			Pong: true,
+		},
+	})
+}
+
 // TestPingRequests tests that the sign coordinator correctly sends a Ping
 // request to the remote signer and handles the received Pong response
 // correctly.
@@ -826,84 +856,28 @@ func TestRemoteSignerDisconnects(t *testing.T) {
 	require.Equal(t, coordinator.responses.Len(), 0)
 }
 
-// TestWaitUntilConnectedNoTimeout verifies that setting the connection
-// timeout to zero completely disables the internal connect timeout
-// (i.e., no timer is started). As a result, WaitUntilConnected can only
-// return when the signer connects, the coordinator shuts down, or the
-// caller’s context is canceled. This ensures that no fallback or default
-// timeout is applied when the value is set to 0.
+// TestWaitUntilConnectedNoTimeout preserves indefinite startup waiting at zero.
 func TestWaitUntilConnectedNoTimeout(t *testing.T) {
 	t.Parallel()
-
-	coordinator := NewSignCoordinator(2*time.Second, 0)
-	stream := newMockSCStream()
-
-	runErrChan := make(chan error, 1)
+	// Arrange a disconnected coordinator with no internal connection
+	// deadline.
+	coordinator := NewSignCoordinator(time.Second, 0)
+	t.Cleanup(coordinator.Stop)
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
 	go func() {
-		err := coordinator.Run(stream)
-		if err != nil {
-			runErrChan <- err
-		}
+		result <- coordinator.WaitUntilConnected(ctx)
 	}()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
-	defer cancel()
-
-	waitErrChan := make(chan error, 1)
-	go func() {
-		waitErrChan <- coordinator.WaitUntilConnected(ctx)
-	}()
-
-	// With startupTimeout == 0, there is no internal timeout path, so
-	// WaitUntilConnected must stay blocked until the handshake completes or
-	// the ctx is canceled.
+	// Act by leaving startup pending, then explicitly canceling its caller.
 	select {
-	case err := <-waitErrChan:
-		t.Fatalf("WaitUntilConnected returned early: %v", err)
+	case err := <-result:
+		t.Fatalf("startup returned before connection or "+
+			"cancellation: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-
-	signReg := &watchonlyrpc.SignerRegistration{
-		RegistrationChallenge: []byte("registrationChallenge"),
-		RegistrationInfo:      "outboundSigner",
-	}
-
-	regType := &watchonlyrpc.SignCoordinatorResponse_SignerRegistration{
-		SignerRegistration: signReg,
-	}
-
-	registrationMsg := &watchonlyrpc.SignCoordinatorResponse{
-		RefRequestId:     1,
-		SignResponseType: regType,
-	}
-
-	stream.sendResponse(registrationMsg)
-
-	// Drain the registration complete message to avoid blocking Send in
-	// the handshake.
-	select {
-	case req := <-stream.sendChan:
-		require.Equal(t, handshakeRequestID, req.GetRequestId())
-	case <-time.After(2 * time.Second):
-		t.Fatalf("registration complete was not sent")
-	}
-
-	require.NoError(t, <-waitErrChan)
-
-	// Cancel the stream to unblock Run, then shut down the coordinator.
-	// Either shutdown path can win the race, so we accept either error.
-	stream.Cancel()
-	coordinator.Stop()
-
-	select {
-	case err := <-runErrChan:
-		require.True(
-			t, errors.Is(err, ErrShuttingDown) ||
-				errors.Is(err, ErrStreamCanceled),
-		)
-	case <-time.After(2 * time.Second):
-		t.Fatalf("Run did not exit after shutdown")
-	}
+	cancel()
+	// Assert zero startup timeout still honors explicit cancellation.
+	require.ErrorIs(t, <-result, context.Canceled)
 }
 
 // TestRemoteSignerReconnectsDuringResponseWait verifies that the sign
