@@ -278,6 +278,188 @@ func (s *SignCoordinator) event(ctx context.Context, event any) error {
 	}
 }
 
+// disconnect settles the active generation exactly once. Keeping an unopened
+// ready channel across failed handshakes lets existing startup waiters recover.
+func (state *coordinatorState) disconnect(err error) {
+	if state.connection == nil {
+		return
+	}
+	close(state.connection.done)
+	state.connection.finished <- err
+	state.connection = nil
+	for id, result := range state.pending {
+		result <- coordinatorResult{err: ErrNotConnected}
+		delete(state.pending, id)
+	}
+	state.queued = nil
+	if state.connected {
+		state.ready = make(chan struct{})
+	}
+	state.connected = false
+}
+
+// run owns state as local variables and never performs blocking stream IO.
+// Readiness, cancellation and shutdown can therefore progress during a stalled
+// Send.
+func (loop *coordinatorLoop) run(s *SignCoordinator) {
+	defer close(loop.done)
+	state := coordinatorState{
+		ready:   make(chan struct{}),
+		nextID:  handshakeRequestID,
+		pending: make(map[uint64]chan coordinatorResult),
+	}
+	for {
+		// A nil send lane disables queue draining until the handshake
+		// is complete. Cancelled queued requests are discarded before
+		// Send.
+		for len(state.queued) > 0 &&
+			state.pending[state.queued[0].RequestId] == nil {
+			state.queued = state.queued[1:]
+		}
+		var send chan *watchonlyrpc.SignCoordinatorRequest
+		var request *watchonlyrpc.SignCoordinatorRequest
+		if state.connected && len(state.queued) > 0 {
+			send = state.connection.send
+			request = state.queued[0]
+		}
+		select {
+		case <-s.cg.Done():
+			// Settle callers with the shutdown sentinel before
+			// releasing Run. Its return closes the real RPC stream
+			// and unblocks IO.
+			for id, result := range state.pending {
+				result <- coordinatorResult{
+					err: ErrShuttingDown,
+				}
+				delete(state.pending, id)
+			}
+			state.disconnect(ErrShuttingDown)
+
+			return
+		case send <- request:
+			state.queued = state.queued[1:]
+		case message := <-loop.events:
+			switch event := message.(type) {
+			case coordinatorConnect:
+				if state.connection != nil {
+					event.reply <- coordinatorConnected{
+						err: ErrMultipleConnections,
+					}
+
+					continue
+				}
+				connection := &coordinatorConnection{
+					send: make(
+						chan *watchonlyrpc.
+							SignCoordinatorRequest,
+					),
+					done:     make(chan struct{}),
+					finished: make(chan error, 1),
+				}
+				state.connection = connection
+				// Only this owner admits wait-group work. Stop
+				// first joins the owner, preventing Add from
+				// racing its subsequent Wait.
+				s.cg.WgAdd(1)
+				event.reply <- coordinatorConnected{
+					connection: connection,
+				}
+			case coordinatorCall:
+				// Admit callers through the owner so Stop can
+				// join admission before waiting for accepted
+				// work.
+				s.cg.WgAdd(1)
+				event.reply <- struct{}{}
+			case coordinatorReady:
+				// Only the current handshake may release
+				// startup waiters; a superseded stream cannot
+				// mark ready.
+				if event.connection == state.connection &&
+					!state.connected {
+
+					state.connected = true
+					close(state.ready)
+				}
+			case coordinatorReadiness:
+				// Return the current generation's readiness
+				// channel without exposing mutable connection
+				// state.
+				event.reply <- state.ready
+			case coordinatorSubmit:
+				// Install routing before queueing so even an
+				// immediate response finds its waiting caller.
+				if !state.connected {
+					event.reply <- coordinatorSubmitted{
+						err: ErrNotConnected,
+					}
+
+					continue
+				}
+				state.nextID++
+				result := make(chan coordinatorResult, 1)
+				payload := event.request.SignRequestType
+				request := &watchonlyrpc.SignCoordinatorRequest{
+					RequestId:       state.nextID,
+					SignRequestType: payload,
+				}
+				state.pending[state.nextID] = result
+				state.queued = append(state.queued, request)
+				event.reply <- coordinatorSubmitted{
+					id:       state.nextID,
+					response: result,
+				}
+			case coordinatorCancel:
+				// Remove routing immediately. Queue draining
+				// drops unsent entries separately; late replies
+				// are ignored.
+				delete(state.pending, event.id)
+			case coordinatorDisconnect:
+				// A returning old Run must not disconnect its
+				// replacement or settle the replacement's
+				// requests.
+				if event.connection == state.connection {
+					state.disconnect(event.err)
+				}
+			case coordinatorReceived:
+				// Generation matching and deletion settle a
+				// caller once despite late or duplicate stream
+				// responses.
+				if event.connection != state.connection {
+					continue
+				}
+				if event.err != nil {
+					state.disconnect(event.err)
+
+					continue
+				}
+				id := event.response.GetRefRequestId()
+				if result := state.pending[id]; result != nil {
+					result <- coordinatorResult{
+						response: event.response,
+					}
+					delete(state.pending, id)
+				}
+			case coordinatorSent:
+				// Successful sends await their responses. Only
+				// a current-generation failure may settle
+				// routing here.
+				if event.connection != state.connection ||
+					event.err == nil {
+
+					continue
+				}
+				result := state.pending[event.id]
+				if result != nil {
+					result <- coordinatorResult{
+						err: event.err,
+					}
+					delete(state.pending, event.id)
+				}
+			}
+		}
+	}
+}
+
 // Run starts the SignCoordinator and blocks until the remote signer either
 // disconnects, the SignCoordinator is shut down, or an error occurs.
 func (s *SignCoordinator) Run(stream StreamServer) error {
