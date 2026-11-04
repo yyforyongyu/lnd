@@ -2,6 +2,7 @@ package lnwallet
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -21,6 +22,8 @@ import (
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/chanstate"
@@ -223,7 +226,7 @@ type InitFundingReserveMsg struct {
 	//
 	// NOTE: This is very useful when opening channels with unconfirmed
 	// inputs to make sure stable non-replaceable inputs are used.
-	AllowUtxoForFunding func(Utxo) bool
+	AllowUtxoForFunding func(wallet.Utxo) bool
 
 	// ZeroConf is a boolean that is true if a zero-conf channel was
 	// negotiated.
@@ -414,10 +417,6 @@ type LightningWallet struct {
 	// duties.
 	Cfg Config
 
-	// WalletController is the core wallet, all non Lightning Network
-	// specific interaction is proxied to the internal wallet.
-	WalletController
-
 	// SecretKeyRing is the interface we'll use to derive any keys related
 	// to our purpose within the network including: multi-sig keys, node
 	// keys, revocation keys, etc.
@@ -472,16 +471,15 @@ type LightningWallet struct {
 func NewLightningWallet(Cfg Config) (*LightningWallet, error) {
 
 	return &LightningWallet{
-		Cfg:              Cfg,
-		SecretKeyRing:    Cfg.SecretKeyRing,
-		WalletController: Cfg.WalletController,
-		msgChan:          make(chan interface{}, msgBufferSize),
-		nextFundingID:    0,
-		fundingLimbo:     make(map[uint64]*ChannelReservation),
-		reservationIDs:   make(map[[32]byte]uint64),
-		lockedOutPoints:  make(map[wire.OutPoint]struct{}),
-		fundingIntents:   make(map[[32]byte]chanfunding.Intent),
-		quit:             make(chan struct{}),
+		Cfg:             Cfg,
+		SecretKeyRing:   Cfg.SecretKeyRing,
+		msgChan:         make(chan interface{}, msgBufferSize),
+		nextFundingID:   0,
+		fundingLimbo:    make(map[uint64]*ChannelReservation),
+		reservationIDs:  make(map[[32]byte]uint64),
+		lockedOutPoints: make(map[wire.OutPoint]struct{}),
+		fundingIntents:  make(map[[32]byte]chanfunding.Intent),
+		quit:            make(chan struct{}),
 	}, nil
 }
 
@@ -494,7 +492,7 @@ func (l *LightningWallet) Startup() error {
 	}
 
 	// Start the underlying wallet controller.
-	if err := l.Start(); err != nil {
+	if err := l.Cfg.WalletServices.Start(); err != nil {
 		return err
 	}
 
@@ -521,7 +519,7 @@ func (l *LightningWallet) Shutdown() error {
 
 	// Signal the underlying wallet controller to shutdown, waiting until
 	// all active goroutines have been shutdown.
-	if err := l.Stop(); err != nil {
+	if err := l.Cfg.WalletServices.Stop(); err != nil {
 		return err
 	}
 
@@ -539,25 +537,27 @@ func (l *LightningWallet) Shutdown() error {
 func (l *LightningWallet) PublishTransaction(tx *wire.MsgTx,
 	label string) error {
 
-	sendTxToWallet := func() error {
-		return l.WalletController.PublishTransaction(tx, label)
+	// Native publication records wallet inputs, change and the label before
+	// relay. Rebroadcasting first would make its mempool check return
+	// early.
+	err := l.Cfg.Wallet.Broadcast(context.Background(), tx, label)
+	retryable := errors.Is(err, chain.ErrMempoolMinFeeNotMet) ||
+		errors.Is(err, chain.ErrMinRelayFeeNotMet)
+	if err != nil && !retryable {
+		return err
 	}
 
 	// If we don't have rebroadcaster then we can exit early (and send only
 	// to the wallet).
 	if l.Cfg.Rebroadcaster == nil || !l.Cfg.Rebroadcaster.Started() {
-		return sendTxToWallet()
+		return err
 	}
 
-	// We pass this into the rebroadcaster first, so the initial attempt
-	// will succeed if the transaction isn't yet in the mempool. However we
-	// ignore the error here as this might be resent on start up and the
-	// transaction already exists.
+	// Channel-close callers tolerate fee rejection while waiting for a
+	// confirmation, relying on this existing queue to retry as fees change.
+	// Successful native publication is also retained until confirmation.
 	_ = l.Cfg.Rebroadcaster.Broadcast(tx)
-
-	// Then we pass things into the wallet as normal, which'll add the
-	// transaction label on disk.
-	if err := sendTxToWallet(); err != nil {
+	if err != nil {
 		return err
 	}
 
@@ -595,19 +595,31 @@ func (l *LightningWallet) PublishTransaction(tx *wire.MsgTx,
 }
 
 // ConfirmedBalance returns the current confirmed balance of a wallet account.
-// This methods wraps the internal WalletController method so we're able to
-// properly hold the coin select mutex while we compute the balance.
+// The channel funding view excludes locked and unsupported witness coins,
+// holding the coin-selection mutex while it takes the native snapshot.
 func (l *LightningWallet) ConfirmedBalance(confs int32,
 	account string) (btcutil.Amount, error) {
 
 	l.coinSelectMtx.Lock()
 	defer l.coinSelectMtx.Unlock()
 
-	return l.WalletController.ConfirmedBalance(confs, account)
+	// Channel funding counts supported witness coins. General RPC balances
+	// retain tracked payment forms without this channel-specific
+	// restriction.
+	utxos, err := l.listUnspentWitness(account, confs, math.MaxInt32)
+	if err != nil {
+		return 0, err
+	}
+	var balance btcutil.Amount
+	for _, utxo := range utxos {
+		balance += utxo.Amount
+	}
+
+	return balance, nil
 }
 
 // ListUnspentWitnessFromDefaultAccount returns all unspent outputs from the
-// default wallet account which are version 0 witness programs. The 'minConfs'
+// default wallet account which use supported witness forms. The 'minConfs'
 // and 'maxConfs' parameters indicate the minimum and maximum number of
 // confirmations an output needs in order to be returned by this method. Passing
 // -1 as 'minConfs' indicates that even unconfirmed outputs should be returned.
@@ -616,49 +628,65 @@ func (l *LightningWallet) ConfirmedBalance(confs int32,
 //
 // NOTE: This method requires the global coin selection lock to be held.
 func (l *LightningWallet) ListUnspentWitnessFromDefaultAccount(
-	minConfs, maxConfs int32) ([]*Utxo, error) {
+	minConfs, maxConfs int32) ([]*wallet.Utxo, error) {
 
-	return l.WalletController.ListUnspentWitness(
-		minConfs, maxConfs, DefaultAccountName,
+	return l.listUnspentWitness(DefaultAccountName, minConfs, maxConfs)
+}
+
+// listUnspentWitness supplies only coins Lightning can use immediately. Native
+// watch-only custody permits remote signatures, but never immature coinbases.
+func (l *LightningWallet) listUnspentWitness(account string,
+	minConfs, maxConfs int32) ([]*wallet.Utxo, error) {
+
+	// The channel fee estimator handles these witness forms; do not impose
+	// that restriction on the wallet's general UTXO or balance APIs.
+	utxos, err := l.Cfg.Wallet.ListUnspent(
+		context.Background(),
+		wallet.UtxoQuery{
+			Account:  account,
+			MinConfs: minConfs,
+			MaxConfs: maxConfs,
+		},
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	var eligible []*wallet.Utxo
+	for _, utxo := range utxos {
+		if utxo.Locked ||
+			(!utxo.Spendable && !l.Cfg.Wallet.IsWatchOnly()) ||
+			!(txscript.IsPayToWitnessPubKeyHash(utxo.PkScript) ||
+				txscript.IsPayToScriptHash(utxo.PkScript) ||
+				txscript.IsPayToTaproot(utxo.PkScript)) {
+
+			continue
+		}
+
+		// The native flag is false for all watch-only outputs,
+		// including
+		// both usable remote funds and immature mining rewards.
+		mature, err := UtxoMature(context.Background(), l.Cfg.Wallet,
+			utxo, l.Cfg.NetParams.CoinbaseMaturity)
+		if err != nil {
+			return nil, err
+		}
+		if mature {
+			eligible = append(eligible, utxo)
+		}
+	}
+
+	return eligible, nil
 }
 
 // LockedOutpoints returns a list of all currently locked outpoint.
 func (l *LightningWallet) LockedOutpoints() []*wire.OutPoint {
 	outPoints := make([]*wire.OutPoint, 0, len(l.lockedOutPoints))
 	for outPoint := range l.lockedOutPoints {
-
 		outPoints = append(outPoints, &outPoint)
 	}
 
 	return outPoints
-}
-
-// ResolveOutputLeaser returns the optional output lease capability implemented
-// by a wallet controller. It traverses wallet adapters so the result reflects
-// the concrete controller rather than a wrapper's method set.
-func ResolveOutputLeaser(wallet WalletController) (
-	OutputLeaserWithOptions, bool) {
-
-	for {
-		leaser, ok := wallet.(OutputLeaserWithOptions)
-		if ok {
-			return leaser, true
-		}
-
-		wrapper, ok := wallet.(WalletControllerWrapper)
-		if !ok {
-			return nil, false
-		}
-
-		wallet = wrapper.UnwrapWalletController()
-	}
-}
-
-// UnwrapWalletController returns the base wallet controller wrapped by the
-// Lightning-aware wallet.
-func (l *LightningWallet) UnwrapWalletController() WalletController {
-	return l.WalletController
 }
 
 // ResetReservations reset the volatile wallet state which tracks all currently
@@ -669,7 +697,11 @@ func (l *LightningWallet) ResetReservations() {
 	l.reservationIDs = make(map[[32]byte]uint64)
 
 	for outpoint := range l.lockedOutPoints {
-		_ = l.ReleaseOutput(chanfunding.LndInternalLockID, outpoint)
+		_ = l.Cfg.Wallet.ReleaseOutput(
+			context.Background(),
+			chanfunding.LndInternalLockID,
+			outpoint,
+		)
 	}
 	l.lockedOutPoints = make(map[wire.OutPoint]struct{})
 }
@@ -945,7 +977,7 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 				l, req.AllowUtxoForFunding,
 			),
 			CoinSelectLocker: l,
-			CoinLeaser:       l,
+			CoinLeaser:       l.Cfg.Wallet,
 			Signer:           l.Cfg.Signer,
 			DustLimit: DustLimitForSize(
 				input.P2WSHSize,
@@ -1024,9 +1056,19 @@ func (l *LightningWallet) handleFundingReserveRequest(req *InitFundingReserveMsg
 			SubtractFees: req.SubtractFees,
 			FeeRate:      req.FundingFeePerKw,
 			ChangeAddr: func() (address.Address, error) {
-				return l.NewAddress(
-					TaprootPubkey, true, DefaultAccountName,
+				info, err := l.Cfg.Wallet.NewAddress(
+					context.Background(),
+					wallet.NewAccountSelectorByName(
+						waddrmgr.KeyScopeBIP0086,
+						DefaultAccountName,
+					),
+					true,
 				)
+				if err != nil {
+					return nil, err
+				}
+
+				return info.Addr, nil
 			},
 			Musig2: req.CommitType.IsTaproot(),
 		}
@@ -1284,7 +1326,7 @@ func (l *LightningWallet) CheckReservedValue(in []wire.OutPoint,
 			continue
 		}
 
-		walletBalance += in.Value
+		walletBalance += in.Amount
 	}
 
 	// Now we go through the outputs of the transaction, if any of the
@@ -1301,7 +1343,10 @@ func (l *LightningWallet) CheckReservedValue(in []wire.OutPoint,
 		}
 
 		for _, addr := range addrs {
-			if !l.IsOurAddress(addr) {
+			_, err := l.Cfg.Wallet.GetAddressInfo(
+				context.Background(), addr,
+			)
+			if err != nil {
 				continue
 			}
 
@@ -1518,7 +1563,7 @@ func (l *LightningWallet) handleFundingCancelRequest(req *fundingReserveCancelMs
 	// requests.
 	for _, unusedInput := range pendingReservation.ourContribution.Inputs {
 		delete(l.lockedOutPoints, unusedInput.PreviousOutPoint)
-		_ = l.ReleaseOutput(
+		_ = l.Cfg.Wallet.ReleaseOutput(context.Background(),
 			chanfunding.LndInternalLockID,
 			unusedInput.PreviousOutPoint,
 		)
@@ -1763,7 +1808,10 @@ func (l *LightningWallet) handleContributionMsg(req *addContributionMsg) {
 			[]*input.Script, 0, len(ourContribution.Inputs),
 		)
 		for _, txIn := range fundingTx.TxIn {
-			_, err := l.FetchOutpointInfo(&txIn.PreviousOutPoint)
+			_, err := l.Cfg.Wallet.GetUtxo(
+				context.Background(),
+				txIn.PreviousOutPoint,
+			)
 			if err != nil {
 				continue
 			}
@@ -2737,11 +2785,13 @@ func (l *LightningWallet) CancelRebroadcast(txid chainhash.Hash) {
 // chanfunding.CoinSource interface.
 type CoinSource struct {
 	wallet    *LightningWallet
-	allowUtxo func(Utxo) bool
+	allowUtxo func(wallet.Utxo) bool
 }
 
 // NewCoinSource creates a new instance of the CoinSource wrapper struct.
-func NewCoinSource(w *LightningWallet, allowUtxo func(Utxo) bool) *CoinSource {
+func NewCoinSource(w *LightningWallet,
+	allowUtxo func(wallet.Utxo) bool) *CoinSource {
+
 	return &CoinSource{
 		wallet:    w,
 		allowUtxo: allowUtxo,
@@ -2775,7 +2825,7 @@ func (c *CoinSource) ListCoins(minConfs int32,
 
 		coins = append(coins, wallet.Coin{
 			TxOut: wire.TxOut{
-				Value:    int64(utxo.Value),
+				Value:    int64(utxo.Amount),
 				PkScript: utxo.PkScript,
 			},
 			OutPoint: utxo.OutPoint,
@@ -2789,14 +2839,14 @@ func (c *CoinSource) ListCoins(minConfs int32,
 // its outpoint. If the coin isn't under the control of the backing CoinSource,
 // then an error should be returned.
 func (c *CoinSource) CoinFromOutPoint(op wire.OutPoint) (*wallet.Coin, error) {
-	inputInfo, err := c.wallet.FetchOutpointInfo(&op)
+	inputInfo, err := c.wallet.Cfg.Wallet.GetUtxo(context.Background(), op)
 	if err != nil {
 		return nil, err
 	}
 
 	return &wallet.Coin{
 		TxOut: wire.TxOut{
-			Value:    int64(inputInfo.Value),
+			Value:    int64(inputInfo.Amount),
 			PkScript: inputInfo.PkScript,
 		},
 		OutPoint: inputInfo.OutPoint,
@@ -2867,7 +2917,7 @@ func ValidateUpfrontShutdown(shutdown lnwire.DeliveryAddress,
 // WalletPrevOutputFetcher is a txscript.PrevOutputFetcher that can fetch
 // outputs from a given wallet controller.
 type WalletPrevOutputFetcher struct {
-	wc WalletController
+	wc wallet.TxReader
 }
 
 // A compile time assertion that WalletPrevOutputFetcher implements the
@@ -2876,7 +2926,7 @@ var _ txscript.PrevOutputFetcher = (*WalletPrevOutputFetcher)(nil)
 
 // NewWalletPrevOutputFetcher creates a new WalletPrevOutputFetcher that fetches
 // previous outputs from the given wallet controller.
-func NewWalletPrevOutputFetcher(wc WalletController) *WalletPrevOutputFetcher {
+func NewWalletPrevOutputFetcher(wc wallet.TxReader) *WalletPrevOutputFetcher {
 	return &WalletPrevOutputFetcher{
 		wc: wc,
 	}
@@ -2885,14 +2935,82 @@ func NewWalletPrevOutputFetcher(wc WalletController) *WalletPrevOutputFetcher {
 // FetchPrevOutput attempts to fetch the previous output referenced by the
 // passed outpoint. A nil value will be returned if the passed outpoint doesn't
 // exist.
-func (w *WalletPrevOutputFetcher) FetchPrevOutput(op wire.OutPoint) *wire.TxOut {
-	utxo, err := w.wc.FetchOutpointInfo(&op)
+func (w *WalletPrevOutputFetcher) FetchPrevOutput(
+	op wire.OutPoint,
+) *wire.TxOut {
+	// Signing may reference an already spent wallet output, so resolve its
+	// stored transaction rather than restricting lookup to the UTXO set.
+	detail, err := w.wc.GetTx(context.Background(), op.Hash)
 	if err != nil {
 		return nil
 	}
-
-	return &wire.TxOut{
-		Value:    int64(utxo.Value),
-		PkScript: utxo.PkScript,
+	for _, output := range detail.Outputs {
+		if output.Index == int(op.Index) {
+			return &wire.TxOut{
+				Value: int64(
+					output.Amount,
+				),
+				PkScript: output.PkScript,
+			}
+		}
 	}
+
+	return nil
+}
+
+// RequiredReserve keeps anchor fee-bumping funds for current public channels.
+func (l *LightningWallet) RequiredReserve(
+	numAnchorChans uint32) btcutil.Amount {
+
+	// Cap the per-channel reserve so large nodes do not immobilize funds in
+	// proportion to every channel's simultaneous worst case.
+	return min(btcutil.Amount(numAnchorChans)*AnchorChanReservedValue,
+		MaxAnchorChanReservedValue)
+}
+
+// SendOutputs composes native authoring with the configured Lightning signer.
+// The same flow works for local keys and remote watch-only signing.
+func (l *LightningWallet) SendOutputs(ctx context.Context,
+	intent *wallet.TxIntent) (*wire.MsgTx, error) {
+
+	// Wallet selects inputs and registers change; signer selection remains
+	// an lnd deployment concern, so signing never bypasses the remote key
+	// ring.
+	authored, err := l.Cfg.Wallet.CreateTransaction(ctx, intent)
+	if err != nil {
+		return nil, err
+	}
+	fetcher := txscript.NewMultiPrevOutFetcher(nil)
+	for i, txIn := range authored.Tx.TxIn {
+		fetcher.AddPrevOut(txIn.PreviousOutPoint, &wire.TxOut{
+			Value:    int64(authored.PrevInputValues[i]),
+			PkScript: authored.PrevScripts[i],
+		})
+	}
+	sigHashes := txscript.NewTxSigHashes(authored.Tx, fetcher)
+	for i, txIn := range authored.Tx.TxIn {
+		output := fetcher.FetchPrevOutput(txIn.PreviousOutPoint)
+		hashType := txscript.SigHashAll
+		if txscript.IsPayToTaproot(output.PkScript) {
+			hashType = txscript.SigHashDefault
+		}
+		script, err := l.Cfg.Signer.ComputeInputScript(authored.Tx,
+			&input.SignDescriptor{
+				Output:            output,
+				InputIndex:        i,
+				HashType:          hashType,
+				SigHashes:         sigHashes,
+				PrevOutputFetcher: fetcher,
+			})
+		if err != nil {
+			return nil, err
+		}
+		txIn.Witness = script.Witness
+		txIn.SignatureScript = script.SigScript
+	}
+	if err := l.PublishTransaction(authored.Tx, intent.Label); err != nil {
+		return nil, err
+	}
+
+	return authored.Tx, nil
 }

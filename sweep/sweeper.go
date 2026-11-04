@@ -1,6 +1,8 @@
 package sweep
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -9,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/fn/v2"
@@ -462,13 +465,25 @@ func New(cfg *UtxoSweeperConfig) *UtxoSweeper {
 	return s
 }
 
-// Start starts the process of constructing and publish sweep txes.
+// Start subscribes to committed wallet observations before constructing and
+// publishing sweep transactions. A subscription failure leaves Start retryable.
 func (s *UtxoSweeper) Start(beat chainio.Blockbeat) error {
 	if !atomic.CompareAndSwapUint32(&s.started, 0, 1) {
 		return nil
 	}
 
 	log.Info("Sweeper starting")
+
+	// The chain notifier can deliver a block before the wallet commits its
+	// credits. Register first so the collector can retry once they exist.
+	walletEvents, cancel, err := s.cfg.Wallet.SubscribeTxns(
+		context.Background(),
+	)
+	if err != nil {
+		atomic.StoreUint32(&s.started, 0)
+
+		return fmt.Errorf("subscribe to wallet transactions: %w", err)
+	}
 
 	// Retrieve relay fee for dust limit calculation. Assume that this will
 	// not change from here on.
@@ -479,7 +494,7 @@ func (s *UtxoSweeper) Start(beat chainio.Blockbeat) error {
 
 	// Start sweeper main loop.
 	s.wg.Add(1)
-	go s.collector()
+	go s.collector(walletEvents, cancel)
 
 	return nil
 }
@@ -585,26 +600,39 @@ func (s *UtxoSweeper) removeConflictSweepDescendants(
 		return err
 	}
 
-	// We'll now go through each past transaction we published during this
-	// epoch and cross reference the spent inputs. If there're any inputs
-	// in common with the inputs the spendingTx spent, then we'll remove
-	// those.
+	// Read the snapshots before deleting any branch. Native deletion also
+	// releases its input claims, so a competing live sweep must first
+	// protect any wallet fee coins that it still uses.
 	//
 	// TODO(roasbeef): need to start to remove all transaction hashes after
 	// every N blocks (assumed point of no return)
+	var conflictingTxs []*wire.MsgTx
+	protectedCoins := make(map[wire.OutPoint]struct{})
 	for _, sweepHash := range pastSweepHashes {
-		sweepTx, err := s.cfg.Wallet.FetchTx(sweepHash)
-		if err != nil {
+		detail, err := s.cfg.Wallet.GetTx(
+			context.Background(),
+			sweepHash,
+		)
+		if err != nil && !errors.Is(err, base.ErrTxNotFound) {
 			return err
 		}
 
-		// Transaction wasn't found in the wallet, may have already
-		// been replaced/removed.
-		if sweepTx == nil {
+		// A previously removed transaction needs no further deletion,
+		// but the application rebroadcaster must stop retrying it.
+		if errors.Is(err, base.ErrTxNotFound) {
 			// If it was removed, then we'll play it safe and mark
 			// it as no longer need to be rebroadcasted.
 			s.cfg.Wallet.CancelRebroadcast(sweepHash)
 			continue
+		}
+
+		// Decode the native history snapshot only for existing conflict
+		// checks.
+		sweepTx := wire.NewMsgTx(2)
+		if err := sweepTx.Deserialize(
+			bytes.NewReader(detail.RawTx),
+		); err != nil {
+			return err
 		}
 
 		// Check to see if this past sweep transaction spent any of the
@@ -617,19 +645,67 @@ func (s *UtxoSweeper) removeConflictSweepDescendants(
 			}
 		}
 
-		if !isConflicting {
+		if isConflicting {
+			conflictingTxs = append(conflictingTxs, sweepTx)
 			continue
 		}
 
-		// If it is conflicting, then we'll signal the wallet to remove
-		// all the transactions that are descendants of outputs created
-		// by the sweepTx and the sweepTx itself.
-		log.Debugf("Removing sweep txid=%v from wallet: %v",
-			sweepTx.TxHash(), lnutils.SpewLogClosure(sweepTx))
+		// A replaced native record can still be monitored by lnd when
+		// Neutrino cannot identify the relayed conflicting spend.
+		// Existing input lifecycle state identifies sweeps whose fee
+		// claims must remain intact, regardless of that native status.
+		if detail.Block != nil {
+			continue
+		}
 
-		err = s.cfg.Wallet.RemoveDescendants(sweepTx)
-		if err != nil {
-			log.Warnf("Unable to remove descendants: %v", err)
+		var monitored bool
+		for _, txIn := range sweepTx.TxIn {
+			inp, ok := s.inputs[txIn.PreviousOutPoint]
+			if ok && !inp.terminated() {
+				monitored = true
+				break
+			}
+		}
+
+		if !monitored {
+			continue
+		}
+
+		// Only native ownership metadata can protect a wallet fee
+		// claim; an external sweep input does not reserve wallet coins.
+		for _, prevOut := range detail.PrevOuts {
+			if prevOut.IsOurs {
+				protectedCoins[prevOut.OutPoint] = struct{}{}
+			}
+		}
+	}
+
+	// Defer destructive cleanup while a live sweep shares a wallet input.
+	// Otherwise a new sweep could select that fee coin and conflict with
+	// the transaction lnd is still fee-bumping. Normal publication and
+	// confirmation reconcile the retained native transaction history.
+	for _, sweepTx := range conflictingTxs {
+		sweepHash := sweepTx.TxHash()
+
+		var sharedFee bool
+		for _, txIn := range sweepTx.TxIn {
+			if _, ok := protectedCoins[txIn.PreviousOutPoint]; ok {
+				sharedFee = true
+				break
+			}
+		}
+
+		if !sharedFee {
+			log.Debugf("Removing sweep txid=%v from wallet: %v",
+				sweepHash, lnutils.SpewLogClosure(sweepTx))
+
+			err = s.cfg.Wallet.DeleteUnconfirmedTx(
+				context.Background(), sweepHash,
+			)
+			if err != nil {
+				log.Warnf("Unable to remove descendants: %v",
+					err)
+			}
 		}
 
 		// If this transaction was conflicting, then we'll stop
@@ -640,10 +716,16 @@ func (s *UtxoSweeper) removeConflictSweepDescendants(
 	return nil
 }
 
-// collector is the sweeper main loop. It processes new inputs, spend
-// notifications and counts down to publication of the sweep tx.
-func (s *UtxoSweeper) collector() {
+// collector processes inputs, spends and committed wallet observations. It owns
+// the wallet subscription until shutdown and retries sweeps using blockbeat
+// height even when a wallet confirmation arrives independently.
+func (s *UtxoSweeper) collector(walletEvents <-chan *base.TxEvent,
+	cancel func()) {
+
 	defer s.wg.Done()
+
+	// Stop waits for subscription cancellation as well as collector exit.
+	defer cancel()
 
 	for {
 		// Clean inputs, which will remove inputs that are swept,
@@ -675,7 +757,7 @@ func (s *UtxoSweeper) collector() {
 			// sweeper.
 			if input.params.Immediate {
 				inputs := s.updateSweeperInputs()
-				s.sweepPendingInputs(inputs)
+				s.sweepPendingInputs(inputs, false)
 			}
 
 		// A spend of one of our inputs is detected. Signal sweep
@@ -700,7 +782,7 @@ func (s *UtxoSweeper) collector() {
 			// Perform an sweep immediately if asked.
 			if req.params.Immediate {
 				inputs := s.updateSweeperInputs()
-				s.sweepPendingInputs(inputs)
+				s.sweepPendingInputs(inputs, false)
 			}
 
 		case resp := <-s.bumpRespChan:
@@ -709,6 +791,26 @@ func (s *UtxoSweeper) collector() {
 			if err != nil {
 				log.Errorf("Failed to handle bump event: %v",
 					err)
+			}
+
+		case event, ok := <-walletEvents:
+			// A closed stream must not spin; blockbeats still retry
+			// pending inputs through the existing path.
+			if !ok {
+				walletEvents = nil
+
+				continue
+			}
+
+			// Confirmed observations are best-effort wakeup hints.
+			// Re-read funds without adopting the event's height;
+			// unconfirmed transactions do not trigger a retry.
+			if event.Detail.Block != nil {
+				inputs := s.updateSweeperInputs()
+
+				// The publisher may have processed this block
+				// already; broadcast without another block.
+				s.sweepPendingInputs(inputs, true)
 			}
 
 		// A new block comes in, update the bestHeight, perform a check
@@ -728,7 +830,7 @@ func (s *UtxoSweeper) collector() {
 				}))
 
 			// Attempt to sweep any pending inputs.
-			s.sweepPendingInputs(inputs)
+			s.sweepPendingInputs(inputs, false)
 
 			// Notify we've processed the block.
 			s.NotifyBlockProcessed(beat, nil)
@@ -829,7 +931,8 @@ func (s *UtxoSweeper) signalResult(pi *SweeperInput, result Result) {
 
 // sweep takes a set of preselected inputs, creates a sweep tx and publishes
 // the tx. The output address is only marked as used if the publish succeeds.
-func (s *UtxoSweeper) sweep(set InputSet) error {
+// immediate requests initial publication without waiting for another blockbeat.
+func (s *UtxoSweeper) sweep(set InputSet, immediate bool) error {
 	// Generate an output script if there isn't an unused script available.
 	if s.currentOutputScript.IsNone() {
 		addr, err := s.cfg.GenSweepScript().Unpack()
@@ -859,7 +962,7 @@ func (s *UtxoSweeper) sweep(set InputSet) error {
 		DeliveryAddress: sweepAddr,
 		MaxFeeRate:      s.cfg.MaxFeeRate.FeePerKWeight(),
 		StartingFeeRate: set.StartingFeeRate(),
-		Immediate:       set.Immediate(),
+		Immediate:       set.Immediate() || immediate,
 		// TODO(yy): pass the strategy here.
 	}
 
@@ -1162,7 +1265,7 @@ func (s *UtxoSweeper) handleUpdateReq(req *updateReq) (
 	// sweeping transaction.
 	sweeperInput, ok := s.inputs[req.input]
 	if !ok {
-		return nil, lnwallet.ErrNotMine
+		return nil, base.ErrUnknownOutput
 	}
 
 	// Create the updated parameters struct. Leave the exclusive group
@@ -1578,9 +1681,10 @@ func (s *UtxoSweeper) updateSweeperInputs() InputsMap {
 	return inputs
 }
 
-// sweepPendingInputs is called when the ticker fires. It will create clusters
-// and attempt to create and publish the sweeping transactions.
-func (s *UtxoSweeper) sweepPendingInputs(inputs InputsMap) {
+// sweepPendingInputs clusters eligible inputs and requests publication.
+// immediate retries after committed wallet credit without waiting for the
+// publisher's next blockbeat; otherwise the input set's policy is preserved.
+func (s *UtxoSweeper) sweepPendingInputs(inputs InputsMap, immediate bool) {
 	log.Debugf("Sweeping %v inputs", len(inputs))
 
 	// Cluster all of our inputs based on the specific Aggregator.
@@ -1598,7 +1702,7 @@ func (s *UtxoSweeper) sweepPendingInputs(inputs InputsMap) {
 			}
 
 			// Create sweeping transaction for each set.
-			err = s.sweep(set)
+			err = s.sweep(set, immediate)
 			if err != nil {
 				return err
 			}
@@ -1615,7 +1719,7 @@ func (s *UtxoSweeper) sweepPendingInputs(inputs InputsMap) {
 		} else {
 			// Sweep the set of inputs that don't need the wallet
 			// inputs.
-			err = s.sweep(set)
+			err = s.sweep(set, immediate)
 		}
 
 		if err != nil {
@@ -2027,5 +2131,5 @@ func (s *UtxoSweeper) handleBumpEventTxUnknownSpend(r *bumpResp) {
 	// now be swept with the updated StartingFeeRate immediately. We may
 	// also include more inputs in the new sweeping tx if new ones with the
 	// same deadline are offered.
-	s.sweepPendingInputs(inputs)
+	s.sweepPendingInputs(inputs, false)
 }

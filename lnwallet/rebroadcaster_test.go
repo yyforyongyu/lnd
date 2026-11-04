@@ -1,16 +1,98 @@
 package lnwallet
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/lnutils"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+// TestPublishTransactionOrdering preserves native recording before relay and
+// keeps retryable channel-close transactions in the existing rebroadcast queue.
+func TestPublishTransactionOrdering(t *testing.T) {
+	t.Parallel()
+	fatalErr := errors.New("wallet record failed")
+	testCases := []struct {
+		name      string
+		nativeErr error
+		queued    bool
+	}{
+		{
+			name:   "native label recorded first",
+			queued: true,
+		},
+		{
+			name:      "mempool fee rejection retained",
+			nativeErr: chain.ErrMempoolMinFeeNotMet,
+			queued:    true,
+		},
+		{
+			name:      "relay fee rejection retained",
+			nativeErr: chain.ErrMinRelayFeeNotMet,
+			queued:    true,
+		},
+		{
+			name:      "fatal wallet failure",
+			nativeErr: fatalErr,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange the existing active broadcaster and a strict
+			// native publication expectation carrying the caller's
+			// label. It must observe an empty rebroadcast queue.
+			rb := newMockRebroadcaster(false)
+			rb.started.Store(true)
+			w := &mockWalletController{}
+			t.Cleanup(func() { w.AssertExpectations(t) })
+			tx := wire.NewMsgTx(2)
+			tx.AddTxOut(&wire.TxOut{})
+			w.On("Broadcast", mock.Anything, tx, "channel close").
+				Run(func(mock.Arguments) {
+					require.Empty(t, rb.rebroadcastAttempt)
+				}).Return(tc.nativeErr).Once()
+			notifier := &mockChainNotifier{
+				ConfChan: make(chan *chainntnfs.TxConfirmation),
+			}
+			lw := &LightningWallet{
+				Cfg: Config{
+					Wallet:        w,
+					Rebroadcaster: rb,
+					ChainIO:       &mockChainIO{},
+					Notifier:      notifier,
+				},
+				quit: make(chan struct{}),
+			}
+			t.Cleanup(func() { close(lw.quit) })
+
+			// Act through the application publisher. Its existing
+			// success tracker exits when cleanup closes quit.
+			err := lw.PublishTransaction(tx, "channel close")
+
+			// Assert native errors retain identity, retryable fees
+			// keep their retry, and fatal failures never enter
+			// relay.
+			if tc.nativeErr != nil {
+				require.ErrorIs(t, err, tc.nativeErr)
+			} else {
+				require.NoError(t, err)
+			}
+			if tc.queued {
+				require.Len(t, rb.rebroadcastAttempt, 1)
+			} else {
+				require.Empty(t, rb.rebroadcastAttempt)
+			}
+		})
+	}
+}
 
 type mockRebroadcaster struct {
 	started atomic.Bool
@@ -118,6 +200,17 @@ func TestWalletRebroadcaster(t *testing.T) {
 	walletController := &mockWalletController{
 		PublishedTransactions: make(chan *wire.MsgTx, 1),
 	}
+	// Arrange exactly three application lifetimes/publications, one per
+	// exercised rebroadcaster configuration; existing channel assertions
+	// inspect native publication through the existing channel.
+	walletController.On("Start").Return(nil).Times(3)
+	walletController.On("Stop").Return(nil).Times(3)
+	walletController.On("Broadcast", mock.Anything, mock.Anything, "").
+		Run(func(args mock.Arguments) {
+			tx, _ := args.Get(1).(*wire.MsgTx)
+			walletController.PublishedTransactions <- tx
+		}).Return(nil).Times(3)
+	t.Cleanup(func() { walletController.AssertExpectations(t) })
 	chainIO := &mockChainIO{}
 	notifier := &mockChainNotifier{
 		SpendChan: make(chan *chainntnfs.SpendDetail, 1),
@@ -125,10 +218,11 @@ func TestWalletRebroadcaster(t *testing.T) {
 		ConfChan:  make(chan *chainntnfs.TxConfirmation, 1),
 	}
 	cfg := &Config{
-		Rebroadcaster:    rebroadcaster,
-		WalletController: walletController,
-		Notifier:         notifier,
-		ChainIO:          chainIO,
+		Rebroadcaster:  rebroadcaster,
+		Wallet:         walletController,
+		WalletServices: walletController,
+		Notifier:       notifier,
+		ChainIO:        chainIO,
 	}
 
 	t.Run("rebroadcast bypass", func(t *testing.T) {

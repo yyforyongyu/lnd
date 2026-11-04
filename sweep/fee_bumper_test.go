@@ -449,9 +449,10 @@ func TestCreateAndCheckTx(t *testing.T) {
 
 	// Mock the wallet to fail on testmempoolaccept on the first call, and
 	// succeed on the second.
-	m.wallet.On("CheckMempoolAcceptance",
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
 		mock.Anything).Return(errDummy).Once()
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
+		mock.Anything).Return(nil).Once()
 
 	// Mock the signer to always return a valid script.
 	//
@@ -565,8 +566,13 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 			name: "success case",
 			setupMock: func() {
 				// Mock the testmempoolaccept to pass.
-				m.wallet.On("CheckMempoolAcceptance",
-					mock.Anything).Return(nil).Once()
+				m.wallet.On(
+					"CheckMempoolAcceptance",
+					mock.Anything,
+					mock.Anything,
+				).
+					Return(nil).
+					Once()
 			},
 			expectedErr: nil,
 		},
@@ -576,8 +582,13 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 			name: "non-fee related testmempoolaccept fail",
 			setupMock: func() {
 				// Mock the testmempoolaccept to fail.
-				m.wallet.On("CheckMempoolAcceptance",
-					mock.Anything).Return(errDummy).Once()
+				m.wallet.On(
+					"CheckMempoolAcceptance",
+					mock.Anything,
+					mock.Anything,
+				).
+					Return(errDummy).
+					Once()
 			},
 			expectedErr: errDummy,
 		},
@@ -587,9 +598,14 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 			name: "fail on increase fee",
 			setupMock: func() {
 				// Mock the testmempoolaccept to fail on fee.
-				m.wallet.On("CheckMempoolAcceptance",
-					mock.Anything).Return(
-					lnwallet.ErrMempoolFee).Once()
+				m.wallet.On(
+					"CheckMempoolAcceptance",
+					mock.Anything,
+					mock.Anything,
+				).
+					Return(
+						chain.ErrMempoolMinFeeNotMet).
+					Once()
 
 				// Mock the fee function to return an error.
 				m.feeFunc.On("Increment").Return(
@@ -604,9 +620,14 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 			setupMock: func() {
 				// Mock the testmempoolaccept to fail on fee
 				// for the first call.
-				m.wallet.On("CheckMempoolAcceptance",
-					mock.Anything).Return(
-					lnwallet.ErrMempoolFee).Once()
+				m.wallet.On(
+					"CheckMempoolAcceptance",
+					mock.Anything,
+					mock.Anything,
+				).
+					Return(
+						chain.ErrMempoolMinFeeNotMet).
+					Once()
 
 				// Mock the fee function to increase feerate.
 				m.feeFunc.On("Increment").Return(
@@ -614,8 +635,13 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 
 				// Mock the testmempoolaccept to pass on the
 				// second call.
-				m.wallet.On("CheckMempoolAcceptance",
-					mock.Anything).Return(nil).Once()
+				m.wallet.On(
+					"CheckMempoolAcceptance",
+					mock.Anything,
+					mock.Anything,
+				).
+					Return(nil).
+					Once()
 			},
 			expectedErr: nil,
 		},
@@ -626,9 +652,14 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 			setupMock: func() {
 				// Mock the testmempoolaccept to fail on fee
 				// for the first call.
-				m.wallet.On("CheckMempoolAcceptance",
-					mock.Anything).Return(
-					chain.ErrInsufficientFee).Once()
+				m.wallet.On(
+					"CheckMempoolAcceptance",
+					mock.Anything,
+					mock.Anything,
+				).
+					Return(
+						chain.ErrInsufficientFee).
+					Once()
 
 				// Mock the fee function to increase feerate.
 				m.feeFunc.On("Increment").Return(
@@ -636,8 +667,13 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 
 				// Mock the testmempoolaccept to pass on the
 				// second call.
-				m.wallet.On("CheckMempoolAcceptance",
-					mock.Anything).Return(nil).Once()
+				m.wallet.On(
+					"CheckMempoolAcceptance",
+					mock.Anything,
+					mock.Anything,
+				).
+					Return(nil).
+					Once()
 			},
 			expectedErr: nil,
 		},
@@ -648,9 +684,14 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 			setupMock: func() {
 				// Mock the testmempoolaccept to fail on fee
 				// for the first call.
-				m.wallet.On("CheckMempoolAcceptance",
-					mock.Anything).Return(
-					chain.ErrInsufficientFee).Once()
+				m.wallet.On(
+					"CheckMempoolAcceptance",
+					mock.Anything,
+					mock.Anything,
+				).
+					Return(
+						chain.ErrInsufficientFee).
+					Once()
 
 				// Mock the fee function to NOT increase
 				// feerate on the first round.
@@ -663,8 +704,13 @@ func TestCreateRBFCompliantTx(t *testing.T) {
 
 				// Mock the testmempoolaccept to pass on the
 				// second call.
-				m.wallet.On("CheckMempoolAcceptance",
-					mock.Anything).Return(nil).Once()
+				m.wallet.On(
+					"CheckMempoolAcceptance",
+					mock.Anything,
+					mock.Anything,
+				).
+					Return(nil).
+					Once()
 			},
 			expectedErr: nil,
 		},
@@ -1169,8 +1215,8 @@ func TestCreateAndPublishFail(t *testing.T) {
 
 	// Mock the testmempoolaccept to return a fee related error that should
 	// be ignored.
-	m.wallet.On("CheckMempoolAcceptance",
-		mock.Anything).Return(lnwallet.ErrMempoolFee).Once()
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
+		mock.Anything).Return(chain.ErrMempoolMinFeeNotMet).Once()
 
 	// Call the createAndPublish method and expect a none option.
 	resultOpt = tp.createAndPublishTx(record)
@@ -1178,7 +1224,7 @@ func TestCreateAndPublishFail(t *testing.T) {
 
 	// Mock the testmempoolaccept to return a fee related error that should
 	// be ignored.
-	m.wallet.On("CheckMempoolAcceptance",
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
 		mock.Anything).Return(chain.ErrInsufficientFee).Once()
 
 	// Call the createAndPublish method and expect a none option.
@@ -1220,7 +1266,8 @@ func TestCreateAndPublishSuccess(t *testing.T) {
 		mock.Anything).Return(script, nil)
 
 	// Mock the testmempoolaccept to return nil.
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil)
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
+		mock.Anything).Return(nil)
 
 	// Mock the wallet to publish and return an error.
 	m.wallet.On("PublishTransaction",
@@ -1447,7 +1494,8 @@ func TestHandleFeeBumpTx(t *testing.T) {
 		mock.Anything).Return(script, nil)
 
 	// Mock the testmempoolaccept to return nil.
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil)
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
+		mock.Anything).Return(nil)
 
 	// Mock the wallet to publish successfully.
 	m.wallet.On("PublishTransaction",
@@ -1524,7 +1572,8 @@ func TestProcessRecordsInitial(t *testing.T) {
 		mock.Anything).Return(&input.Script{}, nil).Once()
 
 	// Mock the testmempoolaccept to return nil.
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
+		mock.Anything).Return(nil).Once()
 
 	// Mock the wallet to publish successfully.
 	m.wallet.On("PublishTransaction",
@@ -1656,7 +1705,8 @@ func TestProcessRecordsFeeBump(t *testing.T) {
 		mock.Anything).Return(&input.Script{}, nil).Once()
 
 	// Mock the testmempoolaccept to return nil.
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
+		mock.Anything).Return(nil).Once()
 
 	// Mock the wallet to publish successfully.
 	m.wallet.On("PublishTransaction",
@@ -1832,7 +1882,8 @@ func TestHandleInitialBroadcastSuccess(t *testing.T) {
 		mock.Anything).Return(script, nil)
 
 	// Mock the testmempoolaccept to pass.
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
+		mock.Anything).Return(nil).Once()
 
 	// Mock the wallet to publish successfully.
 	m.wallet.On("PublishTransaction",
@@ -1918,7 +1969,7 @@ func TestHandleInitialBroadcastFail(t *testing.T) {
 		mock.Anything).Return(script, nil)
 
 	// Mock the testmempoolaccept to return an error.
-	m.wallet.On("CheckMempoolAcceptance",
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
 		mock.Anything).Return(errDummy).Once()
 
 	// Register the testing record use `Broadcast`.
@@ -1948,7 +1999,8 @@ func TestHandleInitialBroadcastFail(t *testing.T) {
 	require.Equal(t, 0, tp.subscriberChans.Len())
 
 	// Mock the testmempoolaccept again, this time it passes.
-	m.wallet.On("CheckMempoolAcceptance", mock.Anything).Return(nil).Once()
+	m.wallet.On("CheckMempoolAcceptance", mock.Anything,
+		mock.Anything).Return(nil).Once()
 
 	// Mock the wallet to fail on publish.
 	m.wallet.On("PublishTransaction",

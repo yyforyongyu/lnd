@@ -92,10 +92,19 @@ var _ chainntnfs.MempoolWatcher = (*BitcoindNotifier)(nil)
 func New(chainConn *chain.BitcoindConn, chainParams *chaincfg.Params,
 	spendHintCache chainntnfs.SpendHintCache,
 	confirmHintCache chainntnfs.ConfirmHintCache,
-	blockCache *blockcache.BlockCache) *BitcoindNotifier {
+	blockCache *blockcache.BlockCache) (*BitcoindNotifier, error) {
+
+	// Register the client before exposing a notifier so a closed connection
+	// cannot leave callers holding a notifier that will never receive
+	// events.
+	client, err := chainConn.NewBitcoindClient()
+	if err != nil {
+		return nil, err
+	}
 
 	notifier := &BitcoindNotifier{
 		chainParams: chainParams,
+		chainConn:   client,
 
 		notificationCancels:  make(chan interface{}),
 		notificationRegistry: make(chan interface{}),
@@ -111,9 +120,7 @@ func New(chainConn *chain.BitcoindConn, chainParams *chaincfg.Params,
 		quit: make(chan struct{}),
 	}
 
-	notifier.chainConn = chainConn.NewBitcoindClient()
-
-	return notifier
+	return notifier, nil
 }
 
 // Start connects to the running bitcoind node over websockets, registers for

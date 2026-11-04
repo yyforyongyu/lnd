@@ -1189,6 +1189,10 @@ message ListUnspentResponse {
 - `p2wkh`: Pay to witness key hash (`WITNESS_PUBKEY_HASH` = 0)
 - `np2wkh`: Pay to nested witness key hash (`NESTED_PUBKEY_HASH` = 1)
 - `p2tr`: Pay to taproot pubkey (`TAPROOT_PUBKEY` = 4)
+
+Ordinary variants allocate a fresh address. UNUSED variants use the wallet's
+receiving-address policy: SQL reuses the oldest unused child in the selected
+account, while kvdb allocates the next child on each call.
 */
 enum AddressType {
     WITNESS_PUBKEY_HASH = 0;
@@ -1200,17 +1204,18 @@ enum AddressType {
 }
 
 message NewAddressRequest {
-    // The type of address to generate.
+    // The receiving address type and account key scope.
     AddressType type = 1;
 
     /*
-    The name of the account to generate a new address for. If empty, the
-    default wallet account is used.
+    The account name within the key scope selected by type. If empty, the
+    default wallet account is used. Ordinary address types allocate a fresh
+    address; UNUSED types may reuse an unused address under the wallet's policy.
     */
     string account = 2;
 }
 message NewAddressResponse {
-    // The newly generated wallet address
+    // The receiving address selected by the wallet.
     string address = 1;
 }
 

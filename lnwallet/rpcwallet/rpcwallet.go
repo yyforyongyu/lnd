@@ -20,14 +20,12 @@ import (
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	basewallet "github.com/btcsuite/btcwallet/wallet"
-	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
-	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -54,10 +52,11 @@ var (
 // local watch-only wallet for keeping track of addresses and transactions but
 // delegates any signing or ECDH operations to a remote node through RPC.
 type RPCKeyRing struct {
-	// WalletController is the embedded wallet controller of the watch-only
-	// base wallet. We need to overwrite/shadow certain of the implemented
-	// methods to make sure we can mirror them to the remote wallet.
-	lnwallet.WalletController
+	// WalletServices keeps local Manager ownership and remote readiness.
+	lnwallet.WalletServices
+
+	// wallet is the same borrowed watch-only Wallet used by data callers.
+	wallet lnwallet.WalletAPI
 
 	watchOnlyKeyRing keychain.SecretKeyRing
 
@@ -71,117 +70,25 @@ type RPCKeyRing struct {
 var _ keychain.SecretKeyRing = (*RPCKeyRing)(nil)
 var _ input.Signer = (*RPCKeyRing)(nil)
 var _ keychain.MessageSignerRing = (*RPCKeyRing)(nil)
-var _ lnwallet.WalletController = (*RPCKeyRing)(nil)
-
-// UnwrapWalletController returns the watch-only wallet controller wrapped by
-// the remote-signing adapter.
-func (r *RPCKeyRing) UnwrapWalletController() lnwallet.WalletController {
-	return r.WalletController
-}
+var _ lnwallet.WalletServices = (*RPCKeyRing)(nil)
 
 // NewRPCKeyRing creates a new remote signing secret key ring that uses the
 // given watch-only base wallet to keep track of addresses and transactions but
 // delegates any signing or ECDH operations to the remove signer through RPC.
 func NewRPCKeyRing(watchOnlyKeyRing keychain.SecretKeyRing,
-	watchOnlyWalletController lnwallet.WalletController,
+	watchOnlyWallet lnwallet.WalletAPI,
+	services lnwallet.WalletServices,
 	remoteSignerConn RemoteSignerConnection,
 	netParams *chaincfg.Params) (*RPCKeyRing, error) {
 
 	return &RPCKeyRing{
-		WalletController: watchOnlyWalletController,
+		WalletServices:   services,
+		wallet:           watchOnlyWallet,
 		watchOnlyKeyRing: watchOnlyKeyRing,
 		netParams:        netParams,
 		rpcTimeout:       remoteSignerConn.RequestTimeout(),
 		remoteSignerConn: remoteSignerConn,
 	}, nil
-}
-
-// NewAddress returns the next external or internal address for the
-// wallet dictated by the value of the `change` parameter. If change is
-// true, then an internal address should be used, otherwise an external
-// address should be returned. The type of address returned is dictated
-// by the wallet's capabilities, and may be of type: p2sh, p2wkh,
-// p2wsh, etc. The account parameter must be non-empty as it determines
-// which account the address should be generated from.
-func (r *RPCKeyRing) NewAddress(addrType lnwallet.AddressType, change bool,
-	account string) (address.Address, error) {
-
-	return r.WalletController.NewAddress(addrType, change, account)
-}
-
-// SendOutputs funds, signs, and broadcasts a Bitcoin transaction paying out to
-// the specified outputs. In the case the wallet has insufficient funds, or the
-// outputs are non-standard, a non-nil error will be returned.
-//
-// NOTE: This method requires the global coin selection lock to be held.
-//
-// NOTE: This is a part of the WalletController interface.
-//
-// NOTE: This method only signs with BIP49/84 keys.
-func (r *RPCKeyRing) SendOutputs(inputs fn.Set[wire.OutPoint],
-	outputs []*wire.TxOut, feeRate chainfee.SatPerKWeight,
-	minConfs int32, label string,
-	strategy basewallet.CoinSelectionStrategy) (*wire.MsgTx, error) {
-
-	tx, err := r.WalletController.SendOutputs(
-		inputs, outputs, feeRate, minConfs, label, strategy,
-	)
-	if err != nil && err != basewallet.ErrTxUnsigned {
-		return nil, err
-	}
-	if err == nil {
-		// This shouldn't happen since our wallet controller is watch-
-		// only and can't sign the TX.
-		return tx, nil
-	}
-
-	// We know at this point that we only have inputs from our own wallet.
-	// So we can just compute the input script using the remote signer.
-	outputFetcher := lnwallet.NewWalletPrevOutputFetcher(r.WalletController)
-	for i, txIn := range tx.TxIn {
-		signDesc := input.SignDescriptor{
-			HashType: txscript.SigHashAll,
-			SigHashes: txscript.NewTxSigHashes(
-				tx, outputFetcher,
-			),
-			PrevOutputFetcher: outputFetcher,
-		}
-
-		// We can only sign this input if it's ours, so we'll ask the
-		// watch-only wallet if it can map this outpoint into a coin we
-		// own. If not, then we can't continue because our wallet state
-		// is out of sync.
-		info, err := r.WalletController.FetchOutpointInfo(
-			&txIn.PreviousOutPoint,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error looking up utxo: %w", err)
-		}
-
-		if txscript.IsPayToTaproot(info.PkScript) {
-			signDesc.HashType = txscript.SigHashDefault
-		}
-
-		// Now that we know the input is ours, we'll populate the
-		// signDesc with the per input unique information.
-		signDesc.Output = &wire.TxOut{
-			Value:    int64(info.Value),
-			PkScript: info.PkScript,
-		}
-		signDesc.InputIndex = i
-
-		// Finally, we'll sign the input as is, and populate the input
-		// with the witness and sigScript (if needed).
-		inputScript, err := r.ComputeInputScript(tx, &signDesc)
-		if err != nil {
-			return nil, err
-		}
-
-		txIn.SignatureScript = inputScript.SigScript
-		txIn.Witness = inputScript.Witness
-	}
-
-	return tx, r.WalletController.PublishTransaction(tx, label)
 }
 
 // SignPsbt expects a partial transaction with all inputs and outputs fully
@@ -194,8 +101,10 @@ func (r *RPCKeyRing) SendOutputs(inputs fn.Set[wire.OutPoint],
 // perform any other tasks (such as coin selection, UTXO locking or
 // input/output/fee value validation, PSBT finalization). Any input that is
 // incomplete will be skipped.
-func (r *RPCKeyRing) SignPsbt(packet *psbt.Packet) ([]uint32, error) {
-	ctxt, cancel := context.WithTimeout(context.Background(), r.rpcTimeout)
+func (r *RPCKeyRing) SignPsbt(ctx context.Context,
+	packet *psbt.Packet) ([]uint32, error) {
+
+	ctxt, cancel := context.WithTimeout(ctx, r.rpcTimeout)
 	defer cancel()
 
 	var buf bytes.Buffer
@@ -228,155 +137,6 @@ func (r *RPCKeyRing) SignPsbt(packet *psbt.Packet) ([]uint32, error) {
 	packet.Unknowns = signedPacket.Unknowns
 
 	return resp.SignedInputs, nil
-}
-
-// CreateAccount is not supported when a remote signer is in use.
-//
-// The local wallet is watch-only, so it holds no master private key to derive
-// an account from; the promoted BtcWallet implementation would fail deep inside
-// waddrmgr with a bare "watching-only wallet". Creating the account on the
-// remote signer and importing its extended public key here (ImportAccount) is
-// the supported path, and has to be driven by the operator.
-//
-// NOTE: This is a part of the WalletController interface.
-func (r *RPCKeyRing) CreateAccount(waddrmgr.KeyScope,
-	string) (*waddrmgr.AccountProperties, error) {
-
-	return nil, ErrRemoteSigningAccountCreation
-}
-
-// FinalizePsbt expects a partial transaction with all inputs and outputs fully
-// declared and tries to sign all inputs that belong to the specified account.
-// Lnd must be the last signer of the transaction. That means, if there are any
-// unsigned non-witness inputs or inputs without UTXO information attached or
-// inputs without witness data that do not belong to lnd's wallet, this method
-// will fail. If no error is returned, the PSBT is ready to be extracted and the
-// final TX within to be broadcast.
-//
-// NOTE: This method does NOT publish the transaction after it's been
-// finalized successfully.
-//
-// NOTE: This is a part of the WalletController interface.
-//
-// NOTE: We need to overwrite this method because we need to redirect the call
-// to ComputeInputScript to the RPC key ring's implementation. If we forward
-// the call to the default WalletController implementation, we get an error
-// since that wallet is watch-only. If we forward the call to the remote signer,
-// we get an error because the signer doesn't know the UTXO information required
-// in ComputeInputScript.
-//
-// TODO(guggero): Refactor btcwallet to accept ComputeInputScript as a function
-// parameter in FinalizePsbt so we can get rid of this code duplication.
-func (r *RPCKeyRing) FinalizePsbt(packet *psbt.Packet, _ string) error {
-	// Let's check that this is actually something we can and want to sign.
-	// We need at least one input and one output. In addition each
-	// input needs nonWitness Utxo or witness Utxo data specified.
-	err := psbt.InputsReadyToSign(packet)
-	if err != nil {
-		return err
-	}
-
-	// Go through each input that doesn't have final witness data attached
-	// to it already and try to sign it. We do expect that we're the last
-	// ones to sign. If there is any input without witness data that we
-	// cannot sign because it's not our UTXO, this will be a hard failure.
-	tx := packet.UnsignedTx
-	prevOutFetcher := basewallet.PsbtPrevOutputFetcher(packet)
-	sigHashes := txscript.NewTxSigHashes(tx, prevOutFetcher)
-	for idx, txIn := range tx.TxIn {
-		in := packet.Inputs[idx]
-
-		// We can only sign if we have UTXO information available. We
-		// can just continue here as a later step will fail with a more
-		// precise error message.
-		if in.WitnessUtxo == nil && in.NonWitnessUtxo == nil {
-			continue
-		}
-
-		// Skip this input if it's got final witness data attached.
-		if len(in.FinalScriptWitness) > 0 {
-			continue
-		}
-
-		// We can only sign this input if it's ours, so we try to map it
-		// to a coin we own. If we can't, then we'll continue as it
-		// isn't our input.
-		utxo, err := r.FetchOutpointInfo(&txIn.PreviousOutPoint)
-		if err != nil {
-			continue
-		}
-		fullTx := utxo.PrevTx
-		signDesc := &input.SignDescriptor{
-			KeyDesc: keychain.KeyDescriptor{},
-			Output: &wire.TxOut{
-				Value:    int64(utxo.Value),
-				PkScript: utxo.PkScript,
-			},
-			HashType:          in.SighashType,
-			SigHashes:         sigHashes,
-			InputIndex:        idx,
-			PrevOutputFetcher: prevOutFetcher,
-		}
-
-		// Find out what UTXO we are signing. Wallets _should_ always
-		// provide the full non-witness UTXO for segwit v0.
-		var signOutput *wire.TxOut
-		if in.NonWitnessUtxo != nil {
-			prevIndex := txIn.PreviousOutPoint.Index
-			signOutput = in.NonWitnessUtxo.TxOut[prevIndex]
-
-			if !psbt.TxOutsEqual(signDesc.Output, signOutput) {
-				return fmt.Errorf("found UTXO %#v but it "+
-					"doesn't match PSBT's input %v",
-					signDesc.Output, signOutput)
-			}
-
-			if fullTx.TxHash() != txIn.PreviousOutPoint.Hash {
-				return fmt.Errorf("found UTXO tx %v but it "+
-					"doesn't match PSBT's input %v",
-					fullTx.TxHash(),
-					txIn.PreviousOutPoint.Hash)
-			}
-		}
-
-		// Fall back to witness UTXO only for older wallets.
-		if in.WitnessUtxo != nil {
-			signOutput = in.WitnessUtxo
-
-			if !psbt.TxOutsEqual(signDesc.Output, signOutput) {
-				return fmt.Errorf("found UTXO %#v but it "+
-					"doesn't match PSBT's input %v",
-					signDesc.Output, signOutput)
-			}
-		}
-
-		// Do the actual signing in ComputeInputScript which in turn
-		// will invoke the remote signer.
-		script, err := r.ComputeInputScript(tx, signDesc)
-		if err != nil {
-			return fmt.Errorf("error computing input script for "+
-				"input %d: %v", idx, err)
-		}
-
-		// Serialize the witness format from the stack representation to
-		// the wire representation.
-		var witnessBytes bytes.Buffer
-		err = psbt.WriteTxWitness(&witnessBytes, script.Witness)
-		if err != nil {
-			return fmt.Errorf("error serializing witness: %w", err)
-		}
-		packet.Inputs[idx].FinalScriptWitness = witnessBytes.Bytes()
-		packet.Inputs[idx].FinalScriptSig = script.SigScript
-	}
-
-	// Make sure the PSBT itself thinks it's finalized and ready to be
-	// broadcast.
-	err = psbt.MaybeFinalizeAll(packet)
-	if err != nil {
-		return fmt.Errorf("error finalizing PSBT: %w", err)
-	}
-
-	return nil
 }
 
 // DeriveNextKey attempts to derive the *next* key within the key family
@@ -613,17 +373,17 @@ func (r *RPCKeyRing) SignOutputRaw(tx *wire.MsgTx,
 func (r *RPCKeyRing) ComputeInputScript(tx *wire.MsgTx,
 	signDesc *input.SignDescriptor) (*input.Script, error) {
 
-	addr, witnessProgram, sigScript, err := r.WalletController.ScriptForOutput(
-		signDesc.Output,
+	info, err := r.wallet.ScriptForOutput(
+		context.Background(), *signDesc.Output,
 	)
 	if err != nil {
 		return nil, err
 	}
-	signDesc.WitnessScript = witnessProgram
+	signDesc.WitnessScript = info.WitnessProgram
 
 	// If this is a p2tr address, then it must be a BIP0086 key spend if we
 	// are coming through this path (instead of SignOutputRaw).
-	switch addr.AddrType() {
+	switch info.AddrType {
 	case waddrmgr.TaprootPubKey:
 		signDesc.SignMethod = input.TaprootKeySpendBIP0086SignMethod
 		signDesc.WitnessScript = nil
@@ -652,7 +412,7 @@ func (r *RPCKeyRing) ComputeInputScript(tx *wire.MsgTx,
 
 	// Let's give the TX to the remote instance now, so it can sign the
 	// input.
-	sig, err := r.remoteSign(tx, signDesc, witnessProgram)
+	sig, err := r.remoteSign(tx, signDesc, info.WitnessProgram)
 	if err != nil {
 		return nil, fmt.Errorf("error signing with remote instance: %w",
 			err)
@@ -664,9 +424,9 @@ func (r *RPCKeyRing) ComputeInputScript(tx *wire.MsgTx,
 	return &input.Script{
 		Witness: wire.TxWitness{
 			append(sig.Serialize(), byte(signDesc.HashType)),
-			addr.PubKey().SerializeCompressed(),
+			info.PubKey.SerializeCompressed(),
 		},
-		SigScript: sigScript,
+		SigScript: info.SigScript,
 	}, nil
 }
 
@@ -985,11 +745,16 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 	// We need to add witness information for all inputs! Otherwise, we'll
 	// have a problem when attempting to sign a taproot input!
 	populateNonSignedInputWitnessUtxos(
-		packet, tx, signDesc, r.WalletController.FetchOutpointInfo,
+		packet,
+		tx,
+		signDesc,
+		lnwallet.NewWalletPrevOutputFetcher(r.wallet),
 	)
 
 	// Catch incorrect signing input index, just in case.
-	if signDesc.InputIndex < 0 || signDesc.InputIndex >= len(packet.Inputs) {
+	if signDesc.InputIndex < 0 ||
+		signDesc.InputIndex >= len(packet.Inputs) {
+
 		return nil, fmt.Errorf("invalid input index in sign descriptor")
 	}
 	in := &packet.Inputs[signDesc.InputIndex]
@@ -1025,19 +790,25 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 				"public key %x: %v", pubKeyBytes, err)
 		}
 
-		managedAddr, err := r.AddressInfo(addr)
+		managedAddr, err := r.wallet.GetAddressInfo(
+			context.Background(),
+			addr,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("error fetching address info "+
 				"for public key %x: %v", pubKeyBytes, err)
 		}
 
-		pubKeyAddr, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
-		if !ok {
-			return nil, fmt.Errorf("address derived for public "+
-				"key %x is not a p2wkh address", pubKeyBytes)
+		// Remote signing needs the persisted origin, not an inferred
+		// account number for an imported key that happens to produce
+		// this address.
+		if managedAddr.PubKey == nil || managedAddr.Derivation == nil {
+			return nil, fmt.Errorf(
+				"address has no key derivation metadata",
+			)
 		}
-
-		scope, path, _ := pubKeyAddr.DerivationInfo()
+		path := managedAddr.Derivation
+		scope := path.KeyScope
 		if scope.Purpose != keychain.BIP0043Purpose {
 			return nil, fmt.Errorf("address derived for public "+
 				"key %x is not in custom key scope %d'",
@@ -1047,7 +818,7 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 		// We now have all the information we need to complete our key
 		// locator information.
 		signDesc.KeyDesc.KeyLocator = keychain.KeyLocator{
-			Family: keychain.KeyFamily(path.InternalAccount),
+			Family: keychain.KeyFamily(path.Account),
 			Index:  path.Index,
 		}
 
@@ -1073,26 +844,39 @@ func (r *RPCKeyRing) remoteSign(tx *wire.MsgTx, signDesc *input.SignDescriptor,
 	// Make sure we actually know about the input. We either have been
 	// watching the UTXO on-chain or we have been given all the required
 	// info in the sign descriptor.
-	info, err := r.WalletController.FetchOutpointInfo(
-		&txIn.PreviousOutPoint,
+	// Stored parent transactions remain available after an output is spent;
+	// key origins come directly from the maintained address API.
+	detail, err := r.wallet.GetTx(
+		context.Background(),
+		txIn.PreviousOutPoint.Hash,
 	)
-
-	// If the wallet is aware of this outpoint, we go ahead and fetch the
-	// derivation info.
+	var parent *wire.MsgTx
+	var output *wire.TxOut
 	if err == nil {
-		derivation, err = r.WalletController.FetchDerivationInfo(
-			info.PkScript,
+		parent = wire.NewMsgTx(2)
+		err = parent.Deserialize(bytes.NewReader(detail.RawTx))
+	}
+	if err == nil && int(txIn.PreviousOutPoint.Index) < len(parent.TxOut) {
+		output = parent.TxOut[txIn.PreviousOutPoint.Index]
+		var info basewallet.OutputScriptInfo
+		info, err = r.wallet.ScriptForOutput(
+			context.Background(),
+			*output,
 		)
+		if err == nil {
+			derivation, err = r.wallet.GetDerivationInfo(
+				context.Background(), info.Addr,
+			)
+		}
+	} else if err == nil {
+		err = basewallet.ErrUnknownOutput
 	}
 
 	switch {
 	// No error, we do have the full UTXO info available.
 	case err == nil:
-		in.WitnessUtxo = &wire.TxOut{
-			Value:    int64(info.Value),
-			PkScript: info.PkScript,
-		}
-		in.NonWitnessUtxo = info.PrevTx
+		in.WitnessUtxo = output
+		in.NonWitnessUtxo = parent
 		in.Bip32Derivation = []*psbt.Bip32Derivation{derivation}
 
 	// The wallet doesn't know about this UTXO, so it's probably a TX that
@@ -1322,11 +1106,6 @@ func extractSignature(in *psbt.PInput,
 	}
 }
 
-// fetchOutpointInfoFn looks up the wallet's local knowledge of an outpoint.
-// Mirrors lnwallet.WalletController.FetchOutpointInfo so the helper below can
-// be exercised in unit tests without standing up a full wallet.
-type fetchOutpointInfoFn func(*wire.OutPoint) (*lnwallet.Utxo, error)
-
 // populateNonSignedInputWitnessUtxos walks every non-signed PSBT input and
 // fills in its WitnessUtxo. The signing path that ultimately ships this PSBT
 // to the remote signer is walletkit.SignPsbt, which rejects any PSBT that
@@ -1349,7 +1128,7 @@ type fetchOutpointInfoFn func(*wire.OutPoint) (*lnwallet.Utxo, error)
 // to later reject the resulting PSBT with "input (index=N) doesn't specify
 // any UTXO info".
 func populateNonSignedInputWitnessUtxos(packet *psbt.Packet, tx *wire.MsgTx,
-	signDesc *input.SignDescriptor, fetchInfo fetchOutpointInfoFn) {
+	signDesc *input.SignDescriptor, fetcher txscript.PrevOutputFetcher) {
 
 	for idx := range packet.Inputs {
 		// Skip the input we're signing for, that will get a special
@@ -1359,8 +1138,8 @@ func populateNonSignedInputWitnessUtxos(packet *psbt.Packet, tx *wire.MsgTx,
 		}
 
 		txIn := tx.TxIn[idx]
-		info, err := fetchInfo(&txIn.PreviousOutPoint)
-		if err != nil {
+		info := fetcher.FetchPrevOutput(txIn.PreviousOutPoint)
+		if info == nil {
 			// The wallet doesn't know about this outpoint. Fall
 			// back to the caller-supplied PrevOutputFetcher.
 			if signDesc.PrevOutputFetcher != nil {
@@ -1381,10 +1160,7 @@ func populateNonSignedInputWitnessUtxos(packet *psbt.Packet, tx *wire.MsgTx,
 
 			continue
 		}
-		packet.Inputs[idx].WitnessUtxo = &wire.TxOut{
-			Value:    int64(info.Value),
-			PkScript: info.PkScript,
-		}
+		packet.Inputs[idx].WitnessUtxo = info
 	}
 }
 
@@ -1448,4 +1224,135 @@ func considerShutdown(err error) {
 	case isStatusErr && statusErr.Code() == codes.Unavailable:
 		log.Critical("RPC signing server not available: %v", err)
 	}
+}
+
+// FinalizePsbt signs owned inputs through the existing remote script transport.
+// Unlike SignPsbt, this flow does not require origins supplied by the caller.
+func (r *RPCKeyRing) FinalizePsbt(ctx context.Context,
+	packet *psbt.Packet) error {
+
+	// Let's check that this is actually something we can and want to sign.
+	// We need at least one input and one output. In addition each
+	// input needs nonWitness Utxo or witness Utxo data specified.
+	err := psbt.InputsReadyToSign(packet)
+	if err != nil {
+		return err
+	}
+
+	// Go through each input that doesn't have final witness data attached
+	// to it already and try to sign it. We do expect that we're the last
+	// ones to sign. If there is any input without witness data that we
+	// cannot sign because it's not our UTXO, this will be a hard failure.
+	tx := packet.UnsignedTx
+	prevOutFetcher, err := basewallet.PsbtPrevOutputFetcher(packet)
+	if err != nil {
+		return err
+	}
+	sigHashes := txscript.NewTxSigHashes(tx, prevOutFetcher)
+	for idx, txIn := range tx.TxIn {
+		in := packet.Inputs[idx]
+
+		// We can only sign if we have UTXO information available. We
+		// can just continue here as a later step will fail with a more
+		// precise error message.
+		if in.WitnessUtxo == nil && in.NonWitnessUtxo == nil {
+			continue
+		}
+
+		// Skip this input if it's got final witness data attached.
+		if len(in.FinalScriptWitness) > 0 {
+			continue
+		}
+
+		// We can only sign this input if it's ours, so we try to map it
+		// to a coin we own. If we can't, then we'll continue as it
+		// isn't our input.
+		utxo, err := r.wallet.GetUtxo(ctx, txIn.PreviousOutPoint)
+		if err != nil {
+			continue
+		}
+		// The native reader retains full parent bytes independently of
+		// the current UTXO view, including the evidence remote signers
+		// need.
+		detail, err := r.wallet.GetTx(ctx, txIn.PreviousOutPoint.Hash)
+		if err != nil {
+			return err
+		}
+		fullTx := wire.NewMsgTx(2)
+		if err := fullTx.Deserialize(
+			bytes.NewReader(detail.RawTx),
+		); err != nil {
+			return err
+		}
+		signDesc := &input.SignDescriptor{
+			KeyDesc: keychain.KeyDescriptor{},
+			Output: &wire.TxOut{
+				Value:    int64(utxo.Amount),
+				PkScript: utxo.PkScript,
+			},
+			HashType:          in.SighashType,
+			SigHashes:         sigHashes,
+			InputIndex:        idx,
+			PrevOutputFetcher: prevOutFetcher,
+		}
+
+		// Find out what UTXO we are signing. Wallets _should_ always
+		// provide the full non-witness UTXO for segwit v0.
+		var signOutput *wire.TxOut
+		if in.NonWitnessUtxo != nil {
+			prevIndex := txIn.PreviousOutPoint.Index
+			signOutput = in.NonWitnessUtxo.TxOut[prevIndex]
+
+			if !psbt.TxOutsEqual(signDesc.Output, signOutput) {
+				return fmt.Errorf("found UTXO %#v but it "+
+					"doesn't match PSBT's input %v",
+					signDesc.Output, signOutput)
+			}
+
+			if fullTx.TxHash() != txIn.PreviousOutPoint.Hash {
+				return fmt.Errorf("found UTXO tx %v but it "+
+					"doesn't match PSBT's input %v",
+					fullTx.TxHash(),
+					txIn.PreviousOutPoint.Hash)
+			}
+		}
+
+		// Fall back to witness UTXO only for older wallets.
+		if in.WitnessUtxo != nil {
+			signOutput = in.WitnessUtxo
+
+			if !psbt.TxOutsEqual(signDesc.Output, signOutput) {
+				return fmt.Errorf("found UTXO %#v but it "+
+					"doesn't match PSBT's input %v",
+					signDesc.Output, signOutput)
+			}
+		}
+
+		// Do the actual signing in ComputeInputScript which in turn
+		// will invoke the remote signer.
+		script, err := r.ComputeInputScript(tx, signDesc)
+		if err != nil {
+			return fmt.Errorf("error computing input script for "+
+				"input %d: %v", idx, err)
+		}
+
+		// Serialize the witness format from the stack representation to
+		// the wire representation.
+		var witnessBytes bytes.Buffer
+		err = psbt.WriteTxWitness(&witnessBytes, script.Witness)
+		if err != nil {
+			return fmt.Errorf("error serializing witness: %w", err)
+		}
+		packet.Inputs[idx].FinalScriptWitness = witnessBytes.Bytes()
+		packet.Inputs[idx].FinalScriptSig = script.SigScript
+	}
+
+	// Make sure the PSBT itself thinks it's finalized and ready to be
+	// broadcast.
+	err = psbt.MaybeFinalizeAll(packet)
+	if err != nil {
+		return fmt.Errorf("error finalizing PSBT: %w", err)
+	}
+
+	return nil
 }

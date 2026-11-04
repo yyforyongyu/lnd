@@ -184,6 +184,12 @@ func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config,
 				reflect.ValueOf(cc.FeeEstimator),
 			)
 			subCfgValue.FieldByName("Wallet").Set(
+				reflect.ValueOf(cc.Wallet.Cfg.Wallet),
+			)
+			// The existing application wallet owns reserve and
+			// signer routing; ordinary WalletKit requests use the
+			// native capability above.
+			subCfgValue.FieldByName("LightningWallet").Set(
 				reflect.ValueOf(cc.Wallet),
 			)
 			subCfgValue.FieldByName("CoinSelectionLocker").Set(

@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/lightningnetwork/lnd/chainio"
 	"github.com/lightningnetwork/lnd/chainntnfs"
@@ -953,7 +954,9 @@ func (c *ChainArbitrator) rebroadcast(channel *chanstate.OpenChannel,
 		labels.LabelTypeChannelClose, &channel.ShortChannelID,
 	)
 	err = c.cfg.PublishTx(closeTx, label)
-	if err != nil && err != lnwallet.ErrDoubleSpend {
+	if err != nil && !errors.Is(err, chain.ErrMempoolConflict) &&
+		!errors.Is(err, chain.ErrMissingInputs) {
+
 		log.Warnf("Unable to broadcast %s close tx(%v): %v",
 			kind, closeTx.TxHash(), err)
 	}

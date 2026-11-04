@@ -1,21 +1,21 @@
 package sweep
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"math"
 	"slices"
-	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	base "github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
-	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 )
@@ -158,7 +158,7 @@ type UtxoSource interface {
 	// default wallet account that have between minConfs and maxConfs
 	// number of confirmations.
 	ListUnspentWitnessFromDefaultAccount(minConfs, maxConfs int32) (
-		[]*lnwallet.Utxo, error)
+		[]*base.Utxo, error)
 }
 
 // CoinSelectionLocker is an interface that allows the caller to perform an
@@ -173,20 +173,6 @@ type CoinSelectionLocker interface {
 	// ability to execute a function closure under an exclusive coin
 	// selection lock.
 	WithCoinSelectLock(func() error) error
-}
-
-// OutputLeaser allows a caller to lease/release an output. When leased, the
-// outputs shouldn't be used for any sort of channel funding or coin selection.
-// Leased outputs are expected to be persisted between restarts.
-type OutputLeaser interface {
-	// LeaseOutput leases a target output, rendering it unusable for coin
-	// selection.
-	LeaseOutput(i wtxmgr.LockID, o wire.OutPoint, d time.Duration) (
-		time.Time, error)
-
-	// ReleaseOutput releases a target output, allowing it to be used for
-	// coin selection once again.
-	ReleaseOutput(i wtxmgr.LockID, o wire.OutPoint) error
 }
 
 // WalletSweepPackage is a package that gives the caller the ability to sweep
@@ -225,13 +211,13 @@ type DeliveryAddr struct {
 func CraftSweepAllTx(feeRate, maxFeeRate chainfee.SatPerKWeight,
 	blockHeight uint32, deliveryAddrs []DeliveryAddr,
 	changeAddr address.Address, coinSelectLocker CoinSelectionLocker,
-	utxoSource UtxoSource, outputLeaser OutputLeaser,
+	utxoSource UtxoSource, outputLeaser base.UtxoManager,
 	signer input.Signer, minConfs int32,
 	selectUtxos fn.Set[wire.OutPoint]) (*WalletSweepPackage, error) {
 
 	// TODO(roasbeef): turn off ATPL as well when available?
 
-	var outputsForSweep []*lnwallet.Utxo
+	var outputsForSweep []*base.Utxo
 
 	// We'll make a function closure up front that allows us to unlock all
 	// selected outputs to ensure that they become available again in the
@@ -242,7 +228,9 @@ func CraftSweepAllTx(feeRate, maxFeeRate chainfee.SatPerKWeight,
 			// Log the error but continue since we're already
 			// handling an error.
 			err := outputLeaser.ReleaseOutput(
-				chanfunding.LndInternalLockID, utxo.OutPoint,
+				context.Background(),
+				chanfunding.LndInternalLockID,
+				utxo.OutPoint,
 			)
 			if err != nil {
 				log.Warnf("Failed to release UTXO %s (%v))",
@@ -288,7 +276,9 @@ func CraftSweepAllTx(feeRate, maxFeeRate chainfee.SatPerKWeight,
 				utxo.OutPoint)
 
 			_, err = outputLeaser.LeaseOutput(
-				chanfunding.LndInternalLockID, utxo.OutPoint,
+				context.Background(),
+				chanfunding.LndInternalLockID,
+				utxo.OutPoint,
 				chanfunding.DefaultLockDuration,
 			)
 			if err != nil {
@@ -323,7 +313,7 @@ func CraftSweepAllTx(feeRate, maxFeeRate chainfee.SatPerKWeight,
 		signDesc := &input.SignDescriptor{
 			Output: &wire.TxOut{
 				PkScript: output.PkScript,
-				Value:    int64(output.Value),
+				Value:    int64(output.Amount),
 			},
 			HashType: txscript.SigHashAll,
 		}
@@ -338,15 +328,15 @@ func CraftSweepAllTx(feeRate, maxFeeRate chainfee.SatPerKWeight,
 
 		// If this is a p2wkh output, then we'll assume it's a witness
 		// key hash witness type.
-		case lnwallet.WitnessPubKey:
+		case waddrmgr.WitnessPubKey:
 			witnessType = input.WitnessKeyHash
 
 		// If this is a p2sh output, then as since it's under control
 		// of the wallet, we'll assume it's a nested p2sh output.
-		case lnwallet.NestedWitnessPubKey:
+		case waddrmgr.NestedWitnessPubKey:
 			witnessType = input.NestedWitnessKeyHash
 
-		case lnwallet.TaprootPubkey:
+		case waddrmgr.TaprootPubKey:
 			witnessType = input.TaprootPubKeySpend
 			signDesc.HashType = txscript.SigHashDefault
 
@@ -413,12 +403,12 @@ func CraftSweepAllTx(feeRate, maxFeeRate chainfee.SatPerKWeight,
 
 // fetchUtxosFromOutpoints returns UTXOs for given outpoints. Errors if any
 // outpoint is not in the passed slice of utxos.
-func fetchUtxosFromOutpoints(utxos []*lnwallet.Utxo,
-	outpoints []wire.OutPoint) ([]*lnwallet.Utxo, error) {
+func fetchUtxosFromOutpoints(utxos []*base.Utxo,
+	outpoints []wire.OutPoint) ([]*base.Utxo, error) {
 
-	lookup := fn.SliceToMap(utxos, func(utxo *lnwallet.Utxo) wire.OutPoint {
+	lookup := fn.SliceToMap(utxos, func(utxo *base.Utxo) wire.OutPoint {
 		return utxo.OutPoint
-	}, func(utxo *lnwallet.Utxo) *lnwallet.Utxo {
+	}, func(utxo *base.Utxo) *base.Utxo {
 		return utxo
 	})
 

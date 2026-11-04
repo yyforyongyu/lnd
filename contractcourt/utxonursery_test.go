@@ -18,6 +18,7 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/fn/v2"
@@ -669,14 +670,14 @@ func TestRejectedCribTransaction(t *testing.T) {
 		{
 			name: "Crib tx is rejected because of low mempool " +
 				"fees",
-			broadcastErr: lnwallet.ErrMempoolFee,
+			broadcastErr: chain.ErrMempoolMinFeeNotMet,
 		},
 		{
 			// We map a rejected rbf transaction to ErrDoubleSpend
 			// in lnd.
 			name: "Crib tx is rejected because of a " +
 				"rbf transaction not succeeding",
-			broadcastErr: lnwallet.ErrDoubleSpend,
+			broadcastErr: chain.ErrMempoolConflict,
 		},
 		{
 			name: "Crib tx is rejected with an " +

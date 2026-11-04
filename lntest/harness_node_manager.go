@@ -170,8 +170,10 @@ func (nm *nodeManager) unlockNode(hn *node.HarnessNode,
 		WalletPassword: hn.Cfg.Password,
 	}
 	if len(chanBackups) != 0 {
+		// The wallet was recovered before this restart. Import channel
+		// state with its persisted addresses, without requesting a new
+		// seed-discovery window during unlock.
 		unlockReq.ChannelBackups = chanBackups[0]
-		unlockReq.RecoveryWindow = 100
 	}
 
 	err := wait.NoError(func() error {

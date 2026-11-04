@@ -1,59 +1,139 @@
 package lnwallet
 
 import (
+	"bytes"
+	"math"
 	"testing"
-	"time"
 
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
-	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/lightningnetwork/lnd/chanstate"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-// leaseOptionsController records optional output lease settings.
-type leaseOptionsController struct {
-	*mockWalletController
-
-	leaseOpts LeaseOutputOptions
-}
-
-// LeaseOutputWithOptions records the options passed through the wallet wrapper.
-func (c *leaseOptionsController) LeaseOutputWithOptions(_ wtxmgr.LockID,
-	_ wire.OutPoint, _ time.Duration,
-	opts LeaseOutputOptions) (time.Time, error) {
-
-	c.leaseOpts = opts
-
-	return time.Unix(123, 0), nil
-}
-
-// TestResolveOutputLeaser verifies that optional lease capability detection
-// reflects the concrete controller behind a LightningWallet wrapper.
-func TestResolveOutputLeaser(t *testing.T) {
+// TestReservedValueMaturity ensures unavailable rewards cannot replace anchor
+// reserves, while mature or ordinary watch-only funds remain remotely usable.
+func TestReservedValueMaturity(t *testing.T) {
 	t.Parallel()
+	testCases := []struct {
+		name          string
+		watchOnly     bool
+		spendable     bool
+		confirmations int32
+		coinbase      bool
+		wantError     bool
+	}{
+		{
+			name:          "local mature",
+			spendable:     true,
+			confirmations: 100,
+		},
+		{
+			name:          "local immature",
+			confirmations: 1,
+			coinbase:      true,
+			wantError:     true,
+		},
+		{
+			name:          "remote mature",
+			watchOnly:     true,
+			confirmations: 100,
+		},
+		{
+			name:          "remote immature",
+			watchOnly:     true,
+			confirmations: 1,
+			coinbase:      true,
+			wantError:     true,
+		},
+		{
+			name:          "remote ordinary",
+			watchOnly:     true,
+			confirmations: 1,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange one mature coin being spent and one candidate
+			// reserve. Only native metadata determines whether the
+			// remaining candidate can secure the anchor channel.
+			spent := wire.OutPoint{
+				Index: 1,
+			}
+			remaining := wire.OutPoint{
+				Index: 2,
+			}
+			w := &mockWalletController{}
+			t.Cleanup(func() { w.AssertExpectations(t) })
+			w.On("ListUnspent", mock.Anything, wallet.UtxoQuery{
+				Account:  DefaultAccountName,
+				MaxConfs: math.MaxInt32,
+			}).Return([]*wallet.Utxo{
+				{
+					OutPoint:  spent,
+					Amount:    20_000,
+					PkScript:  CoinPkScript,
+					Spendable: true,
+				},
+				{
+					OutPoint:      remaining,
+					Amount:        AnchorChanReservedValue,
+					PkScript:      CoinPkScript,
+					Spendable:     tc.spendable,
+					Confirmations: tc.confirmations,
+				},
+			}, nil).Once()
+			if !tc.spendable {
+				w.On("IsWatchOnly").Return(tc.watchOnly).Once()
+			}
+			if tc.watchOnly && tc.confirmations < 100 {
+				parent := wire.NewMsgTx(2)
+				previous := wire.OutPoint{
+					Hash: chainhash.Hash{1},
+				}
+				if tc.coinbase {
+					previous = wire.OutPoint{
+						Index: math.MaxUint32,
+					}
+				}
+				parent.AddTxIn(wire.NewTxIn(
+					&previous, nil, nil,
+				))
+				var raw bytes.Buffer
+				require.NoError(t, parent.Serialize(&raw))
+				w.On("GetTx", mock.Anything, remaining.Hash).
+					Return(&wallet.TxDetail{
+						RawTx: raw.Bytes(),
+					}, nil).Once()
+			}
+			lw := &LightningWallet{
+				Cfg: Config{
+					Wallet:    w,
+					NetParams: chaincfg.MainNetParams,
+				},
+			}
 
-	t.Run("supported", func(t *testing.T) {
-		controller := &leaseOptionsController{
-			mockWalletController: &mockWalletController{},
-		}
-		wallet := &LightningWallet{
-			WalletController: controller,
-		}
+			// Act through the public reserve check after spending
+			// the
+			// only independently mature input.
+			_, err := lw.CheckReservedValue(
+				[]wire.OutPoint{spent}, nil, 1,
+			)
 
-		leaser, ok := ResolveOutputLeaser(wallet)
-		require.True(t, ok)
-		require.Same(t, controller, leaser)
-	})
-
-	t.Run("unsupported", func(t *testing.T) {
-		wallet := &LightningWallet{
-			WalletController: &mockWalletController{},
-		}
-
-		leaser, ok := ResolveOutputLeaser(wallet)
-		require.False(t, ok)
-		require.Nil(t, leaser)
-	})
+			// Assert immature rewards cannot satisfy the reserve;
+			// cleanup verifies the exact metadata lookups once.
+			if tc.wantError {
+				require.ErrorIs(t,
+					err, ErrReservedValueInvalidated,
+				)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 // TestHandleFundingCounterPartySigsMissingReservation tests the missing
