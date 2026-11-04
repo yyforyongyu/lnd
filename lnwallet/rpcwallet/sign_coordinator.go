@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/watchonlyrpc"
@@ -71,6 +72,92 @@ type requestInfo struct {
 	respQuit <-chan struct{}
 }
 
+// coordinatorResult settles one request without sharing mutable response state.
+type coordinatorResult struct {
+	response *RSResponse
+	err      error
+}
+
+// coordinatorConnection is an immutable stream generation shared with its IO
+// routines. Only the owner closes done or settles finished.
+type coordinatorConnection struct {
+	send     chan *watchonlyrpc.SignCoordinatorRequest
+	done     chan struct{}
+	finished chan error
+}
+
+// coordinatorLoop is the sole entry point to connection and request state.
+type coordinatorLoop struct {
+	events chan any
+	done   chan struct{}
+}
+
+// coordinatorState is accessed only by the owner loop; no request or IO
+// goroutine may read its maps, counter, queue or readiness state.
+type coordinatorState struct {
+	connection *coordinatorConnection
+	ready      chan struct{}
+	connected  bool
+	nextID     uint64
+	pending    map[uint64]chan coordinatorResult
+	queued     []*watchonlyrpc.SignCoordinatorRequest
+}
+
+// The event records transfer ownership through channels. Connection pointers
+// are generation identities, so late completions cannot affect a replacement.
+type coordinatorConnect struct {
+	reply chan coordinatorConnected
+}
+
+type coordinatorConnected struct {
+	connection *coordinatorConnection
+	err        error
+}
+
+type coordinatorReady struct {
+	connection *coordinatorConnection
+}
+
+type coordinatorReadiness struct {
+	reply chan (<-chan struct{})
+}
+
+type coordinatorCall struct {
+	reply chan struct{}
+}
+
+type coordinatorSubmit struct {
+	request *watchonlyrpc.SignCoordinatorRequest
+	reply   chan coordinatorSubmitted
+}
+
+type coordinatorSubmitted struct {
+	id       uint64
+	response chan coordinatorResult
+	err      error
+}
+
+type coordinatorCancel struct {
+	id uint64
+}
+
+type coordinatorReceived struct {
+	connection *coordinatorConnection
+	response   *RSResponse
+	err        error
+}
+
+type coordinatorSent struct {
+	connection *coordinatorConnection
+	id         uint64
+	err        error
+}
+
+type coordinatorDisconnect struct {
+	connection *coordinatorConnection
+	err        error
+}
+
 // SignCoordinator is an implementation of the signrpc.SignerClient and the
 // walletrpc.WalletKitClient interfaces that passes on all requests to a remote
 // signer. It is used by the watch-only wallet to delegate any signing or ECDH
@@ -79,6 +166,9 @@ type requestInfo struct {
 // up by the remote signer when it connects to the watch-only wallet, which
 // should execute the Run method.
 type SignCoordinator struct {
+	loop     *coordinatorLoop
+	cg       *fn.ContextGuard
+	gManager *fn.GoroutineManager
 	// nextRequestID keeps track of the next request ID that should
 	// be used when sending a request to the remote signer.
 	nextRequestID atomic.Uint64
@@ -156,8 +246,11 @@ func NewSignCoordinator(requestTimeout time.Duration,
 		clientReady:     make(chan struct{}),
 		clientConnected: false,
 		quit:            make(chan struct{}),
-		requestTimeout:  requestTimeout,
-		startupTimeout:  startupTimeout,
+
+		cg:             fn.NewContextGuard(),
+		gManager:       fn.NewGoroutineManager(),
+		requestTimeout: requestTimeout,
+		startupTimeout: startupTimeout,
 		// Note that the disconnected channel is not initialized here,
 		// as no code listens to it until the Run method has been called
 		// and set the field.
@@ -169,6 +262,20 @@ func NewSignCoordinator(requestTimeout time.Duration,
 	s.nextRequestID.Store(handshakeRequestID)
 
 	return s
+}
+
+// event transfers an immutable operation without blocking shutdown or caller
+// cancellation. Accepted operations always deliver their buffered admission
+// reply.
+func (s *SignCoordinator) event(ctx context.Context, event any) error {
+	select {
+	case <-s.cg.Done():
+		return ErrShuttingDown
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.loop.events <- event:
+		return nil
+	}
 }
 
 // Run starts the SignCoordinator and blocks until the remote signer either
@@ -268,7 +375,9 @@ func (s *SignCoordinator) Stop() {
 
 	s.mu.Unlock()
 
+	s.cg.Quit()
 	s.wg.Wait()
+	s.gManager.Stop()
 }
 
 // handshake performs the initial handshake with the remote signer. This must
@@ -290,10 +399,7 @@ func (s *SignCoordinator) handshake(stream StreamServer) error {
 
 	// Read the first message in a goroutine because the Recv method blocks
 	// until the message arrives.
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-
+	if !s.gManager.Go(ctxt, func(_ context.Context) {
 		msg, err := stream.Recv()
 		if err != nil {
 			select {
@@ -337,7 +443,10 @@ func (s *SignCoordinator) handshake(stream StreamServer) error {
 
 			return
 		}
-	}()
+	}) {
+
+		return ErrShuttingDown
+	}
 
 	// Wait for the initial message to arrive or time out if it takes too
 	// long. The initial message must be a registration message from the
@@ -356,9 +465,9 @@ func (s *SignCoordinator) handshake(stream StreamServer) error {
 
 	case err := <-errChan:
 		return fmt.Errorf("error receiving initial remote signer "+
-			"registration message: %v", err)
+			"registration message: %w", err)
 
-	case <-s.quit:
+	case <-s.cg.Done():
 		return ErrShuttingDown
 
 	case <-ctxt.Done():
@@ -391,10 +500,7 @@ func (s *SignCoordinator) handshake(stream StreamServer) error {
 
 	// Send the message in a goroutine because the Send method blocks until
 	// the message is read by the client.
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-
+	if !s.gManager.Go(ctxt, func(_ context.Context) {
 		err := stream.Send(regCompleteMsg)
 		if err != nil {
 			select {
@@ -406,17 +512,20 @@ func (s *SignCoordinator) handshake(stream StreamServer) error {
 		}
 
 		close(registerDoneChan)
-	}()
+	}) {
+
+		return ErrShuttingDown
+	}
 
 	select {
 	case err := <-errChan:
 		return fmt.Errorf("error sending registration complete "+
-			" message to remote signer: %v", err)
+			" message to remote signer: %w", err)
 
 	case <-ctxt.Done():
 		return ctxt.Err()
 
-	case <-s.quit:
+	case <-s.cg.Done():
 		return ErrShuttingDown
 
 	case <-registerDoneChan:
