@@ -605,6 +605,117 @@ func (r *OutboundClient) waitForRequest(ctx context.Context, stream *Stream) (
 	return req, nil
 }
 
+// signerJob carries an ordered operation without retaining a context in shared
+// state. Cancellation and the response sink are bound in its execution closure.
+type signerJob struct {
+	session  string
+	done     <-chan struct{}
+	accepted chan bool
+	run      func()
+}
+
+// signerDispatcher owns eligibility and queue bounds; workers never block on a
+// per-session lock while independent sessions are waiting for execution.
+type signerDispatcher struct {
+	start     sync.Once
+	incoming  chan signerJob
+	work      chan signerJob
+	completed chan string
+}
+
+// run dispatches FIFO work per session with at most 32 pending jobs. It alone
+// accesses active and pending; reconnecting streams reuse this same owner.
+func (d *signerDispatcher) run(ctx context.Context) {
+	active := make(map[string]bool)
+	var pending []signerJob
+	for {
+		// Drop cancelled queued work before selecting an eligible
+		// session. No worker is consumed waiting for its session's
+		// predecessor.
+		for i := 0; i < len(pending); {
+			select {
+			case <-pending[i].done:
+				pending = append(pending[:i], pending[i+1:]...)
+			default:
+				i++
+			}
+		}
+		var work chan signerJob
+		var next signerJob
+		index := -1
+		for i, job := range pending {
+			if job.session == "" || !active[job.session] {
+				work, next, index = d.work, job, i
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-d.incoming:
+			if len(pending) == 32 {
+				job.accepted <- false
+
+				continue
+			}
+			pending = append(pending, job)
+			job.accepted <- true
+		case session := <-d.completed:
+			delete(active, session)
+		case work <- next:
+			if next.session != "" {
+				active[next.session] = true
+			}
+			pending = append(pending[:index], pending[index+1:]...)
+		}
+	}
+}
+
+// worker drains entered synchronous calls during Stop, while cancelled queued
+// jobs never enter a backend. Completion cannot block after the owner exits.
+func (d *signerDispatcher) worker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-d.work:
+			select {
+			case <-job.done:
+			default:
+				job.run()
+			}
+			select {
+			case d.completed <- job.session:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// signerSession extracts only order-sensitive session IDs. Creation and
+// stateless RPCs may run independently, like the classic gRPC backend.
+func signerSession(request *watchonlyrpc.SignCoordinatorRequest) string {
+	switch request := request.GetSignRequestType().(type) {
+	case *watchonlyrpc.SignCoordinatorRequest_MuSig2RegisterNoncesRequest:
+		return string(
+			request.MuSig2RegisterNoncesRequest.GetSessionId(),
+		)
+	case *watchonlyrpc.SignCoordinatorRequest_MuSig2CombinedNoncesReq:
+		return string(request.MuSig2CombinedNoncesReq.GetSessionId())
+	case *watchonlyrpc.SignCoordinatorRequest_MuSig2GetCombinedNoncesReq:
+		return string(request.MuSig2GetCombinedNoncesReq.GetSessionId())
+	case *watchonlyrpc.SignCoordinatorRequest_MuSig2SignRequest:
+		return string(request.MuSig2SignRequest.GetSessionId())
+	case *watchonlyrpc.SignCoordinatorRequest_MuSig2CombineSigRequest:
+		return string(request.MuSig2CombineSigRequest.GetSessionId())
+	case *watchonlyrpc.SignCoordinatorRequest_MuSig2CleanupRequest:
+		return string(request.MuSig2CleanupRequest.GetSessionId())
+	default:
+		return ""
+	}
+}
+
 // formResponse processes the received request from the watch-only node, and
 // sends the corresponding response back.
 func (r *OutboundClient) formResponse(ctx context.Context,
