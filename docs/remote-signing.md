@@ -405,8 +405,8 @@ node will shut down:
 
 ```text
 # Set the interval for how often the watch-only node will check that the signer
-# node is still connected.
-healthcheck.remotesigner.interval=5s
+# node is still connected; use the documented one-minute minimum.
+healthcheck.remotesigner.interval=1m
 ```
 
 If the signer disconnects after startup, it may take some time to reconnect.
@@ -2134,3 +2134,65 @@ client.initWallet({
     console.log(res);
 });
 ```
+
+## Experimental stream behavior
+
+When the signer dials the watch-only node, upgrade both nodes together. The
+registration protocol requires a fresh challenge, the supported protocol
+version, and a proof from the actual TLS connection. Missing or incompatible
+proofs close registration, without an unsigned fallback. TLS 1.3 or TLS 1.2 with
+Extended Master Secret is required.
+Classic RPC signing keeps its existing wire protocol. The registration proof
+confirms this TLS connection; it does not independently attest to either wallet
+seed.
+
+Keep TLS trust files aligned with the certificate actually served by the
+watch-only node. Certificate replacement, including encrypted-key startup's
+ephemeral/permanent certificate handling, follows the normal lnd TLS procedures;
+registration does not update pinned trust files. Reconnect with the appropriate
+trusted certificate after rotation rather than disabling certificate checks.
+
+The dedicated listener intentionally bypasses RPC middleware, including
+`--rpcmiddleware.addmandatory`, throughout startup and runtime. Middleware
+registers on the main RPC server, whose startup may itself require the signer;
+requiring that registration on the signing stream would create a startup
+cycle. The dedicated server still applies its TLS and macaroon authorization.
+Operators must enforce any additional signing policy outside mandatory RPC
+middleware on the main server.
+
+Independent signing requests and different MuSig2 sessions share four workers.
+Operations within one MuSig2 session execute in receive order. Up to 32 signing
+requests may wait for execution; excess requests receive a busy error. Ping
+health checks bypass the backend queue. A synchronous backend operation already
+entered cannot always be cancelled: shutdown waits for it to return before the
+wallet is closed. Queued work is cancelled, and disconnected streams cannot
+deliver old results to a replacement connection.
+
+For MuSig2 v1.0.0rc2, which accepts supplied nonces, the signer records each
+public-nonce fingerprint and its complete signing transcript in its existing
+wallet database before signing. Recreated sessions may repeat an identical
+transcript, preserving deterministic Taproot force-close recovery after a crash
+or lost result. Reusing that nonce with a changed message, aggregate nonce,
+signer key set or tweak is rejected. A live crypto session retains its
+one-signature behavior. Stateful MuSig2 RPCs are never automatically retried
+after disconnect.
+
+Legacy MuSig2 v0.4.0 generates fresh nonces internally and does not accept
+supplied local nonces. It retains the crypto session's single-use signing
+protection and does not support supplied-nonce reconstruction.
+
+Preserve the signer's wallet database and nonce history. This guard covers
+recorded history with that database intact; it cannot cover nonce uses predating
+its installation or history lost through a deleted, rolled-back or seed-only
+restored database. This nonce-safety check does not enforce transaction policy.
+
+### Recovery and shutdown
+
+A disconnect can be followed by reconnection, but requests can fail during that
+window. Caller deadlines and unavailable RPC errors can request daemon shutdown.
+When the signer dials the watch-only node, the watch-only node's not-connected
+and request-timeout errors rely on the remote-signer health check as their
+shutdown backstop. Configure valid health-check intervals and retry tolerance
+for the deployment. During wallet recovery, `StopDaemon` refuses
+to interrupt a rescan even while startup is waiting for the signer. If recovery
+state is not yet available after unlock, retry shutdown once it is available.
